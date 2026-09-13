@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "onec-interactive-runtime-core"
+version = "0.1.17"
+requires-python = ">=3.12"
+license = "GPL-3.0-only AND MIT"
+license-files = ["LICENSE", "COPYRIGHT", "THIRD_PARTY_NOTICES.txt"]
+dependencies = [
+  "httpx>=0.27,<1",
+  "pandas>=2.2,<4",
+  "paramiko>=4,<5",
+  "psutil>=6,<8",
+]
+
+[dependency-groups]
+dev = [
+  "ipykernel>=6.29,<7",
+  "ipython>=8.22,<10",
+  "jupyter-client>=8.6,<9",
+  "nbclient>=0.10,<1",
+  "nbformat>=5.10,<6",
+  "mcp>=2.0,<3",
+  "pytest>=8,<9",
+  "pytest-timeout>=2.3,<3",
+  "onec-interactive-jupyter",
+  "onec-interactive-mcp",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/onec_runtime", "src/onec_runtime_build"]
+
+[tool.hatch.build.targets.sdist]
+exclude = ["/.venv", "/.pytest_cache", "/artifacts", "/packages/jupyter/frontend/node_modules", "/packages/vscode/node_modules"]
+
+[tool.uv.workspace]
+members = ["packages/jupyter", "packages/mcp"]
+
+[tool.uv.sources]
+onec-interactive-runtime-core = { workspace = true }
+onec-interactive-jupyter = { workspace = true }
+onec-interactive-mcp = { workspace = true }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "integration: requires locally installed 1C:Enterprise",
+  "live_1c: requires an opt-in local 1C:Enterprise runtime and creates a temporary infobase",
+  "packaging: builds and imports an isolated wheel layout",
+  "soak: long-running one-hour experiment",
+]

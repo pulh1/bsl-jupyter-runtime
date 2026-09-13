@@ -1,0 +1,15 @@
+.worktrees/
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+.runtime/
+artifacts/
+*.epf
+!tests/fixtures/worker-v2-platform.epf
+node_modules/
+packages/vscode/out/
+*.vsix
+docs/research/evidence/**
+packages/jupyter/frontend/lib/
+packages/jupyter/src/onec_runtime_jupyter/labextension/

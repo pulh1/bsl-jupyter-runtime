@@ -1,0 +1,582 @@
+"""Method publication contracts with the real controller, parser and EPF builder.
+
+Only the external debugger session and target artifact transport are scripted.
+"""
+from pathlib import Path
+import re
+
+import pytest
+
+from onec_runtime.errors import BslExecutionError, ProtocolError, WorkerPromotionOutcomeUnknown
+from onec_runtime.prototype_runtime import PrototypeRuntimeController
+from onec_runtime.runtime_api import PrototypeRuntimeApi
+from onec_runtime.bsl.source_maps import SourceUnitKind, SourceUnitRef, source_sha256
+from onec_runtime.worker_universe import WorkerModuleArtifactBuilder, WorkerModuleArtifactCache
+
+from test_prototype_runtime import ScriptedSession, SERVICE, CAPTURE_A, CAPTURE_B, USER, evaluation
+from test_runtime_api import (
+    _notebook_worker_builder, _UniverseInstructionExecutor,
+    _SemanticSnapshotFailureTarget, _common_module_catalog, _worker_module_unit,
+)
+
+
+PAIR = 'Функция А()\nВозврат Б();\nКонецФункции\nФункция Б()\nВозврат 1;\nКонецФункции'
+UPDATE = 'Функция Б()\nВозврат 2;\nКонецФункции'
+THIRD = 'Функция В()\nВозврат 3;\nКонецФункции'
+
+
+class TargetSession(ScriptedSession):
+    lose_capture_reply = False
+    lose_capture_resume = False
+
+    def continue_evaluation(self, pending, stop):
+        if self.lose_capture_resume:
+            raise TimeoutError('planned pending evaluation resume loss')
+        return super().continue_evaluation(pending, stop)
+
+    def evaluate(self, expression, **kwargs):
+        if self.lose_capture_reply and 'ВыполнитьКодВКонтекстеОтладки' in expression:
+            raise TimeoutError('planned evaluation transport loss')
+        if any(name in expression for name in ('УстановитьПинПоколенияWorker', 'ОчиститьПинПоколенияWorker')):
+            self.calls.append(('evaluate', expression))
+            return evaluation('Булево', 'Истина')
+        return super().evaluate(expression, **kwargs)
+
+
+def runtime(tmp_path: Path, *, target=None, captured=False):
+    session = TargetSession((CAPTURE_A, CAPTURE_B, SERVICE) if captured else (SERVICE,) * 15)
+    controller = PrototypeRuntimeController(session, SERVICE)
+    builder = _notebook_worker_builder(tmp_path)
+    api = PrototypeRuntimeApi(
+        controller, notebook_worker_builder=builder,
+        worker_module_builder=WorkerModuleArtifactBuilder(
+            builder, cache=WorkerModuleArtifactCache(),
+            packer_version='worker-epf-v1', target_profile='server-test',
+        ),
+        worker_instruction_executor=target or _UniverseInstructionExecutor(),
+        capture_points=(CAPTURE_A, CAPTURE_B) if captured else (),
+        user_breakpoints=(USER,) if captured else (),
+    )
+    return api, controller, session
+
+
+def paths(api):
+    return {entry[0] for entry in api._controller.lowerer.worker_export_identity}
+
+
+def test_notebook_worker_message_reaches_calling_cell(tmp_path):
+    api, _controller, session = runtime(tmp_path)
+    loaded = api.execute_bsl(
+        'Процедура Показать()\n    Сообщить("Успех");\nКонецПроцедуры'
+    )
+    assert loaded.succeeded
+    artifact = api._worker_generation_diagnostics[
+        api.worker_generation_handle.manifest_sha256
+    ][0]
+    assert 'RuntimeKernelServer.ДобавитьСообщение(' in artifact.mapped_source.text
+
+    session.message_values = ["Успех"]
+    called = api.execute_bsl('Показать();')
+
+    assert called.messages == ("Успех",)
+    sent = [value for operation, value in session.calls
+            if operation == 'modify' and value[0] == 'ТекущаяИнструкция']
+    assert '__OnecWorkerMessageSink' in sent[-1][1]
+    assert '__onec_cell_messages_' in sent[-1][1]
+
+
+def test_notebook_method_reads_current_persistent_variable_across_cells(tmp_path):
+    api, _controller, session = runtime(tmp_path)
+    assert api.execute_bsl('А = 100;').succeeded
+    assert api.execute_bsl(
+        'Функция ПолучитьА()\n    Возврат А;\nКонецФункции'
+    ).succeeded
+
+    artifact = api._worker_generation_diagnostics[
+        api.worker_generation_handle.manifest_sha256
+    ][0]
+    mapped = artifact.mapped_source
+    assert 'Возврат __OnecNotebookGlobals.А;' in mapped.text
+    origin = mapped.source_map.map_offset(mapped.text.index('.А;', mapped.text.index('Возврат')) + 1)
+    assert origin.unit is not None
+    assert origin.unit.kind is SourceUnitKind.NOTEBOOK_CELL
+
+    assert api.execute_bsl('Сообщить(ПолучитьА());').succeeded
+    assert api.execute_bsl('А = 200;').succeeded
+    assert api.execute_bsl('Сообщить(ПолучитьА());').succeeded
+    sent = [value for operation, value in session.calls
+            if operation == 'modify' and value[0] == 'ТекущаяИнструкция']
+    assert sum('ПолучитьА()' in value[1] for value in sent) == 2
+    for value in sent[-2:]:
+        assert '__OnecNotebookBoundGlobals.Вставить(' in value[1]
+        assert 'Контекст.А);' in value[1]
+        assert value[1].count(
+            '__OnecNotebookGlobals = __OnecNotebookPreviousGlobals;'
+        ) == 2
+
+
+def test_notebook_method_local_assignment_does_not_bind_global(tmp_path):
+    api, _controller, _session = runtime(tmp_path)
+    assert api.execute_bsl('А = 100;').succeeded
+    assert api.execute_bsl(
+        'Функция ЛокальнаяА()\n'
+        '    А = 1;\n'
+        '    Возврат А;\n'
+        'КонецФункции'
+    ).succeeded
+    artifact = api._worker_generation_diagnostics[
+        api.worker_generation_handle.manifest_sha256
+    ][0]
+    assert 'Возврат __OnecNotebookGlobals.А;' not in artifact.mapped_source.text
+    assert 'Возврат А;' in artifact.mapped_source.text
+
+
+def test_compile_invalid_worker_registration_is_not_recreated_by_value_guard(tmp_path):
+    class CompileFailingTarget(_UniverseInstructionExecutor):
+        fail_next_create = False
+
+        def __call__(self, source):
+            if self.fail_next_create and 'onec-worker-root-prepare-stage=' in source:
+                self.fail_next_create = False
+                marker = re.search(
+                    r'onec-worker-artifact-stage=artifact_sha256=[0-9a-f]{64};'
+                    r'logical_name_sha256=[0-9a-f]{64};phase=create;boundary=create',
+                    source,
+                )
+                assert marker is not None
+                self.last_error = BslExecutionError(
+                    'onec-worker-root-prepare-stage=create\n'
+                    + marker.group(0)
+                    + '\nпо причине:\n'
+                    + '{<Неизвестный модуль>(2,5)}: '
+                    + 'Процедура не определена\n[ОшибкаКомпиляцииВстроенногоЯзыка]'
+                )
+                raise self.last_error
+            return super().__call__(source)
+
+    target = CompileFailingTarget()
+    api, _controller, _session = runtime(tmp_path, target=target)
+    assert api.execute_bsl('Процедура Показать()\nКонецПроцедуры').succeeded
+    before = set(api._worker_universe_target.privacy_registration_snapshot())
+
+    target.fail_next_create = True
+    failed = api.execute_bsl(
+        'Процедура Показать()\n    НеизвестнаяОперация();\nКонецПроцедуры'
+    )
+
+    assert not failed.succeeded
+    assert failed.diagnostic is not None
+    from onec_runtime.server_worker import worker_artifact_stage_failure
+    from onec_runtime.bsl.diagnostics import parse_platform_diagnostic
+    assert worker_artifact_stage_failure(target.last_error) is not None
+    assert parse_platform_diagnostic(str(target.last_error)).has_compilation_marker
+    assert api._worker_universe_target._compile_failed_registrations
+    registrations = api._worker_universe_target.privacy_registration_snapshot()
+    assert set(registrations) == before
+    assert len(api._worker_universe_target._registrations) > len(registrations)
+    target.public_value_guard_results.append(False)
+    api.require_public_value_handles(('Контекст.Число',))
+    guard_source = next(
+        source for source in reversed(target.sources)
+        if 'onec-worker-public-value-guard' in source
+    )
+    assert all(name in guard_source for name in registrations)
+
+
+@pytest.mark.parametrize('prepared', [False, True])
+def test_notebook_worker_message_reaches_capture_cell(tmp_path, prepared):
+    api, _controller, session = runtime(tmp_path, captured=True)
+    loaded = api.execute_bsl(
+        'Процедура Показать()\n    Сообщить("Успех");\nКонецПроцедуры'
+    )
+    assert loaded.succeeded
+    api.execute_bsl('Результат = Capture();')
+
+    session.message_values = ["Успех"]
+    if prepared:
+        candidate = api.prepare_capture_hypothesis('Показать();')
+        called = api.execute_prepared_capture_hypothesis(candidate)
+    else:
+        called = api.execute_bsl('Показать();')
+
+    assert called.succeeded
+    assert called.messages == ("Успех",)
+    evaluations = [
+        str(value) for operation, value in session.calls if operation == 'evaluate'
+    ]
+    capture_source = next(
+        source for source in reversed(evaluations)
+        if 'ВыполнитьКодВКонтекстеОтладки' in source
+    )
+    assert '__OnecWorkerMessageSink' in capture_source
+
+
+@pytest.mark.parametrize('prepared', [False, True])
+def test_upsert_preserves_caller_and_distinct_source_origins(tmp_path, prepared):
+    """Replacing B must retain A and its original source, in both entry paths."""
+    api, controller, session = runtime(tmp_path)
+    api.execute_bsl(PAIR)
+    if prepared:
+        candidate = api.prepare_main_for_capture(UPDATE)
+        activated = api.activate_prepared_main_for_capture(candidate)
+        api.execute_prepared_main_for_capture(activated)
+    else:
+        api.execute_bsl(UPDATE)
+    assert paths(api) == {'а', 'б'}
+    artifacts = api._worker_generation_diagnostics[api.worker_generation_handle.manifest_sha256]
+    mapped = artifacts[0].mapped_source
+    caller_unit = mapped.source_map.map_offset(mapped.text.index('Возврат Б')).unit
+    helper_unit = mapped.source_map.map_offset(mapped.text.index('Возврат 2')).unit
+    assert caller_unit is not None and helper_unit is not None
+    assert caller_unit.unit_id == helper_unit.unit_id
+    assert (caller_unit.revision, helper_unit.revision) == (1, 2)
+    assert caller_unit.source_sha256 != helper_unit.source_sha256
+    # The retained method must be callable via the notebook bare-name receiver.
+    assert api.execute_bsl('Результат = А();').succeeded
+    sent = [value for operation, value in session.calls if operation == 'modify' and value[0] == 'ТекущаяИнструкция']
+    assert '.Получить(""Worker"").А()' in sent[-1][1]
+
+
+def test_failed_candidate_does_not_reappear_on_later_upsert(tmp_path):
+    target = _SemanticSnapshotFailureTarget()
+    api, _, _ = runtime(tmp_path, target=target)
+    api.execute_bsl(PAIR)
+    previous = api.worker_generation_handle
+    target.failure = 'swap_guard'
+    with pytest.raises(BslExecutionError):
+        api.execute_bsl(THIRD)
+    assert api.worker_generation_handle is previous
+    target.failure = None
+    api.execute_bsl(UPDATE)
+    assert paths(api) == {'а', 'б'}
+
+
+@pytest.mark.parametrize('notebook_first', [False, True])
+def test_named_and_notebook_writers_retain_each_others_complete_catalog(tmp_path, notebook_first):
+    api, _, _ = runtime(tmp_path)
+    catalog = _common_module_catalog('МодульА')
+    if notebook_first:
+        api.execute_bsl(PAIR)
+    api.load_worker_modules((_worker_module_unit('МодульА', 1, catalog),), common_modules=catalog)
+    if not notebook_first:
+        api.execute_bsl(PAIR)
+    assert paths(api) == {'модульа.версия', 'а', 'б'}
+    api.load_worker_modules((_worker_module_unit('МодульА', 2, catalog),), common_modules=catalog)
+    assert paths(api) == {'модульа.версия', 'а', 'б'}
+    api.execute_bsl(UPDATE)
+    assert paths(api) == {'модульа.версия', 'а', 'б'}
+    assert {item.logical_name for item in api._worker_universe.active_manifest.modules} == {'МодульА', 'Worker'}
+
+
+def test_reserved_worker_module_is_rejected_before_first_publication(tmp_path):
+    api, _, _ = runtime(tmp_path)
+    catalog = _common_module_catalog('Worker')
+    with pytest.raises(ProtocolError, match='reserved|зарезервирован'):
+        api.load_worker_modules((_worker_module_unit('Worker', 1, catalog),), common_modules=catalog)
+    assert api.worker_generation_handle is None
+
+
+@pytest.mark.parametrize('prepared', [False, True])
+def test_capture_evaluation_uses_new_generation_while_original_main_pin_survives(tmp_path, prepared):
+    api, controller, session = runtime(tmp_path, captured=True)
+    api.execute_bsl(UPDATE)
+    g1 = api.worker_generation_handle
+    stopped = api.execute_bsl('Результат = Б();')
+    original = api._operation_generation_pin
+    assert original.handle is g1
+    api.execute_bsl('Функция Б(Параметр)\nВозврат Параметр;\nКонецФункции')
+    g2 = api.worker_generation_handle
+    if prepared:
+        candidate = api.prepare_capture_hypothesis('РезультатИнструкции = Б(22);')
+        api.execute_prepared_capture_hypothesis(candidate)
+    else:
+        api.execute_bsl('РезультатИнструкции = Б(22);')
+    expressions = [value[0] if isinstance(value, tuple) else value
+                   for operation, value in session.calls if operation == 'evaluate']
+    executed = [text for text in expressions
+                if 'ВыполнитьКодТекущегоКонтекстаОтладки' in text
+                or 'ВыполнитьКодВКонтекстеОтладки' in text]
+    assert g2.manifest_sha256 in executed[-1]
+    assert '__OnecPinnedWorkerGeneration = Контекст.RuntimeWorkerActiveGeneration;' in executed[-1]
+    assert api._operation_generation_pin is original
+    resumed = api.resume_capture()
+    assert resumed.operation_id == stopped.operation_id and resumed.stop_sequence == 2
+    assert api._operation_generation_pin is original
+
+
+def test_prepared_capture_becomes_stale_after_notebook_publication(tmp_path):
+    api, _, _ = runtime(tmp_path, captured=True)
+    api.execute_bsl(UPDATE)
+    api.execute_bsl('Результат = Б();')
+    candidate = api.prepare_capture_hypothesis('РезультатИнструкции = Б();')
+    api.execute_bsl('Функция Б()\nВозврат 44;\nКонецФункции')
+    with pytest.raises(ProtocolError, match='stale'):
+        api.execute_prepared_capture_hypothesis(candidate)
+
+
+def test_mixed_capture_added_name_uses_new_catalog_and_releases_cell_lease(tmp_path):
+    api, _, session = runtime(tmp_path, captured=True)
+    api.execute_bsl(UPDATE)
+    api.execute_bsl('Результат = Б();')
+    original = api._operation_generation_pin
+    reply = api.execute_bsl(THIRD + '\nРезультатИнструкции = В();')
+    assert reply.succeeded
+    assert paths(api) == {'б', 'в'}
+    assert api._operation_generation_pin is original
+    assert api._evaluation_generation_pin is None
+    assert len(api._worker_universe._leases) == 1
+    expressions = [str(value) for operation, value in session.calls if operation == 'evaluate']
+    assert any(api.worker_generation_handle.manifest_sha256 in text and '.В()' in text for text in expressions)
+
+
+@pytest.mark.parametrize('prepared', [False, True])
+def test_known_capture_failure_releases_evaluation_lease_and_remains_captured(tmp_path, prepared):
+    api, controller, session = runtime(tmp_path, captured=True)
+    api.execute_bsl(UPDATE)
+    api.execute_bsl('Результат = Б();')
+    original = api._operation_generation_pin
+    session.capture_evaluations.append(evaluation('Ошибка', '', error='planned division by zero'))
+    source = 'РезультатИнструкции = 1 / 0;'
+    reply = (api.execute_prepared_capture_hypothesis(api.prepare_capture_hypothesis(source))
+             if prepared else api.execute_bsl(source))
+    assert not reply.succeeded
+    assert controller.state.value == 'captured'
+    assert api._operation_generation_pin is original
+    assert len(api._worker_universe._leases) == 1
+    assert api.execute_bsl('РезультатИнструкции = Б();').succeeded
+
+
+@pytest.mark.parametrize('prepared', [False, True])
+def test_unknown_capture_reply_retains_both_generation_leases_until_close(tmp_path, prepared):
+    api, _, session = runtime(tmp_path, captured=True)
+    api.execute_bsl(UPDATE)
+    api.execute_bsl('Результат = Б();')
+    original = api._operation_generation_pin
+    api.execute_bsl(THIRD)
+    source = 'РезультатИнструкции = В();'
+    candidate = api.prepare_capture_hypothesis(source) if prepared else None
+    session.lose_capture_reply = True
+    with pytest.raises(TimeoutError, match='transport loss'):
+        if prepared:
+            api.execute_prepared_capture_hypothesis(candidate)
+        else:
+            api.execute_bsl(source)
+    assert api._operation_generation_pin is original
+    assert len(api._worker_universe._leases) == 2
+    assert sum(lease.outcome_unknown for lease in api._worker_universe._leases.values()) == 1
+    with pytest.raises(WorkerPromotionOutcomeUnknown):
+        api.status()
+    session.lose_capture_reply = False
+    api.close()
+    assert not api._worker_universe._leases
+    assert api._notebook_method_set is None
+
+
+@pytest.mark.parametrize('prepared', [False, True])
+def test_main_stale_or_failed_preparation_does_not_commit_an_extra_name(tmp_path, prepared):
+    api, _, _ = runtime(tmp_path)
+    api.execute_bsl(PAIR)
+    if prepared:
+        candidate = api.prepare_main_for_capture(THIRD)
+        api.execute_bsl(UPDATE)
+        with pytest.raises(ProtocolError, match='stale'):
+            api.activate_prepared_main_for_capture(candidate)
+        with pytest.raises(ProtocolError, match='consumed'):
+            api.activate_prepared_main_for_capture(candidate)
+    else:
+        reply = api.execute_bsl(THIRD + '\nКонтекстОтладки.Значение = 1;')
+        assert not reply.succeeded
+        api.execute_bsl(UPDATE)
+    assert paths(api) == {'а', 'б'}
+
+
+def test_prepared_capture_dispatch_admission_failure_releases_only_evaluation_lease(tmp_path, monkeypatch):
+    api, _, _ = runtime(tmp_path, captured=True)
+    api.execute_bsl(UPDATE)
+    api.execute_bsl('Результат = Б();')
+    original = api._operation_generation_pin
+    candidate = api.prepare_capture_hypothesis('РезультатИнструкции = Б();')
+
+    def reject_dispatch(*args, **kwargs):
+        raise ProtocolError('planned dispatch admission failure')
+
+    monkeypatch.setattr(api, '_require_operation_pin_dispatch_fence_locked', reject_dispatch)
+    with pytest.raises(ProtocolError, match='dispatch admission'):
+        api.execute_prepared_capture_hypothesis(candidate)
+    assert api._operation_generation_pin is original
+    assert len(api._worker_universe._leases) == 1
+
+
+@pytest.mark.parametrize('prepared', [False, True])
+@pytest.mark.parametrize('outcome', ['success', 'failure', 'unknown'])
+def test_pending_capture_evaluation_keeps_g2_across_debug_stops_and_resumes(tmp_path, prepared, outcome):
+    api, controller, session = runtime(tmp_path, captured=True)
+    api.execute_bsl(UPDATE)
+    api.execute_bsl('Результат = Б();')
+    original = api._operation_generation_pin
+    api.execute_bsl(THIRD)
+    if outcome == 'failure':
+        session.capture_evaluations.append(evaluation('Ошибка', '', error='planned pending failure'))
+    user_stop = ScriptedSession((USER,)).stops[0]
+    session.pending_evaluation_stops.append(user_stop)
+    source = 'РезультатИнструкции = В();'
+    reply = (api.execute_prepared_capture_hypothesis(api.prepare_capture_hypothesis(source))
+             if prepared else api.execute_bsl(source))
+    assert reply.state.value == 'capture_debug_stopped'
+    evaluation_pin = api._evaluation_generation_pin
+    assert evaluation_pin is not None
+    assert evaluation_pin.handle is api.worker_generation_handle
+    assert evaluation_pin.handle is not original.handle
+    assert len(api._worker_universe._leases) == 2
+    session.pending_evaluation_stops.append(user_stop)
+    repeated = api.resume_debug_stop()
+    assert repeated.state.value == 'capture_debug_stopped'
+    assert api._evaluation_generation_pin is evaluation_pin
+    assert api._operation_generation_pin is original
+
+    if outcome == 'unknown':
+        session.lose_capture_resume = True
+        with pytest.raises(TimeoutError, match='resume loss'):
+            api.resume_debug_stop()
+        assert len(api._worker_universe._leases) == 2
+        assert sum(lease.outcome_unknown for lease in api._worker_universe._leases.values()) == 1
+        with pytest.raises(WorkerPromotionOutcomeUnknown):
+            api.status()
+    else:
+        completed = api.resume_debug_stop()
+        assert completed.state.value == 'captured'
+        assert completed.succeeded == (outcome == 'success')
+        assert api._evaluation_generation_pin is None
+        assert len(api._worker_universe._leases) == 1
+    assert api._operation_generation_pin is original
+
+
+@pytest.mark.parametrize('statements_only', [False, True])
+def test_retained_original_generation_rejects_conflicting_explicit_source_identity(tmp_path, statements_only):
+    api, _, _ = runtime(tmp_path, captured=True)
+    unit = SourceUnitRef(SourceUnitKind.NOTEBOOK_CELL, 'stable-cell', 1, source_sha256(UPDATE))
+    api.execute_bsl(UPDATE, source_unit=unit)
+    api.execute_bsl('Результат = Б();')
+    api.execute_bsl(UPDATE.replace('Возврат 2', 'Возврат 3'))
+    active = api.worker_generation_handle
+    source = 'РезультатИнструкции = 4;' if statements_only else UPDATE.replace('Возврат 2', 'Возврат 4')
+    conflict = SourceUnitRef(SourceUnitKind.NOTEBOOK_CELL, 'stable-cell', 1, source_sha256(source))
+    with pytest.raises(ProtocolError, match='source identit'):
+        api.execute_bsl(source, source_unit=conflict)
+    assert api.worker_generation_handle is active
+
+
+def test_unused_prepared_candidate_owns_source_identity_until_discard(tmp_path):
+    api, _, _ = runtime(tmp_path)
+    unit = SourceUnitRef(SourceUnitKind.NOTEBOOK_CELL, 'prepared-cell', 1, source_sha256(UPDATE))
+    prepared = api.prepare_main_for_capture(UPDATE, source_unit=unit)
+    conflict = SourceUnitRef(SourceUnitKind.NOTEBOOK_CELL, 'prepared-cell', 1, source_sha256(THIRD))
+    with pytest.raises(ProtocolError, match='source identit'):
+        api.execute_bsl(THIRD, source_unit=conflict)
+    api.discard_prepared_main_for_capture(prepared)
+    assert api.execute_bsl(THIRD, source_unit=conflict).succeeded
+
+
+@pytest.mark.parametrize('captured', [False, True])
+def test_mixed_provenance_is_saved_before_publication_and_matches_final_dispatch(tmp_path, captured, monkeypatch):
+    api, controller, _ = runtime(tmp_path, captured=captured)
+    api.execute_bsl(UPDATE)
+    if captured:
+        api.execute_bsl('Результат = Б();')
+    previous = api.worker_generation_handle
+    dispatched = []
+    name = 'execute_mapped_capture' if captured else 'execute_mapped_main'
+    original = getattr(controller, name)
+
+    def observe_dispatch(visible, mapped, **kwargs):
+        dispatched.append(mapped)
+        return original(visible, mapped, **kwargs)
+
+    monkeypatch.setattr(controller, name, observe_dispatch)
+    saved = []
+
+    def persist(provenance):
+        assert api.worker_generation_handle is previous
+        assert not dispatched
+        saved.append(provenance)
+
+    statement = 'РезультатИнструкции = В();' if captured else 'Результат = В();'
+    assert api.execute_bsl(THIRD + '\n' + statement, on_execution_provenance=persist).succeeded
+    assert len(saved) == len(dispatched) == 1
+    assert saved[0].executed_source_sha256 == dispatched[0].artifact.source_sha256
+    assert saved[0].source_map_sha256 == dispatched[0].source_map_sha256
+
+
+def test_prepared_main_provenance_matches_final_generation_prelude(tmp_path, monkeypatch):
+    api, controller, _ = runtime(tmp_path)
+    api.execute_bsl(UPDATE)
+    candidate = api.prepare_main_for_capture(THIRD + '\nРезультат = В();')
+    provenance = api.prepared_main_execution_provenance(candidate)
+    dispatched = []
+    original = controller.execute_mapped_main
+
+    def observe(visible, mapped, **kwargs):
+        dispatched.append(mapped)
+        return original(visible, mapped, **kwargs)
+
+    monkeypatch.setattr(controller, 'execute_mapped_main', observe)
+    activated = api.activate_prepared_main_for_capture(candidate)
+    assert api.execute_prepared_main_for_capture(activated).succeeded
+    assert provenance.executed_source_sha256 == dispatched[0].artifact.source_sha256
+    assert provenance.source_map_sha256 == dispatched[0].source_map_sha256
+
+
+def test_prepared_main_preview_is_read_only_and_fences_aborted_admission(tmp_path):
+    target = _UniverseInstructionExecutor()
+    api, _, _ = runtime(tmp_path, target=target)
+    api.execute_bsl(UPDATE)
+    active = api.worker_generation_handle
+    methods = api._notebook_method_set
+    before = tuple(target.sources)
+    candidate = api.prepare_main_for_capture(THIRD + '\nРезультат = В();')
+    payload = candidate.contents(api._prepared_main_owner)
+    assert tuple(target.sources) == before
+    assert api._worker_universe._pending is None
+    intervening = api._worker_universe.prepare(
+        api._notebook_publication_artifacts(payload.worker_artifact),
+        export_catalog=api._notebook_effective_catalog(
+            api._complete_notebook_catalog(payload.candidate_catalog)
+        ),
+    )
+    api._worker_universe.discard(intervening)
+    with pytest.raises(ProtocolError, match='preview is stale'):
+        api.activate_prepared_main_for_capture(candidate)
+    assert tuple(target.sources) == before
+    assert api.worker_generation_handle is active
+    assert api._notebook_method_set is methods
+    assert api._worker_universe._pending is None
+    assert paths(api) == {'б'}
+
+
+@pytest.mark.parametrize('captured', [False, True])
+def test_mixed_provenance_rejection_discards_candidate_before_target_mutation(tmp_path, captured):
+    target = _UniverseInstructionExecutor()
+    api, _, _ = runtime(tmp_path, target=target, captured=captured)
+    api.execute_bsl(UPDATE)
+    if captured:
+        api.execute_bsl('Результат = Б();')
+    active = api.worker_generation_handle
+    original_pin = api._operation_generation_pin
+    methods = api._notebook_method_set
+    before = tuple(target.sources)
+    observed = []
+
+    def reject(provenance):
+        observed.append(provenance)
+        raise OSError('planned durable persistence failure')
+
+    with pytest.raises(OSError, match='durable persistence'):
+        api.execute_bsl(THIRD + '\nРезультат = В();', on_execution_provenance=reject)
+    assert len(observed) == 1
+    assert tuple(target.sources) == before
+    assert api.worker_generation_handle is active
+    assert api._notebook_method_set is methods
+    assert api._operation_generation_pin is original_pin
+    assert api._evaluation_generation_pin is None
+    assert api._worker_universe._pending is None
+    assert paths(api) == {'б'}

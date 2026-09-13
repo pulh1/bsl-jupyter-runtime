@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "onec-interactive-mcp"
+version = "0.1.17"
+requires-python = ">=3.12"
+license = "GPL-3.0-only"
+license-files = ["LICENSE", "COPYRIGHT"]
+dependencies = [
+  "onec-interactive-runtime-core==0.1.17",
+  "httpx>=0.27,<1",
+  "mcp>=2.0,<3",
+  "nbformat>=5.10,<6",
+  "psutil>=6,<8",
+  "pydantic>=2,<3",
+]
+
+[project.scripts]
+onec-runtime-service = "onec_runtime_mcp.agent.service_entrypoint:main"
+onec-runtime-mcp = "onec_runtime_mcp.mcp_entrypoint:main"
+
+[tool.uv.sources]
+onec-interactive-runtime-core = { workspace = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/onec_runtime_mcp"]

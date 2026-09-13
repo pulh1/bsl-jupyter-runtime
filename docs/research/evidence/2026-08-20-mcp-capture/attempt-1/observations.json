@@ -1,0 +1,1 @@
+{"attempt":1,"call_sequence":["A:workspace.open","A:runtime.ensure"],"failure":{"boundary":"before_A_operation_wait_runtime","last_completed_phase":"A_runtime_ensure","type":"ExceptionGroup"},"result":"FAIL","schema":"onec-agent-capture-live-observations-v1"}

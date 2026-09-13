@@ -1,0 +1,63 @@
+{
+  "name": "@onec-interactive/jupyter-bsl",
+  "version": "0.1.17",
+  "private": true,
+  "description": "BSL cell magic highlighting for JupyterLab and Notebook 7",
+  "license": "GPL-3.0-only AND MIT",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "files": [
+    "lib/**/*.js",
+    "lib/**/*.d.ts",
+    "LICENSE",
+    "COPYRIGHT"
+  ],
+  "scripts": {
+    "build": "tsc && jupyter labextension build . && node scripts/finalize.mjs",
+    "test": "tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@1c-syntax/codemirror-lang-bsl": "0.3.2",
+    "@codemirror/language": "^6.12.4",
+    "@codemirror/state": "^6.0.0",
+    "@codemirror/view": "^6.0.0",
+    "@jupyterlab/application": "^4.1.0",
+    "@jupyterlab/codemirror": "^4.1.0",
+    "@jupyterlab/completer": "^4.1.0",
+    "@jupyterlab/docmanager": "^4.1.0",
+    "@jupyterlab/docregistry": "^4.1.0",
+    "@jupyterlab/fileeditor": "^4.1.0",
+    "@jupyterlab/lsp": "^4.1.0",
+    "@jupyterlab/notebook": "^4.1.0",
+    "@jupyterlab/services": "^7.1.0",
+    "@lumino/widgets": "^2.0.0"
+  },
+  "devDependencies": {
+    "@codemirror/lang-python": "^6.0.0",
+    "@jupyterlab/builder": "^4.1.0",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "~5.8.3"
+  },
+  "jupyterlab": {
+    "extension": true,
+    "outputDir": "../src/onec_runtime_jupyter/labextension",
+    "sharedPackages": {
+      "@codemirror/language": {
+        "bundled": false,
+        "singleton": true
+      },
+      "@codemirror/view": {
+        "bundled": false,
+        "singleton": true
+      },
+      "@codemirror/state": {
+        "bundled": false,
+        "singleton": true
+      }
+    }
+  },
+  "overrides": {
+    "sanitize-html": "2.17.7"
+  }
+}

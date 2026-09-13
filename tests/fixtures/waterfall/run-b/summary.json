@@ -1,0 +1,17 @@
+{
+  "status": "PASS",
+  "operation_id": 2,
+  "python_context_preserved": true,
+  "context": {
+    "МаркерНоутбука": 777,
+    "МаркерИзCapture": 778,
+    "ПроверкаКонтекста": 779,
+    "ПослеCapture": 780,
+    "ЗначениеВТ": 2
+  },
+  "cleanup": {
+    "owned_process_count": 0
+  },
+  "duration_s": 26.656999999999243,
+  "finished_at": "2026-08-14T20:48:51.595+00:00"
+}

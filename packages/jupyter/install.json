@@ -1,0 +1,5 @@
+{
+  "packageManager": "python",
+  "packageName": "onec-interactive-jupyter",
+  "uninstallInstructions": "Use pip uninstall onec-interactive-jupyter to uninstall this extension."
+}

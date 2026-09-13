@@ -1,0 +1,398 @@
+// Strict server-side BSL grammar for QueryConsole1C parsergen.
+//
+// Purpose:
+//   - syntax/corpus/LL(k) feasibility gate for 1C Interactive Runtime;
+//   - common modules and processing modules (server-side execution path);
+//   - semantic AST + notebook/source-to-source lowering.
+//
+// IMPORTANT:
+//   1. This is a STRICT execution-oriented grammar, not an editor-tolerant grammar.
+//   2. Newline is whitespace. Statements are separated by ';'.
+//   3. Preprocessing is a separate phase. <Модуль> expects already preprocessed BSL.
+//   4. Incomplete editor states such as "Объект." are intentionally invalid.
+//   5. Declarative AST constructors/bindings do not change the accepted token
+//      language and are consumed only by semantic parser targets.
+//   6. One deliberate syntactic superset remains:
+//        <ПростаяИнструкция> accepts a reference chain without assignment.
+//      A semantic check must require either:
+//        - '=' assignment; or
+//        - at least one call in the chain.
+//
+// Lexer contract:
+//   - Russian/English keywords normalize to the canonical Russian token types below;
+//   - identifiers -> ID;
+//   - after '.' keyword-looking member names -> ID;
+//   - after '&' annotation/compiler-directive names -> ID;
+//   - numbers -> NUMBER; strings -> STRING; dates -> DATETIME;
+//   - comments/whitespace are skipped;
+//   - punctuation token type equals its lexeme.
+//
+// Suggested parsergen lookahead: k = 1.
+
+#ID ::= ID
+
+// Entry points
+
+<Модуль> ::=
+    @Module
+    (Declarations += <ОбъявлениеПеременнойМодуля> -= ';')*
+    Elements = <ЭлементыМодуля>
+
+<ЭлементыМодуля> ::=
+    @ModuleElements -= ';'* (
+          Item = <Метод> Rest = <ЭлементыМодуля>
+        | Item = <Инструкция> (-= ';' Rest = <ЭлементыМодуля>)?
+    )?
+
+<БлокНоутбука> ::= <БлокКода>
+// A notebook cell may declare worker methods alongside executable top-level code.
+// Its AST preserves both kinds of element so the runtime can admit the worker
+// atomically before lowering and running the statement projection as MAIN.
+<ЯчейкаНоутбука> ::= @NotebookCell Elements = <ЭлементыМодуля>
+<ОтдельноеВыражение> ::= <Выражение>
+<ОтдельнаяИнструкция> ::= <Инструкция>
+
+// Module declarations
+
+<ОбъявлениеПеременнойМодуля> ::=
+    @ModuleVariableDeclaration -= ПЕРЕМ
+    Variables += <ПеременнаяМодуля>
+    (-= ',' Variables += <ПеременнаяМодуля>)*
+
+<ПеременнаяМодуля> ::=
+    @ModuleVariable Name = #ID Export = ЭКСПОРТ?
+
+<Метод> ::=
+    @Method Decorations += <Декорация>* Async = АСИНХ?
+    Declaration = <ОбъявлениеМетода>
+
+<ОбъявлениеМетода> ::=
+      @ProcedureDeclaration -= ПРОЦЕДУРА Name = #ID -= '('
+        Parameters = <СписокПараметров>? -= ')' Export = ЭКСПОРТ?
+        Body = <ТелоМетода>
+      -= КОНЕЦПРОЦЕДУРЫ
+    | @FunctionDeclaration -= ФУНКЦИЯ Name = #ID -= '('
+        Parameters = <СписокПараметров>? -= ')' Export = ЭКСПОРТ?
+        Body = <ТелоМетода>
+      -= КОНЕЦФУНКЦИИ
+
+<ТелоМетода> ::=
+    @MethodBody
+    (LocalDeclarations += <ОбъявлениеЛокальныхПеременных> -= ';')*
+    Code = <БлокКода>
+
+<ОбъявлениеЛокальныхПеременных> ::=
+    @LocalVariableDeclaration -= ПЕРЕМ Names += #ID (-= ',' Names += #ID)*
+
+<СписокПараметров> ::=
+    @ParameterList Items += <Параметр> (-= ',' Items += <Параметр>)*
+
+<Параметр> ::=
+    @Parameter Decorations += <Декорация>* ByValue = ЗНАЧ? Name = #ID
+    (-= '=' Default = <ЗначениеПоУмолчанию>)?
+
+<ЗначениеПоУмолчанию> ::=
+      <Константа>
+    | @SignedConstant Sign = '+' Value = &NUMBER
+    | @SignedConstant Sign = '-' Value = &NUMBER
+
+// Compiler directives / annotations
+
+<Декорация> ::=
+    @Decoration -= '&' Name = #ID Parameters = <ПараметрыАннотации>?
+
+<ПараметрыАннотации> ::=
+    @AnnotationParameters -= '('
+    (Items += <ПараметрАннотации> (-= ',' Items += <ПараметрАннотации>)*)?
+    -= ')'
+
+<ПараметрАннотации> ::=
+      @NamedAnnotationParameter Name = #ID -= '=' Value = <ЗначениеАннотации>
+    | @PositionalAnnotationParameter Value = <ЗначениеАннотации>
+
+<ЗначениеАннотации> ::=
+      <Константа>
+    | <Декорация>
+
+// Code blocks and semicolon separators
+//
+// Newline never terminates a statement.
+// Examples:
+//
+//   Возврат
+//       X = 10;
+//
+// is the same statement as:
+//
+//   Возврат X = 10;
+//
+// while:
+//
+//   Возврат;
+//   X = 10;
+//
+// is two statements.
+
+<БлокКода> ::=
+    @CodeBlock -= ';'*
+    (First = <Инструкция> (-= ';' Rest = <БлокКода>)?)?
+
+<Инструкция> ::=
+      @LabeledStatement Label = <Метка> Statement = <ЯдроИнструкции>?
+    | <ЯдроИнструкции>
+
+<Метка> ::= @Label -= '~' Name = #ID -= ':'
+
+<ЯдроИнструкции> ::=
+      <Если>
+    | <Пока>
+    | <Для>
+    | <Попытка>
+    | <Возврат>
+    | @ContinueStatement -= ПРОДОЛЖИТЬ
+    | @BreakStatement -= ПРЕРВАТЬ
+    | <ВызватьИсключение>
+    | <Выполнить>
+    | @GotoStatement -= ПЕРЕЙТИ -= '~' Label = #ID
+    | <ДобавитьОбработчик>
+    | <УдалитьОбработчик>
+    | <ЖдатьИнструкция>
+    | <ПростаяИнструкция>
+
+// Compound statements
+
+<Если> ::=
+    @IfStatement -= ЕСЛИ Condition = <Выражение> -= ТОГДА
+        Then = <БлокКода>
+    ElseIf += <ИначеЕсли>*
+    Else = <Иначе>?
+    -= КОНЕЦЕСЛИ
+
+<ИначеЕсли> ::=
+    @ElseIfClause -= ИНАЧЕЕСЛИ Condition = <Выражение> -= ТОГДА
+        Body = <БлокКода>
+
+<Иначе> ::=
+    @ElseClause -= ИНАЧЕ Body = <БлокКода>
+
+<Пока> ::=
+    @WhileStatement -= ПОКА Condition = <Выражение> -= ЦИКЛ
+        Body = <БлокКода>
+    -= КОНЕЦЦИКЛА
+
+<Для> ::= -= ДЛЯ <ХвостДля>
+
+<ХвостДля> ::=
+      @ForEachStatement -= КАЖДОГО Variable = #ID -= ИЗ
+        Iterable = <Выражение> -= ЦИКЛ Body = <БлокКода>
+      -= КОНЕЦЦИКЛА
+    | @ForRangeStatement Variable = #ID -= '=' Start = <Выражение>
+        -= ПО End = <Выражение> -= ЦИКЛ Body = <БлокКода>
+      -= КОНЕЦЦИКЛА
+
+<Попытка> ::=
+    @TryStatement -= ПОПЫТКА TryBody = <БлокКода>
+    -= ИСКЛЮЧЕНИЕ ExceptBody = <БлокКода>
+    -= КОНЕЦПОПЫТКИ
+
+// Simple statements
+
+<Возврат> ::= @ReturnStatement -= ВОЗВРАТ Value = <Выражение>?
+
+<ВызватьИсключение> ::=
+    @RaiseStatement -= ВЫЗВАТЬИСКЛЮЧЕНИЕ
+    Parameters = <ПараметрыВызватьИсключение>?
+
+<ПараметрыВызватьИсключение> ::=
+      @RaiseCallParameters Arguments = <АргументыВызова>
+        Postfix += <ПостфиксДоступа>*
+        Tail = <ХвостВыраженияПослеПервичного>
+    | <ВыражениеБезНачальнойСкобки>
+
+// The platform supports both the legacy statement form
+//
+//   ВызватьИсключение Выражение
+//
+// and the parenthesized multi-argument form. Factoring the leading '(' keeps
+// both forms predictive with k=1. A continuation after parenthesized arguments
+// also preserves legacy expressions such as `(X) + Y`; semantic validation
+// must reject that continuation when the parentheses contain multiple args.
+
+<ВыражениеБезНачальнойСкобки> ::=
+      @ContinuedExpression PrefixOperators += (НЕ | '+' | '-' | ЖДАТЬ)+
+        Primary = <ПервичноеВыражение>
+        Tail = <ХвостВыраженияПослеПервичного>
+    | @ContinuedExpression
+        Primary = <ПервичноеВыражениеБезНачальнойСкобки>
+        Tail = <ХвостВыраженияПослеПервичного>
+
+<ПервичноеВыражениеБезНачальнойСкобки> ::=
+      <Константа>
+    | <ЦепочкаДоступа>
+    | @PostfixedPrimary Base = <Новый> Postfix += <ПостфиксДоступа>*
+    | @PostfixedPrimary Base = <ТернарныйОператор>
+        Postfix += <ПостфиксДоступа>*
+
+<ХвостВыраженияПослеПервичного> ::=
+    @ExpressionTail
+    (MultiplicativeOperators += ('*' | '/' | '%')
+        MultiplicativeOperands += <УнарноеВыражение>)*
+    (AdditiveOperators += ('+' | '-')
+        AdditiveOperands += <МультипликативноеВыражение>)*
+    (ComparisonOperators += <ОператорСравнения>
+        ComparisonOperands += <АддитивноеВыражение>)*
+    (-= И AndOperands += <Сравнение>)*
+    (-= ИЛИ OrOperands += <ЛогическоеИ>)*
+
+<Выполнить> ::= @ExecuteStatement -= ВЫПОЛНИТЬ Value = <Выражение>
+
+<ДобавитьОбработчик> ::=
+    @AddHandlerStatement -= ДОБАВИТЬОБРАБОТЧИК
+    Event = <Выражение> -= ',' Handler = <Выражение>
+
+<УдалитьОбработчик> ::=
+    @RemoveHandlerStatement -= УДАЛИТЬОБРАБОТЧИК
+    Event = <Выражение> -= ',' Handler = <Выражение>
+
+<ЖдатьИнструкция> ::= @AwaitStatement -= ЖДАТЬ Value = <Выражение>
+
+// Assignment and procedure-call statements share an arbitrarily long access prefix.
+// Semantic validation must reject a bare chain that is neither assignment nor call.
+
+<ПростаяИнструкция> ::=
+    @SimpleStatement Target = <ЦепочкаДоступа>
+    (-= '=' Value = <Выражение>)?
+
+// Expressions
+//
+// Precedence high -> low:
+// unary; * / %; + -; comparisons; AND; OR.
+
+<Выражение> ::=
+    @OrExpression First = <ЛогическоеИ>
+    (-= ИЛИ Operands += <ЛогическоеИ>)*
+
+<ЛогическоеИ> ::=
+    @AndExpression First = <Сравнение>
+    (-= И Operands += <Сравнение>)*
+
+<Сравнение> ::=
+    @ComparisonExpression First = <АддитивноеВыражение>
+    (Operators += <ОператорСравнения>
+        Operands += <АддитивноеВыражение>)*
+
+<ОператорСравнения> ::=
+      '='
+    | '<>'
+    | '<'
+    | '<='
+    | '>'
+    | '>='
+
+<АддитивноеВыражение> ::=
+    @AdditiveExpression First = <МультипликативноеВыражение>
+    (Operators += ('+' | '-') Operands += <МультипликативноеВыражение>)*
+
+<МультипликативноеВыражение> ::=
+    @MultiplicativeExpression First = <УнарноеВыражение>
+    (Operators += ('*' | '/' | '%') Operands += <УнарноеВыражение>)*
+
+<УнарноеВыражение> ::=
+    @UnaryExpression Operators += (НЕ | '+' | '-' | ЖДАТЬ)*
+    Value = <ПервичноеВыражение>
+
+<ПервичноеВыражение> ::=
+      <Константа>
+    | <ЦепочкаДоступа>
+    | @ParenthesizedExpression -= '(' Value = <Выражение> -= ')'
+        Postfix += <ПостфиксДоступа>*
+    | @PostfixedPrimary Base = <Новый> Postfix += <ПостфиксДоступа>*
+    | @PostfixedPrimary Base = <ТернарныйОператор>
+        Postfix += <ПостфиксДоступа>*
+
+// Reference / member / call chains
+
+<ЦепочкаДоступа> ::=
+    @AccessChain Root = #ID Arguments = <АргументыВызова>?
+    Postfix += <ПостфиксДоступа>*
+
+<ПостфиксДоступа> ::=
+      @MemberAccess -= '.' Name = #ID Arguments = <АргументыВызова>?
+    | @IndexAccess -= '[' Index = <Выражение> -= ']'
+
+<АргументыВызова> ::=
+    @CallArguments -= '(' Items = <СписокАргументов>? -= ')'
+
+// Empty actual parameters:
+//   F(, X)
+//   F(X, )
+//   F(,)
+
+<СписокАргументов> ::=
+      @ArgumentList Items += <Выражение> (-= ',' Items += <Аргумент>)*
+    | @ArgumentList -= ',' Items += <Аргумент>
+        (-= ',' Items += <Аргумент>)*
+
+<Аргумент> ::=
+      <Выражение>
+    | @OmittedArgument
+
+// NEW and ternary
+
+<Новый> ::=
+    @NewExpression -= НОВЫЙ
+    (Type = #ID Arguments = <АргументыВызова>? | Arguments = <АргументыВызова>)
+
+<ТернарныйОператор> ::=
+    @TernaryExpression -= '?' -= '(' Condition = <Выражение> -= ','
+    Then = <Выражение> -= ',' Else = <Выражение> -= ')'
+
+// Constants
+
+<Константа> ::=
+    @ConstantLiteral Value = (
+          &NUMBER
+        | &STRING
+        | &DATETIME
+        | ИСТИНА
+        | ЛОЖЬ
+        | НЕОПРЕДЕЛЕНО
+        | NULL
+    )
+
+// Preprocessor grammar: separate phase / separate entry point.
+//
+// <Модуль> intentionally does not include these rules.
+// The runtime compiler should first select/preserve the server-effective source,
+// then parse executable BSL.
+
+<ДирективаПрепроцессора> ::= -= '#' <ДирективаПослеРешетки>
+
+<ДирективаПослеРешетки> ::=
+      @RegionDirective -= ОБЛАСТЬ Name = #ID
+    | @EndRegionDirective -= КОНЕЦОБЛАСТИ
+    | @PreprocessorIfDirective -= ЕСЛИ
+        Condition = <ПрепроцессорноеВыражение> -= ТОГДА
+    | @PreprocessorElseIfDirective -= ИНАЧЕЕСЛИ
+        Condition = <ПрепроцессорноеВыражение> -= ТОГДА
+    | @PreprocessorElseDirective -= ИНАЧЕ
+    | @PreprocessorEndIfDirective -= КОНЕЦЕСЛИ
+    | @UseDirective -= ИСПОЛЬЗОВАТЬ Library = <ИспользуемаяБиблиотека>
+    | @NativeDirective -= NATIVE
+    | @StackDirective -= STACK
+
+<ИспользуемаяБиблиотека> ::=
+    @UsedLibrary Value = (&STRING | #ID)
+
+<ПрепроцессорноеВыражение> ::=
+    @PreprocessorOr First = <ПрепроцессорноеИ>
+    (-= ИЛИ Operands += <ПрепроцессорноеИ>)*
+
+<ПрепроцессорноеИ> ::=
+    @PreprocessorAnd First = <ПрепроцессорноеУнарное>
+    (-= И Operands += <ПрепроцессорноеУнарное>)*
+
+<ПрепроцессорноеУнарное> ::=
+      @PreprocessorNot -= НЕ Value = <ПрепроцессорноеУнарное>
+    | -= '(' <ПрепроцессорноеВыражение> -= ')'
+    | @PreprocessorIdentifier Name = #ID

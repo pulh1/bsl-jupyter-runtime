@@ -1,0 +1,11 @@
+{
+  "scopeName": "onec.bsl.cell.injection",
+  "injectionSelector": "L:source.python",
+  "patterns": [{
+    "begin": "\\A[ \\t]*%%bsl[ \\t]*(?=\\r?$)",
+    "end": "\\z",
+    "beginCaptures": {"0": {"name": "keyword.control.magic.bsl"}},
+    "contentName": "meta.embedded.block.bsl",
+    "patterns": [{"include": "source.bsl"}]
+  }]
+}

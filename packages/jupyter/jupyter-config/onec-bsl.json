@@ -1,0 +1,10 @@
+{
+  "ServerApp": {
+    "jpserver_extensions": {
+      "onec_runtime_jupyter.lsp_server_extension": true
+    }
+  },
+  "KernelManager": {
+    "shutdown_wait_time": 120.0
+  }
+}

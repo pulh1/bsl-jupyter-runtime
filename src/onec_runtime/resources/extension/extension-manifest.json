@@ -1,0 +1,108 @@
+{
+  "schema_version": 1,
+  "product_id": "onec-interactive-runtime",
+  "extension_name": "OnecInteractiveRuntime",
+  "artifact_version": "0.1.2",
+  "protocol_version": "1",
+  "cfe_filename": "OnecInteractiveRuntime.cfe",
+  "cfe_size": 20556,
+  "cfe_sha256": "d052016b6f95540de0a498c191506217ef2b5b70f8ac4992cb821322e92aa06c",
+  "fingerprints": {
+    "identity": {
+      "product_id": "onec-interactive-runtime",
+      "extension_name": "OnecInteractiveRuntime",
+      "root_id": "fcac7610-e58e-4c3b-b637-9d809453a8a2",
+      "runtime_module_ids": [
+        "33445a61-8047-40aa-8144-690175755340",
+        "403bd06b-17d6-4171-94d6-e38fc5f8a585",
+        "4a0aa21a-4046-47f7-8421-5eeb79d0e9f0",
+        "c8a390d7-e463-4413-ae75-2bb83ce8c299"
+      ],
+      "purpose": "AddOn",
+      "name_prefix": "OnecInteractiveRuntime_",
+      "vendor": "onec-interactive-runtime"
+    },
+    "artifact": {
+      "artifact_version": "0.1.2",
+      "protocol_version": "1",
+      "language_bound_by_name": false,
+      "metadata": [
+        {
+          "name": "CommonModule.RuntimeContextStoreServer",
+          "object_id": "c8a390d7-e463-4413-ae75-2bb83ce8c299"
+        },
+        {
+          "name": "CommonModule.RuntimeContextStoreServer.Module",
+          "object_id": "c8a390d7-e463-4413-ae75-2bb83ce8c299"
+        },
+        {
+          "name": "CommonModule.RuntimeKernelServer",
+          "object_id": "4a0aa21a-4046-47f7-8421-5eeb79d0e9f0"
+        },
+        {
+          "name": "CommonModule.RuntimeKernelServer.Module",
+          "object_id": "4a0aa21a-4046-47f7-8421-5eeb79d0e9f0"
+        },
+        {
+          "name": "CommonModule.RuntimeTableTransferServer",
+          "object_id": "33445a61-8047-40aa-8144-690175755340"
+        },
+        {
+          "name": "CommonModule.RuntimeTableTransferServer.Module",
+          "object_id": "33445a61-8047-40aa-8144-690175755340"
+        },
+        {
+          "name": "CommonModule.RuntimeValueTransferServer",
+          "object_id": "403bd06b-17d6-4171-94d6-e38fc5f8a585"
+        },
+        {
+          "name": "CommonModule.RuntimeValueTransferServer.Module",
+          "object_id": "403bd06b-17d6-4171-94d6-e38fc5f8a585"
+        },
+        {
+          "name": "Configuration.OnecInteractiveRuntime",
+          "object_id": "fcac7610-e58e-4c3b-b637-9d809453a8a2"
+        },
+        {
+          "name": "Configuration.OnecInteractiveRuntime.ManagedApplicationModule",
+          "object_id": "96ff5058-0bc6-4207-935b-3cb72a166691"
+        }
+      ],
+      "source_sha256": {
+        "CommonModules/RuntimeKernelServer/Ext/Module.bsl": "fe05d7264bb4470d349e577ce967a054f96854b40cdea4dc6b02739208afc3b6",
+        "Ext/ManagedApplicationModule.bsl": "d58c93d80b76a813191f20e593ec96c2610d21dc4cd0f86d450c9bcea589cd2c"
+      }
+    },
+    "identity_sha256": "726065a5d3c6f5472e24a83fc0c474fd5f13c42eace441b90c7eba1b404df496",
+    "artifact_sha256": "e4147b6d09ca927d9e87a82f4beac35797b643b48480f0d59e3c7dfc87176f04"
+  },
+  "breakpoints": {
+    "managed": {
+      "module_type": "ExtensionModule",
+      "url": "",
+      "object_id": "fcac7610-e58e-4c3b-b637-9d809453a8a2",
+      "property_id": "d22e852a-cf8a-4f77-8ccb-3548e7792bea",
+      "line": 7,
+      "extension_name": "OnecInteractiveRuntime",
+      "ext_id": 0
+    },
+    "server_entry": {
+      "module_type": "ExtensionModule",
+      "url": "",
+      "object_id": "4a0aa21a-4046-47f7-8421-5eeb79d0e9f0",
+      "property_id": "d5963243-262e-4398-b4d7-fb16d06484f6",
+      "line": 110,
+      "extension_name": "OnecInteractiveRuntime",
+      "ext_id": 0
+    },
+    "server_service": {
+      "module_type": "ExtensionModule",
+      "url": "",
+      "object_id": "4a0aa21a-4046-47f7-8421-5eeb79d0e9f0",
+      "property_id": "d5963243-262e-4398-b4d7-fb16d06484f6",
+      "line": 117,
+      "extension_name": "OnecInteractiveRuntime",
+      "ext_id": 0
+    }
+  }
+}

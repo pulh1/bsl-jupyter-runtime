@@ -1,0 +1,25 @@
+name: VS Code notebook unit and process-tree tests
+
+on:
+  push:
+    paths: ['packages/vscode/**', '.github/workflows/vscode-unit.yml']
+  pull_request:
+    paths: ['packages/vscode/**', '.github/workflows/vscode-unit.yml']
+
+jobs:
+  unit:
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: packages/vscode/package-lock.json
+      - run: npm --prefix packages/vscode ci
+      - run: npm --prefix packages/vscode run test:unit
+      - run: npm --prefix packages/vscode run compile

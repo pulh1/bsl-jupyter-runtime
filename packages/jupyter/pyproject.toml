@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling>=1.27,<2", "hatch-jupyter-builder>=0.9.1,<1", "jupyterlab>=4.1,<5"]
+build-backend = "hatchling.build"
+
+[project]
+name = "onec-interactive-jupyter"
+version = "0.1.17"
+requires-python = ">=3.12"
+license = "GPL-3.0-only AND MIT"
+license-files = ["LICENSE", "COPYRIGHT"]
+dependencies = [
+  "ipykernel>=6.29,<7",
+  "ipython>=8.22,<10",
+  "jupyter-client>=8.6,<9",
+  "onec-interactive-runtime-core==0.1.17",
+  "psutil>=6,<8",
+]
+
+[tool.uv.sources]
+onec-interactive-runtime-core = { workspace = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/onec_runtime_jupyter"]
+
+[tool.hatch.build.targets.sdist]
+exclude = ["/frontend/node_modules"]
+
+[project.optional-dependencies]
+lsp = ["jupyterlab-lsp>=5.3,<6", "jupyter-lsp>=2.2,<3"]
+
+[project.entry-points.jupyter_lsp_spec_v1]
+onec-bsl = "onec_runtime_jupyter.lsp:language_server_spec"
+
+[tool.hatch.build.targets.wheel.shared-data]
+"jupyter-config/onec-bsl.json" = "etc/jupyter/jupyter_server_config.d/onec-bsl.json"
+"src/onec_runtime_jupyter/labextension" = "share/jupyter/labextensions/@onec-interactive/jupyter-bsl"
+"install.json" = "share/jupyter/labextensions/@onec-interactive/jupyter-bsl/install.json"
+
+[tool.hatch.build.hooks.jupyter-builder]
+build-function = "hatch_jupyter_builder.npm_builder"
+ensured-targets = ["src/onec_runtime_jupyter/labextension/package.json", "src/onec_runtime_jupyter/labextension/static/third-party-licenses.json"]
+
+[tool.hatch.build.hooks.jupyter-builder.build-kwargs]
+path = "frontend"
+npm = ["npm"]
+build_cmd = "build"
+source_dir = "frontend"
+build_dir = "src/onec_runtime_jupyter/labextension"

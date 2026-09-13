@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" version="2.20">
+	<CommonModule uuid="403bd06b-17d6-4171-94d6-e38fc5f8a585">
+		<Properties>
+			<Name>RuntimeValueTransferServer</Name>
+			<Synonym><v8:item><v8:lang>ru</v8:lang><v8:content>Runtime value transfer server</v8:content></v8:item></Synonym>
+			<Comment/><Global>false</Global><ClientManagedApplication>false</ClientManagedApplication>
+			<Server>true</Server><ExternalConnection>false</ExternalConnection>
+			<ClientOrdinaryApplication>false</ClientOrdinaryApplication><ServerCall>false</ServerCall>
+			<Privileged>false</Privileged><ReturnValuesReuse>DontUse</ReturnValuesReuse>
+		</Properties>
+	</CommonModule>
+</MetaDataObject>
