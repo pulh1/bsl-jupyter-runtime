@@ -8,11 +8,11 @@ It never indexes the notebook directory or Jupyter working directory implicitly.
 
 ## Install
 
-Install the matching core and Jupyter wheels from the `v0.1.17` release. The prebuilt wheels need no Node.js/npm; a developer build of the Jupyter frontend does.
+Install the matching core and Jupyter wheels from the `v0.1.18` release. The prebuilt wheels need no Node.js/npm; a developer build of the Jupyter frontend does.
 
 ```powershell
-python -m pip install .\onec_interactive_runtime_core-0.1.17-py3-none-any.whl
-python -m pip install '.\onec_interactive_jupyter-0.1.17-py3-none-any.whl[lsp]' "jupyterlab>=4.1,<5"
+python -m pip install .\onec_interactive_runtime_core-0.1.18-py3-none-any.whl
+python -m pip install '.\onec_interactive_jupyter-0.1.18-py3-none-any.whl[lsp]' "jupyterlab>=4.1,<5"
 ```
 
 Installing the prebuilt wheels needs neither Node.js nor parsergen. The Jupyter

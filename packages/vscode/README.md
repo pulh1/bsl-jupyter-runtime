@@ -16,7 +16,7 @@ Use VS Code 1.136 or newer with Microsoft Jupyter, Python/Pylance, and
 with **Extensions: Install from VSIX**, or:
 
 ```powershell
-code --install-extension .\bsl-notebook-0.1.3.vsix
+code --install-extension .\bsl-notebook-0.1.4.vsix
 ```
 
 The installed BSL extension starts and manages its language server. This

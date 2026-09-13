@@ -16,14 +16,14 @@
 
 ## Установка релиза
 
-Скачайте файлы [релиза `v0.1.17`](https://github.com/pulh1/bsl-jupyter-runtime/releases/tag/v0.1.17) в одну папку. Для Python нужны версия 3.12+ и доступ к PyPI для обычных зависимостей. На Windows создайте окружение и установите нужные компоненты из скачанных файлов:
+Скачайте файлы [релиза `v0.1.18`](https://github.com/pulh1/bsl-jupyter-runtime/releases/tag/v0.1.18) в одну папку. Для Python нужны версия 3.12+ и доступ к PyPI для обычных зависимостей. На Windows создайте окружение и установите нужные компоненты из скачанных файлов:
 
 ```powershell
 py -3.12 -m venv .venv
 $python = ".\.venv\Scripts\python.exe"
-& $python -m pip install .\onec_interactive_runtime_core-0.1.17-py3-none-any.whl
-& $python -m pip install .\onec_interactive_jupyter-0.1.17-py3-none-any.whl "jupyterlab>=4.1,<5"
-& $python -m pip install .\onec_interactive_mcp-0.1.17-py3-none-any.whl
+& $python -m pip install .\onec_interactive_runtime_core-0.1.18-py3-none-any.whl
+& $python -m pip install .\onec_interactive_jupyter-0.1.18-py3-none-any.whl "jupyterlab>=4.1,<5"
+& $python -m pip install .\onec_interactive_mcp-0.1.18-py3-none-any.whl
 ```
 
 Core нужен обоим адаптерам. Для одного только core оставьте первую команду установки; для Jupyter или MCP добавьте соответствующую команду. Установите одинаковые версии core и Jupyter в окружениях сервера Jupyter и kernel, если они разделены. Готовый wheel Jupyter уже содержит frontend и не требует Node.js. Для диаграмм в демо установите `matplotlib>=3.11,<4`.
@@ -39,7 +39,7 @@ Core нужен обоим адаптерам. Для одного только 
 
 MCP работает через отдельный foreground-сервис. После установки MCP wheel запустите `onec-runtime-service --workspace C:\path\to\workspace`, затем подключите MCP-клиент к `onec-runtime-mcp --workspace C:\path\to\workspace` по stdio. Используйте один и тот же каталог workspace для обоих процессов; сервис по умолчанию работает в режиме `observe`.
 
-Для VS Code установите `bsl-notebook-0.1.3.vsix` через **Extensions: Install from VSIX** или `code --install-extension .\bsl-notebook-0.1.3.vsix`. Требуются VS Code 1.136+, расширения Microsoft Jupyter, Python/Pylance и `1c-syntax.language-1c-bsl`; подробности — в [инструкции расширения](packages/vscode/README.md). VSIX предоставляет статические функции для `%%bsl` в локальных notebooks; выполнение ячеек обеспечивают Jupyter и Python-пакеты выше.
+Для VS Code установите `bsl-notebook-0.1.4.vsix` через **Extensions: Install from VSIX** или `code --install-extension .\bsl-notebook-0.1.4.vsix`. Требуются VS Code 1.136+, расширения Microsoft Jupyter, Python/Pylance и `1c-syntax.language-1c-bsl`; подробности — в [инструкции расширения](packages/vscode/README.md). VSIX предоставляет статические функции для `%%bsl` в локальных notebooks; выполнение ячеек обеспечивают Jupyter и Python-пакеты выше.
 
 Core wheel уже содержит `OnecInteractiveRuntime.cfe` и при обычном запуске устанавливает расширение в целевую ИБ автоматически. Для ручной установки возьмите одноимённый CFE из релиза, загрузите его в расширения конфигурации через Конфигуратор и примените изменения к ИБ. Затем задайте `extension_mode=ExtensionMode.MANUAL` в `RuntimeSessionConfig`; [manifest](src/onec_runtime/resources/extension/extension-manifest.json) из релиза позволяет сверить версию и SHA-256 CFE. Платформа 1С и сама ИБ в релиз не входят.
 

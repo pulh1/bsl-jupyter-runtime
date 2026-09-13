@@ -112,8 +112,9 @@ export async function mapDefinition(_snapshot: NotebookSnapshot, rootPath: strin
     const relative = path.relative(canonicalRoot, canonicalFile);
     if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative) || !info.isFile()) return undefined;
     await access(canonicalFile, constants.R_OK);
-    // Check again after asynchronous filesystem work; never publish a linked path.
-    return isProjectFile(canonicalRoot, target.uri) ? target : undefined;
+    // Recheck the original spelling after asynchronous work. On Windows, realpath
+    // may expand an 8.3 root name while the LSP URI still uses that short name.
+    return isProjectFile(rootPath, target.uri) ? target : undefined;
   } catch { return undefined; }
 }
 
