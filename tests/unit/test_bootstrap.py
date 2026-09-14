@@ -12,6 +12,7 @@ from onec_runtime.bootstrap import (
     enable_server_kernel_loop,
     observe_extension_handshake,
     verify_extension_handshake,
+    verify_extension_safe_mode_disabled,
     wait_for_managed_startup_stop,
     wait_for_server_entry_then_service,
 )
@@ -109,6 +110,38 @@ def handshake_contract() -> ExtensionHandshakeContract:
 
 def matching_session() -> EvaluatingSession:
     return EvaluatingSession(dict(HANDSHAKE_VALUES))
+
+
+@pytest.mark.parametrize(
+    ("type_name", "presentation", "error_occurred", "accepted"),
+    [
+        ("Булево", "Ложь", False, True),
+        ("Boolean", "False", False, True),
+        ("Булево", "Истина", False, False),
+        ("Булево", "Ложь", True, False),
+        ("Строка", "Ложь", False, False),
+    ],
+)
+def test_live_extension_safe_mode_check_requires_unambiguous_false(
+    type_name: str, presentation: str, error_occurred: bool, accepted: bool,
+) -> None:
+    class SafeModeSession:
+        expressions: list[str] = []
+
+        def evaluate(self, expression: str) -> EvaluationResult:
+            self.expressions.append(expression)
+            return EvaluationResult(
+                UUID(int=1), type_name, presentation, error_occurred,
+            )
+
+    session = SafeModeSession()
+    if accepted:
+        verify_extension_safe_mode_disabled(session)  # type: ignore[arg-type]
+    else:
+        with pytest.raises(ExtensionHandshakeError, match="safe mode"):
+            verify_extension_safe_mode_disabled(session)  # type: ignore[arg-type]
+    assert len(session.expressions) == 1
+    assert '"OnecInteractiveRuntime"' in session.expressions[0]
 
 
 def verify_matching_handshake(

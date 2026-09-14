@@ -12,7 +12,7 @@ from onec_runtime.errors import (
     ProtocolError,
     UnexpectedStop,
 )
-from onec_runtime.extension_bundle import ExtensionHandshakeEvidence
+from onec_runtime.extension_bundle import EXTENSION_NAME, ExtensionHandshakeEvidence
 from onec_runtime.kernel import SESSION_MODULE_PROPERTY_ID
 from onec_runtime.rdbg.models import (
     DebugTarget,
@@ -150,6 +150,23 @@ def verify_extension_handshake(
                 f"Extension handshake mismatch for {variable}"
             )
     return evidence
+
+
+def verify_extension_safe_mode_disabled(session: ServerGuardSession) -> None:
+    """Verify the installed extension property in the live server infobase."""
+    expression = (
+        'РасширенияКонфигурации.Получить(Новый Структура("Имя", '
+        f'"{EXTENSION_NAME}"))[0].БезопасныйРежим'
+    )
+    result = session.evaluate(expression)
+    if (
+        result.error_occurred
+        or result.type_name not in {"Булево", "Boolean"}
+        or result.presentation not in {"Ложь", "False"}
+    ):
+        raise ExtensionHandshakeError(
+            "Runtime extension safe mode is enabled or could not be verified"
+        )
 
 
 @dataclass(frozen=True)

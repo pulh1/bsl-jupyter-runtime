@@ -13,7 +13,7 @@ from onec_runtime_jupyter import InteractiveRuntimeSession
 PLATFORM_BIN = r'C:\\path\\to\\1cv8\\bin'
 CONNECTION_STRING = r'File="C:\\path\\to\\ZUP-demo-copy";'
 SOURCE_ROOT = r'C:\\path\\to\\ZUP-source'
-EXTENSION_MODE = ExtensionMode.AUTO  # MANUAL для ИБ с заранее установленным расширением.
+EXTENSION_MODE = ExtensionMode.AUTO  # Совместимое расширение проверяется при запуске.
 
 runtime = InteractiveRuntimeSession.start(
     RuntimeSessionConfig(
@@ -277,7 +277,7 @@ from onec_runtime_jupyter import InteractiveRuntimeSession
 PLATFORM_BIN = r'C:\\path\\to\\1cv8\\bin'
 CONNECTION_STRING = r'File="C:\\demo\\UT";'
 SOURCE_ROOT = r'C:\\exports\\UT'
-EXTENSION_MODE = ExtensionMode.AUTO  # MANUAL для ИБ с установленным расширением.
+EXTENSION_MODE = ExtensionMode.AUTO  # Совместимое расширение проверяется при запуске.
 
 runtime = InteractiveRuntimeSession.start(
     RuntimeSessionConfig(

@@ -28,7 +28,9 @@ class SafetyTools(FakeExtensionTools):
 
 
 @pytest.mark.parametrize("installed", ["absent", "current", "older"])
-def test_auto_prepares_verified_extension_before_returning(tmp_path: Path, installed: str) -> None:
+def test_auto_requires_live_safe_mode_check_for_current_extension(
+    tmp_path: Path, installed: str,
+) -> None:
     dumps = {
         "absent": [ExtensionNotInstalled("absent"), _current_dump(tmp_path / "after")],
         "current": [_current_dump(tmp_path / "current")],
@@ -39,9 +41,14 @@ def test_auto_prepares_verified_extension_before_returning(tmp_path: Path, insta
 
     decision = fixture.lifecycle.prepare()
 
-    assert decision.mode is LifecycleMode.SLOW
-    assert tools.safe_mode is False
-    assert tools.calls[-1] == "disable-safe-mode"
+    if installed == "current":
+        assert decision.mode is LifecycleMode.PROBED
+        assert tools.safe_mode is True
+        assert "disable-safe-mode" not in tools.calls
+    else:
+        assert decision.mode is LifecycleMode.SLOW
+        assert tools.safe_mode is False
+        assert tools.calls[-1] == "disable-safe-mode"
     assert fixture.state_store.read() is None  # Still needs a live handshake.
 
 
@@ -66,8 +73,9 @@ def test_legacy_marker_does_not_skip_safe_mode_preparation(tmp_path: Path) -> No
 
     decision = fixture.lifecycle.prepare()
 
-    assert decision.mode is LifecycleMode.SLOW
-    assert tools.safe_mode is False
+    assert decision.mode is LifecycleMode.PROBED
+    assert tools.safe_mode is True
+    assert fixture.state_store.read() is None
 
 
 def test_foreign_extension_never_has_safe_mode_changed(tmp_path: Path) -> None:

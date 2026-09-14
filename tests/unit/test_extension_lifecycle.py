@@ -350,7 +350,7 @@ def test_absent_extension_installs_applies_and_redumps_without_check(tmp_path: P
     assert fixture.profiler.events[0].error_present is False
 
 
-def test_exact_current_skips_redundant_check_and_redump(tmp_path: Path) -> None:
+def test_exact_current_without_marker_tries_handshake_before_agent(tmp_path: Path) -> None:
     tools = FakeExtensionTools(
         dumps=[_current_dump(tmp_path / "first")]
     )
@@ -358,10 +358,12 @@ def test_exact_current_skips_redundant_check_and_redump(tmp_path: Path) -> None:
 
     decision = fixture.lifecycle.prepare()
 
+    assert decision.mode is LifecycleMode.PROBED
     assert decision.target_state is TargetExtensionState.CURRENT
-    assert tools.calls == ["dump-files", "disable-safe-mode"]
-    assert "load-cfe" not in tools.calls
-    assert "apply" not in tools.calls
+    assert decision.retry_allowed is True
+    assert tools.calls == ["dump-files"]
+    assert tools.mutation_sessions == 0
+    assert fixture.state_store.read() is None
 
 
 def test_recognized_0_0_9_updates_to_packaged_0_1_0(tmp_path: Path) -> None:

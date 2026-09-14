@@ -23,6 +23,7 @@ from onec_runtime.bootstrap import (
     enable_server_kernel_loop,
     observe_extension_handshake,
     verify_extension_handshake,
+    verify_extension_safe_mode_disabled,
     wait_for_managed_startup_stop,
     wait_for_server_entry_then_service,
 )
@@ -690,6 +691,9 @@ class RuntimeSession:
                         bundle,
                         lifecycle,
                         profiler,
+                        verify_safe_mode=decision.mode in {
+                            LifecycleMode.FAST, LifecycleMode.PROBED,
+                        },
                         progress=progress,
                     )
                 except _OwnedAttemptFailure as failure:
@@ -737,7 +741,7 @@ class RuntimeSession:
                     may_repair = (
                         extension_repair_available
                         and not manual_mode
-                        and decision.mode is LifecycleMode.FAST
+                        and decision.mode in {LifecycleMode.FAST, LifecycleMode.PROBED}
                         and decision.retry_allowed
                         and failure.repairable
                         and failure.cleanup_succeeded
@@ -912,6 +916,7 @@ class RuntimeSession:
         lifecycle: ExtensionLifecycle,
         profiler: PhaseRecorder,
         *,
+        verify_safe_mode: bool = False,
         progress: Callable[[str], None] | None = None,
     ) -> tuple["RuntimeSession", tuple[ExtensionHandshakeEvidence, ...]]:
         del lifecycle, profiler
@@ -1049,6 +1054,12 @@ class RuntimeSession:
                     "Runtime server entry/service stops belong to different server targets"
                 )
 
+            if verify_safe_mode:
+                stage = "safe-mode-check"
+                if progress is not None:
+                    progress("Проверка безопасного режима расширения 1С")
+                verify_extension_safe_mode_disabled(rdbg)
+
             journal = RecoveryJournal(artifacts.append_jsonl)
             controller = PrototypeRuntimeController(
                 rdbg,
@@ -1140,6 +1151,9 @@ class RuntimeSession:
                 _expose_startup_cleanup_retry(error, cleanup_retry)
             repairable = (
                 stage in {"managed-handshake", "server-entry-handshake"}
+                and isinstance(error, ExtensionHandshakeError)
+            ) or (
+                stage == "safe-mode-check"
                 and isinstance(error, ExtensionHandshakeError)
             ) or (
                 stage == "managed-bootstrap"

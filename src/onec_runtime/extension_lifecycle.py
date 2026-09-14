@@ -51,6 +51,7 @@ class TargetExtensionState(StrEnum):
 
 class LifecycleMode(StrEnum):
     FAST = "fast"
+    PROBED = "probed"
     SLOW = "slow"
     MANUAL = "manual"
 
@@ -130,6 +131,17 @@ class ExtensionLifecycle:
             ):
                 raise ExtensionIdentityConflict(
                     "installed extension has a foreign permanent identity"
+                )
+
+            # The exact artifact is already present. Admit it only after the
+            # live client/server handshake and safe-mode property check;
+            # repair through the Agent if either check fails.
+            if state is TargetExtensionState.CURRENT and not force_slow:
+                return LifecycleDecision(
+                    LifecycleMode.PROBED,
+                    TargetExtensionState.CURRENT,
+                    self.bundle,
+                    retry_allowed=True,
                 )
 
             with self.tools.mutation_session(paths.root / "agent"):

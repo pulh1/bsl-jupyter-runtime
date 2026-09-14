@@ -88,6 +88,8 @@ class AttemptProbe:
     managed_errors: dict[int, BaseException] = field(default_factory=dict)
     registration_errors: dict[int, BaseException] = field(default_factory=dict)
     handshake_values: dict[tuple[int, str, str], str] = field(default_factory=dict)
+    safe_mode_presentations: dict[int, str] = field(default_factory=dict)
+    safe_mode_checks: list[int] = field(default_factory=list)
     server_entry_errors: dict[int, BaseException] = field(default_factory=dict)
     server_target_id: TargetId = TARGET_ID
     service_target_id: TargetId | None = None
@@ -833,6 +835,14 @@ def patch_successful_runtime_attempt(
                 raise error
 
         def evaluate(self, expression: str) -> EvaluationResult:
+            if expression.startswith("РасширенияКонфигурации.Получить("):
+                probe.safe_mode_checks.append(self.attempt)
+                return EvaluationResult(
+                    UUID(int=1),
+                    "Булево",
+                    probe.safe_mode_presentations.get(self.attempt, "Ложь"),
+                    False,
+                )
             target_type = self.target.target_type
             if target_type not in self._recorded_targets:
                 lifecycle.events.append(
@@ -1070,6 +1080,7 @@ def test_start_reports_visible_stages_in_order(
             "Ожидание клиентского сеанса 1С",
             "Проверка расширения в клиентском сеансе",
             "Подключение серверного сеанса 1С",
+            "Проверка безопасного режима расширения 1С",
             "Сеанс 1С готов",
         ]
     finally:
@@ -1434,11 +1445,73 @@ def test_manual_unavailable_preserves_only_sanitized_cleanup_diagnostic(
     assert not (run_dir / "bootstrap.json").exists()
 
 
-def test_fast_handshake_failure_cleans_up_then_retries_slow_once(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("mode", (LifecycleMode.FAST, LifecycleMode.PROBED))
+def test_existing_extension_checks_live_safe_mode_before_marking_it_verified(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: LifecycleMode,
+) -> None:
+    lifecycle = FakeLifecycle(decisions=[
+        LifecycleDecision(
+            mode, TargetExtensionState.CURRENT, BUNDLE,
+            retry_allowed=True,
+        )
+    ])
+    started = patch_successful_runtime_attempt(monkeypatch, lifecycle)
+
+    session = RuntimeSession.start(session_config(tmp_path))
+    try:
+        assert started.safe_mode_checks == [1]
+        assert lifecycle.events[-1] == "commit"
+        evidence = json.loads(
+            (session.artifacts.run_dir / "bootstrap.json").read_text(encoding="utf-8")
+        )
+        assert evidence["lifecycle"]["mode"] == mode.value
+    finally:
+        session.close()
+
+
+@pytest.mark.parametrize("mode", (LifecycleMode.FAST, LifecycleMode.PROBED))
+def test_existing_extension_with_safe_mode_enabled_repairs_through_agent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: LifecycleMode,
+) -> None:
+    lifecycle = FakeLifecycle(decisions=[
+        LifecycleDecision(
+            mode, TargetExtensionState.CURRENT, BUNDLE,
+            retry_allowed=True,
+        ),
+        slow_decision(),
+    ])
+    started = patch_successful_runtime_attempt(monkeypatch, lifecycle)
+    started.safe_mode_presentations[1] = "Истина"
+
+    session = RuntimeSession.start(session_config(tmp_path))
+    try:
+        assert started.safe_mode_checks == [1]
+        assert lifecycle.events.count("commit") == 1
+        assert lifecycle.events.index("commit") > lifecycle.events.index("prepare-force-slow")
+        evidence = json.loads(
+            (session.artifacts.run_dir / "bootstrap.json").read_text(encoding="utf-8")
+        )
+        assert evidence["lifecycle"]["mode"] == "slow"
+        assert evidence["attempt_failures"][0]["stage"] == "safe-mode-check"
+        assert evidence["attempt_failures"][0]["repairable"] is True
+    finally:
+        session.close()
+
+
+@pytest.mark.parametrize("initial_mode", (LifecycleMode.FAST, LifecycleMode.PROBED))
+def test_existing_extension_handshake_failure_cleans_up_then_retries_slow_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, initial_mode: LifecycleMode
 ) -> None:
     lifecycle = FakeLifecycle(
-        decisions=[fast_decision(), slow_decision()],
+        decisions=[
+            LifecycleDecision(
+                initial_mode,
+                TargetExtensionState.CURRENT,
+                BUNDLE,
+                retry_allowed=True,
+            ),
+            slow_decision(),
+        ],
         first_handshake_error=ExtensionHandshakeError("mismatch"),
     )
     started = patch_successful_runtime_attempt(monkeypatch, lifecycle)
@@ -1468,7 +1541,7 @@ def test_fast_handshake_failure_cleans_up_then_retries_slow_once(
             "admitted": False,
             "attempt": 1,
             "cleanup_succeeded": True,
-            "decision_mode": "fast",
+            "decision_mode": initial_mode.value,
             "error_type": "ExtensionHandshakeError",
             "repairable": True,
             "stage": "managed-handshake",
