@@ -61,6 +61,6 @@ uv sync --group dev
 uv run python -m pytest tests/unit -q
 ```
 
-Проверки генератора парсера используют включённый в репозиторий [тестовый исходник](tests/fixtures/parsergen/README.md). Архитектура описана [отдельно](docs/architecture/2026-08-12-canonical-runtime-architecture.md), а сведения о первоначальном переносе сохранены в [MIGRATION.md](MIGRATION.md).
+Проверки генератора парсера используют включённый в репозиторий [тестовый исходник](tests/fixtures/parsergen/README.md). Архитектура описана [отдельно](docs/architecture/2026-08-12-canonical-runtime-architecture.md).
 
 Собственный код распространяется по `GPL-3.0-only`; лицензии и уведомления сторонних компонентов находятся в [LICENSE](LICENSE) и [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt).
