@@ -1,6 +1,6 @@
 {
   "name": "@onec-interactive/jupyter-bsl",
-  "version": "0.1.18",
+  "version": "0.1.19",
   "private": true,
   "description": "BSL cell magic highlighting for JupyterLab and Notebook 7",
   "license": "GPL-3.0-only AND MIT",
