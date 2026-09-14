@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "onec-interactive-runtime-core"
-version = "0.1.18"
+version = "0.1.19"
 requires-python = ">=3.12"
 license = "GPL-3.0-only AND MIT"
 license-files = ["LICENSE", "COPYRIGHT", "THIRD_PARTY_NOTICES.txt"]
