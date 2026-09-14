@@ -64,6 +64,7 @@ NotebookCell = NotebookCellProjection
 class _ProjectionItem:
     ordinal: int
     node: Any
+    start: int
     end: int
 
 
@@ -89,19 +90,21 @@ def split_notebook_cell(
     while elements is not None and elements.Item is not None:
         ordered.append(elements.Item)
         elements = elements.Rest
+    starts = tuple(_projection_start(item, tokens, token_starts) for item in ordered)
 
     method_items: list[_ProjectionItem] = []
     statement_items: list[_ProjectionItem] = []
     exports: dict[str, WorkerExport] = {}
     for ordinal, item in enumerate(ordered):
         following_start = (
-            ordered[ordinal + 1].span.start
+            starts[ordinal + 1]
             if ordinal + 1 < len(ordered)
             else len(source)
         )
         projected = _ProjectionItem(
             ordinal,
             item,
+            starts[ordinal],
             _projection_end(item.span.end, following_start, tokens, token_starts),
         )
         if type(item).__name__ == "Method":
@@ -151,7 +154,7 @@ def _build_method_projection(
     # The optional semicolon belongs to the notebook element separator, not
     # the method AST. In a composed Worker it starts the module body and makes
     # every subsequently appended declaration illegal on the platform.
-    method = _ProjectionItem(item.ordinal, item.node, item.node.span.end)
+    method = _ProjectionItem(item.ordinal, item.node, item.start, item.node.span.end)
     _copy_method(builder, method, tokens)
     return builder.build(SourceArtifactKind.WORKER_PROJECTION)
 
@@ -172,6 +175,18 @@ def _projection_end(
     return following.end if following is not None and following.type == ";" else item_end
 
 
+def _projection_start(
+    item: Any, tokens: tuple[Any, ...], token_starts: tuple[int, ...],
+) -> int:
+    if type(item).__name__ not in {"ForEachStatement", "ForRangeStatement"}:
+        return item.span.start
+    # The generated loop node starts after its leading `Для` token.
+    token_index = bisect_left(token_starts, item.span.start)
+    if token_index == 0 or tokens[token_index - 1].type != "ДЛЯ":
+        raise ProtocolError("Notebook loop has no leading Для token")
+    return tokens[token_index - 1].start
+
+
 def _build_projection(
     visible: MappedSource,
     items: list[_ProjectionItem],
@@ -185,19 +200,19 @@ def _build_projection(
     for item in items:
         if previous is not None:
             if item.ordinal == previous.ordinal + 1:
-                separator = SourceSpan(previous.end, item.node.span.start)
+                separator = SourceSpan(previous.end, item.start)
                 if separator.start < separator.end:
                     builder.copy(separator)
             else:
                 builder.synthetic(
                     "\n",
-                    SourceSpan(item.node.span.start, item.node.span.start),
+                    SourceSpan(item.start, item.start),
                     "notebook_projection_join",
                 )
         if kind is SourceArtifactKind.WORKER_PROJECTION:
             _copy_method(builder, item, tokens)
         else:
-            builder.copy(SourceSpan(item.node.span.start, item.end))
+            builder.copy(SourceSpan(item.start, item.end))
         previous = item
     return builder.build(kind)
 

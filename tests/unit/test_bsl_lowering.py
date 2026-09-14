@@ -135,6 +135,52 @@ def test_statement_only_cell_has_only_exact_statement_projection(
     assert second.origin_span == SourceSpan(source.index("Второе"), source.index("Второе") + 1)
 
 
+@pytest.mark.parametrize(
+    "source",
+    (
+        pytest.param(
+            "Для Каждого Элемент Из Коллекция Цикл\n"
+            "    Сообщить(Элемент);\n"
+            "КонецЦикла;",
+            id="for-each-first",
+        ),
+        pytest.param(
+            "Для Номер = 1 По 2 Цикл\n"
+            "    Сообщить(Номер);\n"
+            "КонецЦикла;",
+            id="for-range-first",
+        ),
+        pytest.param(
+            "Начало = 1;\n"
+            "Для Каждого Элемент Из Коллекция Цикл\n"
+            "    Сообщить(Элемент);\n"
+            "КонецЦикла;",
+            id="for-each-after-statement",
+        ),
+    ),
+)
+def test_top_level_for_loop_keeps_keyword_through_notebook_projection(
+    target: PythonParserTarget, source: str,
+) -> None:
+    """Break caught: a projected top-level loop must still be executable BSL."""
+    from onec_runtime.bsl.semantic_lowering import LoweringMode, SemanticNotebookLowerer
+
+    unit = _unit("top-level-for", 1, source)
+    cell = split_notebook_cell(target, source, source_unit=unit)
+
+    assert cell.statements is not None
+    assert cell.statement_source == source
+    keyword_offset = source.index("Для")
+    mapped = cell.statements.source_map.map_offset(keyword_offset)
+    assert mapped.relation is MappingRelation.EXACT
+    assert mapped.origin_span == SourceSpan(keyword_offset, keyword_offset + 1)
+
+    lowered = SemanticNotebookLowerer(target).lower(
+        cell.statement_source, mode=LoweringMode.CAPTURE,
+    )
+    target.parse(lowered.source, "БлокНоутбука")
+
+
 def test_adjacent_statements_copy_comment_separator_exactly(
     target: PythonParserTarget,
 ) -> None:
