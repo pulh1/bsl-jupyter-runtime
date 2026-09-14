@@ -67,3 +67,32 @@ def test_current_demo_code_cells_parse(tmp_path, monkeypatch) -> None:
                 split_notebook_cell(parser, cell.source.removeprefix("%%bsl\n"))
             else:
                 ast.parse(cell.source)
+
+
+def test_overview_builds_from_first_bsl_cell_to_posting_result(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(builder, "DEMO_DEST", tmp_path / "demo")
+    builder.build()
+    notebook = nbformat.read(tmp_path / "demo" / "ZUP" / "01-overview.ipynb", as_version=4)
+    sources = [cell.source for cell in notebook.cells]
+
+    def position(fragment: str) -> int:
+        return next(index for index, source in enumerate(sources) if fragment in source)
+
+    assert position('Сообщить("Привет, мир!")') < position("ПроцентПовышения = 10;")
+    assert position("Функция УвеличитьНаПроцент") < position("КадровыйУчет.СотрудникиОрганизации")
+    assert position("КадровыйУчет.КадровыеДанныеСотрудников") < position("КадровыеДанные.to_df(")
+    assert position("Прием.materialize(") < position("runtime.load_worker_module(")
+    assert position("runtime.load_worker_module(") < position("runtime.add_capture_point(")
+    assert position("runtime.add_capture_point(") < position("КонтекстОтладки.СтруктураДанных")
+    assert position("КонтекстОтладки.СтруктураДанных") < position("runtime.resume_capture()")
+    assert position("runtime.resume_capture()") < position(
+        "РегистрСведений.ЗначенияПериодическихПоказателейРасчетаЗарплатыСотрудников"
+    )
+    joined = "\n".join(sources)
+    assert "УвеличитьНаПроцент(СтрокаОклада.Значение)" in joined
+    assert "УвеличитьНаПроцент(СтрокаФОТ.Размер)" in joined
+    assert "И НЕ Прием.БронированиеПозиции" in joined
+    assert "СтрокаНачисления.ИдентификаторСтрокиВидаРасчета = ВыборкаПриемов.ИдентификаторСтрокиВидаРасчета" in joined
+    assert "РегистрСведений.ПлановыеНачисления" in joined
+    assert "РегистрСведений.ПлановыйФОТИтоги" in joined
+    assert "ПланПослеПроведения" in joined
