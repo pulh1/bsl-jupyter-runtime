@@ -1,0 +1,126 @@
+name: Publish Python packages to PyPI
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pypi-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: packages/jupyter/frontend/package-lock.json
+      - uses: astral-sh/setup-uv@v9
+        with:
+          version: "0.12.13"
+
+      - name: Verify release commit is on master
+        run: |
+          git fetch origin master
+          git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD
+
+      - name: Verify release tag and package versions
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import tomllib
+          from pathlib import Path
+
+          projects = (
+              Path('pyproject.toml'),
+              Path('packages/jupyter/pyproject.toml'),
+          )
+          versions = {
+              str(path): tomllib.loads(path.read_text(encoding='utf-8'))['project']['version']
+              for path in projects
+          }
+          versions['packages/jupyter/frontend/package.json'] = json.loads(
+              Path('packages/jupyter/frontend/package.json').read_text(encoding='utf-8')
+          )['version']
+          if len(set(versions.values())) != 1:
+              raise SystemExit(f'Package versions differ: {versions}')
+          version = next(iter(versions.values()))
+          if os.environ['RELEASE_TAG'] != f'v{version}':
+              raise SystemExit(f"Release tag {os.environ['RELEASE_TAG']} does not match v{version}")
+          PY
+
+      - name: Install Jupyter frontend dependencies
+        run: npm ci --prefix packages/jupyter/frontend
+
+      - name: Test package contents and dependencies
+        run: >-
+          uvx --from "pytest>=8,<9" pytest -q tests/packaging/test_product_wheels.py
+          -k "jupyter_release_build_produces_one_core_dependent_wheel or
+          jupyter_wheel_ships_discoverable_highlighting_and_licenses"
+
+      - name: Build wheels and source distributions
+        run: |
+          uv build --package onec-interactive-runtime-core --no-sources --out-dir dist
+          uv build --package onec-interactive-jupyter --no-sources --out-dir dist
+
+      - name: Verify release artifacts
+        run: |
+          python - <<'PY'
+          import tomllib
+          from pathlib import Path
+
+          projects = (
+              Path('pyproject.toml'),
+              Path('packages/jupyter/pyproject.toml'),
+          )
+          expected = set()
+          for project in projects:
+              metadata = tomllib.loads(project.read_text(encoding='utf-8'))['project']
+              prefix = metadata['name'].replace('-', '_') + '-' + metadata['version']
+              wheels = list(Path('dist').glob(prefix + '-*.whl'))
+              if len(wheels) != 1:
+                  raise SystemExit(f'Expected one wheel for {prefix}, found: {wheels}')
+              expected.update((wheels[0].name, prefix + '.tar.gz'))
+          # uv creates a .gitignore in a new output directory.
+          actual = {
+              path.name for path in Path('dist').iterdir()
+              if path.is_file() and path.name != '.gitignore'
+          }
+          if actual != expected:
+              raise SystemExit(f'Release artifacts differ: expected {expected}, found {actual}')
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-distributions
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: python-distributions
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
