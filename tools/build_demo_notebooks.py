@@ -196,7 +196,8 @@ UT_TOTALS = '''ВыручкаПредыдущегоМесяца = 0;
 КонецЦикла;
 
 ПриростВыручки = ПродажиСервер.ПроцентПрироста(
-    ВыручкаПредыдущегоМесяца, ВыручкаПоследнегоМесяца);'''
+    ВыручкаПредыдущегоМесяца, ВыручкаПоследнегоМесяца);
+КонтрольныйПриростДо = ПродажиСервер.ПроцентПрироста(0, 100);'''
 
 UT_CAPTURE_ARM = '''runtime.add_capture_point(r'CommonModules\\ПродажиСервер\\Ext\\Module.bsl', 9311)'''
 
@@ -209,6 +210,9 @@ UT_CAPTURE_READ = '''СнимокПрироста = Новый ТаблицаЗ�
 СтрокаСнимка.ВыручкаПоследнегоМесяца = КонтекстОтладки.ТекущееЗначение;
 СтрокаСнимка.ПриростПроцентов = КонтекстОтладки.Результат;'''
 
+UT_RELOADED_BRANCH = '''ИначеЕсли ПредыдущееЗначение = 0 Тогда
+    Результат = Неопределено;'''
+
 def md(text): return nbf.v4.new_markdown_cell(text)
 def py(source): return nbf.v4.new_code_cell(source)
 def bsl(source): return py('%%bsl\n' + source)
@@ -216,7 +220,7 @@ def bsl(source): return py('%%bsl\n' + source)
 def opening(title, goal, *, setup=OVERVIEW_SETUP, setup_note='', snapshot_note='ЗУП КОРП 3.1.38.92, платформа 8.5.1.1529, дата данных 01.08.2021. '):
     return [md('# '+title+'\n\n'+goal+'\n\n'+snapshot_note+
         'Используйте отдельную демо-копию и соответствующую ей выгрузку исходников. '
-        'Подготовка окружения — в [README](README.md). Сеанс закрывается последней ячейкой; при прерывании выполните `runtime.close()`.'),
+        'Подготовка окружения — в [README](../README.md). Сеанс закрывается последней ячейкой; при прерывании выполните `runtime.close()`.'),
         md('## Подготовка' + setup_note), py(setup)]
 
 def overview_reload_cells():
@@ -306,11 +310,40 @@ def overview_capture_cells():
 
 def cleanup(): return [md('## Завершение'),py("runtime.close()\nprint('Сеанс закрыт')")]
 
+def ut_reload_cells():
+    return [
+        md('## Hot reload: нет базы для процента\n\nТиповая функция возвращает 100% '
+           'для пары `(0, 100)`. Попробуем другую трактовку: при нулевой '
+           'предыдущей и положительной текущей выручке процент не определён. '
+           'В **локальной копии** выгрузки `SOURCE_ROOT` откройте '
+           '`CommonModules/ПродажиСервер/Ext/Module.bsl`. В функции '
+           '`ПроцентПрироста` найдите ветку `ИначеЕсли ПредыдущееЗначение = 0 Тогда` '
+           'и замените в ней `Результат = 100;` на `Результат = Неопределено;`. '
+           'После правки ветка должна выглядеть так:\n\n'
+           '```bsl\n' + UT_RELOADED_BRANCH + '\n```\n\n'
+           'Сохраните файл, оставив остальную функцию без изменений. '
+           'Конфигурация ИБ не меняется: следующий шаг загрузит изменённый '
+           'модуль в текущий runtime-сеанс. При переносе в Python значение '
+           '`Неопределено` представлено как `ONEC_UNDEFINED`.'),
+        py("runtime.load_worker_module(r'CommonModules\\ПродажиСервер\\Ext\\Module.bsl')"),
+        bsl('ПриростПослеПерезагрузки = ПродажиСервер.ПроцентПрироста(\n'
+            '    ВыручкаПредыдущегоМесяца, ВыручкаПоследнегоМесяца);\n'
+            'КонтрольныйПриростПосле = ПродажиСервер.ПроцентПрироста(0, 100);'),
+        py('''from onec_runtime.value_materialization import ONEC_UNDEFINED
+
+growth_after = ПриростПослеПерезагрузки.materialize()
+probe_after = КонтрольныйПриростПосле.materialize()
+assert probe_before == 100 and probe_after is ONEC_UNDEFINED
+print('Контрольный вызов (0, 100):', probe_before, '→ Неопределено')
+print('Выручка ИБ:', growth_before, '→',
+      'Неопределено' if growth_after is ONEC_UNDEFINED else growth_after)'''),
+    ]
+
 def ut_overview_cells():
     cells = opening(
-        'Продажи УТ: выручка по месяцам и шаг внутрь типового расчёта',
+        'Продажи УТ: выручка, capture и hot reload',
         'Найдём последний месяц с выручкой и предыдущий календарный месяц, сравним обороты '
-        'по подразделениям и остановим типовую функцию расчёта прироста перед возвратом.',
+        'по подразделениям, остановим расчёт прироста и изменим его через hot reload.',
         setup=UT_SETUP,
         snapshot_note='Метаданные сверены с УТ 11.6.1.61; дата данных ИБ не фиксируется. ',
         setup_note='\n\nУкажите `PLATFORM_BIN`, `CONNECTION_STRING` и `SOURCE_ROOT` '
@@ -373,7 +406,10 @@ plt.close(fig)'''),
            'и отрицательную базу сравнения: результат для нулевой базы '
            'не равен обычному математическому проценту роста.'),
         bsl(UT_TOTALS),
-        py("print('Прирост выручки, %:', ПриростВыручки.materialize())"),
+        py("growth_before = ПриростВыручки.materialize()\n"
+           "probe_before = КонтрольныйПриростДо.materialize()\n"
+           "print('Прирост выручки, %:', growth_before)\n"
+           "print('Контрольный вызов (0, 100), %:', probe_before)"),
         md('## Останов перед возвратом\n\nПоставим точку на строке 9311 '
            'метода `ПродажиСервер.ПроцентПрироста`, перед `Возврат Результат;`. '
            'Номер относится к выгрузке УТ 11.6.1.61.'),
@@ -393,10 +429,13 @@ display(pd.DataFrame(stack['frames'])[['level', 'module_type', 'line']])'''),
 runtime.clear_capture_points()
 assert completed.succeeded and completed.state.value == 'completed'
 print('Результат после продолжения, %:', completed.result)'''),
+    ]
+    cells += ut_reload_cells()
+    cells += [
         md('## Что дальше\n\nМожно заменить два месяца другим интервалом, '
            'добавить отбор по организации или исследовать отдельное '
            'подразделение. Для сравнения с ЗУП откройте '
-           '[01-overview.ipynb](01-overview.ipynb).'),
+           '[01-overview.ipynb](../ZUP/01-overview.ipynb).'),
     ]
     return cells + cleanup()
 
@@ -484,8 +523,9 @@ print('ФОТ после обычного вызова:', restored['ФОТ'].sum
            'а не код уже начатого вызова. Для присваивания нового значения скалярной '
            'локальной переменной нужен другой механизм.'),
     ] + cleanup()
-    for name, cells in [('01-overview', overview), ('03-capture', capture),
-                        ('05-ut-sales', ut_overview_cells())]:
+    for folder, name, cells in [('ZUP', '01-overview', overview),
+                                ('ZUP', '03-capture', capture),
+                                ('UT', '05-ut-sales', ut_overview_cells())]:
         for index, cell in enumerate(cells):
             cell.id = f'{name}-{index:02d}'
         notebook = nbf.v4.new_notebook(
@@ -496,8 +536,9 @@ print('ФОТ после обычного вызова:', restored['ФОТ'].sum
             },
         )
         nbf.validate(notebook)
-        DEMO_DEST.mkdir(parents=True, exist_ok=True)
-        nbf.write(notebook, DEMO_DEST / (name + '.ipynb'))
-        print(name, len(cells), 'cells')
+        destination = DEMO_DEST / folder
+        destination.mkdir(parents=True, exist_ok=True)
+        nbf.write(notebook, destination / (name + '.ipynb'))
+        print(folder, name, len(cells), 'cells')
 
 if __name__ == '__main__': build()

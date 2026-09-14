@@ -15,12 +15,12 @@ def test_demo_notebooks_are_standalone_and_capture_uses_notebook_flow(tmp_path, 
 
     builder.build()
 
-    assert sorted(path.name for path in demo_dir.glob("*.ipynb")) == [
-        "01-overview.ipynb", "03-capture.ipynb", "05-ut-sales.ipynb"
+    assert sorted(path.relative_to(demo_dir).as_posix() for path in demo_dir.rglob("*.ipynb")) == [
+        "UT/05-ut-sales.ipynb", "ZUP/01-overview.ipynb", "ZUP/03-capture.ipynb"
     ]
-    overview = nbformat.read(demo_dir / "01-overview.ipynb", as_version=4)
-    capture = nbformat.read(demo_dir / "03-capture.ipynb", as_version=4)
-    ut_sales = nbformat.read(demo_dir / "05-ut-sales.ipynb", as_version=4)
+    overview = nbformat.read(demo_dir / "ZUP" / "01-overview.ipynb", as_version=4)
+    capture = nbformat.read(demo_dir / "ZUP" / "03-capture.ipynb", as_version=4)
+    ut_sales = nbformat.read(demo_dir / "UT" / "05-ut-sales.ipynb", as_version=4)
     for notebook in (overview, capture, ut_sales):
         nbformat.validate(notebook)
         assert notebook.metadata.kernelspec.name == "onec-demo"
@@ -37,6 +37,7 @@ def test_demo_notebooks_are_standalone_and_capture_uses_notebook_flow(tmp_path, 
     assert "runtime.add_capture_point(" in ut_sources
     assert "runtime.clear_capture_points()" in ut_sources
     assert "runtime.runtime_api.capture_stack(" in ut_sources
+    assert "runtime.load_worker_module(" in ut_sources
     assert "CommonModules\\ПродажиСервер\\Ext\\Module.bsl" in ut_sources
 
     assert overview.cells[2].source == capture.cells[2].source
@@ -57,7 +58,7 @@ def test_current_demo_code_cells_parse(tmp_path, monkeypatch) -> None:
     builder.build()
     parser = PythonParserTarget.from_generated()
 
-    for path in (tmp_path / "demo").glob("*.ipynb"):
+    for path in (tmp_path / "demo").rglob("*.ipynb"):
         notebook = nbformat.read(path, as_version=4)
         for cell in notebook.cells:
             if cell.cell_type != "code":
