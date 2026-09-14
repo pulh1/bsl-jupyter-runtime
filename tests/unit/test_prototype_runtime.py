@@ -2016,7 +2016,8 @@ def test_rejected_notebook_main_does_not_mutate_later_capture_lowering() -> None
         if name == "evaluate"
         and "ВыполнитьКодВКонтекстеОтладки" in str(value)
     )
-    assert "Контекст.ОтклоненнаяПеременная" in str(capture_call)
+    assert "Контекст.ОтклоненнаяПеременная" not in str(capture_call)
+    assert "ОтклоненнаяПеременная" in str(capture_call)
 
 
 def test_capture_cell_journals_hashes_without_source_or_values() -> None:

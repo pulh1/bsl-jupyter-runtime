@@ -199,7 +199,7 @@ def test_platform_globals_and_nested_capture_mutation_are_not_rebound(
     )
     result = SemanticNotebookLowerer(
         parser_target,
-        context_names=("Таблица",),
+        context_names=("Таблица", "Значение"),
         platform_globals=("Строка",),
     ).lower(source, mode=LoweringMode.CAPTURE)
 
@@ -249,6 +249,30 @@ def test_context_name_catalog_persists_across_cells(
     )
 
 
+def test_unknown_bare_read_remains_for_platform_resolution(
+    parser_target: PythonParserTarget,
+) -> None:
+    from onec_runtime.bsl.semantic_lowering import LoweringMode, SemanticNotebookLowerer
+
+    lowerer = SemanticNotebookLowerer(parser_target)
+    first = lowerer.lower(
+        "Результат = НеизвестноеПлатформенноеИмя.Свойство;",
+        mode=LoweringMode.MAIN,
+    )
+    assert first.source == "Результат = НеизвестноеПлатформенноеИмя.Свойство;"
+    assert first.context_names == ()
+
+    lowerer.lower("Оклад = 100;", mode=LoweringMode.MAIN)
+    second = lowerer.lower(
+        "Результат = Оклад + НеизвестноеПлатформенноеИмя.Свойство;",
+        mode=LoweringMode.MAIN,
+    )
+    assert second.source == (
+        "Результат = Контекст.Оклад + НеизвестноеПлатформенноеИмя.Свойство;"
+    )
+    assert second.context_names == ("Оклад",)
+
+
 def test_main_persistent_assignments_publish_declared_write_candidates(
     parser_target: PythonParserTarget,
 ) -> None:
@@ -276,6 +300,7 @@ def test_module_binding_registers_scopes_without_lowering_worker_source(
 
     lowerer = SemanticNotebookLowerer(
         parser_target,
+        context_names=("Значение",),
         platform_globals=("Сообщить",),
     )
     module_source = (
@@ -315,6 +340,7 @@ def test_worker_export_shadows_platform_message_interception(
 
     result = SemanticNotebookLowerer(
         parser_target,
+        context_names=("Значение",),
         platform_globals=("Сообщить",),
         worker_exports=(WorkerExport("Сообщить", "Показать"),),
     ).lower("Сообщить(Значение);", mode=LoweringMode.MAIN)
@@ -461,7 +487,7 @@ def test_platform_calls_stay_unqualified_but_known_context_call_chains_lower(
     )
     result = SemanticNotebookLowerer(
         parser_target,
-        context_names=("Расчет",),
+        context_names=("Расчет", "Значение"),
     ).lower(source, mode=LoweringMode.MAIN)
 
     assert result.source == (
@@ -472,10 +498,10 @@ def test_platform_calls_stay_unqualified_but_known_context_call_chains_lower(
     )
     assert result.context_names == (
         "Расчет",
+        "Значение",
         "Дата",
         "Строковое",
         "Элемент",
-        "Значение",
     )
 
 
@@ -765,7 +791,9 @@ def test_persistent_assignment_uses_derived_name_and_fragment_mappings(
     source = "Ответ =\nДелитель / Делитель;"
     visible = _mapped(source, "cell-main", 3)
 
-    result = SemanticNotebookLowerer(parser_target).lower_mapped(
+    result = SemanticNotebookLowerer(
+        parser_target, context_names=("Делитель",),
+    ).lower_mapped(
         visible,
         mode=LoweringMode.MAIN,
     )

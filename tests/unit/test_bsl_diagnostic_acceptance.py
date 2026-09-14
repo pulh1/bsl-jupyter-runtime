@@ -184,6 +184,7 @@ _SCENARIOS = {
         "Результат = Удвоить(Повтор + Повтор);",
         5,
         71,
+        context_names=("Повтор",),
         worker_exports=(("Удвоить", "Удвоить"),),
     ),
     "worker_export_callee": _ScenarioSpec(

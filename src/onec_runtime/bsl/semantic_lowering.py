@@ -1177,19 +1177,9 @@ class SemanticNotebookLowerer:
             return
         if normalized in self._platform_globals:
             return
-        if self._has_call(node):
-            return
-        self._context.setdefault(normalized, root)
-        self._edit(
-            node.span.start,
-            node.span.start,
-            "persistent-reference",
-            _SyntheticFragment(
-                "Контекст.",
-                SourceSpan(node.span.start, node.span.start),
-                "persistent_reference_prefix",
-            ),
-        )
+        # Unknown reads belong to the native BSL name resolver. Only names
+        # established by notebook writes or imported context are persistent.
+        return
 
     def _bind_message_call(self, node: Any) -> Any | None:
         arguments = node.Arguments.Items

@@ -141,6 +141,31 @@ def test_persistent_method_reads_preserve_shadows_literals_and_origins():
     PythonParserTarget.from_generated().parse_ast(bound.text, 'Модуль')
 
 
+def test_notebook_method_binds_known_name_and_leaves_platform_name_native():
+    from onec_runtime.bsl.notebook_method_globals import bind_notebook_method_globals
+
+    source = (
+        'Функция Проверка()\n'
+        '    Если ВидДвиженияНакопления.Приход = ВидДвиженияНакопления.Приход Тогда\n'
+        '        Возврат ПроцентПовышения;\n'
+        '    КонецЕсли;\n'
+        'КонецФункции'
+    )
+    cell, _ = parse_cell(source)
+    candidate = merge(None, cell)
+
+    bound, names = bind_notebook_method_globals(
+        candidate.mapped_source,
+        context_names=('ПроцентПовышения',),
+        exports=candidate.exports,
+    )
+
+    assert names == ('ПроцентПовышения',)
+    assert 'Возврат __OnecNotebookGlobals.ПроцентПовышения;' in bound.text
+    assert bound.text.count('ВидДвиженияНакопления.Приход') == 2
+    assert '__OnecNotebookGlobals.ВидДвиженияНакопления' not in bound.text
+
+
 def test_replacing_helper_retains_caller_order_and_exact_origins():
     first, unit1 = parse_cell("Функция А()\nВозврат Б();\nКонецФункции\nФункция Б()\nВозврат 1;\nКонецФункции")
     second, unit2 = parse_cell("Функция Б()\nВозврат 2;\nКонецФункции", 2)
