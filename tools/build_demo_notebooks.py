@@ -1,4 +1,4 @@
-"""Build the two reader demo notebooks from reviewable cell sources."""
+"""Build the reader demo notebooks from reviewable cell sources."""
 from pathlib import Path
 import nbformat as nbf
 
@@ -45,32 +45,9 @@ OVERVIEW_PLAN = '''ПлановыйФот = ПлановыеНачисления
     Неопределено, СписокСотрудников);
 ПланФОТ = ПлановыйФот.Скопировать(, "Сотрудник,ФОТ");'''
 
-CAPTURE_ARM = '''from pathlib import Path
-
-MODULE_PATH = r'CommonModules\\КадровыйУчет\\Ext\\Module.bsl'
-lines = (Path(SOURCE_ROOT) / MODULE_PATH).read_text(encoding='utf-8-sig').splitlines()
-starts = [index for index, line in enumerate(lines)
-          if line.startswith('Функция КадровыеДанныеСотрудников(')]
-if len(starts) != 1:
-    raise ValueError('Проверьте выгрузку: метод КадровыеДанныеСотрудников не найден однозначно')
-ends = [index for index in range(starts[0] + 1, len(lines))
-        if lines[index].startswith('КонецФункции')]
-if not ends:
-    raise ValueError('Проверьте выгрузку: конец метода не найден')
-end = ends[0]
-
-def line_of(statement):
-    found = [index + 1 for index in range(starts[0], end)
-             if lines[index].strip() == statement]
-    if len(found) != 1:
-        raise ValueError(f'Проверьте исходный код метода: {statement}')
-    return found[0]
-
-CAPTURE_LINE_A = line_of('КадровыеДанныеСотрудников = Запрос.Выполнить().Выгрузить();')
-CAPTURE_LINE_B = line_of('Возврат КадровыеДанныеСотрудников;')
-runtime.add_capture_point(MODULE_PATH, CAPTURE_LINE_A)
-runtime.add_capture_point(MODULE_PATH, CAPTURE_LINE_B)
-print('Точки A/B:', CAPTURE_LINE_A, CAPTURE_LINE_B)'''
+CAPTURE_ARM = '''MODULE_PATH = r'CommonModules\\КадровыйУчет\\Ext\\Module.bsl'
+runtime.add_capture_point(MODULE_PATH, 127)  # A: выгрузка результата запроса
+runtime.add_capture_point(MODULE_PATH, 129)  # B: возврат таблицы'''
 
 CAPTURE_CALL = '''ПланПовтор = КадровыйУчет.КадровыеДанныеСотрудников(
     Истина, СотрудникиДемо,
@@ -106,8 +83,7 @@ display(fig)
 plt.close(fig)'''
 
 OVERVIEW_CAPTURE_ARM = '''MODULE_PATH = r'CommonModules\\ПлановыеНачисленияСотрудников\\Ext\\Module.bsl'
-CAPTURE_LINE = 745  # Строка Возврат ЗначенияДанныхОплатыТруда; в вашей выгрузке.
-runtime.add_capture_point(MODULE_PATH, CAPTURE_LINE)'''
+runtime.add_capture_point(MODULE_PATH, 745)  # Возврат ЗначенияДанныхОплатыТруда'''
 
 OVERVIEW_CAPTURE_READ = '''captured_plan = СнимокВызова.to_df(refs='presentation')
 display(captured_plan)'''
@@ -146,6 +122,92 @@ OVERVIEW_RELOADED_METHOD = '''Функция ТекущиеДанныеОпла�
     ЗначенияДанныхОплатыТруда = Запрос.Выполнить().Выгрузить();
     Возврат ЗначенияДанныхОплатыТруда;
 КонецФункции'''
+
+UT_SETUP = '''from IPython.display import display
+from onec_runtime.config import RuntimeConfig
+from onec_runtime.session import ExtensionMode, RuntimeSessionConfig
+from onec_runtime_jupyter import InteractiveRuntimeSession
+
+PLATFORM_BIN = r'C:\\path\\to\\1cv8\\bin'
+CONNECTION_STRING = r'File="C:\\demo\\UT";'
+SOURCE_ROOT = r'C:\\exports\\UT'
+EXTENSION_MODE = ExtensionMode.AUTO  # MANUAL для ИБ с установленным расширением.
+
+runtime = InteractiveRuntimeSession.start(
+    RuntimeSessionConfig(
+        runtime=RuntimeConfig(
+            platform_bin=PLATFORM_BIN,
+            connection_string=CONNECTION_STRING,
+        ),
+        source_root=SOURCE_ROOT,
+        extension_mode=EXTENSION_MODE,
+    )
+)'''
+
+UT_LAST_SALE = '''ЗапросПоследнейПродажи = Новый Запрос;
+ЗапросПоследнейПродажи.Текст =
+    "ВЫБРАТЬ ПЕРВЫЕ 1
+    |   Движения.Период КАК Период
+    |ИЗ
+    |   РегистрНакопления.ВыручкаИСебестоимостьПродаж КАК Движения
+    |ГДЕ
+    |   Движения.Активность
+    |   И Движения.СуммаВыручки <> 0
+    |УПОРЯДОЧИТЬ ПО
+    |   Движения.Период УБЫВ";
+ПоследняяПродажа = ЗапросПоследнейПродажи.Выполнить().Выбрать();
+Если Не ПоследняяПродажа.Следующий() Тогда
+    ВызватьИсключение "В регистре нет активных движений выручки. Выберите ИБ с продажами.";
+КонецЕсли;
+
+НачалоПоследнегоМесяца = НачалоМесяца(ПоследняяПродажа.Период);
+НачалоПредыдущегоМесяца = ДобавитьМесяц(НачалоПоследнегоМесяца, -1);
+КонецПоследнегоМесяца = КонецМесяца(ПоследняяПродажа.Период);'''
+
+UT_SALES = '''ЗапросПродаж = Новый Запрос;
+ЗапросПродаж.Текст =
+    "ВЫБРАТЬ
+    |   Продажи.Период КАК Месяц,
+    |   Продажи.Подразделение КАК Подразделение,
+    |   СУММА(Продажи.СуммаВыручкиОборот) КАК Выручка
+    |ИЗ
+    |   РегистрНакопления.ВыручкаИСебестоимостьПродаж.Обороты(
+    |       &НачалоПериода, &КонецПериода, Месяц, ) КАК Продажи
+    |СГРУППИРОВАТЬ ПО
+    |   Продажи.Период,
+    |   Продажи.Подразделение
+    |УПОРЯДОЧИТЬ ПО
+    |   Месяц";
+ЗапросПродаж.УстановитьПараметр("НачалоПериода", НачалоПредыдущегоМесяца);
+ЗапросПродаж.УстановитьПараметр("КонецПериода", КонецПоследнегоМесяца);
+ПродажиПоМесяцам = ЗапросПродаж.Выполнить().Выгрузить();
+Если ПродажиПоМесяцам.Количество() = 0 Тогда
+    ВызватьИсключение "За выбранные два месяца оборотов выручки нет.";
+КонецЕсли;'''
+
+UT_TOTALS = '''ВыручкаПредыдущегоМесяца = 0;
+ВыручкаПоследнегоМесяца = 0;
+Для Каждого СтрокаПродаж Из ПродажиПоМесяцам Цикл
+    Если СтрокаПродаж.Месяц = НачалоПоследнегоМесяца Тогда
+        ВыручкаПоследнегоМесяца = ВыручкаПоследнегоМесяца + СтрокаПродаж.Выручка;
+    Иначе
+        ВыручкаПредыдущегоМесяца = ВыручкаПредыдущегоМесяца + СтрокаПродаж.Выручка;
+    КонецЕсли;
+КонецЦикла;
+
+ПриростВыручки = ПродажиСервер.ПроцентПрироста(
+    ВыручкаПредыдущегоМесяца, ВыручкаПоследнегоМесяца);'''
+
+UT_CAPTURE_ARM = '''runtime.add_capture_point(r'CommonModules\\ПродажиСервер\\Ext\\Module.bsl', 9311)'''
+
+UT_CAPTURE_READ = '''СнимокПрироста = Новый ТаблицаЗначений;
+СнимокПрироста.Колонки.Добавить("ВыручкаПредыдущегоМесяца");
+СнимокПрироста.Колонки.Добавить("ВыручкаПоследнегоМесяца");
+СнимокПрироста.Колонки.Добавить("ПриростПроцентов");
+СтрокаСнимка = СнимокПрироста.Добавить();
+СтрокаСнимка.ВыручкаПредыдущегоМесяца = КонтекстОтладки.ПредыдущееЗначение;
+СтрокаСнимка.ВыручкаПоследнегоМесяца = КонтекстОтладки.ТекущееЗначение;
+СтрокаСнимка.ПриростПроцентов = КонтекстОтладки.Результат;'''
 
 def md(text): return nbf.v4.new_markdown_cell(text)
 def py(source): return nbf.v4.new_code_cell(source)
@@ -190,10 +252,10 @@ plt.close(fig)'''),
 
 def capture_control():
     return [
-        md('## Две точки внутри типового метода\n\nA — перед выгрузкой итогового запроса; '
-           'B — перед возвратом таблицы. Следующая Python-ячейка находит эти инструкции '
-           'в вашей выгрузке `КадровыйУчет` и устанавливает точки через путь к модулю и номер строки. '
-           'Выгрузка должна соответствовать запущенной конфигурации.'),
+        md('## Две точки внутри типового метода\n\nA — перед выгрузкой итогового запроса '
+           '(строка 127); B — перед возвратом таблицы (строка 129). '
+           'Номера относятся к выгрузке ЗУП КОРП 3.1.38.92. '
+           'Точки задаём путём к модулю и номером строки.'),
         py(CAPTURE_ARM),
         md('## Запускаем вызов\n\nВызов находится в отдельной BSL-ячейке. '
            'Она остановится в точке A; последующие ячейки работают с тем же вызовом.'),
@@ -230,11 +292,9 @@ print('Обычный результат:', completed.result, '₽')'''),
 
 def overview_capture_cells():
     return [
-        md('## Внутри типового метода\n\nТочка на строке возврата позволяет '
-           'посмотреть локальную таблицу до завершения вызова. Путь может быть '
-           'абсолютным или относительным к SOURCE_ROOT. Перед запуском укажите '
-           'в CAPTURE_LINE строку Возврат ЗначенияДанныхОплатыТруда; '
-           'из своей выгрузки.'),
+        md('## Внутри типового метода\n\nТочка на строке 745 '
+           'позволяет посмотреть локальную таблицу перед возвратом. '
+           'Номер относится к выгрузке ЗУП КОРП 3.1.38.92.'),
         py(OVERVIEW_CAPTURE_ARM),
         bsl(OVERVIEW_CAPTURE_CALL),
         bsl('СнимокВызова = КонтекстОтладки.ЗначенияДанныхОплатыТруда.Скопировать(, "Сотрудник,ФОТ");'),
@@ -245,6 +305,100 @@ def overview_capture_cells():
     ]
 
 def cleanup(): return [md('## Завершение'),py("runtime.close()\nprint('Сеанс закрыт')")]
+
+def ut_overview_cells():
+    cells = opening(
+        'Продажи УТ: выручка по месяцам и шаг внутрь типового расчёта',
+        'Найдём последний месяц с выручкой и предыдущий календарный месяц, сравним обороты '
+        'по подразделениям и остановим типовую функцию расчёта прироста перед возвратом.',
+        setup=UT_SETUP,
+        snapshot_note='Метаданные сверены с УТ 11.6.1.61; дата данных ИБ не фиксируется. ',
+        setup_note='\n\nУкажите `PLATFORM_BIN`, `CONNECTION_STRING` и `SOURCE_ROOT` '
+                   'для отдельной копии УТ 11.6.1.61. В `SOURCE_ROOT` нужна выгрузка '
+                   'исходников этой же конфигурации. Если в ИБ есть пользователи, '
+                   'задайте `username` и `password` в `RuntimeConfig` локально.',
+    )
+    cells += [
+        md('## От какого месяца считать\n\nБерём последнюю дату активного движения '
+           'с ненулевой выручкой. Сравниваем месяц этой даты с предыдущим '
+           'календарным месяцем. Если движений нет, ячейка остановится '
+           'с понятной ошибкой вместо пустой диаграммы.'),
+        bsl(UT_LAST_SALE),
+        md('## Обороты регистра\n\nВиртуальная таблица `Обороты` '
+           'учитывает движения выручки, в том числе корректировки и возвраты. '
+           'Группируем по месяцу и подразделению; `СуммаВыручки` — ресурс '
+           'регистра с НДС. В этой выборке нет пересчёта сумм документов по валютам.'),
+        bsl(UT_SALES),
+        md('## Таблица и диаграммы\n\nПереносим результат `%%bsl` в pandas. '
+           'Подписи ссылок получаем через `refs="presentation"`; '
+           'они нужны только для показа, а не для сопоставления объектов. '
+           'Месяц без движений показываем с нулевой выручкой.'),
+        py('''import pandas as pd
+import matplotlib.pyplot as plt
+
+sales = ПродажиПоМесяцам.to_df(refs='presentation')
+display(sales)
+monthly = (sales.assign(Месяц=pd.to_datetime(sales['Месяц']).dt.to_period('M'))
+           .groupby('Месяц')['Выручка'].sum())
+months = pd.period_range(end=monthly.index.max(), periods=2, freq='M')
+monthly = monthly.reindex(months, fill_value=0)
+display(monthly.rename_axis('Месяц').to_frame())
+
+fig, ax = plt.subplots(figsize=(7, 4))
+ax.bar([str(month) for month in monthly.index], monthly.map(float))
+ax.set_ylabel('Выручка с НДС')
+ax.set_title('Два последних календарных месяца по данным ИБ')
+fig.tight_layout()
+display(fig)
+plt.close(fig)'''),
+        py('''latest_month = sales['Месяц'].max()
+by_department = (sales.loc[sales['Месяц'] == latest_month]
+                 .assign(Подразделение=lambda data:
+                         data['Подразделение'].fillna('Без подразделения'))
+                 .groupby('Подразделение')['Выручка'].sum()
+                 .sort_values(ascending=False).head(10))
+display(by_department.to_frame('Выручка'))
+
+fig, ax = plt.subplots(figsize=(9, max(3, len(by_department) * 0.4)))
+ax.barh(by_department.index, by_department.map(float))
+ax.invert_yaxis()
+ax.set_xlabel('Выручка с НДС')
+ax.set_title(f'Подразделения за {str(latest_month)[:7]}')
+fig.tight_layout()
+display(fig)
+plt.close(fig)'''),
+        md('## Типовая логика прироста\n\nСначала суммируем выручку '
+           'в BSL и вызываем `ПродажиСервер.ПроцентПрироста`. '
+           'В УТ 11.6.1.61 эта функция отдельно обрабатывает нулевую '
+           'и отрицательную базу сравнения: результат для нулевой базы '
+           'не равен обычному математическому проценту роста.'),
+        bsl(UT_TOTALS),
+        py("print('Прирост выручки, %:', ПриростВыручки.materialize())"),
+        md('## Останов перед возвратом\n\nПоставим точку на строке 9311 '
+           'метода `ПродажиСервер.ПроцентПрироста`, перед `Возврат Результат;`. '
+           'Номер относится к выгрузке УТ 11.6.1.61.'),
+        py(UT_CAPTURE_ARM),
+        bsl('Результат = ПродажиСервер.ПроцентПрироста(\n'
+            '    ВыручкаПредыдущегоМесяца, ВыручкаПоследнегоМесяца);'),
+        py('''status = runtime.status()
+assert status.state.value == 'captured'
+stack = runtime.runtime_api.capture_stack(cursor=0, limit=20)
+display(pd.DataFrame(stack['frames'])[['level', 'module_type', 'line']])'''),
+        md('## Значения внутри вызова\n\nПока вызов остановлен, '
+           '`КонтекстОтладки` даёт аргументы и локальный результат. '
+           'Скопируем только три числа в таблицу для просмотра в Python.'),
+        bsl(UT_CAPTURE_READ),
+        py("display(СнимокПрироста.to_df())"),
+        py('''completed = runtime.resume_capture()
+runtime.clear_capture_points()
+assert completed.succeeded and completed.state.value == 'completed'
+print('Результат после продолжения, %:', completed.result)'''),
+        md('## Что дальше\n\nМожно заменить два месяца другим интервалом, '
+           'добавить отбор по организации или исследовать отдельное '
+           'подразделение. Для сравнения с ЗУП откройте '
+           '[01-overview.ipynb](01-overview.ipynb).'),
+    ]
+    return cells + cleanup()
 
 def build():
     overview = opening('Плановый ФОТ в Jupyter: от метода ЗУП к hot reload',
@@ -294,8 +448,8 @@ def build():
         md('## Меняем результат одного вызова\n\nПовторно ставим те же точки. '
            'В останове A меняем текст локального `Запрос`: новый запрос читает прежнюю '
            'временную таблицу и умножает ФОТ на 1,1. Исходная конфигурация не меняется.'),
-        py('''runtime.add_capture_point(MODULE_PATH, CAPTURE_LINE_A)
-runtime.add_capture_point(MODULE_PATH, CAPTURE_LINE_B)'''),
+        py('''runtime.add_capture_point(MODULE_PATH, 127)
+runtime.add_capture_point(MODULE_PATH, 129)'''),
         bsl(CAPTURE_CALL),
         py("experiment_a = runtime.status()\nassert experiment_a.state.value == 'captured'"),
         bsl('КонтекстОтладки.Запрос.Текст = "ВЫБРАТЬ Сотрудник, Организация, ФОТ * 1.1 КАК ФОТ ИЗ ВТКадровыеДанныеСотрудников";'),
@@ -330,7 +484,8 @@ print('ФОТ после обычного вызова:', restored['ФОТ'].sum
            'а не код уже начатого вызова. Для присваивания нового значения скалярной '
            'локальной переменной нужен другой механизм.'),
     ] + cleanup()
-    for name, cells in [('01-overview', overview), ('03-capture', capture)]:
+    for name, cells in [('01-overview', overview), ('03-capture', capture),
+                        ('05-ut-sales', ut_overview_cells())]:
         for index, cell in enumerate(cells):
             cell.id = f'{name}-{index:02d}'
         notebook = nbf.v4.new_notebook(

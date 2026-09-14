@@ -16,18 +16,28 @@ def test_demo_notebooks_are_standalone_and_capture_uses_notebook_flow(tmp_path, 
     builder.build()
 
     assert sorted(path.name for path in demo_dir.glob("*.ipynb")) == [
-        "01-overview.ipynb", "03-capture.ipynb"
+        "01-overview.ipynb", "03-capture.ipynb", "05-ut-sales.ipynb"
     ]
     overview = nbformat.read(demo_dir / "01-overview.ipynb", as_version=4)
     capture = nbformat.read(demo_dir / "03-capture.ipynb", as_version=4)
-    for notebook in (overview, capture):
+    ut_sales = nbformat.read(demo_dir / "05-ut-sales.ipynb", as_version=4)
+    for notebook in (overview, capture, ut_sales):
         nbformat.validate(notebook)
         assert notebook.metadata.kernelspec.name == "onec-demo"
         assert all(
             cell.cell_type != "code" or (cell.execution_count is None and not cell.outputs)
             for cell in notebook.cells
         )
+    for notebook in (overview, capture):
         assert "ЗУП КОРП 3.1.38.92" in notebook.cells[0].source
+
+    assert "УТ 11.6.1.61" in ut_sales.cells[0].source
+    assert "дата данных ИБ не фиксируется" in ut_sales.cells[0].source
+    ut_sources = "\n".join(cell.source for cell in ut_sales.cells)
+    assert "runtime.add_capture_point(" in ut_sources
+    assert "runtime.clear_capture_points()" in ut_sources
+    assert "runtime.runtime_api.capture_stack(" in ut_sources
+    assert "CommonModules\\ПродажиСервер\\Ext\\Module.bsl" in ut_sources
 
     assert overview.cells[2].source == capture.cells[2].source
     sources = [cell.source for cell in capture.cells]
