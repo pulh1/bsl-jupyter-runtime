@@ -6,7 +6,20 @@
 
 ## Быстрый старт в VS Code
 
-Для локального запуска нужны Windows, Python 3.12+, VS Code 1.136+, установленная платформа 1С и доступ к **отдельной копии ИБ**: runtime устанавливает в неё служебное расширение. Для установки Python-зависимостей нужен доступ к PyPI. Демо ЗУП проверено с **ЗУП КОРП 3.1.38.92**, демо УТ — с **УТ 11.6.1.61** на платформе **8.5.1.1529**; для каждого нужна локальная копия выгрузки исходников той же конфигурации. Платформа, демобазы и выгрузки в релиз не входят.
+Нужны Windows, Python 3.12+, VS Code 1.136+, установленная платформа 1С, **отдельная копия ИБ** и локальная копия выгрузки исходников той же конфигурации. По умолчанию runtime устанавливает в ИБ служебное расширение. Демо проверены на платформе **8.5.1.1529**: ЗУП — с **ЗУП КОРП 3.1.38.92** и снимком данных от **01.08.2021**, УТ — с **УТ 11.6.1.61** (дата данных определяется из ИБ). Платформа, демобазы и выгрузки в пакет не входят.
+
+Скачайте **Source code (zip)** из [релиза v0.1.19](https://github.com/pulh1/bsl-jupyter-runtime/releases/tag/v0.1.19) и распакуйте архив: в нём находятся `notebooks/demo`. Из [релиза v0.1.18](https://github.com/pulh1/bsl-jupyter-runtime/releases/tag/v0.1.18) скачайте `bsl-notebook-0.1.4.vsix`. VSIX отвечает за подсказки BSL в редакторе; Python-пакеты версии 0.1.19 устанавливаются из PyPI.
+
+В PowerShell из папки распакованного проекта создайте окружение, установите пакет и зарегистрируйте kernel:
+
+```powershell
+py -3.12 -m venv .venv
+$python = ".\.venv\Scripts\python.exe"
+& $python -m pip install "onec-interactive-jupyter==0.1.19" "ipykernel>=6.29,<7" "matplotlib>=3.11,<4"
+& $python -m ipykernel install --user --name onec-bsl --display-name "1C BSL"
+```
+
+`onec-interactive-jupyter` установит совместимый `onec-interactive-runtime-core` и его служебное расширение 1С. `matplotlib` нужен для диаграмм в демо.
 
 Установите расширения VS Code из Marketplace:
 
@@ -15,23 +28,46 @@
 - [Pylance](https://marketplace.visualstudio.com/items?itemName=ms-python.vscode-pylance) (`ms-python.vscode-pylance`; обычно устанавливается вместе с Python);
 - [Language 1C (BSL)](https://marketplace.visualstudio.com/items?itemName=1c-syntax.language-1c-bsl) (`1c-syntax.language-1c-bsl`).
 
-Наше расширение **1C BSL Notebooks** поставляется файлом VSIX. Из [релиза `v0.1.18`](https://github.com/pulh1/bsl-jupyter-runtime/releases/tag/v0.1.18) скачайте **Source code (zip)**, `onec_interactive_runtime_core-0.1.18-py3-none-any.whl`, `onec_interactive_jupyter-0.1.18-py3-none-any.whl` и `bsl-notebook-0.1.4.vsix`. Распакуйте архив, положите три скачанных файла в корень распакованного проекта и откройте там PowerShell. Архив содержит `notebooks/demo`; версии core и Jupyter должны совпадать.
+В VS Code выполните **Extensions: Install from VSIX** и укажите скачанный `bsl-notebook-0.1.4.vsix`. Откройте папку с выгрузкой исходников 1С через **File → Open Folder**, затем добавьте распакованный проект через **File → Add Folder to Workspace**. Выгрузка должна быть первой папкой рабочего пространства. В notebook выберите kernel **1C BSL** (при необходимости через **Select Another Kernel → Jupyter Kernels**) и выполните команду **1C BSL: Выбрать исходники проекта**, указав выгрузку.
 
-```powershell
-py -3.12 -m venv .venv
-$python = ".\.venv\Scripts\python.exe"
-& $python -m pip install `
-    .\onec_interactive_runtime_core-0.1.18-py3-none-any.whl `
-    .\onec_interactive_jupyter-0.1.18-py3-none-any.whl `
-    "matplotlib>=3.11,<4"
-& $python -m ipykernel install --user --name onec-bsl --display-name "1C BSL"
+Для первой пробы создайте пустой Python-notebook. В первой ячейке запустите сеанс, подставив пути к своей платформе, **копии** ИБ и **копии** исходников:
+
+```python
+from onec_runtime.config import RuntimeConfig
+from onec_runtime.session import ExtensionMode, RuntimeSessionConfig
+from onec_runtime_jupyter import InteractiveRuntimeSession
+
+runtime = InteractiveRuntimeSession.start(
+    RuntimeSessionConfig(
+        runtime=RuntimeConfig(
+            platform_bin=r'C:\Program Files\1cv8\8.5.1.1529\bin',
+            connection_string=r'File="C:\demo\ZUP-copy";',
+            # При необходимости добавьте username="...", password="...".
+        ),
+        source_root=r'C:\demo\ZUP-source-copy',
+        extension_mode=ExtensionMode.AUTO,
+    )
+)
 ```
 
-В VS Code выполните **Extensions: Install from VSIX** и укажите `bsl-notebook-0.1.4.vsix`. Откройте папку с выгрузкой исходников 1С через **File → Open Folder**, затем добавьте распакованный проект через **File → Add Folder to Workspace**. Выгрузка должна быть первой папкой рабочего пространства: так BSL-расширение сможет искать определения в конфигурации. Из второй папки откройте `notebooks/demo/ZUP/01-overview.ipynb`, выполните команду **1C BSL: Выбрать исходники проекта** и укажите выгрузку. Выберите kernel **1C BSL** в правом верхнем углу notebook (при необходимости через **Select Another Kernel → Jupyter Kernels**).
+Во второй ячейке выполните BSL:
 
-В стартовой Python-ячейке укажите путь к `bin` установленной платформы (`PLATFORM_BIN`), строку подключения к ИБ (`CONNECTION_STRING`) и путь к **локальной копии** выгрузки (`SOURCE_ROOT`). Выбор исходников в редакторе не заменяет `SOURCE_ROOT` в ячейке. При необходимости измените имя пользователя и `EXTENSION_MODE`. Затем запускайте ячейки по порядку: первые BSL-ячейки получат данные, а Python-ячейки покажут их через `ПланФОТ.to_df(refs='presentation')`.
+```python
+%%bsl
+Сообщить("Привет, мир!");
+```
 
-Номера строк точек останова заданы для указанных версий конфигураций; при другой выгрузке сверьте их перед запуском. В разделе hot reload notebook предлагает изменить метод в локальной копии модуля из `SOURCE_ROOT`; не правьте исходную выгрузку. Последняя ячейка закрывает сеанс через `runtime.close()`. Подготовка демобаз и все сценарии подробнее описаны в [руководстве по демо](notebooks/demo/README.md).
+После опыта закройте сеанс в Python-ячейке: `runtime.close()`.
+
+Если хотите управлять расширением вручную, сначала найдите CFE из установленного пакета:
+
+```powershell
+& $python -c "from importlib.resources import files; print(files('onec_runtime').joinpath('resources/extension/OnecInteractiveRuntime.cfe'))"
+```
+
+Загрузите этот CFE через Конфигуратор в копию ИБ, отключите у расширения **«Безопасный режим»** и примените изменения к ИБ. Затем в стартовой Python-ячейке используйте `extension_mode=ExtensionMode.MANUAL` вместо `ExtensionMode.AUTO`. Runtime проверит совместимость установленного расширения при запуске.
+
+Для готового сценария откройте [обзор ЗУП](notebooks/demo/ZUP/01-overview.ipynb), [capture ЗУП](notebooks/demo/ZUP/03-capture.ipynb) или [продажи УТ](notebooks/demo/UT/05-ut-sales.ipynb). В их стартовой ячейке замените `PLATFORM_BIN`, `CONNECTION_STRING` и `SOURCE_ROOT` на свои значения и запускайте ячейки по порядку; второй сеанс из примера выше создавать не нужно. Выбор исходников в редакторе не заменяет `SOURCE_ROOT` в notebook. Номера строк точек останова заданы для указанных версий конфигураций. Для hot reload меняйте только локальную копию исходников. Подготовка баз и сценарии подробнее описаны в [руководстве по демо](notebooks/demo/README.md).
 
 ## Компоненты
 
@@ -50,7 +86,7 @@ VSIX добавляет подсветку, автодополнение, сиг
 
 ## Расширение 1С
 
-Core wheel содержит `OnecInteractiveRuntime.cfe` и при обычном запуске автоматически устанавливает его в целевую ИБ. Если расширение нужно установить вручную, возьмите CFE из того же релиза, загрузите его через Конфигуратор, примените изменения к ИБ и задайте `extension_mode=ExtensionMode.MANUAL` в `RuntimeSessionConfig`. Версию и SHA-256 CFE можно сверить по [manifest](src/onec_runtime/resources/extension/extension-manifest.json) из релиза.
+Core wheel содержит `OnecInteractiveRuntime.cfe` и при обычном запуске автоматически устанавливает его в целевую ИБ. Вариант с ручной установкой и `ExtensionMode.MANUAL` показан в «Быстром старте». Версию и SHA-256 CFE можно сверить по [manifest](src/onec_runtime/resources/extension/extension-manifest.json), который также входит в пакет.
 
 ## Разработка
 

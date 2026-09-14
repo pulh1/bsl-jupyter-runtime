@@ -739,7 +739,7 @@ display(НачисленияПриема.head(5).to_df(refs="presentation"))''')
         'затем изменим запрос только внутри выбранного вызова.',
         setup=OVERVIEW_SETUP,
         snapshot_note='Пример рассчитан на ЗУП КОРП 3.1.38.92 и платформу 8.5.1.1529; дата демоснимка — 01.08.2021. ',
-        setup_note='\n\nИспользуйте API wheels 0.1.18. Перед запуском измените '
+        setup_note='\n\nУстановите пакет из PyPI по [корневому README](../../../README.md). Перед запуском измените '
                    '`PLATFORM_BIN`, `CONNECTION_STRING` и `SOURCE_ROOT` в следующей ячейке. '
                    'Если нужны учётные данные, задайте их локально в `RuntimeConfig`.')
     capture += [
