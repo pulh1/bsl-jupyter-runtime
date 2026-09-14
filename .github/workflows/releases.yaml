@@ -120,13 +120,21 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: python-distributions
+          name: core-distributions
           path: |
-            dist/*.whl
-            dist/*.tar.gz
+            dist/onec_interactive_runtime_core-*.whl
+            dist/onec_interactive_runtime_core-*.tar.gz
           if-no-files-found: error
 
-  publish:
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jupyter-distributions
+          path: |
+            dist/onec_interactive_jupyter-*.whl
+            dist/onec_interactive_jupyter-*.tar.gz
+          if-no-files-found: error
+
+  publish-core:
     needs: build
     runs-on: ubuntu-latest
     environment: pypi
@@ -135,6 +143,19 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: python-distributions
+          name: core-distributions
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  publish-jupyter:
+    needs: [build, publish-core]
+    runs-on: ubuntu-latest
+    environment: pypi-jupyter
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: jupyter-distributions
           path: dist
       - uses: pypa/gh-action-pypi-publish@release/v1
