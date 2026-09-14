@@ -18,6 +18,7 @@ from onec_runtime.value_materialization import (
     ONEC_NULL,
     ONEC_UNDEFINED,
     MaterializationOptions,
+    OnecEnumValue,
     OnecObjectSnapshot,
     OnecReference,
     OnecTreeSnapshot,
@@ -136,6 +137,33 @@ def test_object_snapshot_is_read_only_mapping_with_recursive_attributes() -> Non
     assert result.tabular_sections == ("Зарплата", "Выплаты")
     with pytest.raises(TypeError):
         result.attributes["Номер"] = "changed"  # type: ignore[index]
+
+
+def test_object_snapshot_accepts_empty_enumeration_attribute() -> None:
+    result = decode_value_payload(
+        _payload(
+            {
+                "t": "object",
+                "type": "ДокументОбъект.ПриемНаРаботу",
+                "attributes": [
+                    [
+                        "ПорядокРасчета",
+                        {
+                            "t": "enum",
+                            "type": "ПеречислениеСсылка.ПорядокРасчета",
+                            "name": "",
+                            "presentation": "",
+                        },
+                    ],
+                ],
+                "sections": [],
+            }
+        )
+    )
+
+    assert result["ПорядокРасчета"] == OnecEnumValue(
+        "ПеречислениеСсылка.ПорядокРасчета", "", ""
+    )
 
 
 def test_tree_snapshot_preserves_nested_rows() -> None:

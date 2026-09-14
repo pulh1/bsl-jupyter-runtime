@@ -284,8 +284,11 @@ class _ValueDecoder:
     def _decode_enum(self, node: dict[str, object], path: str) -> OnecEnumValue:
         self._exact(node, {"t", "type", "name", "presentation"}, path)
         values = (node["type"], node["name"], node["presentation"])
-        if any(not isinstance(value, str) or not value for value in values[:2]) or not isinstance(
-            values[2], str
+        if (
+            not isinstance(values[0], str)
+            or not values[0]
+            or not isinstance(values[1], str)
+            or not isinstance(values[2], str)
         ):
             raise ValuePayloadError(f"enumeration node is invalid at {path}")
         return OnecEnumValue(values[0], values[1], values[2])

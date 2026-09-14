@@ -204,8 +204,17 @@ fig.tight_layout()
 display(fig)
 plt.close(fig)'''
 
-OVERVIEW_CAPTURE_ARM = '''CAPTURE_MODULE_PATH = r'CommonModules\\РасчетЗарплатыРасширенный\\Ext\\Module.bsl'
-runtime.add_capture_point(CAPTURE_MODULE_PATH, 759)'''
+OVERVIEW_CAPTURE_ARM = '''from pathlib import Path
+
+CAPTURE_MODULE_PATH = r'CommonModules\\РасчетЗарплатыРасширенный\\Ext\\Module.bsl'
+capture_source = (Path(SOURCE_ROOT) / CAPTURE_MODULE_PATH).read_text(encoding="utf-8-sig")
+capture_marker = 'Если СтруктураДанных.Свойство("ДанныеОПлановыхНачислениях") Тогда'
+capture_lines = [
+    number for number, line in enumerate(capture_source.splitlines(), start=1)
+    if line.strip() == capture_marker
+]
+assert len(capture_lines) == 1
+runtime.add_capture_point(CAPTURE_MODULE_PATH, capture_lines[0])'''
 
 OVERVIEW_CAPTURE_MUTATE = '''СтрокиОклада = КонтекстОтладки.СтруктураДанных.ЗначенияПоказателей.НайтиСтроки(
     Новый Структура("Сотрудник,Показатель", СотрудникДляОпыта, ПоказательОклада)
@@ -431,7 +440,8 @@ def overview_capture_cells():
            'Выбранный документ уже проведён в демокопии. Повторное проведение '
            'из notebook остановим в `РасчетЗарплатыРасширенный` перед обработкой '
            'таблиц плановых начислений и значений показателей. '
-           'Строка 759 относится к выгрузке ЗУП КОРП 3.1.38.92. '
+           'Номер строки определяем по локальной выгрузке ЗУП КОРП 3.1.38.92: '
+           'он может отличаться между форматами выгрузки. '
            'Для финального опыта возвращаем повышение к 10%.'),
         bsl('ПроцентПовышения = 10;'),
         py(OVERVIEW_CAPTURE_ARM),
@@ -494,8 +504,10 @@ before_plan = ПланФОТ.to_df(refs="uuid")
 after_plan = ПланПослеКратко.to_df(refs="uuid")
 before_value = before_plan.loc[before_plan["Сотрудник"] == employee_uuid, "ФОТ"]
 after_value = after_plan.loc[after_plan["Сотрудник"] == employee_uuid, "ФОТ"]
-assert len(before_value) == len(after_value) == 1
-print("Плановый ФОТ:", before_value.iloc[0], "→", after_value.iloc[0])'''),
+if len(before_value) and len(after_value):
+    print("Плановый ФОТ на дату снимка:", before_value.iloc[0], "→", after_value.iloc[0])
+else:
+    print("В срезе на дату снимка нет строки этого сотрудника; ФОТ документа показан выше.")'''),
     ]
 
 def cleanup(): return [md('## Завершение'),py("runtime.close()\nprint('Сеанс закрыт')")]
@@ -687,14 +699,16 @@ display(df_both[["Сотрудник", "Сотрудник__uuid", "Подраз
            'из выбранного списка. Служебная ячейка найдёт подходящий документ '
            'в демокопии и запомнит исходные значения для финального опыта.'),
         bsl(OVERVIEW_HIRE_SELECT),
+        bsl('ПоказателиПриема = Прием.Показатели.Выгрузить();\n'
+            'НачисленияПриема = Прием.Начисления.Выгрузить();'),
         py('''data = Прием.materialize(refs="presentation")
 print(data["Дата"], data["Организация"], data["Сотрудник"])
 print("Табличные части:", data.tabular_sections)
-display(Прием.tabular_section("Показатели").head(5).to_df(refs="presentation"))
-display(Прием.tabular_section("Начисления").head(5).to_df(refs="presentation"))'''),
+display(ПоказателиПриема.head(5).to_df(refs="presentation"))
+display(НачисленияПриема.head(5).to_df(refs="presentation"))'''),
         md('`materialize()` работает не только с таблицами: объект документа '
            'даёт Python-снимок реквизитов и список табличных частей. '
-           'Нужную табличную часть можно перенести отдельно. Аналогично '
+           'Нужную табличную часть можно выгрузить отдельно. Аналогично '
            'материализуются структуры, массивы и соответствия.'),
         md('## Большую таблицу можно читать порциями\n\nЕсли нужен быстрый '
            'просмотр, ограничиваем перенос на стороне 1С.'),

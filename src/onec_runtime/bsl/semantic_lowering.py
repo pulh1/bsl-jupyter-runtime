@@ -192,6 +192,7 @@ class SemanticNotebookLowerer:
     _KNOWN_PLATFORM_GLOBALS = frozenset(
         {
             "статуссообщения",
+            "режимзаписидокумента",
             "символы",
             "кодировкатекста",
             "справочники",

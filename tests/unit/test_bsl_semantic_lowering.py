@@ -738,6 +738,24 @@ def test_standard_manager_roots_are_non_call_platform_globals(
     assert f"Контекст.{root}" not in result.source
 
 
+def test_document_write_mode_is_a_platform_global(
+    parser_target: PythonParserTarget,
+) -> None:
+    from onec_runtime.bsl import LoweringMode, SemanticNotebookLowerer
+
+    result = SemanticNotebookLowerer(
+        parser_target,
+        context_names=("Прием",),
+    ).lower(
+        "Прием.Записать(РежимЗаписиДокумента.Проведение);",
+        mode=LoweringMode.MAIN,
+    )
+
+    assert result.source == (
+        "Контекст.Прием.Записать(РежимЗаписиДокумента.Проведение);"
+    )
+
+
 def test_persistent_assignment_uses_derived_name_and_fragment_mappings(
     parser_target: PythonParserTarget,
 ) -> None:
