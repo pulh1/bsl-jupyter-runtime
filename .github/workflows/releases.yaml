@@ -72,6 +72,13 @@ jobs:
           -k "jupyter_release_build_produces_one_core_dependent_wheel or
           jupyter_wheel_ships_discoverable_highlighting_and_licenses"
 
+      - name: Verify packaged 1C extension matches source
+        env:
+          PYTHONPATH: src
+        run: >-
+          uvx --from "pytest>=8,<9" pytest -q
+          tests/unit/test_universal_extension_source.py::test_checked_in_bundle_matches_canonical_source_and_manifest
+
       - name: Build wheels and source distributions
         run: |
           uv build --package onec-interactive-runtime-core --no-sources --out-dir dist
@@ -82,6 +89,7 @@ jobs:
           python - <<'PY'
           import tomllib
           from pathlib import Path
+          from zipfile import ZipFile
 
           projects = (
               Path('pyproject.toml'),
@@ -102,6 +110,12 @@ jobs:
           }
           if actual != expected:
               raise SystemExit(f'Release artifacts differ: expected {expected}, found {actual}')
+          core_wheel = next(Path('dist').glob('onec_interactive_runtime_core-*.whl'))
+          with ZipFile(core_wheel) as archive:
+              for filename in ('OnecInteractiveRuntime.cfe', 'extension-manifest.json'):
+                  resource = f'onec_runtime/resources/extension/{filename}'
+                  if archive.read(resource) != (Path('src') / resource).read_bytes():
+                      raise SystemExit(f'Core wheel has a stale extension resource: {resource}')
           PY
 
       - uses: actions/upload-artifact@v4
