@@ -343,26 +343,33 @@ class LocalStackAdapter:
     def _read(self, start: int, stop: int, *, native: bool) -> StackPage:
         frames = self._backend.read_stack(self._fence)
         runtime = tuple(self._is_runtime(frame) for frame in frames)
-        total = len(frames) if native else sum(not hidden for hidden in runtime)
         selected: list[StackFrame] = []
         entries: list[StackFrame | RuntimeFrameMarker] = []
-        cursor = 0
-        hidden_count = 0
-        for frame, hidden in zip(frames, runtime, strict=True):
-            if hidden and not native:
-                hidden_count += 1
-                continue
-            if hidden_count:
+        if native:
+            total = 0 if not frames else max(frame.level for frame in frames) + 1
+            selected.extend(
+                frame for frame in frames if start <= frame.level < stop
+            )
+            entries.extend(selected)
+        else:
+            total = sum(not hidden for hidden in runtime)
+            cursor = 0
+            hidden_count = 0
+            for frame, hidden in zip(frames, runtime, strict=True):
+                if hidden:
+                    hidden_count += 1
+                    continue
+                if hidden_count:
+                    if start <= cursor < stop:
+                        entries.append(RuntimeFrameMarker(hidden_count))
+                    hidden_count = 0
                 if start <= cursor < stop:
-                    entries.append(RuntimeFrameMarker(hidden_count))
-                hidden_count = 0
-            if start <= cursor < stop:
-                entries.append(frame)
-                selected.append(frame)
-            cursor += 1
-        if (hidden_count and start <= cursor <= stop and stop > start
-                and (selected or total == 0 and start == 0)):
-            entries.append(RuntimeFrameMarker(hidden_count))
+                    entries.append(frame)
+                    selected.append(frame)
+                cursor += 1
+            if (hidden_count and start <= cursor <= stop and stop > start
+                    and (selected or total == 0 and start == 0)):
+                entries.append(RuntimeFrameMarker(hidden_count))
         sources = (None,) * len(selected) if native else self._resolve_sources(tuple(selected))
         mapped = dict(zip((frame.level for frame in selected), sources, strict=True))
         result = []

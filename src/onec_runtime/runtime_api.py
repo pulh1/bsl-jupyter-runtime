@@ -1182,8 +1182,20 @@ class PrototypeRuntimeApi:
             read = getattr(self._controller, "capture_stack_inventory", None)
             if not callable(read):
                 raise ProtocolError("Runtime controller cannot read a fresh capture stack")
-            with self._remaining_command_timeout() as remaining:
-                frames = read(timeout_s=remaining)
+            inventory_failed = False
+            try:
+                with self._remaining_command_timeout() as remaining:
+                    frames = read(timeout_s=remaining)
+            except Exception:
+                inventory_failed = True
+            if inventory_failed:
+                # Recheck lifecycle outside the exception handler so a concurrent
+                # stale/busy transition wins and no transport exception remains as
+                # __cause__ or __context__ of the bounded public error.
+                self._require_capture_stack_fence(fence)
+                raise ProtocolError(
+                    "fresh capture stack inventory is unavailable"
+                )
             if type(frames) is not tuple or not frames or any(
                 type(frame) is not StackFrame for frame in frames
             ):
