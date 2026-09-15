@@ -3714,9 +3714,10 @@ def test_capture_evaluation_worker_stop_requires_recovery_without_public_nested_
     assert shielded.shielded is True
     assert CAPTURE_A not in shielded.effective_locations
     assert WORKER_BREAKPOINT in shielded.effective_locations
-    with pytest.raises(ProtocolError, match="requires state"):
+    continue_count = session.continue_count
+    with pytest.raises(CaptureRecoveryRequiredError):
         controller.resume_debug_stop()
-    assert session.continue_count == 1
+    assert session.continue_count == continue_count
 
 
 def test_bsl_error_restores_workspace_and_next_capture_cell_succeeds() -> None:

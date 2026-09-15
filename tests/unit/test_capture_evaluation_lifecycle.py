@@ -23,7 +23,6 @@ from onec_runtime.errors import (
     CaptureOutcomeUnknownError,
     CaptureRecoveryRequiredError,
     CommandTimeout,
-    ProtocolError,
     StaleCaptureError,
     TargetLost,
 )
@@ -279,10 +278,23 @@ def close_owner(controller, session: ControlledCaptureSession) -> None:  # type:
 class FailingEvalTransport:
     def __init__(self) -> None:
         self.calls: list[str] = []
+        self.request_entered = False
+        self.dispatch_marker_set = False
+
+    def mark_evalexpr_dispatch(self) -> None:
+        assert not self.request_entered, (
+            "dispatch marker must precede transport.request entry"
+        )
+        assert not self.dispatch_marker_set
+        self.dispatch_marker_set = True
 
     def request(self, method: str, payload: bytes) -> bytes:
         del payload
+        self.request_entered = True
         self.calls.append(method)
+        assert self.dispatch_marker_set, (
+            "transport.request entered before the dispatch marker"
+        )
         raise OSError("synthetic evalExpr transport failure")
 
 
@@ -296,30 +308,30 @@ def ready_rdbg(transport: FailingEvalTransport) -> RdbgSession:
 def test_rdbg_dispatch_marker_excludes_local_start_validation() -> None:
     transport = FailingEvalTransport()
     session = ready_rdbg(transport)
-    entries: list[str] = []
 
     with pytest.raises(ValueError, match="non-empty"):
         session.start_evaluation(
             "",
-            on_transport_dispatch=lambda: entries.append("evalExpr"),
+            on_transport_dispatch=transport.mark_evalexpr_dispatch,
         )
 
-    assert entries == []
+    assert transport.dispatch_marker_set is False
+    assert transport.request_entered is False
     assert transport.calls == []
 
 
 def test_rdbg_dispatch_marker_runs_at_transport_entry_before_acceptance() -> None:
     transport = FailingEvalTransport()
     session = ready_rdbg(transport)
-    entries: list[str] = []
 
     with pytest.raises(OSError, match="transport failure"):
         session.start_evaluation(
             "Результат = 1",
-            on_transport_dispatch=lambda: entries.append("evalExpr"),
+            on_transport_dispatch=transport.mark_evalexpr_dispatch,
         )
 
-    assert entries == ["evalExpr"]
+    assert transport.dispatch_marker_set is True
+    assert transport.request_entered is True
     assert transport.calls == ["evalExpr"]
 
 
@@ -358,13 +370,20 @@ def test_coordinator_classifies_exact_evalexpr_entry_boundary(
     owner = CaptureEvaluationCoordinator(capture_fence, poll_interval_s=0.01)
     dispositions: list[str] = []
     try:
+        def dispatch(entered):  # type: ignore[no-untyped-def]
+            def exact_transport_entry() -> None:
+                entered()
+                transport.mark_evalexpr_dispatch()
+
+            return session.start_evaluation(
+                expression,
+                on_transport_dispatch=exact_transport_entry,
+            )
+
         ticket = owner.submit_evaluation(CaptureEvaluationRequest(
             capture_fence,
             CaptureEvaluationKind.USER_BSL,
-            lambda entered: session.start_evaluation(
-                expression,
-                on_transport_dispatch=entered,
-            ),
+            dispatch,
             lambda pending, timeout_s: session.wait_evaluation_event(
                 pending, timeout_s=timeout_s,
             ),
@@ -379,6 +398,8 @@ def test_coordinator_classifies_exact_evalexpr_entry_boundary(
         assert owner.status(capture_fence).phase is phase
         assert dispositions == [disposition]
         assert transport.calls == transport_calls
+        assert transport.request_entered is bool(transport_calls)
+        assert transport.dispatch_marker_set is bool(transport_calls)
     finally:
         owner.begin_close()
         assert owner.join(2)
@@ -662,6 +683,8 @@ def test_late_user_result_seals_messages_inline_before_paused_publication(
     session.message_values = ["late sealed message"]
     controller = captured_controller(session, command_timeout_s=0.02)
     initiating_thread = current_thread().ident
+    workspace_call_baseline = session.workspace_call_count
+    workspace_thread_baseline = len(session.workspace_threads)
     try:
         source = 'Сообщить("late sealed message");'
         if bsl_error:
@@ -683,6 +706,12 @@ def test_late_user_result_seals_messages_inline_before_paused_publication(
         assert during_sealing.pending_evaluation_id == caught.value.evaluation_id
         assert during_sealing.evaluation_kind is CaptureEvaluationKind.USER_BSL
         assert during_sealing.evaluation_timing.remote_step_count == 2
+        owner_thread = session.dispatch_threads[0]
+        shielded = controller.breakpoint_workspace_owner.confirmed_snapshot
+        assert shielded.shielded is True
+        assert shielded.effective_locations == (SERVICE, USER)
+        assert session.workspace_call_count == workspace_call_baseline + 1
+        assert session.workspace_threads[workspace_thread_baseline:] == [owner_thread]
 
         session.allow_message_step.set()
         outcome = probe.wait(caught.value.evaluation_id, timeout_s=1)
@@ -697,9 +726,16 @@ def test_late_user_result_seals_messages_inline_before_paused_publication(
             assert outcome.diagnostic is not None
             assert outcome.diagnostic.code == "bsl_error"
         assert probe.status().phase is CapturePhase.PAUSED
+        restored = controller.breakpoint_workspace_owner.confirmed_snapshot
+        assert restored.shielded is False
+        assert restored.effective_locations == (SERVICE, CAPTURE_A, CAPTURE_B, USER)
+        assert session.workspace_call_count == workspace_call_baseline + 2
+        assert session.workspace_threads[workspace_thread_baseline:] == [
+            owner_thread,
+            owner_thread,
+        ]
         assert session.capture_start_count == 2
         assert session.primary_dispatch_count == 1
-        owner_thread = session.dispatch_threads[0]
         assert owner_thread != initiating_thread
         assert set(session.start_threads + session.dispatch_threads + session.poll_threads) == {
             owner_thread
@@ -729,7 +765,6 @@ def test_workspace_restoration_failure_requires_recovery_after_confirmed_result(
         assert status.phase is CapturePhase.RECOVERY_REQUIRED
         assert status.failure is not None
         assert status.failure.code == "workspace_restore_failed"
-        assert controller.state.value == "breakpoint_restore_failure"
         assert session.capture_start_count == 1
     finally:
         close_owner(controller, session)
@@ -769,8 +804,10 @@ def test_unexpected_stop_requires_recovery_and_is_not_exposed_as_nested_capture(
         assert controller.breakpoint_workspace_owner.confirmed_snapshot.shielded is True
         with pytest.raises(CaptureRecoveryRequiredError):
             controller.execute_capture("РезультатИнструкции = 902;")
-        with pytest.raises(ProtocolError, match="requires state"):
+        continue_count = session.continue_count
+        with pytest.raises(CaptureRecoveryRequiredError):
             controller.resume_debug_stop()
+        assert session.continue_count == continue_count
         assert session.primary_dispatch_count == 1
     finally:
         close_owner(controller, session)
@@ -809,19 +846,21 @@ def inspect_temporary_table(controller):  # type: ignore[no-untyped-def]
 
 
 @pytest.mark.parametrize(
-    ("invoke", "expected_kind", "late_type", "late_value"),
+    ("invoke", "expected_kind", "late_type", "late_value", "changes_workspace"),
     [
         (
             lambda controller: controller.execute_system_capture("Результат = 1;"),
             CaptureEvaluationKind.MATERIALIZATION_HELPER,
             "Число",
             "1",
+            True,
         ),
         (
             lambda controller: controller.resolve_capture_manager_origin("Скаляр", ()),
             CaptureEvaluationKind.INSPECTION,
             "Булево",
             "Истина",
+            False,
         ),
         (
             lambda controller: controller.take_context_string(
@@ -830,6 +869,7 @@ def inspect_temporary_table(controller):  # type: ignore[no-untyped-def]
             CaptureEvaluationKind.MATERIALIZATION_HELPER,
             "Строка",
             '"payload"',
+            False,
         ),
         (
             lambda controller: controller.install_capture_worker_generation_pin(
@@ -838,12 +878,14 @@ def inspect_temporary_table(controller):  # type: ignore[no-untyped-def]
             CaptureEvaluationKind.MATERIALIZATION_HELPER,
             "Булево",
             "Истина",
+            False,
         ),
         (
             lambda controller: controller.clear_capture_worker_generation_pin(),
             CaptureEvaluationKind.MATERIALIZATION_HELPER,
             "Булево",
             "Истина",
+            False,
         ),
         (
             lambda controller: controller.drop_context_value(
@@ -852,20 +894,26 @@ def inspect_temporary_table(controller):  # type: ignore[no-untyped-def]
             CaptureEvaluationKind.MATERIALIZATION_HELPER,
             "Неопределено",
             "Неопределено",
+            False,
         ),
         (
             inspect_temporary_table,
             CaptureEvaluationKind.INSPECTION,
             "Булево",
             "Истина",
+            False,
         ),
     ],
 )
 def test_controller_owned_internal_evaluations_use_explicit_kind_and_same_owner(
     invoke, expected_kind, late_type: str, late_value: str,  # type: ignore[no-untyped-def]
+    changes_workspace: bool,
 ) -> None:
     session = ControlledCaptureSession()
     controller = captured_controller(session, command_timeout_s=0.02)
+    initiating_thread = current_thread().ident
+    workspace_call_baseline = session.workspace_call_count
+    workspace_thread_baseline = len(session.workspace_threads)
     try:
         with pytest.raises(CaptureEvaluationPendingError) as caught:
             invoke(controller)
@@ -874,6 +922,18 @@ def test_controller_owned_internal_evaluations_use_explicit_kind_and_same_owner(
         assert status.evaluation_kind is expected_kind
         assert status.phase is CapturePhase.EVALUATING
         assert session.capture_start_count == 1
+        owner_thread = session.dispatch_threads[0]
+        assert owner_thread != initiating_thread
+        assert set(
+            session.start_threads + session.dispatch_threads + session.poll_threads
+        ) == {owner_thread}
+        if changes_workspace:
+            assert session.workspace_call_count == workspace_call_baseline + 1
+            assert session.workspace_threads[workspace_thread_baseline:] == [
+                owner_thread
+            ]
+        else:
+            assert session.workspace_call_count == workspace_call_baseline
 
         session.complete(late_value, type_name=late_type)
         outcome = capture_probe(controller).wait(
@@ -883,5 +943,16 @@ def test_controller_owned_internal_evaluations_use_explicit_kind_and_same_owner(
         assert outcome.result is None
         assert controller.state.value == "captured"
         assert session.capture_start_count == 1
+        assert set(
+            session.start_threads + session.dispatch_threads + session.poll_threads
+        ) == {owner_thread}
+        if changes_workspace:
+            assert session.workspace_call_count == workspace_call_baseline + 2
+            assert session.workspace_threads[workspace_thread_baseline:] == [
+                owner_thread,
+                owner_thread,
+            ]
+        else:
+            assert session.workspace_call_count == workspace_call_baseline
     finally:
         close_owner(controller, session)
