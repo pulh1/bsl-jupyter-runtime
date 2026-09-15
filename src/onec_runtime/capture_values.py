@@ -243,9 +243,10 @@ class CaptureValueBackend(Protocol):
     privacy or source work.  Each later call must validate the same fence again
     while it runs.  Projection and guard calls are coordinator-owned inspection
     operations; temporary-handle cleanup is a materialization-helper step.
-    Variable projections apply the requested role before paging.  The adapter
-    defensively filters and orders every returned page and rejects a role leak
-    that would make a nonterminal cursor ambiguous.
+    Variable projections apply the requested role before paging.  Parameter
+    pages must preserve absolute source order and publish totals/cursors for the
+    classified parameter inventory.  The adapter verifies this contract; only
+    a terminal full inventory can be classified locally without ambiguity.
     """
 
     def validate_inspection(self, fence: object) -> None: ...
@@ -519,23 +520,14 @@ class LocalCaptureValueAdapter:
         }
         original = projection.entries
         if request.role is VariableRole.PARAMETERS:
-            entries = tuple(
-                entry for entry in original
-                if isinstance(entry.name, str) and entry.name.casefold() in parameter_order
+            return LocalCaptureValueAdapter._classify_parameter_projection(
+                projection, request, parameter_order,
             )
-            folded = tuple(cast(str, entry.name).casefold() for entry in entries)
-            if len(set(folded)) != len(folded):
-                raise CaptureValueCheckError("parameter projection is ambiguous")
-            entries = tuple(sorted(
-                entries,
-                key=lambda entry: parameter_order[cast(str, entry.name).casefold()],
-            ))
-        else:
-            entries = tuple(
-                entry for entry in original
-                if not isinstance(entry.name, str)
-                or entry.name.casefold() not in parameter_order
-            )
+        entries = tuple(
+            entry for entry in original
+            if not isinstance(entry.name, str)
+            or entry.name.casefold() not in parameter_order
+        )
         changed = entries != original
         if changed and projection.next_cursor is not None:
             raise CaptureValueCheckError(
@@ -548,11 +540,77 @@ class LocalCaptureValueAdapter:
         )
         return PrivateValueProjection(entries, total, projection.next_cursor)
 
+    @staticmethod
+    def _classify_parameter_projection(
+        projection: PrivateValueProjection,
+        request: ValueInspectionRequest,
+        parameter_order: dict[str, int],
+    ) -> PrivateValueProjection:
+        if request.exact is not None:
+            entries = tuple(
+                entry for entry in projection.entries
+                if isinstance(entry.name, str)
+                and entry.name.casefold() in parameter_order
+            )
+            folded = tuple(cast(str, entry.name).casefold() for entry in entries)
+            if len(set(folded)) != len(folded):
+                raise CaptureValueCheckError("parameter projection is ambiguous")
+            return PrivateValueProjection(entries, len(entries), None)
+
+        expected_all = tuple(name.casefold() for name in request.parameter_names)
+        full_inventory = (
+            request.start == 0
+            and projection.next_cursor is None
+            and request.stop >= projection.total
+        )
+        if full_inventory:
+            entries = tuple(
+                entry for entry in projection.entries
+                if isinstance(entry.name, str)
+                and entry.name.casefold() in parameter_order
+            )
+            entries = tuple(sorted(
+                entries,
+                key=lambda entry: parameter_order[cast(str, entry.name).casefold()],
+            ))
+            actual = tuple(cast(str, entry.name).casefold() for entry in entries)
+            if actual != expected_all:
+                raise CaptureValueCheckError(
+                    "backend parameter page does not match source order"
+                )
+            return PrivateValueProjection(entries, len(expected_all), None)
+
+        actual = tuple(
+            entry.name.casefold() if isinstance(entry.name, str) else None
+            for entry in projection.entries
+        )
+        expected = expected_all[request.start:request.stop]
+        total = len(expected_all)
+        next_cursor = request.stop if request.stop < total else None
+        if (
+            actual != expected
+            or projection.total != total
+            or projection.next_cursor != next_cursor
+        ):
+            raise CaptureValueCheckError(
+                "backend parameter page does not match source order"
+            )
+        return projection
+
     def _parameters(self, root: ValueRoot) -> tuple[str, ...]:
         source_unavailable = False
         try:
             names = self._resolve_parameters(root)
-        except CaptureSourceUnavailableError:
+        except (
+            CaptureBusyError,
+            CaptureEvaluationPendingError,
+            CaptureOutcomeUnknownError,
+            CaptureRecoveryRequiredError,
+            NoActiveCaptureError,
+            StaleCaptureError,
+        ):
+            raise
+        except Exception:
             source_unavailable = True
             names = ()
         if source_unavailable:

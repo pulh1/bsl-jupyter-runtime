@@ -8,6 +8,7 @@ from onec_runtime.errors import (
     CaptureLookupError,
     CapturePathError,
     CaptureSourceUnavailableError,
+    CaptureValueCheckError,
 )
 
 
@@ -150,6 +151,21 @@ def test_parameters_and_locals_direct_to_variables_when_source_is_unavailable():
     assert sum(call[0] == "project" for call in backend.calls) == 1
 
 
+def test_unexpected_parameter_resolver_failure_is_sanitized_without_a_chain():
+    def broken(root):
+        raise RuntimeError("PRIVATE_SOURCE_PATH_C:/customer/x.bsl")
+    adapter, backend = setup_adapter(resolver=broken)
+
+    with pytest.raises(CaptureSourceUnavailableError, match="variables") as raised:
+        adapter.context.parameters[:1]
+
+    rendered = "".join(traceback.format_exception(raised.value))
+    assert "PRIVATE_SOURCE_PATH" not in rendered and "customer" not in rendered
+    assert "PRIVATE_SOURCE_PATH" not in repr(raised.value)
+    assert raised.value.__cause__ is None and raised.value.__context__ is None
+    assert backend.calls == [("validate", backend.fence)]
+
+
 @pytest.mark.parametrize(
     "key",
     [slice(None), slice(-1, 1), slice(0, 101), slice(0, 2, 2), -1, True],
@@ -219,6 +235,45 @@ def test_adapter_filters_and_orders_roles_when_backend_returns_plain_debugger_or
     ]
     assert [item.name for item in locals_page.items] == ["Локальная"]
     assert parameters.total == 2 and locals_page.total == 1
+
+
+@pytest.mark.parametrize("page_slice", [slice(0, 1), slice(1, 2), slice(1, 20)])
+def test_partial_parameter_page_rejects_role_ignoring_backend(page_slice):
+    adapter, backend = setup_adapter()
+    original = backend.project_values
+    def ignore_role(fence, request):
+        return original(
+            fence,
+            replace(
+                request,
+                role=api().VariableRole.VARIABLES,
+                parameter_names=(),
+            ),
+        )
+    backend.project_values = ignore_role
+
+    with pytest.raises(CaptureValueCheckError, match="parameter page"):
+        adapter.context.parameters[page_slice]
+
+
+@pytest.mark.parametrize(
+    ("page_slice", "expected", "total", "next_cursor"),
+    [
+        (slice(0, 1), ["ПервыйПараметр"], 2, 1),
+        (slice(1, 2), ["ВторойПараметр"], 2, None),
+        (slice(1, 20), ["ВторойПараметр"], 2, None),
+        (slice(20, 21), [], 2, None),
+    ],
+)
+def test_parameter_pages_have_absolute_source_order_and_inventory_cursors(
+    page_slice, expected, total, next_cursor,
+):
+    adapter, _ = setup_adapter()
+
+    page = adapter.context.parameters[page_slice]
+
+    assert [item.name for item in page.items] == expected
+    assert page.total == total and page.next_cursor == next_cursor
 
 
 @pytest.mark.parametrize("start", [0, 3, 99])
