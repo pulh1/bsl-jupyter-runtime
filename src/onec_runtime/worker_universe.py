@@ -2635,6 +2635,7 @@ class ServerWorkerUniverseRegistry:
         self._instruction_executor = instruction_executor
         self._mutation_executor = mutation_executor
         self._mutations: dict[UUID, PreparedWorkerMutation] = {}
+        self._claimed_mutations: set[UUID] = set()
         self._target_incarnation_id = target_incarnation_id or uuid4()
         self._platform_build = platform_build
         self._lock = RLock()
@@ -2658,7 +2659,7 @@ class ServerWorkerUniverseRegistry:
         abort: Callable[[BaseException], object],
     ) -> PreparedWorkerMutation:
         with self._lock:
-            if self._broken or self._mutations:
+            if self._broken or self._host.state is WorkerUniverseState.CLOSED or self._mutations:
                 raise ProtocolError("Worker target mutation is unavailable")
             reservation = WorkerMutationReservation(uuid4(), commit, abort)
             prepared = PreparedWorkerMutation(instruction, reservation, self)
@@ -2666,10 +2667,17 @@ class ServerWorkerUniverseRegistry:
             return prepared
 
     def _take_mutation(self, prepared: PreparedWorkerMutation) -> WorkerMutationReservation:
+        reservation = self._require_exact_mutation(prepared)
+        del self._mutations[reservation.token]
+        self._claimed_mutations.discard(reservation.token)
+        return reservation
+
+    def _require_exact_mutation(self, prepared: PreparedWorkerMutation) -> WorkerMutationReservation:
+        if type(prepared) is not PreparedWorkerMutation or prepared.owner is not self:
+            raise ProtocolError("Worker mutation reservation is stale or forged")
         reservation = prepared.reservation
         if self._mutations.get(reservation.token) is not prepared:
             raise ProtocolError("Worker mutation reservation is stale or forged")
-        del self._mutations[reservation.token]
         return reservation
 
     def commit_mutation(self, prepared: PreparedWorkerMutation, result: object) -> object:
@@ -2683,6 +2691,15 @@ class ServerWorkerUniverseRegistry:
             return reservation.abort(error)
 
     def execute_mutation(self, prepared: PreparedWorkerMutation) -> object:
+        with self._lock:
+            if self._broken or self._host.state is WorkerUniverseState.CLOSED:
+                raise ProtocolError("Worker target mutation is unavailable")
+            reservation = self._require_exact_mutation(prepared)
+            if reservation.token in self._claimed_mutations:
+                raise ProtocolError("Worker mutation execution was already claimed")
+            # Claim once before crossing either remote boundary. Completion
+            # consumes this claim; another caller cannot replay or race it.
+            self._claimed_mutations.add(reservation.token)
         # A coordinator adapter owns commit/abort after accepting this plan.
         # In particular the caller must never abort its timed-out ticket.
         if self._mutation_executor is not None:
@@ -3163,6 +3180,7 @@ class ServerWorkerUniverseRegistry:
             self._compile_failed_registrations.clear()
             self._prepared_roots.clear()
             self._mutations.clear()
+            self._claimed_mutations.clear()
             self._orphan_urls.clear()
             self._storage_session_id = None
 
@@ -3182,6 +3200,7 @@ class ServerWorkerUniverseRegistry:
             self._compile_failed_registrations.clear()
             self._prepared_roots.clear()
             self._mutations.clear()
+            self._claimed_mutations.clear()
             self._orphan_urls.clear()
             self._storage_session_id = None
             self._broken = True

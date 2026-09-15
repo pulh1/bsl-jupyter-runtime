@@ -579,9 +579,16 @@ class CaptureStepContext:
         with owner._condition:
             if owner._active is not self._record or self._record.outcome is not None:
                 raise ProtocolError("CAPTURE inline steps require the active record")
-            if self._record.capability is not None:
-                raise ProtocolError("CAPTURE record already owns a remote capability")
-        return owner._execute_remote_step(self._record, step)
+            if self._record.step_in_progress or self._record.capability is not None:
+                raise ProtocolError("CAPTURE record already owns a remote step")
+            # Reserve the whole callback lifetime, including the gap before
+            # dispatch returns its capability and after polling restores state.
+            self._record.step_in_progress = True
+        try:
+            return owner._execute_remote_step(self._record, step)
+        finally:
+            with owner._condition:
+                self._record.step_in_progress = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -648,6 +655,7 @@ class _CaptureEvaluationRecord:
     poll_count: int = 0
     poll_events: int = 0
     capability: PendingEvaluation | None = None
+    step_in_progress: bool = False
     dispatch_entered: bool = False
     acknowledged: bool = False
     initiator_attached: bool = True
@@ -1038,6 +1046,8 @@ class CaptureEvaluationCoordinator:
                 record.acknowledged = True
                 self._evidence_locked(record, "rdbg_acknowledged", step_index=step_index)
             self._flush_evidence()
+        except _RemoteStepFailure:
+            raise
         except TargetLost:
             raise _RemoteStepFailure(CapturePhase.STALE, "target_lost", uncertain=True) from None
         except BaseException:
@@ -1055,6 +1065,8 @@ class CaptureEvaluationCoordinator:
             except CommandTimeout:
                 self._poll_evidence(record)
                 continue
+            except _RemoteStepFailure:
+                raise
             except TargetLost:
                 raise _RemoteStepFailure(CapturePhase.STALE, "target_lost", uncertain=True) from None
             except BaseException as error:
@@ -1072,6 +1084,8 @@ class CaptureEvaluationCoordinator:
             break
         try:
             step.restore()
+        except _RemoteStepFailure:
+            raise
         except TargetLost:
             raise _RemoteStepFailure(CapturePhase.STALE, "target_lost", uncertain=True) from None
         except BaseException:
@@ -1116,9 +1130,12 @@ class CaptureEvaluationCoordinator:
                 )
             except BaseException:
                 private_result = None
-                state = CaptureEvaluationState.FAILED
-                diagnostic = _diagnostic("result_delivery_failed")
-                candidate = None
+                if phase is CapturePhase.PAUSED:
+                    state = CaptureEvaluationState.FAILED
+                    diagnostic = _diagnostic("result_delivery_failed")
+                    candidate = None
+                # Local delivery cannot resolve an unknown remote outcome or
+                # replace the primary recovery/stale lifecycle diagnostic.
         try:
             record.request.pin_lease("quarantine" if quarantine else "release")
         except BaseException:

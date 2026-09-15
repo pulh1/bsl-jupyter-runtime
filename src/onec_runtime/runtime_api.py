@@ -740,6 +740,8 @@ class _PreparedCaptureExecution:
     completion: Callable[[object, BaseException | None], object]
     release_writer: Callable[[], AbstractContextManager[None]]
     transferred: bool = False
+    rejection: Callable[[BaseException], object] | None = None
+    submitted: bool = False
 
     def execute_sync(self) -> object:
         if self.transferred:
@@ -756,10 +758,14 @@ class _PreparedCaptureExecution:
                 ticket = submit(pin_lease=lease, completion=self.completion)
             except BaseException as error:
                 try:
-                    self.completion(None, error)
+                    if self.rejection is not None:
+                        self.rejection(error)
+                    else:
+                        self.completion(None, error)
                 finally:
                     lease("release")
                 raise
+            self.submitted = True
             return ticket.wait_initiator()
 
 
@@ -2249,15 +2255,25 @@ class PrototypeRuntimeApi:
                     # Mandatory local completion is owned by the record,
                     # including after its initiating waiter detaches.
                     with self._lock:
+                        # A confirmed execution may write a captured root
+                        # before BSL fails. This ledger belongs to completion,
+                        # even when no initiating caller remains to see it.
+                        if error is None or isinstance(error, BslExecutionError):
+                            for root in lowering.dirty_roots:
+                                self._pending_dirty_roots.setdefault(root.casefold(), root)
                         if error is not None:
                             lowerer.restore_persistent_names(context_before)
                             return None
                         reply = self._reply(result)
-                        for root in lowering.dirty_roots:
-                            self._pending_dirty_roots.setdefault(root.casefold(), root)
                         return self._finalize_namespace_reply(
                             reply, lowering=lowering, context_before=context_before, lowerer=lowerer,
                         )
+
+                def rejection(error: BaseException) -> None:
+                    # Submission did not create an owned record. Its error
+                    # type is not proof that captured BSL actually executed.
+                    with self._lock:
+                        lowerer.restore_persistent_names(context_before)
 
                 try:
                     if callable(execute_mapped):
@@ -2275,6 +2291,7 @@ class PrototypeRuntimeApi:
                             detach_pin=self._detach_capture_evaluation_pin_locked,
                             completion=completion,
                             release_writer=self._capture_owner_handoff,
+                            rejection=rejection,
                         )
                         result = self._execute_prepared_capture_handoff(handoff)
                         if handoff.transferred:
@@ -2298,6 +2315,15 @@ class PrototypeRuntimeApi:
                         messages=error.messages,
                         diagnostic=diagnostic,
                     )
+                    if handoff is not None and handoff.transferred:
+                        # Mandatory completion/rejection already updated
+                        # namespace and dirty roots on the owning path.
+                        if handoff.submitted:
+                            reply = replace(
+                                reply, changed_roots=lowering.persistent_write_roots,
+                                capture_dirty_roots=lowering.dirty_roots,
+                            )
+                        return reply
             except BaseException:
                 if handoff is not None and handoff.transferred:
                     raise

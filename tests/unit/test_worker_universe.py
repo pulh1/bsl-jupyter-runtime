@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import pickle
 import re
+from threading import Event, Thread
 from uuid import UUID
 from weakref import ref
 
@@ -96,6 +97,110 @@ def test_root_transaction_validation_precedes_any_staging(tmp_path):
         registry.prepare_root(candidate, transaction_id="invalid")
     assert not target.calls
     assert not registry._registrations
+
+
+def _mutation_registry(*, coordinated=False, remote=None):
+    calls, settlements = [], []
+    host = worker_universe.WorkerUniverseRegistry(runtime_generation=7, context_generation=3)
+    def execute(source):
+        assert not registry._lock._is_owned()
+        calls.append(source)
+        return remote(source) if remote is not None else "confirmed"
+    def submit(plan):
+        assert not registry._lock._is_owned()
+        try:
+            result = execute(plan.instruction)
+        except BaseException as error:
+            return plan.abort(error)
+        return plan.commit(result)
+    registry = worker_universe.ServerWorkerUniverseRegistry(
+        host, execute, mutation_executor=submit if coordinated else None,
+    )
+    plan = registry.reserve_mutation(
+        "original", commit=lambda result: settlements.append(("commit", result)),
+        abort=lambda error: settlements.append(("abort", type(error).__name__)),
+    )
+    return registry, plan, calls, settlements
+
+
+@pytest.mark.parametrize("coordinated", [False, True])
+@pytest.mark.parametrize("failed", [False, True])
+def test_worker_mutation_replay_cannot_dispatch_after_commit_or_abort(coordinated, failed):
+    def remote(source):
+        if failed:
+            raise OSError("synthetic dispatch failure")
+        return "confirmed"
+    registry, plan, calls, settlements = _mutation_registry(coordinated=coordinated, remote=remote)
+    registry.execute_mutation(plan)
+    with pytest.raises(ProtocolError):
+        registry.execute_mutation(plan)
+    assert calls == ["original"]
+    assert settlements == [("abort", "OSError") if failed else ("commit", "confirmed")]
+    assert not registry._mutations
+
+
+@pytest.mark.parametrize("coordinated", [False, True])
+@pytest.mark.parametrize("invalid", ["instruction", "reservation", "owner", "foreign", "teardown", "abandon"])
+def test_worker_mutation_invalid_plan_is_rejected_before_executor(coordinated, invalid):
+    registry, plan, calls, settlements = _mutation_registry(coordinated=coordinated)
+    other, other_plan, other_calls, _ = _mutation_registry(coordinated=coordinated)
+    attempted = plan
+    if invalid == "instruction":
+        attempted = replace(plan, instruction="forged")
+    elif invalid == "reservation":
+        attempted = replace(plan, reservation=replace(plan.reservation))
+    elif invalid == "owner":
+        attempted = replace(plan, owner=other)
+    elif invalid == "foreign":
+        attempted = other_plan
+    elif invalid == "teardown":
+        registry.teardown()
+    else:
+        registry.abandon_target()
+    with pytest.raises(ProtocolError):
+        registry.execute_mutation(attempted)
+    assert not calls and not other_calls
+    assert not settlements
+    if invalid not in {"teardown", "abandon"}:
+        registry.execute_mutation(plan)
+        assert calls == ["original"]
+        assert settlements == [("commit", "confirmed")]
+
+
+@pytest.mark.parametrize("coordinated", [False, True])
+def test_concurrent_worker_mutation_claim_has_one_remote_owner(coordinated):
+    entered, release, second_finished = Event(), Event(), Event()
+    errors = []
+    def remote(source):
+        entered.set()
+        assert release.wait(2)
+        return "confirmed"
+    registry, plan, calls, settlements = _mutation_registry(coordinated=coordinated, remote=remote)
+    def execute(*, second=False):
+        try:
+            registry.execute_mutation(plan)
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            if second:
+                second_finished.set()
+    first = Thread(target=execute)
+    second = Thread(target=lambda: execute(second=True))
+    first.start()
+    try:
+        assert entered.wait(1)
+        second.start()
+        assert second_finished.wait(0.5), "duplicate owner entered the blocked remote executor"
+        assert len(errors) == 1 and isinstance(errors[0], ProtocolError)
+    finally:
+        release.set()
+        first.join(2)
+        if second.ident is not None:
+            second.join(2)
+        assert not first.is_alive() and not second.is_alive()
+    assert calls == ["original"]
+    assert settlements == [("commit", "confirmed")]
+    assert not registry._mutations
 
 
 class _CountingArtifactBuilder:

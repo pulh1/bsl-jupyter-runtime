@@ -394,6 +394,82 @@ def test_prepared_capture_coordinator_owns_pin_after_waiter_timeout(tmp_path, mo
         assert not thread.is_alive()
 
 
+@pytest.mark.parametrize("detach", ["timeout", "interrupt", "attached"])
+def test_owned_late_bsl_failure_records_dirty_roots_before_paused(tmp_path, monkeypatch, detach):
+    from dataclasses import replace
+    from threading import current_thread
+    from onec_runtime.capture_evaluation import CaptureEvaluationCoordinator, CaptureEvaluationState, CapturePhase
+    from onec_runtime.errors import CaptureEvaluationPendingError
+    from onec_runtime.prototype_runtime import CaptureCellResult
+    from test_capture_evaluation_coordinator import Driver, FENCE
+
+    api, controller, _ = runtime(tmp_path, captured=True)
+    api.execute_bsl(UPDATE)
+    api.execute_bsl('Результат = Б();')
+    context_before = controller.lowerer.persistent_names
+    prepared = api.prepare_capture_hypothesis(
+        'НовоеЗначение = 12; КонтекстОтладки.Скаляр = 778; ВызватьИсключение "synthetic failure";'
+    )
+    coordinator = CaptureEvaluationCoordinator(FENCE, poll_interval_s=0.01)
+    driver = Driver()
+    tickets, pin_observations = [], []
+    class Waiter:
+        def __init__(self, ticket):
+            self.ticket = ticket
+        def wait_initiator(self):
+            assert driver.polling.wait(1)
+            if detach == "attached":
+                driver.result(failed=True)
+            return self.ticket.wait_initiator(1 if detach == "attached" else 0.01)
+    def submit(*, pin_lease, completion):
+        def settle(value, error):
+            return completion(CaptureCellResult(controller.operation_id, "visible", "lowered", value), error)
+        def dispose(disposition):
+            pin_observations.append((
+                disposition, tuple(api._pending_dirty_roots.values()),
+                controller.lowerer.persistent_names, coordinator.status(FENCE).phase,
+            ))
+            pin_lease(disposition)
+        ticket = coordinator.submit_evaluation(replace(
+            driver.request(cleanup_leases=()), completion=settle, pin_lease=dispose,
+        ))
+        tickets.append(ticket)
+        return Waiter(ticket)
+    monkeypatch.setattr(api, '_execute_prepared_capture_handoff', lambda handoff: handoff.execute_owned(submit))
+    caller_thread = current_thread()
+    original_wait = coordinator._condition.wait
+    def interrupt_wait(timeout=None):
+        if current_thread() is caller_thread:
+            raise KeyboardInterrupt()
+        return original_wait(timeout)
+    try:
+        if detach == "interrupt":
+            monkeypatch.setattr(coordinator._condition, 'wait', interrupt_wait)
+        if detach == "attached":
+            reply = api.execute_prepared_capture_hypothesis(prepared)
+            assert not reply.succeeded
+            assert reply.capture_dirty_roots == ("Скаляр",)
+            assert reply.changed_roots == ("НовоеЗначение",)
+        else:
+            with pytest.raises(KeyboardInterrupt if detach == "interrupt" else CaptureEvaluationPendingError):
+                api.execute_prepared_capture_hypothesis(prepared)
+        monkeypatch.setattr(coordinator._condition, 'wait', original_wait)
+        if detach != "attached":
+            assert not api._pending_dirty_roots
+            driver.result(failed=True)
+        outcome = coordinator.wait(FENCE, tickets[0].evaluation_id, timeout_s=1)
+        assert outcome.state is CaptureEvaluationState.FAILED
+        assert outcome.diagnostic.code == "bsl_error"
+        assert pin_observations == [("release", ("Скаляр",), context_before, CapturePhase.EVALUATING)]
+        assert tuple(api._pending_dirty_roots.values()) == ("Скаляр",)
+        assert coordinator.status(FENCE).phase is CapturePhase.PAUSED
+        assert len(api._worker_universe._leases) == 1
+    finally:
+        coordinator.begin_close()
+        driver.closed.set()
+        assert coordinator.join(2)
+
+
 def test_mixed_capture_added_name_uses_new_catalog_and_releases_cell_lease(tmp_path):
     api, _, session = runtime(tmp_path, captured=True)
     api.execute_bsl(UPDATE)
@@ -487,18 +563,23 @@ def test_prepared_capture_dispatch_admission_failure_releases_only_evaluation_le
     assert len(api._worker_universe._leases) == 1
 
 
-def test_owned_capture_submission_rejection_restores_prepared_namespace(tmp_path, monkeypatch):
+@pytest.mark.parametrize("error_type", [ProtocolError, BslExecutionError])
+def test_owned_capture_submission_rejection_restores_prepared_namespace(tmp_path, monkeypatch, error_type):
     api, controller, _ = runtime(tmp_path, captured=True)
     api.execute_bsl(UPDATE)
     api.execute_bsl('Результат = Б();')
     context_before = controller.lowerer.persistent_names
-    prepared = api.prepare_capture_hypothesis('НовоеЗначение = 12;')
+    prepared = api.prepare_capture_hypothesis('НовоеЗначение = 12; КонтекстОтладки.Скаляр = 778;')
     def reject(**kwargs):
-        raise ProtocolError('rejected before record ownership')
+        raise error_type('rejected before record ownership')
     monkeypatch.setattr(api, '_execute_prepared_capture_handoff', lambda handoff: handoff.execute_owned(reject))
-    with pytest.raises(ProtocolError, match='before record ownership'):
-        api.execute_prepared_capture_hypothesis(prepared)
+    if error_type is ProtocolError:
+        with pytest.raises(ProtocolError, match='before record ownership'):
+            api.execute_prepared_capture_hypothesis(prepared)
+    else:
+        assert not api.execute_prepared_capture_hypothesis(prepared).succeeded
     assert controller.lowerer.persistent_names == context_before
+    assert not api._pending_dirty_roots
     assert len(api._worker_universe._leases) == 1
 
 

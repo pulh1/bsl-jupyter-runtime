@@ -103,6 +103,139 @@ def test_inline_remote_uncertainty_is_not_a_local_policy_error(environment):
         contexts[0].execute_inline(step)
 
 
+@pytest.mark.parametrize("boundary", ["before_dispatch_marker", "after_ack_before_return", "restore"])
+def test_inline_step_reentry_cannot_dispatch_another_capability(environment, boundary):
+    create, _ = environment
+    coordinator, first, _ = create()
+    outer, nested = Driver(), Driver()
+    outer.result(17)
+    nested.result(99)
+    rejections = []
+    def policy(context, result):
+        def attempt_reentry():
+            try:
+                context.execute_inline(remote_step(nested))
+            except ProtocolError:
+                rejections.append(boundary)
+        def dispatch(entered):
+            if boundary == "before_dispatch_marker":
+                attempt_reentry()
+            capability = outer.dispatch(entered)
+            if boundary == "after_ack_before_return":
+                attempt_reentry()
+            return capability
+        def restore():
+            if boundary == "restore":
+                attempt_reentry()
+            outer.restore()
+        return int(context.execute_inline(capture.CaptureRemoteStep(dispatch, outer.poll, restore)).presentation)
+    ticket = coordinator.submit_evaluation(replace(first.request(cleanup_leases=()), step_policy=policy))
+    first.result()
+    assert ticket.wait_initiator(1) == 17
+    assert rejections == [boundary]
+    assert nested.dispatch_count == 0
+    assert outer.consumed == 1
+    assert ticket._record.remote_step_count == 2
+
+
+def test_nested_inline_uncertainty_is_rejected_before_transport_or_retained(environment):
+    create, _ = environment
+    coordinator, first, _ = create()
+    remote_entries = []
+    def policy(context, result):
+        def uncertain(entered):
+            entered()
+            remote_entries.append(True)
+            raise OSError("synthetic uncertain transport")
+        def outer_dispatch(entered):
+            return context.execute_inline(capture.CaptureRemoteStep(uncertain, Driver().poll))
+        return context.execute_inline(capture.CaptureRemoteStep(outer_dispatch, Driver().poll))
+    ticket = coordinator.submit_evaluation(replace(first.request(cleanup_leases=()), step_policy=policy))
+    first.result()
+    outcome = coordinator.wait(FENCE, ticket.evaluation_id, timeout_s=1)
+    phase = coordinator.status(FENCE).phase
+    assert not remote_entries or phase is capture.CapturePhase.RECOVERY_REQUIRED
+    assert outcome.diagnostic.code != "result_policy_failed"
+    if remote_entries:
+        assert first.dispositions == ["quarantine"]
+
+
+@pytest.mark.parametrize("boundary", ["dispatch", "poll", "restore"])
+def test_classified_inline_uncertainty_survives_callback_boundary(environment, boundary):
+    create, _ = environment
+    coordinator, first, _ = create()
+    classified = capture._RemoteStepFailure(capture.CapturePhase.RECOVERY_REQUIRED, "dispatch_uncertain", uncertain=True)
+    outer = Driver()
+    outer.result()
+    def propagate(*args):
+        raise classified
+    step = replace(remote_step(outer), **{boundary: propagate})
+    ticket = coordinator.submit_evaluation(replace(
+        first.request(cleanup_leases=()), step_policy=lambda context, result: context.execute_inline(step),
+    ))
+    first.result()
+    outcome = coordinator.wait(FENCE, ticket.evaluation_id, timeout_s=1)
+    assert outcome.diagnostic.code == "dispatch_uncertain"
+    assert coordinator.status(FENCE).phase is capture.CapturePhase.RECOVERY_REQUIRED
+    assert first.dispositions == ["quarantine"]
+
+
+@pytest.mark.parametrize("failure, phase, state, code", [
+    ("dispatch", "outcome_unknown", "unknown", "dispatch_uncertain"),
+    ("poll", "recovery_required", "failed", "evaluation_stream_failed"),
+    ("restore", "recovery_required", "failed", "workspace_restore_failed"),
+    ("cleanup", "recovery_required", "failed", "cleanup_failed"),
+    ("target_lost", "stale", "failed", "target_lost"),
+    ("normal", "paused", "failed", "result_delivery_failed"),
+])
+def test_completion_failure_preserves_primary_remote_outcome(environment, failure, phase, state, code):
+    from onec_runtime.errors import StaleCaptureError, TargetLost
+    create, _ = environment
+    coordinator, driver, _ = create()
+    completion_calls = []
+    def completion(value, error):
+        completion_calls.append(type(error).__name__ if error is not None else None)
+        raise RuntimeError("synthetic local completion failure")
+    request = driver.request(cleanup_leases=(), completion=completion)
+    if failure == "dispatch":
+        def uncertain(entered):
+            entered()
+            raise OSError("synthetic uncertain dispatch")
+        request = replace(request, dispatch=uncertain)
+    elif failure == "poll":
+        driver.events.put(OSError("synthetic stream loss"))
+    elif failure == "target_lost":
+        driver.events.put(TargetLost("synthetic target loss"))
+    else:
+        driver.result()
+        if failure == "restore":
+            def restore():
+                raise RuntimeError("synthetic restoration failure")
+            request = replace(request, restore=restore)
+        elif failure == "cleanup":
+            cleaner = Driver()
+            cleaner.result(failed=True)
+            request = replace(request, cleanup_leases=(capture.CaptureCleanupLease("private-key", remote_step(cleaner)),))
+    ticket = coordinator.submit_evaluation(request)
+    if failure == "target_lost":
+        with pytest.raises(StaleCaptureError):
+            coordinator.wait(FENCE, ticket.evaluation_id, timeout_s=1)
+        outcome = ticket._record.outcome
+    else:
+        outcome = coordinator.wait(FENCE, ticket.evaluation_id, timeout_s=1)
+    assert outcome.state.value == state
+    assert outcome.diagnostic.code == code
+    assert coordinator.status(FENCE).phase.value == phase
+    assert len(completion_calls) == 1
+    assert driver.dispositions == ["release" if failure == "normal" else "quarantine"]
+    assert ticket._record.outcome is outcome
+    if failure == "dispatch":
+        assert coordinator.wait(FENCE, ticket.evaluation_id, timeout_s=0) is outcome
+    if failure == "cleanup":
+        assert ticket._record.cleanup_status == "failed"
+        assert coordinator._quarantined is ticket._record
+
+
 def test_inline_steps_use_active_record_and_reject_recursive_submission(environment):
     create, _ = environment
     coordinator, driver, _ = create()
