@@ -5,6 +5,7 @@ import hashlib
 import json
 
 import pytest
+import onec_runtime.privacy as privacy
 
 from onec_runtime.bsl.diagnostics import (
     DiagnosticTextSpan,
@@ -750,6 +751,54 @@ def test_deterministic_parse_error_normalizes_through_exact_input() -> None:
     assert diagnostic.platform_diagnostic is None
     assert diagnostic.platform_diagnostic_sha256 is None
     assert diagnostic.runtime_summary == "BSL parsing failed"
+    assert diagnostic.causes == ()
+    assert diagnostic.frames == ()
+    assert diagnostic.frames_truncated is False
+    assert diagnostic.causes_truncated is False
+
+
+def test_rich_trace_does_not_expand_existing_wire_shapes() -> None:
+    """Break caught: trace fields leak into public or expert wire contracts."""
+    raw = "{<Неизвестный модуль>(1,1)}: " + "x" * 10_000
+    diagnostic = remap_platform_diagnostic(
+        parse_platform_diagnostic(raw),
+        _wrapped("Результат = 1;"),
+        stage=DiagnosticStage.EXECUTION,
+    )
+
+    assert set(privacy.diagnostic_to_public_wire(diagnostic)) == {
+        "diagnostic_id",
+        "runtime_summary",
+        "stage",
+        "mapping_confidence",
+        "visible_location",
+        "related_visible_span",
+        "excerpt",
+        "synthetic_region",
+    }
+    assert set(privacy.diagnostic_to_expert_wire(diagnostic)) == {
+        "diagnostic_id",
+        "runtime_summary",
+        "stage",
+        "mapping_confidence",
+        "visible_location",
+        "related_visible_span",
+        "excerpt",
+        "synthetic_region",
+        "lowered_location",
+        "platform_diagnostic",
+        "platform_diagnostic_sha256",
+        "platform_diagnostic_truncated",
+        "platform_diagnostic_redacted",
+        "execution_artifact_sha256",
+        "source_map_sha256",
+        "worker_generation",
+        "worker_manifest_sha256",
+    }
+    expert = privacy.diagnostic_to_expert_wire(diagnostic)
+    assert expert["platform_diagnostic"] == raw
+    assert expert["platform_diagnostic_truncated"] is False
+    assert expert["platform_diagnostic_redacted"] is False
 
 
 @pytest.mark.parametrize("phase", ("connect", "create"))

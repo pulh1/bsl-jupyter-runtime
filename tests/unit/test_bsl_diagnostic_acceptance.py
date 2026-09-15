@@ -1070,6 +1070,35 @@ def test_source_map_manifest_and_diagnostic_wires_never_contain_full_sources(
             result.executed.text,
         ),
     )
+    assert set(public) == {
+        "diagnostic_id",
+        "runtime_summary",
+        "stage",
+        "mapping_confidence",
+        "visible_location",
+        "related_visible_span",
+        "excerpt",
+        "synthetic_region",
+    }
+    assert set(expert) == {
+        "diagnostic_id",
+        "runtime_summary",
+        "stage",
+        "mapping_confidence",
+        "visible_location",
+        "related_visible_span",
+        "excerpt",
+        "synthetic_region",
+        "lowered_location",
+        "platform_diagnostic",
+        "platform_diagnostic_sha256",
+        "platform_diagnostic_truncated",
+        "platform_diagnostic_redacted",
+        "execution_artifact_sha256",
+        "source_map_sha256",
+        "worker_generation",
+        "worker_manifest_sha256",
+    }
     assert "<redacted>" in repr(result.executed)
     manifest_text = json.dumps(manifest, ensure_ascii=False, sort_keys=True)
     assert result.source_unit.source_sha256 in manifest_text

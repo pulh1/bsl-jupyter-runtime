@@ -11,14 +11,28 @@ from onec_runtime.bsl import (
     MappingConfidence,
     NormalizedDiagnostic,
     SourceSpan,
+    SourceUnitKind,
     SourceUnitRef,
     VisibleSourceLocation,
+)
+from onec_runtime.bsl.diagnostics import (
+    DiagnosticCoordinateSpace,
+    DiagnosticTextSpan,
+    ErrorTraceCause,
+    ErrorTraceFrame,
+    ErrorTraceFrameOrigin,
+    LoweredSourceLocation,
+    PlatformDiagnosticLocation,
+    WorkerArtifactPlatformLocation,
+    WorkerRuntimeFrameDiagnostic,
 )
 
 
 MAX_DIAGNOSTIC_COORDINATE = 10_000_000
 MAX_DIAGNOSTIC_LABEL_LENGTH = 128
 MAX_PRIVATE_DIAGNOSTIC_BYTES = 64 * 1024
+MAX_DIAGNOSTIC_FRAMES = 128
+MAX_DIAGNOSTIC_CAUSES = 32
 
 _DIAGNOSTIC_ID_RE = re.compile(r"[0-9a-f]{64}\Z")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -61,18 +75,17 @@ def sanitize_normalized_diagnostic(
         ):
             return None
         if value.source_unit is not None and (
-            not isinstance(value.source_unit, SourceUnitRef)
-            or len(value.source_unit.unit_id) > 256
+            not _bounded_source_unit(value.source_unit)
         ):
             return None
         if value.visible_location is not None:
             location = value.visible_location
             if (
                 not isinstance(location, VisibleSourceLocation)
+                or not _bounded_source_unit(location.source_unit)
                 or not _bounded_positive_coordinate(location.line)
                 or not _bounded_positive_coordinate(location.column)
                 or not _bounded_span(location.span)
-                or len(location.source_unit.unit_id) > 256
                 or (
                     value.source_unit is not None
                     and location.source_unit != value.source_unit
@@ -83,10 +96,16 @@ def sanitize_normalized_diagnostic(
             value.related_visible_span
         ):
             return None
+        if any(
+            not _bounded_optional_span(anchor)
+            for anchor in (value.dependency_anchor, value.method_anchor)
+        ):
+            return None
         if value.lowered_location is not None:
             location = value.lowered_location
             if (
-                not _bounded_positive_coordinate(location.line)
+                not isinstance(location, LoweredSourceLocation)
+                or not _bounded_positive_coordinate(location.line)
                 or not _bounded_positive_coordinate(location.column)
                 or type(location.offset) is not int
                 or not 0 <= location.offset <= MAX_DIAGNOSTIC_COORDINATE
@@ -114,6 +133,8 @@ def sanitize_normalized_diagnostic(
             or value.platform_diagnostic_sha256 is None
         ):
             return None
+        if not _bounded_trace(value, platform_diagnostic):
+            return None
         return replace(
             value,
             runtime_summary=_DIAGNOSTIC_SUMMARIES[value.stage],
@@ -133,6 +154,289 @@ def _bounded_span(value: object) -> bool:
         and type(value.end) is int
         and 0 <= value.start <= value.end <= MAX_DIAGNOSTIC_COORDINATE
     )
+
+
+def _bounded_source_unit(value: object) -> bool:
+    return (
+        isinstance(value, SourceUnitRef)
+        and type(value.kind) is SourceUnitKind
+        and type(value.unit_id) is str
+        and 0 < len(value.unit_id) <= 256
+        and type(value.revision) is int
+        and 0 <= value.revision <= MAX_DIAGNOSTIC_COORDINATE
+        and type(value.source_sha256) is str
+        and _SHA256_RE.fullmatch(value.source_sha256) is not None
+    )
+
+
+def _bounded_diagnostic_span(value: object, text_length: int) -> bool:
+    return (
+        isinstance(value, DiagnosticTextSpan)
+        and type(value.start) is int
+        and type(value.end) is int
+        and 0 <= value.start <= value.end <= text_length
+    )
+
+
+def _bounded_platform_location(value: object) -> bool:
+    return (
+        isinstance(value, PlatformDiagnosticLocation)
+        and type(value.module_name) is str
+        and 0 < len(value.module_name) <= 512
+        and type(value.module_components) is tuple
+        and 0 < len(value.module_components) <= 32
+        and all(type(item) is str and item for item in value.module_components)
+        and value.module_name == ".".join(value.module_components)
+        and type(value.line) is int
+        and 0 <= value.line <= MAX_DIAGNOSTIC_COORDINATE
+        and (
+            value.column is None
+            or (
+                type(value.column) is int
+                and 0 <= value.column <= MAX_DIAGNOSTIC_COORDINATE
+            )
+        )
+        and type(value.coordinate_space) is DiagnosticCoordinateSpace
+        and (
+            value.worker_artifact_location is None
+            or (
+                isinstance(
+                    value.worker_artifact_location,
+                    WorkerArtifactPlatformLocation,
+                )
+                and type(value.worker_artifact_location.registration_name) is str
+                and 0
+                < len(value.worker_artifact_location.registration_name)
+                <= 512
+                and len(value.module_components) == 3
+                and value.module_components[1]
+                == value.worker_artifact_location.registration_name
+            )
+        )
+    )
+
+
+def _bounded_optional_label(value: object, *, maximum: int = 256) -> bool:
+    return value is None or (type(value) is str and 0 < len(value) <= maximum)
+
+
+def _bounded_optional_span(value: object) -> bool:
+    return value is None or _bounded_span(value)
+
+
+def _bounded_trace_frame_fields(frame: ErrorTraceFrame) -> bool:
+    if type(frame.mapping_confidence) is not MappingConfidence:
+        return False
+    if not _bounded_optional_label(frame.registration_name, maximum=512):
+        return False
+    if not _bounded_optional_label(frame.logical_name):
+        return False
+    if frame.revision is not None and (
+        type(frame.revision) is not int
+        or not 0 <= frame.revision <= MAX_DIAGNOSTIC_COORDINATE
+    ):
+        return False
+    if frame.artifact_sha256 is not None and (
+        type(frame.artifact_sha256) is not str
+        or _SHA256_RE.fullmatch(frame.artifact_sha256) is None
+    ):
+        return False
+    if frame.source_unit is not None and not _bounded_source_unit(frame.source_unit):
+        return False
+    if frame.visible_location is not None:
+        visible = frame.visible_location
+        if (
+            not isinstance(visible, VisibleSourceLocation)
+            or not _bounded_source_unit(visible.source_unit)
+            or not _bounded_positive_coordinate(visible.line)
+            or not _bounded_positive_coordinate(visible.column)
+            or not _bounded_span(visible.span)
+            or (
+                frame.source_unit is not None
+                and visible.source_unit != frame.source_unit
+            )
+        ):
+            return False
+    if frame.lowered_location is not None:
+        lowered = frame.lowered_location
+        if (
+            not isinstance(lowered, LoweredSourceLocation)
+            or not _bounded_positive_coordinate(lowered.line)
+            or not _bounded_positive_coordinate(lowered.column)
+            or type(lowered.offset) is not int
+            or not 0 <= lowered.offset <= MAX_DIAGNOSTIC_COORDINATE
+            or not _bounded_span(lowered.span)
+        ):
+            return False
+    if any(
+        not _bounded_optional_span(value)
+        for value in (
+            frame.visible_line_span,
+            frame.related_visible_span,
+            frame.dependency_anchor,
+            frame.method_anchor,
+        )
+    ):
+        return False
+    if frame.synthetic_region is not None and (
+        type(frame.synthetic_region) is not str
+        or len(frame.synthetic_region) > MAX_DIAGNOSTIC_LABEL_LENGTH
+        or _DIAGNOSTIC_LABEL_RE.fullmatch(frame.synthetic_region) is None
+    ):
+        return False
+    return True
+
+
+def _bounded_worker_frame(value: object) -> bool:
+    if not isinstance(value, WorkerRuntimeFrameDiagnostic):
+        return False
+    if not (
+        type(value.registration_name) is str
+        and 0 < len(value.registration_name) <= 512
+    ):
+        return False
+    if not _bounded_optional_label(value.logical_name):
+        return False
+    if type(value.mapping_confidence) is not MappingConfidence:
+        return False
+    if value.revision is not None and (
+        type(value.revision) is not int
+        or not 0 <= value.revision <= MAX_DIAGNOSTIC_COORDINATE
+    ):
+        return False
+    if value.artifact_sha256 is not None and (
+        type(value.artifact_sha256) is not str
+        or _SHA256_RE.fullmatch(value.artifact_sha256) is None
+    ):
+        return False
+    if value.source_unit is not None and not _bounded_source_unit(value.source_unit):
+        return False
+    if value.visible_location is not None:
+        visible = value.visible_location
+        if (
+            not isinstance(visible, VisibleSourceLocation)
+            or not _bounded_source_unit(visible.source_unit)
+            or not _bounded_positive_coordinate(visible.line)
+            or not _bounded_positive_coordinate(visible.column)
+            or not _bounded_span(visible.span)
+            or (
+                value.source_unit is not None
+                and visible.source_unit != value.source_unit
+            )
+        ):
+            return False
+    if value.lowered_location is not None:
+        lowered = value.lowered_location
+        if (
+            not isinstance(lowered, LoweredSourceLocation)
+            or not _bounded_positive_coordinate(lowered.line)
+            or not _bounded_positive_coordinate(lowered.column)
+            or type(lowered.offset) is not int
+            or not 0 <= lowered.offset <= MAX_DIAGNOSTIC_COORDINATE
+            or not _bounded_span(lowered.span)
+        ):
+            return False
+    if any(
+        not _bounded_optional_span(item)
+        for item in (
+            value.related_visible_span,
+            value.dependency_anchor,
+            value.method_anchor,
+        )
+    ):
+        return False
+    return value.synthetic_region is None or (
+        type(value.synthetic_region) is str
+        and len(value.synthetic_region) <= MAX_DIAGNOSTIC_LABEL_LENGTH
+        and _DIAGNOSTIC_LABEL_RE.fullmatch(value.synthetic_region) is not None
+    )
+
+
+def _bounded_trace(
+    value: NormalizedDiagnostic,
+    platform_text: str | None,
+) -> bool:
+    if (
+        type(value.worker_frames) is not tuple
+        or len(value.worker_frames) > MAX_DIAGNOSTIC_FRAMES
+    ):
+        return False
+    if any(not _bounded_worker_frame(frame) for frame in value.worker_frames):
+        return False
+    if (
+        type(value.frames) is not tuple
+        or len(value.frames) > MAX_DIAGNOSTIC_FRAMES
+    ):
+        return False
+    if type(value.causes) is not tuple or len(value.causes) > MAX_DIAGNOSTIC_CAUSES:
+        return False
+    if type(value.frames_truncated) is not bool or type(value.causes_truncated) is not bool:
+        return False
+    if (value.frames or value.causes) and platform_text is None:
+        return False
+    text_length = 0 if platform_text is None else len(platform_text)
+    for index, cause in enumerate(value.causes):
+        if (
+            not isinstance(cause, ErrorTraceCause)
+            or type(cause.ordinal) is not int
+            or cause.ordinal != index
+            or not _bounded_diagnostic_span(cause.summary_span, text_length)
+            or not _bounded_diagnostic_span(cause.block_span, text_length)
+            or not (
+                cause.block_span.start
+                <= cause.summary_span.start
+                <= cause.summary_span.end
+                <= cause.block_span.end
+            )
+            or type(cause.frame_ordinals) is not tuple
+            or any(type(item) is not int for item in cause.frame_ordinals)
+            or tuple(sorted(set(cause.frame_ordinals))) != cause.frame_ordinals
+            or any(not 0 <= item < len(value.frames) for item in cause.frame_ordinals)
+        ):
+            return False
+    for index, frame in enumerate(value.frames):
+        if (
+            not isinstance(frame, ErrorTraceFrame)
+            or type(frame.ordinal) is not int
+            or frame.ordinal != index
+            or type(frame.origin) is not ErrorTraceFrameOrigin
+            or not _bounded_platform_location(frame.platform_location)
+            or not _bounded_trace_frame_fields(frame)
+            or not _bounded_diagnostic_span(frame.block_span, text_length)
+            or (
+                frame.detail_span is not None
+                and not _bounded_diagnostic_span(frame.detail_span, text_length)
+            )
+            or (
+                frame.detail_span is not None
+                and not (
+                    frame.block_span.start
+                    <= frame.detail_span.start
+                    <= frame.detail_span.end
+                    <= frame.block_span.end
+                )
+            )
+            or (
+                frame.cause_ordinal is not None
+                and (
+                    type(frame.cause_ordinal) is not int
+                    or not 0 <= frame.cause_ordinal < len(value.causes)
+                )
+            )
+        ):
+            return False
+        if frame.cause_ordinal is not None and index not in value.causes[
+            frame.cause_ordinal
+        ].frame_ordinals:
+            return False
+    for cause in value.causes:
+        if cause.frame_ordinals != tuple(
+            frame.ordinal
+            for frame in value.frames
+            if frame.cause_ordinal == cause.ordinal
+        ):
+            return False
+    return True
 
 
 @dataclass(frozen=True, slots=True)
