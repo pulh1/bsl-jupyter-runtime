@@ -605,3 +605,173 @@ def test_runtime_stack_uses_main_pinned_worker_source_and_shared_syntax(tmp_path
     assert detailed.source_sha256 == first_unit.mapped_source.artifact.source_sha256
     assert first_generation is operation_pin.handle
     assert worker_runtime.worker_generation_handle is not first_generation
+
+
+def test_runtime_stack_resolves_multiple_notebook_cells_from_historical_generation(
+    tmp_path,
+) -> None:
+    from test_runtime_api import _common_module_catalog, _semantic_snapshot_runtime
+    from onec_runtime.bsl.source_maps import SourceUnitKind, SourceUnitRef, source_sha256
+    from onec_runtime.worker_breakpoints import resolve_source_line
+
+    worker_runtime = _semantic_snapshot_runtime(tmp_path, _common_module_catalog())
+    sources = (
+        "Процедура Первый()\n    А = 1;\nКонецПроцедуры;",
+        "Процедура Второй()\n    Б = 2;\nКонецПроцедуры;",
+        "Процедура Третий()\n    В = 3;\nКонецПроцедуры;",
+    )
+    units = tuple(
+        SourceUnitRef(
+            SourceUnitKind.NOTEBOOK_CELL,
+            f"Cell{index}",
+            index,
+            source_sha256(source),
+        )
+        for index, source in enumerate(sources, start=1)
+    )
+    for source, unit in zip(sources[:2], units[:2], strict=True):
+        worker_runtime.execute_bsl(source, source_unit=unit)
+    historical_pin = worker_runtime._worker_universe.pin_active()
+    historical_view = worker_runtime._worker_universe._operation_debug_view(
+        historical_pin
+    )
+    historical_module = historical_view.modules[0]
+    generated_lines = tuple(
+        resolve_source_line(historical_module, unit, 2).generated_line
+        for unit in units[:2]
+    )
+    assert all(line is not None for line in generated_lines)
+
+    worker_runtime.execute_bsl(sources[2], source_unit=units[2])
+    _, controller, session = captured_stack_api()
+    worker_runtime._controller = controller
+    worker_runtime._operation_generation_pin = historical_pin
+    session.live_frames = (
+        session.live_frames[0],
+        *(
+            StackFrame(
+                session.live_frames[0].target_id,
+                level,
+                historical_module.registration.module_location(line),
+            )
+            for level, line in enumerate(generated_lines, start=1)
+            if line is not None
+        ),
+        replace(session.live_frames[2], level=3),
+    )
+
+    page = worker_runtime.current_capture().stack[:20].with_methods()
+    frames = tuple(frame for frame in page.frames if isinstance(frame, api().DebugFrame))
+
+    assert [frame.source_status for frame in frames] == [
+        "runtime_verified",
+        "runtime_verified",
+    ]
+    assert [frame.method.name for frame in frames] == ["Первый", "Второй"]
+    assert [frame._resolved.version.generation for frame in frames] == [
+        historical_pin.handle.generation,
+        historical_pin.handle.generation,
+    ]
+    assert worker_runtime.worker_generation_handle is not historical_pin.handle
+
+
+def test_common_source_is_repinned_after_notebook_publication_and_history_survives(
+    tmp_path,
+) -> None:
+    from test_runtime_api import (
+        _common_module_catalog, _semantic_snapshot_runtime, _worker_module_unit,
+    )
+    from onec_runtime.bsl.source_maps import SourceUnitKind, SourceUnitRef, source_sha256
+    from onec_runtime.worker_breakpoints import resolve_source_line
+
+    catalog = _common_module_catalog("МодульА")
+    worker_runtime = _semantic_snapshot_runtime(tmp_path, catalog)
+    first_handle = worker_runtime.load_worker_modules(
+        (_worker_module_unit("МодульА", 1, catalog),), common_modules=catalog,
+    )
+    historical_pin = worker_runtime._worker_universe.pin_active()
+    notebook_source = "Процедура ИзНоутбука()\n    А = 1;\nКонецПроцедуры;"
+    notebook_unit = SourceUnitRef(
+        SourceUnitKind.NOTEBOOK_CELL,
+        "CellAfterCommon",
+        1,
+        source_sha256(notebook_source),
+    )
+    worker_runtime.execute_bsl(notebook_source, source_unit=notebook_unit)
+    current_pin = worker_runtime._worker_universe.pin_active()
+    current_view = worker_runtime._worker_universe._operation_debug_view(current_pin)
+    common_module = next(
+        module for module in current_view.modules
+        if module.canonical_module == "модульа"
+    )
+    generated_line = resolve_source_line(
+        common_module, common_module.source_unit, 2,
+    ).generated_line
+    assert generated_line is not None
+
+    _, controller, session = captured_stack_api()
+    worker_runtime._controller = controller
+    worker_runtime._operation_generation_pin = current_pin
+    session.live_frames = (
+        session.live_frames[0],
+        StackFrame(
+            session.live_frames[0].target_id,
+            1,
+            common_module.registration.module_location(generated_line),
+        ),
+        session.live_frames[2],
+    )
+
+    current_frame = worker_runtime.current_capture().stack[0]
+    worker_runtime._operation_generation_pin = historical_pin
+    historical_module = worker_runtime._worker_universe._operation_debug_view(
+        historical_pin
+    ).modules[0]
+    historical_line = resolve_source_line(
+        historical_module, historical_module.source_unit, 2,
+    ).generated_line
+    assert historical_line is not None
+    session.live_frames = (
+        session.live_frames[0],
+        StackFrame(
+            session.live_frames[0].target_id,
+            1,
+            historical_module.registration.module_location(historical_line),
+        ),
+        session.live_frames[2],
+    )
+    historical_frame = worker_runtime.current_capture().stack[0]
+
+    assert current_frame.source_status == historical_frame.source_status == "runtime_verified"
+    assert current_frame._resolved.version.generation == current_pin.handle.generation
+    assert historical_frame._resolved.version.generation == first_handle.generation
+
+
+@pytest.mark.parametrize(
+    "failure",
+    (
+        PermissionError(13, "denied", r"C:\\private\\export\\Common.xml"),
+        FileNotFoundError(2, "missing", r"C:\\private\\export\\Common.xml"),
+        ProtocolError("configuration module metadata is invalid"),
+    ),
+)
+def test_public_stack_sanitizes_configuration_source_filesystem_failures(failure) -> None:
+    runtime, _, _ = captured_stack_api()
+
+    def fail_resolution(_frames):
+        if isinstance(failure, ProtocolError):
+            try:
+                raise PermissionError(
+                    13, "denied", r"C:\\private\\export\\Common.xml"
+                )
+            except PermissionError as error:
+                raise failure from error
+        raise failure
+
+    runtime._capture_stack_source_resolver = fail_resolution
+
+    page = runtime.current_capture().stack[:20]
+
+    frame = next(frame for frame in page.frames if isinstance(frame, api().DebugFrame))
+    assert frame.source_status == "unavailable"
+    assert r"C:\private\export" not in repr(page)
