@@ -556,6 +556,88 @@ def test_interrupt_inside_admit_keeps_one_detached_resume_owner(
         controller.shutdown_capture_evaluation()
 
 
+@pytest.mark.parametrize("entry", ("runtime-api", "session"))
+def test_preflight_rejection_leaves_no_resume_owner_or_session_ticket(
+    monkeypatch: pytest.MonkeyPatch,
+    entry: str,
+) -> None:
+    """A rejected admission is retryable because it never adopts a record."""
+
+    rdbg = ResumeBarrierSession((CAPTURE_A, SERVICE))
+    controller = captured_controller(rdbg, command_timeout_s=1)
+    api = PrototypeRuntimeApi(controller)
+    old_view = api.current_capture()
+    runtime: RuntimeSession | None = None
+    active: object | None = None
+    delivered: list[object] = []
+    if entry == "session":
+        runtime = object.__new__(RuntimeSession)
+        runtime._operation_lock = RLock()
+        runtime._capture_resume_listeners = []
+        active = SimpleNamespace(
+            ticket_id="capture-ticket",
+            capture_intent_id="intent",
+            operation_id="operation",
+            capture_generation=1,
+            source_revision=1,
+            source_sha256="a" * 64,
+            stop_sequence=1,
+        )
+        runtime._active_capture_ticket = active
+        runtime.runtime_api = api
+        runtime.add_capture_resume_listener(delivered.append)
+
+    original_preflight = controller._preflight_capture_resume_admission
+
+    def reject_preflight() -> None:
+        raise ProtocolError("planned resume preflight rejection")
+
+    monkeypatch.setattr(
+        controller,
+        "_preflight_capture_resume_admission",
+        reject_preflight,
+    )
+    try:
+        for _ in range(2):
+            with pytest.raises(ProtocolError, match="preflight rejection"):
+                if runtime is None:
+                    api.resume_capture(dirty_roots=("Скаляр",))
+                else:
+                    runtime.resume_capture(dirty_roots=("Скаляр",))
+            owner = controller._capture_evaluation_coordinator
+            assert owner is not None
+            assert controller.state is OperationState.CAPTURED
+            assert owner.status(owner._fence).phase is CapturePhase.PAUSED
+            assert owner._active_resume is None
+            assert old_view.status().phase is CapturePhase.PAUSED
+            assert rdbg.root_export_entered.is_set() is False
+            assert rdbg.continue_count == 1
+            if runtime is not None:
+                assert runtime._active_capture_ticket is active
+                assert delivered == []
+
+        monkeypatch.setattr(
+            controller,
+            "_preflight_capture_resume_admission",
+            original_preflight,
+        )
+        rdbg.release_root_export.set()
+        rdbg.release_next_stop.set()
+        if runtime is None:
+            completed = api.resume_capture(dirty_roots=("Скаляр",))
+        else:
+            completed = runtime.resume_capture(dirty_roots=("Скаляр",))
+        assert completed.kind is RuntimeReplyKind.MAIN_COMPLETED
+        assert rdbg.continue_count == 2
+        if runtime is not None:
+            assert runtime._active_capture_ticket is None
+            assert len(delivered) == 1
+    finally:
+        rdbg.release_root_export.set()
+        rdbg.release_next_stop.set()
+        controller.shutdown_capture_evaluation()
+
+
 @pytest.mark.parametrize("stage", ("root", "modify", "cleanup", "continue", "wait"))
 def test_interrupt_at_every_resume_boundary_keeps_the_same_worker_plan(
     stage: str,
