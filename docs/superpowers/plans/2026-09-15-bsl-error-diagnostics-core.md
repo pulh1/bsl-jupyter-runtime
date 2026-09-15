@@ -12,8 +12,8 @@
 
 ## Global Constraints
 
-- Work is core-led in `src/onec_runtime/bsl/diagnostics.py` and `src/onec_runtime/runtime_contracts.py`; the approved one-bound evidence work may also update privacy/MCP diagnostic transport and its directly affected tests while preserving all wire key sets.
-- Do not modify `prototype_runtime.py`, `runtime_api.py`, `session.py`, `errors.py`, Jupyter rendering, MCP schemas, VS Code, configuration resolution, RDBG, or the 1C extension.
+- Work is core-led in `src/onec_runtime/bsl/diagnostics.py` and `src/onec_runtime/runtime_contracts.py`. The user-approved narrow exception permits privacy/Jupyter/MCP diagnostic-path changes and directly affected tests only to retain the same 64 KiB UTF-8 verbatim expert/private evidence and remove arbitrary platform prose from presentation; compact/public omission and all wire key sets remain unchanged.
+- Do not modify `prototype_runtime.py`, `runtime_api.py`, `session.py`, `errors.py`, VS Code, configuration resolution, RDBG, or the 1C extension. Do not expand Jupyter rendering or MCP schemas beyond the approved diagnostic-path exception.
 - Retain at most 64 KiB of UTF-8 diagnostic text, 128 frames, and 32 causes; report each truncation independently.
 - Preserve raw-detail SHA-256 over the complete original UTF-8 input.
 - Preserve existing diagnostic IDs, entrypoint-specific primary selection, `locations`, `worker_frames`, and public/expert wire key sets for existing inputs.
@@ -1858,7 +1858,7 @@ git diff --check master...HEAD
 git diff --name-only master...HEAD
 ```
 
-Expected: the baseline remains `4005 passed, 83 skipped` plus the new tests, `git diff --check` prints nothing, and the changed-file list contains only the two core files, three focused test files, the approved spec, and this plan.
+Expected: the baseline remains `4005 passed, 83 skipped` plus the new tests, `git diff --check` prints nothing, and the changed-file list is limited to the core/parser-contract work, focused tests, this spec/plan, and only the user-approved privacy/Jupyter/MCP diagnostic-path files needed for the shared 64 KiB verbatim expert/private boundary or presentation-prose removal.
 
 - [ ] **Step 7: Commit contract validation and regression locks**
 

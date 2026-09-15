@@ -467,6 +467,136 @@ def test_sanitizer_rejects_legacy_worker_mapping_with_partial_identity() -> None
     assert sanitize_normalized_diagnostic(malformed) is None
 
 
+@pytest.mark.parametrize("target", ("both", "trace", "legacy"))
+def test_sanitizer_rejects_exact_worker_without_intrinsic_source_mapping(
+    target: str,
+) -> None:
+    """Break caught: exact confidence must prove source mapping per representation."""
+    diagnostic = _valid_worker_trace_diagnostic()
+    frame = diagnostic.frames[0]
+    worker = diagnostic.worker_frames[0]
+    missing_trace = replace(
+        frame,
+        source_unit=None,
+        visible_location=None,
+        visible_line_span=None,
+    )
+    missing_worker = replace(
+        worker,
+        source_unit=None,
+        visible_location=None,
+    )
+    if target == "both":
+        malformed = replace(
+            diagnostic,
+            frames=(missing_trace,),
+            worker_frames=(missing_worker,),
+        )
+    elif target == "trace":
+        malformed = replace(diagnostic, frames=(missing_trace,))
+    elif target == "legacy":
+        malformed = replace(diagnostic, worker_frames=(missing_worker,))
+    else:
+        raise AssertionError(f"unknown exact mapping target: {target}")
+
+    assert sanitize_normalized_diagnostic(malformed) is None
+
+
+@pytest.mark.parametrize(
+    "confidence",
+    (
+        MappingConfidence.EXACT,
+        MappingConfidence.NEAREST,
+        MappingConfidence.SYNTHETIC,
+        MappingConfidence.UNKNOWN,
+    ),
+)
+def test_sanitizer_accepts_intrinsically_valid_worker_mapping_confidence(
+    confidence: MappingConfidence,
+) -> None:
+    """Break caught: confidence validation must retain normalizer-compatible forms."""
+    diagnostic = _valid_worker_trace_diagnostic()
+    frame = diagnostic.frames[0]
+    worker = diagnostic.worker_frames[0]
+    if confidence is MappingConfidence.EXACT:
+        safe = diagnostic
+    elif confidence is MappingConfidence.NEAREST:
+        safe = replace(
+            diagnostic,
+            frames=(
+                replace(
+                    frame,
+                    mapping_confidence=confidence,
+                    visible_location=None,
+                    visible_line_span=None,
+                    related_visible_span=SourceSpan(0, 1),
+                ),
+            ),
+            worker_frames=(
+                replace(
+                    worker,
+                    mapping_confidence=confidence,
+                    visible_location=None,
+                    related_visible_span=SourceSpan(0, 1),
+                ),
+            ),
+        )
+    elif confidence is MappingConfidence.SYNTHETIC:
+        safe = replace(
+            diagnostic,
+            frames=(
+                replace(
+                    frame,
+                    mapping_confidence=confidence,
+                    visible_location=None,
+                    visible_line_span=None,
+                    related_visible_span=SourceSpan(0, 1),
+                    synthetic_region="worker_synthetic",
+                ),
+            ),
+            worker_frames=(
+                replace(
+                    worker,
+                    mapping_confidence=confidence,
+                    visible_location=None,
+                    related_visible_span=SourceSpan(0, 1),
+                    synthetic_region="worker_synthetic",
+                ),
+            ),
+        )
+    else:
+        safe = replace(
+            diagnostic,
+            frames=(
+                replace(
+                    frame,
+                    mapping_confidence=confidence,
+                    source_unit=None,
+                    visible_location=None,
+                    visible_line_span=None,
+                    related_visible_span=None,
+                    synthetic_region=None,
+                    dependency_anchor=None,
+                    method_anchor=None,
+                ),
+            ),
+            worker_frames=(
+                replace(
+                    worker,
+                    mapping_confidence=confidence,
+                    source_unit=None,
+                    visible_location=None,
+                    related_visible_span=None,
+                    synthetic_region=None,
+                    dependency_anchor=None,
+                    method_anchor=None,
+                ),
+            ),
+        )
+
+    assert sanitize_normalized_diagnostic(safe) is not None
+
+
 @pytest.mark.parametrize("mutation", ("reordered", "overlapping", "frame_outside"))
 def test_sanitizer_rejects_nonmonotonic_trace_text_topology(
     mutation: str,

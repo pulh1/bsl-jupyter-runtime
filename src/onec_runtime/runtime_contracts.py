@@ -282,6 +282,44 @@ def _bounded_visible_mapping(
     )
 
 
+def _bounded_mapping_confidence(
+    confidence: MappingConfidence,
+    source_unit: SourceUnitRef | None,
+    visible_location: VisibleSourceLocation | None,
+    related_visible_span: SourceSpan | None,
+    synthetic_region: str | None,
+    dependency_anchor: SourceSpan | None,
+    method_anchor: SourceSpan | None,
+) -> bool:
+    if confidence is MappingConfidence.EXACT:
+        return source_unit is not None and visible_location is not None
+    if confidence is MappingConfidence.NEAREST:
+        return (
+            source_unit is not None
+            and visible_location is None
+            and related_visible_span is not None
+        )
+    if confidence is MappingConfidence.SYNTHETIC:
+        return (
+            visible_location is None
+            and synthetic_region is not None
+            and (source_unit is None) == (related_visible_span is None)
+        )
+    if confidence is MappingConfidence.UNKNOWN:
+        return all(
+            value is None
+            for value in (
+                source_unit,
+                visible_location,
+                related_visible_span,
+                synthetic_region,
+                dependency_anchor,
+                method_anchor,
+            )
+        )
+    return False
+
+
 def _bounded_trace_frame_fields(frame: ErrorTraceFrame) -> bool:
     if type(frame.mapping_confidence) is not MappingConfidence:
         return False
@@ -361,7 +399,15 @@ def _bounded_trace_frame_fields(frame: ErrorTraceFrame) -> bool:
         or _DIAGNOSTIC_LABEL_RE.fullmatch(frame.synthetic_region) is None
     ):
         return False
-    return True
+    return _bounded_mapping_confidence(
+        frame.mapping_confidence,
+        frame.source_unit,
+        frame.visible_location,
+        frame.related_visible_span,
+        frame.synthetic_region,
+        frame.dependency_anchor,
+        frame.method_anchor,
+    )
 
 
 def _frame_has_no_generated_mapping(frame: ErrorTraceFrame) -> bool:
@@ -392,31 +438,8 @@ def _frame_has_no_worker_provenance(frame: ErrorTraceFrame) -> bool:
     )
 
 
-def _matches_worker_projection(
-    frame: ErrorTraceFrame,
-    projection: WorkerRuntimeFrameDiagnostic,
-) -> bool:
-    return (
-        frame.registration_name is not None
-        and frame.registration_name.casefold()
-        == projection.registration_name.casefold()
-        and frame.logical_name == projection.logical_name
-        and frame.revision == projection.revision
-        and frame.artifact_sha256 == projection.artifact_sha256
-        and frame.mapping_confidence is projection.mapping_confidence
-        and frame.source_unit == projection.source_unit
-        and frame.visible_location == projection.visible_location
-        and frame.related_visible_span == projection.related_visible_span
-        and frame.lowered_location == projection.lowered_location
-        and frame.synthetic_region == projection.synthetic_region
-        and frame.dependency_anchor == projection.dependency_anchor
-        and frame.method_anchor == projection.method_anchor
-    )
-
-
 def _bounded_origin_specific_trace_fields(
     frame: ErrorTraceFrame,
-    worker_frames: tuple[WorkerRuntimeFrameDiagnostic, ...],
 ) -> bool:
     location = frame.platform_location
     if frame.origin is ErrorTraceFrameOrigin.NATIVE_MODULE:
@@ -439,10 +462,7 @@ def _bounded_origin_specific_trace_fields(
             != frame.registration_name.casefold()
         ):
             return False
-        return any(
-            _matches_worker_projection(frame, projection)
-            for projection in worker_frames
-        )
+        return True
     if frame.origin is ErrorTraceFrameOrigin.UNKNOWN:
         if (
             frame.mapping_confidence is not MappingConfidence.UNKNOWN
@@ -553,10 +573,20 @@ def _bounded_worker_frame(value: object) -> bool:
         )
     ):
         return False
-    return value.synthetic_region is None or (
-        type(value.synthetic_region) is str
-        and len(value.synthetic_region) <= MAX_DIAGNOSTIC_LABEL_LENGTH
-        and _DIAGNOSTIC_LABEL_RE.fullmatch(value.synthetic_region) is not None
+    if value.synthetic_region is not None and (
+        type(value.synthetic_region) is not str
+        or len(value.synthetic_region) > MAX_DIAGNOSTIC_LABEL_LENGTH
+        or _DIAGNOSTIC_LABEL_RE.fullmatch(value.synthetic_region) is None
+    ):
+        return False
+    return _bounded_mapping_confidence(
+        value.mapping_confidence,
+        value.source_unit,
+        value.visible_location,
+        value.related_visible_span,
+        value.synthetic_region,
+        value.dependency_anchor,
+        value.method_anchor,
     )
 
 
@@ -613,10 +643,7 @@ def _bounded_trace(
             or not _bounded_platform_location(frame.platform_location)
             or not _bounded_trace_origin(frame)
             or not _bounded_trace_frame_fields(frame)
-            or not _bounded_origin_specific_trace_fields(
-                frame,
-                value.worker_frames,
-            )
+            or not _bounded_origin_specific_trace_fields(frame)
             or not _bounded_diagnostic_span(frame.block_span, text_length)
             or (
                 frame.detail_span is not None

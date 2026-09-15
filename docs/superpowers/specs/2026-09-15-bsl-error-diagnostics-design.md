@@ -36,7 +36,7 @@ This first, independently deliverable core tranche does not:
 - stop on RDBG exceptions or request a live debugger stack;
 - change operation coordination, capture fencing, or generation pin lifetime;
 - introduce a configuration `source_root` resolver;
-- change Jupyter rendering or MCP schemas;
+- change Jupyter rendering or MCP schemas beyond the user-approved diagnostic-path exception: preserve one 64 KiB UTF-8 verbatim expert/private value and remove arbitrary platform prose from presentation, without expanding wire key sets or compact/public output;
 - expose source text in public artifacts;
 - unify postmortem error traces with live capture frames or live variable inspection.
 
@@ -274,8 +274,8 @@ The parallel capture-inspection plan overlaps in runtime orchestration and adapt
 | `prototype_runtime.py`, `runtime_api.py`, `session.py` | Do not modify | Coordinate after capture lifecycle changes |
 | Configuration module resolver / `source_root` | Do not implement | Reuse the capture configuration-source resolver; never create a second resolver |
 | Live stopped-call stack and variables | Separate types | Capture owns `StackPage`/`DebugFrame`; may later share module identity/location primitives only |
-| Jupyter rendering | Do not modify | Integrate after capture Jupyter changes |
-| MCP contracts and schemas | Do not modify | Integrate after capture MCP changes |
+| Jupyter rendering | Only remove arbitrary platform prose from presentation; keep compact/public omission | Broader rendering remains a later integration |
+| MCP contracts and schemas | Only preserve the shared 64 KiB verbatim expert/private diagnostic path; do not add keys | Broader MCP integration remains later |
 | 1C extension | No changes | No changes required |
 
 To keep the tranche independently mergeable, implementation is limited to:
@@ -284,7 +284,7 @@ To keep the tranche independently mergeable, implementation is limited to:
 - `src/onec_runtime/runtime_contracts.py` for validation and the private-text bound;
 - focused diagnostic and contract tests.
 
-It deliberately avoids `errors.py`, runtime orchestration, configuration resolution, RDBG, and extension sources. The approved evidence-bound work may touch privacy and MCP diagnostic transport only to preserve the same verbatim 64 KiB private/expert evidence; it does not change compact/public omission, wire key sets, or adapter rendering.
+It deliberately avoids `errors.py`, runtime orchestration, configuration resolution, RDBG, and extension sources. The approved diagnostic-path exception may touch privacy, Jupyter presentation, and MCP transport only to preserve the same verbatim 64 KiB private/expert evidence and remove arbitrary platform prose from presentation; it does not change compact/public omission or wire key sets.
 
 ## Test strategy
 

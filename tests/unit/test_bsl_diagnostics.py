@@ -1662,6 +1662,83 @@ def test_pinned_worker_trace_honors_explicit_stage_and_legacy_wrapper_execution(
     assert legacy.diagnostic_id == explicit_execution.diagnostic_id
 
 
+def test_sanitizer_keeps_pinned_worker_trace_beyond_legacy_location_cap() -> None:
+    """Break caught: independent legacy retention cannot erase a valid trace frame."""
+    from onec_runtime.runtime_contracts import sanitize_normalized_diagnostic
+
+    manifest = "c" * 64
+    worker = _worker_diagnostic_artifact(
+        "ПозднийМодуль",
+        18,
+        "OnecRuntime_bbbbbbbb_bbbbbbbbbbbbbbbb",
+        "b" * 64,
+        manifest,
+    )
+    raw = (
+        "{<Неизвестный модуль>(10000001,1)}: skipped\n" * 128
+        + "{ВнешняяОбработка."
+        + worker.registration_name
+        + ".МодульОбъекта(1,1)}: retained"
+    )
+
+    parsed = parse_platform_diagnostic(raw)
+    diagnostic = remap_worker_runtime_diagnostic(
+        parsed,
+        pinned_manifest_sha256=manifest,
+        pinned_artifacts=(worker,),
+    )
+
+    assert len(parsed.locations) == 128
+    assert len(parsed.frames) == 1
+    assert diagnostic.frames[0].mapping_confidence is MappingConfidence.EXACT
+    assert all(
+        frame.mapping_confidence is MappingConfidence.UNKNOWN
+        for frame in diagnostic.worker_frames
+    )
+    assert sanitize_normalized_diagnostic(diagnostic) is not None
+
+
+def test_sanitizer_keeps_exact_trace_after_one_shot_legacy_worker_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: legacy fallback and trace mapping fail independently."""
+    import onec_runtime.bsl.diagnostics as diagnostics_module
+    from onec_runtime.runtime_contracts import sanitize_normalized_diagnostic
+
+    manifest = "c" * 64
+    worker = _worker_diagnostic_artifact(
+        "МодульБ",
+        18,
+        "OnecRuntime_bbbbbbbb_bbbbbbbbbbbbbbbb",
+        "b" * 64,
+        manifest,
+    )
+    real_mapper = diagnostics_module._worker_runtime_frame
+    calls = 0
+
+    def fail_once(location, artifact, observed_registration):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ValueError("injected legacy-only failure")
+        return real_mapper(location, artifact, observed_registration)
+
+    monkeypatch.setattr(diagnostics_module, "_worker_runtime_frame", fail_once)
+    diagnostic = remap_worker_runtime_diagnostic(
+        parse_platform_diagnostic(
+            "{ВнешняяОбработка."
+            f"{worker.registration_name}.МодульОбъекта(1,1)}}: worker"
+        ),
+        pinned_manifest_sha256=manifest,
+        pinned_artifacts=(worker,),
+    )
+
+    assert calls == 2
+    assert diagnostic.worker_frames[0].mapping_confidence is MappingConfidence.UNKNOWN
+    assert diagnostic.frames[0].mapping_confidence is MappingConfidence.EXACT
+    assert sanitize_normalized_diagnostic(diagnostic) is not None
+
+
 def test_runtime_canonical_line_only_worker_frames_map_exactly_in_order() -> None:
     manifest = "c" * 64
     source_a = "Функция А() Экспорт\n    Возврат 1;\nКонецФункции"
