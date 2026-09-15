@@ -15,7 +15,7 @@ from traitlets.config import Config
 import pytest
 
 from onec_runtime.runtime_api import RuntimeNamespaceSnapshot
-from onec_runtime.errors import ProtocolError, StaleCaptureError
+from onec_runtime.errors import ProtocolError, StaleCaptureError, TargetLost
 from onec_runtime.recovery_journal import RecoveryJournal
 from onec_runtime.runtime_api import PrototypeRuntimeApi
 from onec_runtime.worker_universe import (
@@ -32,7 +32,13 @@ from test_capture_control_plane import (
     observe_shutdown_control_plane,
     start_shutdown_evaluation,
 )
-from test_prototype_runtime import captured_controller
+from test_prototype_runtime import (
+    CAPTURE_A,
+    SERVICE,
+    ScriptedSession,
+    captured_controller,
+    evaluation,
+)
 from test_runtime_api import (
     _UniverseInstructionExecutor,
     _common_module_catalog,
@@ -85,6 +91,45 @@ class _ShutdownTransport:
 
 
 class _ServerShutdownCaptureSession(ShutdownBlockingCaptureSession):
+    def terminate_bound_server_session(self) -> bool:
+        self.shutdown_timeline.append("server_termination_requested")
+        return True
+
+    def detach(self) -> None:
+        self.shutdown_timeline.append("debug_ui_detached")
+
+
+class _ServerResumeShutdownSession(ScriptedSession):
+    """A real controller-owned resume held after Continue until shutdown."""
+
+    def __init__(self, *, wake_on_invalidate: bool = True) -> None:
+        super().__init__((CAPTURE_A, SERVICE))
+        self.wake_on_invalidate = wake_on_invalidate
+        self.next_stop_wait_entered = Event()
+        self.next_stop_release = Event()
+        self.shutdown_timeline: list[str] = []
+
+    def evaluate(self, expression: str, **kwargs: object):  # type: ignore[no-untyped-def]
+        if "ПинПоколенияWorker" in expression:
+            return evaluation("Булево", "Истина")
+        return super().evaluate(expression, **kwargs)
+
+    def wait_for_any_stop(self, *, timeout_s: float):  # type: ignore[no-untyped-def]
+        if self.continue_count >= 2:
+            self.next_stop_wait_entered.set()
+            assert self.next_stop_release.wait(2), "shutdown did not release next stop"
+            if self.invalidated:
+                raise TargetLost("planned target termination during CAPTURE resume")
+        return super().wait_for_any_stop(timeout_s=timeout_s)
+
+    def invalidate(self) -> None:
+        if self.invalidated:
+            return
+        self.shutdown_timeline.append("transport_invalidated")
+        super().invalidate()
+        if self.wake_on_invalidate:
+            self.next_stop_release.set()
+
     def terminate_bound_server_session(self) -> bool:
         self.shutdown_timeline.append("server_termination_requested")
         return True
@@ -808,6 +853,226 @@ def test_late_worker_exit_keeps_abandoned_shutdown_retryable(
                 pass
         if not wrapper._closed:
             wrapper.close()
+
+
+@pytest.mark.parametrize("shutdown_entry", ("normal", "kernel"))
+@pytest.mark.parametrize("waiter", ("attached", "detached"))
+def test_runtime_session_shutdown_finishes_attached_or_detached_controller_resume(
+    tmp_path: Path,
+    shutdown_entry: str,
+    waiter: str,
+) -> None:
+    """Target shutdown owns a live post-Continue resume for both public paths."""
+
+    rdbg = _ServerResumeShutdownSession()
+    journal = RecoveryJournal()
+    controller = captured_controller(
+        rdbg,
+        command_timeout_s=0.05,
+        journal=journal,
+    )
+    api, _target, handle = _real_worker_shutdown_api(tmp_path, controller, journal)
+    host = api._worker_universe
+    target_registry = api._worker_universe_target
+    registration_keys = tuple(sorted(target_registry._registrations, key=str.casefold))
+    assert len(registration_keys) == 2
+    pin = host.pin_active()
+    assert pin.handle is handle
+    api._operation_generation_pin = pin
+    runtime = _shutdown_runtime_session(rdbg, api, server=True)
+    active = SimpleNamespace(
+        ticket_id="capture-ticket",
+        capture_intent_id="capture-intent",
+        operation_id="operation",
+        capture_generation=controller.runtime_generation,
+        source_revision=1,
+        source_sha256="a" * 64,
+        stop_sequence=controller.stop_sequence,
+    )
+    runtime._active_capture_ticket = active
+    runtime._capture_resume_listeners = []
+    delivered: list[object] = []
+    runtime.add_capture_resume_listener(delivered.append)
+    old_view = api.current_capture()
+    resume_errors: list[BaseException] = []
+    resume_thread: Thread | None = None
+
+    def resume_attached() -> None:
+        try:
+            runtime.resume_capture(dirty_roots=("Скаляр",))
+        except BaseException as error:
+            resume_errors.append(error)
+
+    if waiter == "attached":
+        resume_thread = Thread(
+            target=resume_attached,
+            name="attached-capture-resume",
+            daemon=True,
+        )
+        resume_thread.start()
+    else:
+        with pytest.raises(TimeoutError, match="resume remains pending"):
+            runtime.resume_capture(dirty_roots=("Скаляр",), timeout_s=0.01)
+
+    close_thread: Thread | None = None
+    try:
+        assert rdbg.next_stop_wait_entered.wait(1)
+        assert api.status().state.value == "resuming"
+        assert old_view.status().phase.value == "stale"
+        assert api.operation_worker_generation is handle
+        assert host._leases
+        with pytest.raises(ProtocolError, match="already executing|CAPTURE"):
+            runtime.execute_bsl("НоваяКоманда = 1;")
+
+        shutdown = (
+            runtime.close
+            if shutdown_entry == "normal"
+            else runtime.close_for_kernel_shutdown
+        )
+        close_thread, close_finished, close_errors = _start_shutdown_thread(
+            shutdown,
+            rdbg.shutdown_timeline,
+        )
+        assert close_finished.wait(2), "RuntimeSession shutdown exceeded its bound"
+        close_thread.join(1)
+        assert not close_thread.is_alive()
+        assert close_errors == []
+
+        if resume_thread is not None:
+            resume_thread.join(1)
+            assert not resume_thread.is_alive()
+            assert len(resume_errors) == 1
+            assert isinstance(resume_errors[0], TargetLost)
+
+        deadline = monotonic() + 1
+        while runtime._active_capture_ticket is not None:
+            assert monotonic() < deadline, "Session resume fence was not retired"
+            Event().wait(0.002)
+        assert len(delivered) == 1
+        assert rdbg.continue_count == 2
+        assert runtime.is_closed is True
+        assert api._capture_shutdown_finished is True
+        assert api._capture_shutdown_termination_proven is True
+        assert api._target_terminated is True
+        assert api._data_plane_finalized is True
+        assert api._closed is True
+        assert host.state is WorkerUniverseState.CLOSED
+        assert host._leases == {}
+        assert host._registration_refcounts == {}
+        assert target_registry._registrations == {}
+        assert api._worker_generation_handle is None
+        assert api._api_owned_worker_generation_handle is None
+        assert api._operation_generation_pin is None
+        assert api._preparing_generation_pin is None
+        assert api._evaluation_generation_pin is None
+
+        runtime.close()
+        runtime.close_for_kernel_shutdown()
+        assert len(delivered) == 1
+        assert rdbg.continue_count == 2
+    finally:
+        rdbg.next_stop_release.set()
+        if resume_thread is not None:
+            resume_thread.join(2)
+        if close_thread is not None:
+            close_thread.join(2)
+        controller.shutdown_capture_evaluation()
+        if not runtime.is_closed:
+            try:
+                runtime.close_for_kernel_shutdown()
+            except ProtocolError:
+                pass
+
+
+@pytest.mark.parametrize("shutdown_entry", ("normal", "kernel"))
+def test_target_death_finalizes_real_worker_while_detached_resume_exits_late(
+    tmp_path: Path,
+    shutdown_entry: str,
+) -> None:
+    """A late resume worker cannot retain the old MAIN's Worker ownership."""
+
+    rdbg = _ServerResumeShutdownSession(wake_on_invalidate=False)
+    journal = RecoveryJournal()
+    controller = captured_controller(
+        rdbg,
+        command_timeout_s=0.05,
+        journal=journal,
+    )
+    api, _target, handle = _real_worker_shutdown_api(tmp_path, controller, journal)
+    host = api._worker_universe
+    target_registry = api._worker_universe_target
+    pin = host.pin_active()
+    assert pin.handle is handle
+    api._operation_generation_pin = pin
+    runtime = _shutdown_runtime_session(rdbg, api, server=True)
+    active = SimpleNamespace(
+        ticket_id="capture-ticket",
+        capture_intent_id="capture-intent",
+        operation_id="operation",
+        capture_generation=controller.runtime_generation,
+        source_revision=1,
+        source_sha256="a" * 64,
+        stop_sequence=controller.stop_sequence,
+    )
+    runtime._active_capture_ticket = active
+    runtime._capture_resume_listeners = []
+    delivered: list[object] = []
+    runtime.add_capture_resume_listener(delivered.append)
+
+    try:
+        with pytest.raises(TimeoutError, match="resume remains pending"):
+            runtime.resume_capture(dirty_roots=("Скаляр",), timeout_s=0.01)
+        assert rdbg.next_stop_wait_entered.wait(1)
+        owner = controller._capture_evaluation_coordinator
+        assert owner is not None
+
+        shutdown = (
+            runtime.close
+            if shutdown_entry == "normal"
+            else runtime.close_for_kernel_shutdown
+        )
+        close_thread, close_finished, close_errors = _start_shutdown_thread(
+            shutdown,
+            rdbg.shutdown_timeline,
+        )
+        assert close_finished.wait(1), "target-death shutdown exceeded its bound"
+        close_thread.join(1)
+        assert close_errors == []
+        assert owner.join(0) is False
+        assert api._capture_shutdown_finished is True
+        assert api._capture_shutdown_termination_proven is False
+        assert api._target_terminated is True
+        assert api._data_plane_finalized is True
+        assert runtime.is_closed is True
+        assert host.state is WorkerUniverseState.CLOSED
+        assert host._leases == {}
+        assert host._registration_refcounts == {}
+        assert target_registry._registrations == {}
+        assert target_registry._broken is True
+        assert api._worker_generation_handle is None
+        assert api._operation_generation_pin is None
+
+        # The explicit public retry remains bounded while the owner is still
+        # alive, then remains idempotent after the delayed RDBG exit.
+        api.close()
+        assert owner.join(0) is False
+        rdbg.next_stop_release.set()
+        assert owner.join(1), "late resume owner did not exit"
+        api.close()
+        deadline = monotonic() + 1
+        while runtime._active_capture_ticket is not None:
+            assert monotonic() < deadline, "late detached resume stranded Session"
+            Event().wait(0.002)
+        assert len(delivered) == 1
+        assert rdbg.continue_count == 2
+    finally:
+        rdbg.next_stop_release.set()
+        controller.shutdown_capture_evaluation()
+        if not runtime.is_closed:
+            try:
+                runtime.close_for_kernel_shutdown()
+            except ProtocolError:
+                pass
 
 
 @pytest.mark.parametrize("first_entry", ("normal", "kernel"))

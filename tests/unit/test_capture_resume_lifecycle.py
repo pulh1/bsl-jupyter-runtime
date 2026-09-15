@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from pathlib import Path
 from threading import Event, RLock, Thread, current_thread, get_ident
 from types import SimpleNamespace
 from time import monotonic, sleep
@@ -8,12 +9,37 @@ from time import monotonic, sleep
 import pytest
 
 from onec_runtime.capture_evaluation import CapturePhase, CaptureResumeTicket
-from onec_runtime.errors import CaptureBusyError, CaptureRecoveryRequiredError
+from onec_runtime.errors import (
+    CaptureBusyError,
+    CaptureRecoveryRequiredError,
+    ProtocolError,
+    RdbgTransportError,
+)
 from onec_runtime.prototype_runtime import OperationState, PartialWritebackError
 from onec_runtime.runtime_api import PrototypeRuntimeApi, RuntimeReplyKind
 from onec_runtime.session import RuntimeSession
+from onec_runtime.fault_injection import FaultPoint
+from onec_runtime.worker_universe import (
+    WorkerModuleArtifactBuilder,
+    WorkerModuleArtifactCache,
+)
 
-from test_prototype_runtime import CAPTURE_A, CAPTURE_B, SERVICE, USER, ScriptedSession, captured_controller
+from test_prototype_runtime import (
+    CAPTURE_A,
+    CAPTURE_B,
+    SERVICE,
+    USER,
+    ScriptedSession,
+    captured_controller,
+    evaluation,
+    runtime_module,
+)
+from test_runtime_api import (
+    _UniverseInstructionExecutor,
+    _common_module_catalog,
+    _notebook_worker_builder,
+    _worker_module_unit,
+)
 
 
 class ResumeBarrierSession(ScriptedSession):
@@ -38,6 +64,15 @@ class ResumeBarrierSession(ScriptedSession):
             self.next_stop_wait_entered.set()
             assert self.release_next_stop.wait(2), "next stop was not released"
         return super().wait_for_any_stop(timeout_s=timeout_s)
+
+
+class WorkerResumeBarrierSession(ResumeBarrierSession):
+    """Model the two trusted CAPTURE pin helpers around a real Worker host."""
+
+    def evaluate(self, expression: str, **kwargs: object):  # type: ignore[no-untyped-def]
+        if "ПинПоколенияWorker" in expression:
+            return evaluation("Булево", "Истина")
+        return super().evaluate(expression, **kwargs)
 
 
 class ResumeBoundarySession(ScriptedSession):
@@ -108,6 +143,8 @@ def test_resume_admission_is_controller_owned_before_root_export_and_preserves_n
     controller = captured_controller(session, command_timeout_s=1)
     api = PrototypeRuntimeApi(controller)
     old_view = api.current_capture()
+    initial_status = api.status()
+    initial_namespace = api.namespace_snapshot()
     replies: list[object] = []
     failures: list[BaseException] = []
 
@@ -146,15 +183,106 @@ def test_resume_admission_is_controller_owned_before_root_export_and_preserves_n
         assert len(replies) == 1
         assert replies[0].kind is expected_kind
         assert session.continue_count == 2
+        assert api.status().runtime_generation == initial_status.runtime_generation
+        assert api.namespace_snapshot() == initial_namespace
 
         if expected_kind is RuntimeReplyKind.MAIN_COMPLETED:
             next_main = api.execute_bsl("СледующаяКоманда = 1;")
             assert next_main.kind is RuntimeReplyKind.MAIN_COMPLETED
             assert next_main.operation_id == replies[0].operation_id + 1
+        elif expected_kind is RuntimeReplyKind.CAPTURED:
+            successor = api.current_capture()
+            assert successor != old_view
+            assert successor.operation_id == old_view.operation_id
+            assert successor.capture_generation == old_view.capture_generation
+            assert successor.stop_sequence > old_view.stop_sequence
+            assert successor.status().phase is CapturePhase.PAUSED
+        else:
+            assert api.status().state is OperationState.DEBUG_STOPPED
+            with pytest.raises(ProtocolError, match="current state is debug_stopped"):
+                api.execute_bsl("НоваяКоманда = 1;")
     finally:
         session.release_root_export.set()
         session.release_next_stop.set()
         thread.join(timeout=2)
+        controller.shutdown_capture_evaluation()
+
+
+def test_detached_resume_preserves_real_worker_pin_and_context_until_terminal(
+    tmp_path: Path,
+) -> None:
+    """The accepted owner retains one old MAIN identity through its next event."""
+
+    session = WorkerResumeBarrierSession((CAPTURE_A, SERVICE, SERVICE))
+    controller = runtime_module().PrototypeRuntimeController(session, SERVICE)
+    catalog = _common_module_catalog("МодульА")
+    builder = _notebook_worker_builder(tmp_path)
+    target = _UniverseInstructionExecutor()
+    api = PrototypeRuntimeApi(
+        controller,
+        capture_points=(CAPTURE_A, CAPTURE_B),
+        user_breakpoints=(USER,),
+        notebook_worker_builder=builder,
+        worker_module_builder=WorkerModuleArtifactBuilder(
+            builder,
+            cache=WorkerModuleArtifactCache(),
+            packer_version="worker-epf-v1",
+            target_profile=catalog.profile,
+        ),
+        worker_instruction_executor=target,
+    )
+    handle = api.load_worker_modules(
+        (_worker_module_unit("МодульА", 17, catalog),),
+        common_modules=catalog,
+    )
+    host = api._worker_universe
+    initial = api.execute_bsl("СохраненноеИмя = 1;")
+    assert initial.kind is RuntimeReplyKind.CAPTURED
+    assert api.operation_worker_generation is handle
+    old_view = api.current_capture()
+    before = api.status()
+    session.release_root_export.set()
+
+    try:
+        with pytest.raises(TimeoutError, match="resume remains pending"):
+            api.resume_capture(dirty_roots=("Скаляр",), timeout_s=0.01)
+        assert session.next_stop_wait_entered.wait(1)
+
+        # A detached caller has no writer ownership, but the old MAIN's exact
+        # Worker generation, runtime/context identity, and pending namespace
+        # remain live until the controller receives the next RDBG event.
+        assert api.status().state is OperationState.RESUMING
+        assert api.status().runtime_generation == before.runtime_generation
+        assert api.namespace_snapshot().context_generation == 1
+        assert api.operation_worker_generation is handle
+        assert old_view.status().phase is CapturePhase.STALE
+        assert host._leases
+        with pytest.raises(CaptureBusyError):
+            api.execute_bsl("ЗапрещеноВоВремяResume = 1;")
+
+        session.release_next_stop.set()
+        eventually(lambda: controller.state is OperationState.COMPLETED)
+        assert api.operation_worker_generation is None
+        assert host._leases == {}
+        assert api.namespace_snapshot().names == ("СохраненноеИмя",)
+        assert "Скаляр" not in api.namespace_snapshot().names
+
+        # The next MAIN stays on the same runtime/session and observes the
+        # committed namespace only after the old controller-owned operation
+        # became terminal.
+        next_main = api.execute_bsl("СледующееИмя = 2;")
+        assert next_main.kind is RuntimeReplyKind.MAIN_COMPLETED
+        assert next_main.operation_id == initial.operation_id + 1
+        assert api.status().runtime_generation == before.runtime_generation
+        assert controller.session is session
+        assert api.namespace_snapshot().names == (
+            "СохраненноеИмя",
+            "СледующееИмя",
+        )
+        assert session.continue_count == 3
+    finally:
+        session.release_root_export.set()
+        session.release_next_stop.set()
         controller.shutdown_capture_evaluation()
 
 
@@ -334,8 +462,7 @@ def test_interrupt_at_every_resume_boundary_keeps_the_same_worker_plan(
         timeout_s: float | None = None,
     ) -> object:
         assert rdbg.entered.wait(1), f"{stage} was never reached"
-        with ticket._coordinator._condition:
-            ticket._coordinator._detach_resume_locked(ticket._record)
+        del ticket, timeout_s
         raise KeyboardInterrupt
 
     monkeypatch.setattr(CaptureResumeTicket, "wait_initiator", interrupt_after_boundary)
@@ -391,6 +518,107 @@ def test_failed_writeback_publishes_typed_recovery_instead_of_stale_capture() ->
         assert api.status().state is OperationState.RECOVERING
         with pytest.raises(CaptureRecoveryRequiredError):
             api.resume_capture()
+    finally:
+        controller.shutdown_capture_evaluation()
+
+
+def test_confirmed_pre_mutation_writeback_failure_keeps_the_session_capture_paused() -> None:
+    """A rejected root export cannot discard the still-live CAPTURE fence."""
+
+    class RootExportFailureSession(ScriptedSession):
+        fail_export = True
+
+        def evaluate(self, expression: str, **kwargs: object):  # type: ignore[no-untyped-def]
+            if self.fail_export and "ПоместитьЗначениеКонтекстаОтладки" in expression:
+                return evaluation("Ошибка", "", error="planned root export failure")
+            return super().evaluate(expression, **kwargs)
+
+    rdbg = RootExportFailureSession((CAPTURE_A, SERVICE))
+    controller = captured_controller(rdbg, command_timeout_s=1)
+    api = PrototypeRuntimeApi(controller)
+    runtime = object.__new__(RuntimeSession)
+    runtime._operation_lock = RLock()
+    runtime._capture_resume_listeners = []
+    active = SimpleNamespace(
+        ticket_id="capture-ticket",
+        capture_intent_id="intent",
+        operation_id="operation",
+        capture_generation=1,
+        source_revision=1,
+        source_sha256="a" * 64,
+        stop_sequence=1,
+    )
+    runtime._active_capture_ticket = active
+    runtime.runtime_api = api
+    delivered: list[object] = []
+    runtime.add_capture_resume_listener(delivered.append)
+    old_view = api.current_capture()
+    try:
+        with pytest.raises(PartialWritebackError, match="root export failure"):
+            runtime.resume_capture(dirty_roots=("Скаляр",))
+
+        assert controller.state is OperationState.CAPTURED
+        assert old_view.status().phase is CapturePhase.PAUSED
+        assert runtime._active_capture_ticket is active
+        assert delivered == []
+        assert rdbg.continue_count == 1
+
+        rdbg.fail_export = False
+        completed = runtime.resume_capture(dirty_roots=("Скаляр",))
+        assert completed.kind is RuntimeReplyKind.MAIN_COMPLETED
+        assert runtime._active_capture_ticket is None
+        assert len(delivered) == 1
+        assert rdbg.continue_count == 2
+    finally:
+        controller.shutdown_capture_evaluation()
+
+
+@pytest.mark.parametrize(
+    ("stage", "expected_error", "expected_continue_count"),
+    (
+        ("after-first-root", RdbgTransportError, 1),
+        ("cleanup", PartialWritebackError, 1),
+        ("continue", RdbgTransportError, 2),
+    ),
+)
+def test_resume_failure_after_mutation_or_required_step_requires_recovery(
+    stage: str,
+    expected_error: type[BaseException],
+    expected_continue_count: int,
+) -> None:
+    """Only a proven pre-mutation rejection may retain a paused capture."""
+
+    class RequiredStepFailureSession(ScriptedSession):
+        def evaluate(self, expression: str, **kwargs: object):  # type: ignore[no-untyped-def]
+            if stage == "cleanup" and "ЗавершитьКонтекстОтладки" in expression:
+                return evaluation("Ошибка", "", error="planned cleanup failure")
+            return super().evaluate(expression, **kwargs)
+
+        def continue_(self) -> None:
+            super().continue_()
+            if stage == "continue" and self.continue_count == 2:
+                raise RdbgTransportError("planned uncertain Continue")
+
+    def fault(point: FaultPoint) -> None:
+        if stage == "after-first-root" and point is FaultPoint.AFTER_FIRST_ROOT_WRITE:
+            raise RdbgTransportError("planned post-mutation transport loss")
+
+    rdbg = RequiredStepFailureSession((CAPTURE_A, SERVICE))
+    controller = captured_controller(rdbg, command_timeout_s=1, fault_hook=fault)
+    api = PrototypeRuntimeApi(controller)
+    old_view = api.current_capture()
+    try:
+        with pytest.raises(expected_error):
+            api.resume_capture(dirty_roots=("Скаляр",))
+
+        assert controller.state in {
+            OperationState.PARTIAL_WRITEBACK_FAILURE,
+            OperationState.RECOVERING,
+        }
+        assert old_view.status().phase is CapturePhase.RECOVERY_REQUIRED
+        with pytest.raises(CaptureRecoveryRequiredError):
+            api.resume_capture()
+        assert rdbg.continue_count == expected_continue_count
     finally:
         controller.shutdown_capture_evaluation()
 
