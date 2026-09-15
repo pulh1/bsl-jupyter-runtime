@@ -39,6 +39,7 @@ from onec_runtime.errors import (
     CaptureRecoveryRequiredError,
     NoActiveCaptureError,
     NoCaptureEvaluationError,
+    ProtocolError,
     StaleCaptureError,
     TargetLost,
     WorkerPromotionOutcomeUnknown,
@@ -463,6 +464,7 @@ def start_shutdown_evaluation(
     transport: ShutdownBlockingCaptureSession,
     *,
     completion=None,  # type: ignore[no-untyped-def]
+    pin_lease=None,  # type: ignore[no-untyped-def]
 ):  # type: ignore[no-untyped-def]
     owner = _capture_owner(controller)
 
@@ -511,8 +513,12 @@ def start_shutdown_evaluation(
         dispatch,
         poll,
         lambda _result: 901,
-        pin_lease=lambda disposition: transport.shutdown_timeline.append(
-            "pin_" + disposition
+        pin_lease=(
+            pin_lease
+            if pin_lease is not None
+            else lambda disposition: transport.shutdown_timeline.append(
+                "pin_" + disposition
+            )
         ),
         cleanup_leases=(cleanup,),
         completion=completion,
@@ -1102,6 +1108,145 @@ def test_unproven_close_claim_prevents_late_worker_disposition() -> None:
         closer.join(_JOIN_TIMEOUT_S)
 
     assert not closer.is_alive()
+
+
+def test_unproven_close_does_not_claim_retained_while_pin_is_in_flight() -> None:
+    pin_entered = Event()
+    release_pin = Event()
+
+    def blocking_pin(disposition: str) -> None:
+        pin_entered.set()
+        assert release_pin.wait(_JOIN_TIMEOUT_S)
+        transport.shutdown_timeline.append("pin_" + disposition)
+
+    transport = ShutdownBlockingCaptureSession(
+        wake_on_invalidate=False,
+        result_on_release=True,
+    )
+    journal = RecoveryJournal()
+    controller = captured_controller(
+        transport,
+        command_timeout_s=0.05,
+        journal=journal,
+    )
+    api = PrototypeRuntimeApi(controller, journal=journal)
+    owner, ticket, cleanup_probe = start_shutdown_evaluation(
+        controller,
+        transport,
+        pin_lease=blocking_pin,
+    )
+    evaluation_id = ticket.evaluation_id
+    del ticket
+    transport.shutdown_poll_release.set()
+    assert pin_entered.wait(1), "pin disposition did not enter"
+
+    closer, finished, close_errors = _run_close(
+        api.close,
+        transport.shutdown_timeline,
+    )
+    try:
+        assert finished.wait(0.6), "in-flight disposition close was not bounded"
+        assert len(close_errors) == 1
+        assert isinstance(close_errors[0], ProtocolError)
+        assert "private" not in (str(close_errors[0]) + repr(close_errors[0]))
+        assert not any(
+            event.event == "capture_evaluation_shutdown_abandoned"
+            for event in journal.events
+        )
+        assert "pin_release" not in transport.shutdown_timeline
+        assert "pin_quarantine" not in transport.shutdown_timeline
+        assert cleanup_probe.dispositions == []
+        assert cleanup_probe.is_product_owned
+
+        release_pin.set()
+        assert owner.join(_JOIN_TIMEOUT_S), "worker did not exit after pin rescue"
+        assert transport.shutdown_timeline.count("pin_release") == 1
+        assert not any(
+            event.event == "capture_evaluation_shutdown_abandoned"
+            for event in journal.events
+        )
+        assert cleanup_probe.dispositions == []
+        assert cleanup_probe.is_product_owned
+
+        api.close()
+        disposed = [
+            event
+            for event in journal.events
+            if event.event == "capture_evaluation_shutdown_disposed"
+        ]
+        assert len(disposed) == 1
+        assert disposed[0].fields["evaluation_id"] == evaluation_id
+        assert disposed[0].fields["pin_disposition"] == "release"
+        assert cleanup_probe.dispositions == [
+            (cleanup_probe.lease_identity, "release")
+        ]
+        assert transport.shutdown_timeline.count("pin_release") == 1
+    finally:
+        release_pin.set()
+        transport.shutdown_poll_release.set()
+        owner.begin_close()
+        assert owner.join(_JOIN_TIMEOUT_S)
+        closer.join(_JOIN_TIMEOUT_S)
+
+
+def test_runtime_api_pin_failure_remains_unknown_and_never_becomes_noop_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = ShutdownBlockingCaptureSession(
+        wake_on_invalidate=True,
+        result_on_release=True,
+    )
+    journal = RecoveryJournal()
+    controller = captured_controller(
+        transport,
+        command_timeout_s=0.05,
+        journal=journal,
+    )
+    api = PrototypeRuntimeApi(controller, journal=journal)
+    physical_pin = object()
+    api._evaluation_generation_pin = physical_pin  # type: ignore[assignment]
+    physical_attempts = []
+
+    def fail_physical_release(pin):  # type: ignore[no-untyped-def]
+        physical_attempts.append(pin)
+        raise RuntimeError("private physical Worker pin failure")
+
+    monkeypatch.setattr(api, "_release_generation_pin_locked", fail_physical_release)
+    pin_lease = api._detach_capture_evaluation_pin_locked()
+    owner, ticket, cleanup_probe = start_shutdown_evaluation(
+        controller,
+        transport,
+        pin_lease=pin_lease,
+    )
+    evaluation_id = ticket.evaluation_id
+    del ticket, pin_lease
+
+    for _attempt in range(2):
+        with pytest.raises(
+            ProtocolError,
+            match="CAPTURE shutdown disposition",
+        ) as caught:
+            api.close()
+        assert "private physical Worker pin failure" not in (
+            str(caught.value) + repr(caught.value)
+        )
+        assert physical_attempts == [physical_pin]
+        assert cleanup_probe.dispositions == [
+            (cleanup_probe.lease_identity, "release")
+        ]
+        assert cleanup_probe.is_product_owned
+        assert not any(
+            event.event == "capture_evaluation_shutdown_disposed"
+            for event in journal.events
+        )
+        assert not any(
+            event.fields.get("evaluation_id") == evaluation_id
+            and event.event.endswith("shutdown_disposed")
+            for event in journal.events
+        )
+
+    owner.begin_close()
+    assert owner.join(_JOIN_TIMEOUT_S)
 
 
 def test_current_capture_rejects_runtime_without_a_capture() -> None:

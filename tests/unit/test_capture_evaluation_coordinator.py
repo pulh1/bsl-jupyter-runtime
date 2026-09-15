@@ -667,8 +667,7 @@ def _prepare_release_shutdown_record(coordinator, driver, *, pin, cleanup_leases
     del ticket
 
 
-def test_shutdown_pin_failure_attempts_cleanup_and_retries_only_unfinished(environment):
-    import gc
+def test_shutdown_pin_failure_is_unknown_and_never_retried_without_proof(environment):
     import weakref
 
     create, _ = environment
@@ -716,19 +715,16 @@ def test_shutdown_pin_failure_attempts_cleanup_and_retries_only_unfinished(envir
     )
     del caught
 
-    coordinator.finish_close(True)
-    coordinator.finish_close(True)
-    assert pin_attempts == ["release", "release"]
+    with pytest.raises(ProtocolError, match="CAPTURE shutdown disposition failed"):
+        coordinator.finish_close(True)
+    assert pin_attempts == ["release"]
     assert first_cleanup_attempts == ["release"]
     assert second_cleanup_attempts == ["release"]
-    disposed = [
-        event
+    assert first_ref() is not None and second_ref() is not None
+    assert not any(
+        event.event == "capture_evaluation_shutdown_disposed"
         for event in journal.events
-        if event.event == "capture_evaluation_shutdown_disposed"
-    ]
-    assert len(disposed) == 1
-    gc.collect()
-    assert first_ref() is None and second_ref() is None
+    )
 
 
 def test_shutdown_cleanup_failure_attempts_siblings_and_retries_only_unfinished(environment):
@@ -1017,6 +1013,90 @@ class PublicationBarrierJournal(RecoveryJournal):
         if event == "capture_evaluation_outcome_published":
             self.recorded.set()
         return result
+
+
+class ShutdownPublicationBarrierJournal(RecoveryJournal):
+    def __init__(self):
+        super().__init__()
+        self.entered = Event()
+        self.release = Event()
+        self.shutdown_record_calls = 0
+
+    def record(self, stream, event, **fields):  # type: ignore[no-untyped-def]
+        if event in {
+            "capture_evaluation_shutdown_abandoned",
+            "capture_evaluation_shutdown_disposed",
+        }:
+            self.shutdown_record_calls += 1
+            self.entered.set()
+            assert self.release.wait(2)
+        return super().record(stream, event, **fields)
+
+
+@pytest.mark.parametrize("contender_proven", [False, True])
+def test_shutdown_classification_publication_is_reserved_once_without_waiting(
+    environment,
+    contender_proven,
+):
+    create, threads = environment
+    journal = ShutdownPublicationBarrierJournal()
+    coordinator, driver, _ = create(journal=journal)
+    _prepare_release_shutdown_record(
+        coordinator,
+        driver,
+        pin=driver.pin,
+        cleanup_leases=(),
+    )
+    first_errors = []
+    contender_errors = []
+    contender_finished = Event()
+
+    def first() -> None:
+        try:
+            coordinator.finish_close(False)
+        except BaseException as error:
+            first_errors.append(error)
+
+    def contend() -> None:
+        try:
+            coordinator.finish_close(contender_proven)
+        except BaseException as error:
+            contender_errors.append(error)
+        finally:
+            contender_finished.set()
+
+    first_thread = Thread(target=first)
+    contender_thread = Thread(target=contend)
+    threads.extend((first_thread, contender_thread))
+    first_thread.start()
+    assert journal.entered.wait(1), "first classification did not reserve publication"
+    contender_thread.start()
+    try:
+        assert contender_finished.wait(0.2), (
+            "contending classification waited for journal or disposition"
+        )
+        assert journal.shutdown_record_calls == 1
+        assert driver.dispositions == []
+    finally:
+        journal.release.set()
+    first_thread.join(1)
+    contender_thread.join(1)
+
+    assert not first_errors
+    assert not contender_errors
+    assert journal.shutdown_record_calls == 1
+    abandoned = [
+        event
+        for event in journal.events
+        if event.event == "capture_evaluation_shutdown_abandoned"
+    ]
+    assert len(abandoned) == 1
+    assert abandoned[0].fields["pin_disposition"] == "retained"
+    assert not any(
+        event.event == "capture_evaluation_shutdown_disposed"
+        for event in journal.events
+    )
+    assert driver.dispositions == []
 
 
 @pytest.mark.parametrize("close_at_barrier", [False, True])
