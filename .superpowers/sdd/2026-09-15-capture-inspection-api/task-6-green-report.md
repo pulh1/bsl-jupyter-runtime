@@ -312,6 +312,63 @@ full unit suite: 4263 passed, 57 skipped, 1 known Windows Proactor/pyzmq warning
 No live 1C qualification was run; all evidence is unit/scripted transport
 coverage.
 
+## Direct RuntimeApi retry remediation
+
+The terminal-axes Sol xhigh review found that Session could destroy the target
+while abandoned capture-publication retry was incomplete, without publishing
+that irreversible fact to `PrototypeRuntimeApi`. A direct API retry could then
+successfully publish the retained abandoned result with an unproven coordinator
+join, cache that false proof, and return forever without finalizing the real
+Worker data plane. If the coordinator had already exited, direct close used
+ordinary `teardown()` instead of `abandon_target()`, leaving the server
+registry reusable even though its target was gone.
+
+The correction is split into:
+
+- `ecfde90` — `test: require direct shutdown finalization`
+- `ecaa39e` — `fix: finalize RuntimeApi after target death`
+
+`RuntimeSession` now publishes a dedicated monotonic target-death fact after
+its local server/process/UI/transport resources are terminal. That publication
+is independent of capture journal publication and coordinator-worker join.
+`PrototypeRuntimeApi.close()` first completes the capture-control attempt; if
+target death is known and capture publication has completed, it enters the
+existing single-writer finalizer with `target_terminated=True`. The finalizer
+therefore uses `abandon_target()` and clears local Worker ownership without a
+remote instruction even when the cached coordinator termination proof remains
+false. `_close_after_target_termination()` also records the same fact, making
+the Session path and direct-retry path converge. Session's three-axis terminal
+predicate remains unchanged.
+
+The RED combines all dimensions that had previously been split across tests:
+real `WorkerUniverseRegistry` and `ServerWorkerUniverseRegistry` ownership,
+two registrations, a detached capture pin lease, first abandoned-journal write
+failure, normal/kernel first close, normal/kernel/direct retry, and either a
+retry while the coordinator is alive or after its late exit. Direct retries in
+the former ordering run again after late exit. Every final row requires a
+closed host, zero lease and registration ledgers, an empty broken server
+registry, cleared RuntimeApi generation/pin/cache owners, no target source or
+disconnect, one bounded private abandoned event, no cleanup dispatch, and
+idempotent later API/Jupyter close calls.
+
+Direct-retry verification:
+
+```text
+RED combined real-worker matrix: 6 failed, 6 passed in 4.30s
+  direct cached-false rows: data_plane_finalized=False / host READY / lease=1 / registrations=2
+  late-exit rows: ordinary teardown left server registry _broken=False
+GREEN combined real-worker matrix: 12 passed in 4.02s
+GREEN combined matrix repeated: 10/10 invocations passed (12 rows each)
+Jupyter shutdown file: 49 passed, 1 known Windows Proactor/pyzmq warning in 31.92s
+RuntimeApi/control-plane/completion focused: 359 passed in 12.47s
+Worker/server/prototype/guardian/kernel nearby: 381 passed, 1 known Windows Proactor/pyzmq warning in 19.60s
+full unit suite: 4281 passed, 57 skipped, 1 known Windows Proactor/pyzmq warning in 242.66s
+```
+
+All pytest commands used `uv run python -m pytest` from the worktree root.
+No live 1C qualification was run; all evidence is unit/scripted transport
+coverage.
+
 
 ## Bounded shutdown state-machine remediation
 
