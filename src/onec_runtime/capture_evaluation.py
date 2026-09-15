@@ -1004,6 +1004,8 @@ class CaptureEvaluationCoordinator:
                 return
             if self._shutdown_publication is not None:
                 return
+            if self._shutdown_abandoned:
+                termination_proven = False
             if termination_proven and self._worker.is_alive():
                 raise ProtocolError(
                     "CAPTURE shutdown termination has not been proven"
@@ -1015,7 +1017,6 @@ class CaptureEvaluationCoordinator:
             elapsed_ms = self._offset(record)
             cleanup_count = len(record.request.cleanup_leases)
             if not termination_proven:
-                self._shutdown_abandoned = True
                 self._shutdown_record = record
                 self._quarantined = record
                 self._phase = CapturePhase.STALE
@@ -1026,6 +1027,7 @@ class CaptureEvaluationCoordinator:
                     raise ProtocolError(
                         "CAPTURE shutdown disposition remains unresolved"
                     ) from None
+                self._shutdown_abandoned = True
                 if self._active is record:
                     self._active = None
                 self._condition.notify_all()
