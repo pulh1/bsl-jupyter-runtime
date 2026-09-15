@@ -245,7 +245,7 @@ The first tranche implements only pure core code, so it cannot yet change either
 - Detailed platform text and its spans remain private evidence.
 - The core sanitizer measures private diagnostic text as UTF-8 and accepts at most 64 KiB; it validates all new collection sizes, ordinals, spans, coordinates, labels, identities, and nested types fail-closed.
 - Existing public and expert wire shapes do not change in this tranche.
-- Existing expert serialization may continue to redact and emit at most 4,096 characters until Jupyter/MCP schema work is coordinated.
+- Expert serialization emits the retained diagnostic verbatim up to the same 64 KiB UTF-8 bound. It does not mask token-, password-, authorization-, PID-, session-, or connection-like substrings: text emitted by 1C is debugging evidence.
 - No automatic public artifact contains BSL source or a reversible source path.
 - Future Jupyter local rendering may use private text and explicitly provided hash-matched source. Ordinary MCP responses remain short; fuller text/frames require an explicit expert diagnostic contract.
 
@@ -258,7 +258,7 @@ The change is additive at the dataclass boundary:
 - existing `locations` and `worker_frames` order and meaning stay stable;
 - deterministic parser/lowering diagnostics receive empty traces;
 - public/expert serializers emit their current keys only;
-- Jupyter and MCP behavior is unchanged until their integration tranches.
+- Compact/public Jupyter and MCP behavior is unchanged until their integration tranches. Existing expert/private paths may carry the expanded verbatim diagnostic without a schema change.
 
 If changing the retained-text bound changes the digest-independent `platform_diagnostic` value for long inputs, that is intentional. The SHA-256 continues to identify the complete original input.
 

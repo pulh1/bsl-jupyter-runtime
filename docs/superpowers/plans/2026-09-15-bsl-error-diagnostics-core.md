@@ -31,11 +31,15 @@
 
 **Files:**
 - Modify: `src/onec_runtime/bsl/diagnostics.py:22-46,306-409`
+- Modify: `src/onec_runtime/runtime_contracts.py`
+- Modify: `src/onec_runtime/privacy.py`
+- Modify: `packages/mcp/src/onec_runtime_mcp/agent/operations.py`
 - Test: `tests/unit/test_bsl_diagnostics.py:134-312,1072-1099,1237-1273`
+- Test: directly affected runtime-contract, privacy, and MCP diagnostic tests
 
 **Interfaces:**
 - Consumes: existing `ParsedPlatformDiagnostic`, `PlatformDiagnosticLocation`, `_parse_worker_artifact_location`.
-- Produces: `_PLATFORM_DIAGNOSTIC_LIMIT_BYTES = 64 * 1024`, `_bound_platform_diagnostic(message: str) -> tuple[str, bool]`, and one ordered `_accepted_platform_locations(text: str)` result reused by Task 2.
+- Produces: `_PLATFORM_DIAGNOSTIC_LIMIT_BYTES = 64 * 1024`, `_bound_platform_diagnostic(message: str) -> tuple[str, bool]`, one ordered `_accepted_platform_locations(text: str)` result reused by Task 2, and one 64 KiB UTF-8 verbatim diagnostic bound across core, private MCP storage, and expert output.
 
 - [ ] **Step 1: Write failing UTF-8 and line-only parser tests**
 
@@ -1418,7 +1422,7 @@ git commit -m "feat: normalize mixed BSL error stacks"
 
 **Interfaces:**
 - Consumes: `DiagnosticTextSpan`, `ErrorTraceCause`, `ErrorTraceFrame`, `ErrorTraceFrameOrigin`, and enriched `NormalizedDiagnostic` from Tasks 2–4.
-- Produces: fail-closed validation for every nested trace value while preserving existing public/expert serialization shapes and their 4,096-character expert redaction bound.
+- Produces: fail-closed validation for every nested trace value while preserving existing public/expert serialization key shapes and the 64 KiB UTF-8 verbatim diagnostic bound established in Task 1.
 
 - [ ] **Step 1: Write failing sanitizer and wire-shape tests**
 
@@ -1817,7 +1821,7 @@ def _bounded_trace_frame_fields(frame: ErrorTraceFrame) -> bool:
 
 In `sanitize_normalized_diagnostic`, replace the old string-length check with `len(platform_diagnostic.encode("utf-8")) > MAX_PRIVATE_DIAGNOSTIC_BYTES`, then call `_bounded_trace(value, platform_diagnostic)` before the existing `replace(value, runtime_summary=_DIAGNOSTIC_SUMMARIES[value.stage])` return. Keep the outer `try/except BaseException` so all malformed cases return `None`.
 
-Do not change `privacy.py`; its independent 4,096-character redaction/output cap is part of the current expert wire contract.
+Do not reintroduce an independent expert-output cap or content filter in `privacy.py`; Task 1 establishes one 64 KiB UTF-8 verbatim bound across retained evidence, private MCP storage, and expert output.
 
 - [ ] **Step 4: Lock deterministic and legacy compatibility in acceptance tests**
 
