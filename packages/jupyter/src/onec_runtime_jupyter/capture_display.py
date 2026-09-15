@@ -21,6 +21,7 @@ from onec_runtime.capture_values import (
 
 
 MAX_RENDER_ITEMS = 100
+MAX_STACK_MARKERS = MAX_RENDER_ITEMS + 1
 MAX_METHOD_PARAMETERS = 32
 MAX_LABEL_CHARS = 512
 MAX_PATH_CHARS = 1_024
@@ -123,8 +124,29 @@ def _frame_text(frame: DebugFrame) -> str:
     return text
 
 
+def _bounded_stack_entries(
+    frames: tuple[DebugFrame | RuntimeFrameMarker, ...],
+) -> tuple[tuple[DebugFrame | RuntimeFrameMarker, ...], int]:
+    entries: list[DebugFrame | RuntimeFrameMarker] = []
+    visible_frames = 0
+    markers = 0
+    consumed = 0
+    for frame in frames:
+        if type(frame) is RuntimeFrameMarker:
+            if markers >= MAX_STACK_MARKERS:
+                break
+            markers += 1
+        else:
+            if visible_frames >= MAX_RENDER_ITEMS:
+                break
+            visible_frames += 1
+        entries.append(frame)
+        consumed += 1
+    return tuple(entries), len(frames) - consumed
+
+
 def _stack_lines(page: StackPage) -> list[str]:
-    entries = page.frames[:MAX_RENDER_ITEMS]
+    entries, omitted = _bounded_stack_entries(page.frames)
     detail = _clean(page.detail, 64)
     mode = f"native, {detail}" if page.native else detail
     lines = [f"Стек вызовов ({mode})"]
@@ -135,7 +157,6 @@ def _stack_lines(page: StackPage) -> list[str]:
         else:
             rendered = _frame_text(frame)
         lines.append(f"{connector} {rendered}")
-    omitted = len(page.frames) - len(entries)
     if omitted:
         lines.append(f"… не показано {omitted} элементов стека")
     shown = sum(type(frame) is DebugFrame for frame in entries)
@@ -229,7 +250,7 @@ def _status_html(status: CaptureStatus) -> str:
 
 
 def _stack_html(page: StackPage) -> str:
-    entries = page.frames[:MAX_RENDER_ITEMS]
+    entries, omitted = _bounded_stack_entries(page.frames)
     items: list[str] = []
     for frame in entries:
         if type(frame) is RuntimeFrameMarker:
@@ -239,7 +260,6 @@ def _stack_html(page: StackPage) -> str:
             value = _frame_text(frame)
             css_class = "onec-capture-frame"
         items.append(f'<li class="{css_class}">{_html_text(value)}</li>')
-    omitted = len(page.frames) - len(entries)
     if omitted:
         items.append(
             '<li class="onec-capture-truncated">'
@@ -340,8 +360,13 @@ class _FormatterRegistration:
     formatter: object
     value_type: type[object]
     installed: object
-    had_previous: bool
-    previous: object | None
+    had_direct: bool
+    previous_direct: object | None
+    deferred_key: tuple[str, str]
+    had_deferred: bool
+    previous_deferred: object | None
+    had_deferred_after_install: bool
+    deferred_after_install: object | None
 
 
 _REGISTRATIONS: WeakKeyDictionary[object, tuple[_FormatterRegistration, ...]] = (
@@ -377,17 +402,42 @@ def install_capture_formatters(shell: object) -> None:
         registrations: list[_FormatterRegistration] = []
         for formatter, callback in selected:
             printers = formatter.type_printers
+            deferred_printers = getattr(formatter, "deferred_printers", None)
             for value_type in _SNAPSHOT_TYPES:
-                had_previous = value_type in printers
-                previous = printers.get(value_type)
+                had_direct = value_type in printers
+                previous_direct = printers.get(value_type)
+                deferred_key = (value_type.__module__, value_type.__name__)
+                had_deferred = (
+                    isinstance(deferred_printers, dict)
+                    and deferred_key in deferred_printers
+                )
+                previous_deferred = (
+                    deferred_printers.get(deferred_key)
+                    if isinstance(deferred_printers, dict)
+                    else None
+                )
                 formatter.for_type(value_type, callback)
+                had_deferred_after_install = (
+                    isinstance(deferred_printers, dict)
+                    and deferred_key in deferred_printers
+                )
+                deferred_after_install = (
+                    deferred_printers.get(deferred_key)
+                    if isinstance(deferred_printers, dict)
+                    else None
+                )
                 registrations.append(
                     _FormatterRegistration(
                         formatter,
                         value_type,
                         callback,
-                        had_previous,
-                        previous,
+                        had_direct,
+                        previous_direct,
+                        deferred_key,
+                        had_deferred,
+                        previous_deferred,
+                        had_deferred_after_install,
+                        deferred_after_install,
                     )
                 )
         _REGISTRATIONS[shell] = tuple(registrations)
@@ -405,16 +455,32 @@ def remove_capture_formatters(shell: object) -> None:
             printers = getattr(registration.formatter, "type_printers", None)
             if not isinstance(printers, dict):
                 continue
-            if printers.get(registration.value_type) is not registration.installed:
-                continue
-            if registration.had_previous:
-                registration.formatter.for_type(
-                    registration.value_type,
-                    registration.previous,
-                )
-            else:
-                pop = getattr(registration.formatter, "pop", None)
-                if callable(pop):
-                    pop(registration.value_type)
+            if printers.get(registration.value_type) is registration.installed:
+                if registration.had_direct:
+                    printers[registration.value_type] = registration.previous_direct
                 else:
                     printers.pop(registration.value_type, None)
+            deferred_printers = getattr(
+                registration.formatter,
+                "deferred_printers",
+                None,
+            )
+            if not isinstance(deferred_printers, dict):
+                continue
+            has_current_deferred = registration.deferred_key in deferred_printers
+            current_deferred = deferred_printers.get(registration.deferred_key)
+            deferred_is_unchanged = (
+                has_current_deferred == registration.had_deferred_after_install
+                and (
+                    not has_current_deferred
+                    or current_deferred is registration.deferred_after_install
+                )
+            )
+            if not deferred_is_unchanged:
+                continue
+            if registration.had_deferred:
+                deferred_printers[registration.deferred_key] = (
+                    registration.previous_deferred
+                )
+            else:
+                deferred_printers.pop(registration.deferred_key, None)

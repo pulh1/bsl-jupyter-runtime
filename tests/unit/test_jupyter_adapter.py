@@ -1023,14 +1023,33 @@ def test_extension_registers_magics() -> None:
 class _FakeTypeFormatter:
     def __init__(self) -> None:
         self.type_printers: dict[type[object], object] = {}
+        self.deferred_printers: dict[tuple[str, str], object] = {}
 
     def for_type(self, value_type: type[object], formatter: object) -> object | None:
         previous = self.type_printers.get(value_type)
+        key = (value_type.__module__, value_type.__name__)
+        if previous is None and key in self.deferred_printers:
+            previous = self.deferred_printers.pop(key)
+            self.type_printers[value_type] = previous
         self.type_printers[value_type] = formatter
         return previous
 
     def pop(self, value_type: type[object]) -> object:
-        return self.type_printers.pop(value_type)
+        if value_type in self.type_printers:
+            return self.type_printers.pop(value_type)
+        return self.deferred_printers.pop(
+            (value_type.__module__, value_type.__name__)
+        )
+
+    def for_type_by_name(
+        self,
+        module: str,
+        name: str,
+        formatter: object,
+    ) -> object | None:
+        previous = self.deferred_printers.get((module, name))
+        self.deferred_printers[(module, name)] = formatter
+        return previous
 
 
 class _FakeDisplayFormatter:
@@ -1044,14 +1063,21 @@ class _FakeDisplayFormatter:
 def test_extension_registers_capture_snapshot_formatters_without_global_alias() -> None:
     shell = FakeShell()
     shell.display_formatter = _FakeDisplayFormatter()  # type: ignore[attr-defined]
+    plain = shell.display_formatter.formatters["text/plain"]  # type: ignore[attr-defined]
+    html = shell.display_formatter.formatters["text/html"]  # type: ignore[attr-defined]
+    deferred_key = (StackPage.__module__, StackPage.__name__)
+    previous_plain = object()
+    previous_html = object()
+    plain.for_type_by_name(*deferred_key, previous_plain)
+    html.for_type_by_name(*deferred_key, previous_html)
 
     load_ipython_extension(shell)  # type: ignore[arg-type]
 
     expected = {CaptureStatus, StackPage, DebugFrame, ValuePage, ValueNode}
-    plain = shell.display_formatter.formatters["text/plain"]  # type: ignore[attr-defined]
-    html = shell.display_formatter.formatters["text/html"]  # type: ignore[attr-defined]
     assert expected <= plain.type_printers.keys()
     assert expected <= html.type_printers.keys()
+    assert deferred_key not in plain.deferred_printers
+    assert deferred_key not in html.deferred_printers
     assert "capture" not in shell.user_ns
 
     status = CaptureStatus(7, 2, 1, CapturePhase.PAUSED)
@@ -1073,3 +1099,5 @@ def test_extension_registers_capture_snapshot_formatters_without_global_alias() 
 
     assert not (expected & plain.type_printers.keys())
     assert not (expected & html.type_printers.keys())
+    assert plain.deferred_printers[deferred_key] is previous_plain
+    assert html.deferred_printers[deferred_key] is previous_html

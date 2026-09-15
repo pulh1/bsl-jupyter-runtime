@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 import pytest
+from IPython.core.formatters import HTMLFormatter, PlainTextFormatter
 
 from onec_runtime.bsl import SourceSpan
 from onec_runtime.bsl.module_syntax import MethodSyntaxInfo
@@ -33,6 +34,8 @@ from onec_runtime.runtime_api import PrototypeRuntimeApi
 from onec_runtime.session import RuntimeSession
 from onec_runtime_jupyter.capture_display import (
     CaptureSnapshotDisplay,
+    install_capture_formatters,
+    remove_capture_formatters,
     render_capture_html,
     render_capture_text,
 )
@@ -172,6 +175,39 @@ def test_native_stack_page_is_visibly_distinct_from_default_stack() -> None:
 
     assert render_capture_text(page).startswith("Стек вызовов (native, line)")
     assert "native, line" in render_capture_html(page)
+
+
+def test_stack_render_limit_counts_visible_frames_separately_from_markers() -> None:
+    frames = tuple(
+        item
+        for index in range(100)
+        for item in (
+            RuntimeFrameMarker(index + 1),
+            DebugFrame(
+                native_level=index * 2 + 1,
+                visible_index=index,
+                source=f"ОбщийМодуль.Модуль{index}",
+                line=index + 1,
+                source_status="resolved",
+            ),
+        )
+    ) + (
+        RuntimeFrameMarker(101),
+    )
+    page = StackPage(frames, total=100, next_cursor=None)
+
+    text = render_capture_text(page)
+    html = render_capture_html(page)
+
+    assert "скрыто 1 служебных кадров" in text
+    assert "скрыто 101 служебных кадров" in text
+    assert "#99 ОбщийМодуль.Модуль99:100" in text
+    assert "Показано кадров: 100 из 100; next_cursor=none" in text
+    assert "не показано" not in text
+    assert "#99 ОбщийМодуль.Модуль99:100" in html
+    assert "Показано кадров: 100 из 100; next_cursor=none" in html
+    assert html.count('class="onec-capture-runtime-marker"') == 101
+    assert "onec-capture-truncated" not in html
 
 
 def test_single_frame_render_redacts_runtime_coordinates_and_escapes_source() -> None:
@@ -407,3 +443,83 @@ def test_rendering_is_bounded_even_for_an_invalidly_oversized_saved_page() -> No
 def test_capture_snapshot_display_rejects_unknown_or_live_objects(value: object) -> None:
     with pytest.raises(TypeError, match="immutable capture snapshot"):
         CaptureSnapshotDisplay(value)
+
+
+def test_real_ipython_formatters_restore_direct_and_deferred_registrations() -> None:
+    plain = PlainTextFormatter()
+    html = HTMLFormatter()
+
+    class Shell:
+        pass
+
+    shell = Shell()
+    shell.display_formatter = type(
+        "DisplayFormatter",
+        (),
+        {"formatters": {"text/plain": plain, "text/html": html}},
+    )()
+
+    def old_plain_direct(*_args: object) -> str:
+        return "old plain direct"
+
+    def old_html_direct(*_args: object) -> str:
+        return "old html direct"
+
+    def old_plain_deferred(*_args: object) -> str:
+        return "old plain deferred"
+
+    def old_html_deferred(*_args: object) -> str:
+        return "old html deferred"
+
+    def newer_plain_direct(*_args: object) -> str:
+        return "newer plain direct"
+
+    def newer_html_direct(*_args: object) -> str:
+        return "newer html direct"
+
+    def newer_plain_deferred(*_args: object) -> str:
+        return "newer plain deferred"
+
+    def newer_html_deferred(*_args: object) -> str:
+        return "newer html deferred"
+
+    direct_previous = {
+        plain: old_plain_direct,
+        html: old_html_direct,
+    }
+    deferred_previous = {
+        plain: old_plain_deferred,
+        html: old_html_deferred,
+    }
+    newer_direct = {
+        plain: newer_plain_direct,
+        html: newer_html_direct,
+    }
+    newer_deferred = {
+        plain: newer_plain_deferred,
+        html: newer_html_deferred,
+    }
+    deferred_stack_key = (StackPage.__module__, StackPage.__name__)
+    deferred_value_key = (ValuePage.__module__, ValuePage.__name__)
+    for formatter in (plain, html):
+        formatter.for_type(CaptureStatus, direct_previous[formatter])
+        formatter.for_type_by_name(*deferred_stack_key, deferred_previous[formatter])
+
+    install_capture_formatters(shell)
+
+    for formatter in (plain, html):
+        assert formatter.type_printers[CaptureStatus] is not direct_previous[formatter]
+        assert formatter.type_printers[StackPage] is not deferred_previous[formatter]
+        assert deferred_stack_key not in formatter.deferred_printers
+        formatter.for_type(DebugFrame, newer_direct[formatter])
+        formatter.for_type_by_name(*deferred_value_key, newer_deferred[formatter])
+
+    remove_capture_formatters(shell)
+
+    for formatter in (plain, html):
+        assert formatter.type_printers[CaptureStatus] is direct_previous[formatter]
+        assert StackPage not in formatter.type_printers
+        assert formatter.deferred_printers[deferred_stack_key] is deferred_previous[formatter]
+        assert formatter.type_printers[DebugFrame] is newer_direct[formatter]
+        assert ValuePage not in formatter.type_printers
+        assert formatter.deferred_printers[deferred_value_key] is newer_deferred[formatter]
