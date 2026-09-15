@@ -14,6 +14,7 @@ from traitlets.config import Config
 import pytest
 
 from onec_runtime.runtime_api import RuntimeNamespaceSnapshot
+from onec_runtime.errors import StaleCaptureError
 from onec_runtime.recovery_journal import RecoveryJournal
 from onec_runtime.runtime_api import PrototypeRuntimeApi
 from onec_runtime_jupyter import InteractiveRuntimeSession, install_runtime
@@ -21,7 +22,8 @@ from onec_runtime_jupyter import session as session_module
 
 from test_capture_control_plane import (
     ShutdownBlockingCaptureSession,
-    observe_shutdown_join,
+    attempt_shutdown_submission,
+    observe_shutdown_control_plane,
     start_shutdown_evaluation,
 )
 from test_prototype_runtime import captured_controller
@@ -119,9 +121,32 @@ def _start_shutdown_thread(invoke, timeline: list[str]):  # type: ignore[no-unty
             timeline.append("session_close_returned")
             finished.set()
 
-    thread = Thread(target=run, name="jupyter-runtime-shutdown-caller")
+    thread = Thread(
+        target=run,
+        name="jupyter-runtime-shutdown-caller",
+        daemon=True,
+    )
     thread.start()
     return thread, finished, errors
+
+
+def _start_lock_holder(lock: RLock):  # type: ignore[valid-type, no-untyped-def]
+    acquired = Event()
+    release = Event()
+    errors: list[BaseException] = []
+
+    def hold() -> None:
+        try:
+            with lock:
+                acquired.set()
+                assert release.wait(2), "shutdown test did not release the operation lock"
+        except BaseException as error:
+            errors.append(error)
+
+    thread = Thread(target=hold, name="runtime-session-operation-lock-holder")
+    thread.start()
+    assert acquired.wait(1), "operation lock holder did not start"
+    return thread, release, errors
 
 
 def start_owned(monkeypatch, shell, runtime):
@@ -324,7 +349,10 @@ def test_guardian_start_failure_closes_new_runtime(monkeypatch):
 
 
 def test_runtime_session_close_joins_pending_capture_consumer_before_return() -> None:
-    rdbg = ShutdownBlockingCaptureSession(wake_on_invalidate=True)
+    rdbg = ShutdownBlockingCaptureSession(
+        wake_on_invalidate=True,
+        gate_invalidation=True,
+    )
     journal = RecoveryJournal()
     controller = captured_controller(
         rdbg,
@@ -333,39 +361,57 @@ def test_runtime_session_close_joins_pending_capture_consumer_before_return() ->
     )
     api = PrototypeRuntimeApi(controller, journal=journal)
     owner, _ticket = start_shutdown_evaluation(controller, rdbg)
-    join_timeouts = observe_shutdown_join(owner, rdbg.shutdown_timeline)
+    join_timeouts = observe_shutdown_control_plane(owner, rdbg.shutdown_timeline)
     runtime = _shutdown_runtime_session(rdbg, api, server=False)
+    holder, release_operation, holder_errors = _start_lock_holder(
+        runtime._operation_lock
+    )
     closer, finished, errors = _start_shutdown_thread(
         runtime.close,
         rdbg.shutdown_timeline,
     )
+    caught: BaseException | None = None
     try:
+        invalidation_while_operation_owned = rdbg.shutdown_invalidate_entered.wait(0.4)
+        timeline_before_operation_release = tuple(rdbg.shutdown_timeline)
+        caught = attempt_shutdown_submission(owner)
+        rdbg.shutdown_allow_invalidate.set()
+        release_operation.set()
         finished_in_deadline = finished.wait(0.6)
         close_join_timeouts = tuple(join_timeouts)
-        joined_before_rescue = owner.join(0.05)
+        timeline_before_rescue = tuple(rdbg.shutdown_timeline)
     finally:
+        rdbg.shutdown_allow_invalidate.set()
         rdbg.shutdown_poll_release.set()
+        release_operation.set()
+        holder.join(2)
         owner.begin_close()
         assert owner.join(2)
         closer.join(2)
 
     assert finished_in_deadline, "RuntimeSession.close exceeded the configured deadline"
     assert not errors
+    assert not holder_errors
+    assert invalidation_while_operation_owned
+    assert timeline_before_operation_release[:2] == (
+        "coordinator_closing_entered",
+        "transport_invalidated",
+    )
+    assert isinstance(caught, StaleCaptureError)
     assert close_join_timeouts
     assert all(0 <= timeout <= 0.05 for timeout in close_join_timeouts)
-    assert joined_before_rescue, "RuntimeSession.close left the capture consumer alive"
-    assert rdbg.shutdown_timeline.index("transport_invalidated") < (
-        rdbg.shutdown_timeline.index("poll_returned")
+    assert timeline_before_rescue.index("transport_invalidated") < (
+        timeline_before_rescue.index("event_consumer_join_entered")
     )
-    assert rdbg.shutdown_timeline.index("poll_returned") < (
-        rdbg.shutdown_timeline.index("event_consumer_joined")
+    assert timeline_before_rescue.index("event_consumer_join_returned_true") < (
+        timeline_before_rescue.index("pin_quarantine")
     )
-    assert rdbg.shutdown_timeline.index("event_consumer_joined") < (
-        rdbg.shutdown_timeline.index("pin_quarantine")
+    assert timeline_before_rescue.index("pin_quarantine") < (
+        timeline_before_rescue.index("session_close_returned")
     )
-    assert rdbg.shutdown_timeline.index("pin_quarantine") < (
-        rdbg.shutdown_timeline.index("session_close_returned")
-    )
+    assert rdbg.shutdown_cleanup_dispatches == 0
+    assert timeline_before_rescue.count("pin_quarantine") == 1
+    assert not holder.is_alive()
     assert not closer.is_alive()
 
 
@@ -379,7 +425,7 @@ def test_jupyter_shutdown_from_another_thread_joins_pending_capture_consumer() -
     )
     api = PrototypeRuntimeApi(controller, journal=journal)
     owner, _ticket = start_shutdown_evaluation(controller, rdbg)
-    join_timeouts = observe_shutdown_join(owner, rdbg.shutdown_timeline)
+    join_timeouts = observe_shutdown_control_plane(owner, rdbg.shutdown_timeline)
     runtime = _shutdown_runtime_session(rdbg, api, server=True)
     interactive = InteractiveRuntimeSession(runtime)
     closer, finished, errors = _start_shutdown_thread(
@@ -389,7 +435,7 @@ def test_jupyter_shutdown_from_another_thread_joins_pending_capture_consumer() -
     try:
         finished_in_deadline = finished.wait(0.6)
         close_join_timeouts = tuple(join_timeouts)
-        joined_before_rescue = owner.join(0.05)
+        timeline_before_rescue = tuple(rdbg.shutdown_timeline)
     finally:
         rdbg.shutdown_poll_release.set()
         owner.begin_close()
@@ -400,19 +446,20 @@ def test_jupyter_shutdown_from_another_thread_joins_pending_capture_consumer() -
     assert not errors
     assert close_join_timeouts
     assert all(0 <= timeout <= 0.05 for timeout in close_join_timeouts)
-    assert joined_before_rescue, "kernel shutdown left the capture consumer alive"
-    assert rdbg.shutdown_timeline.index("transport_invalidated") < (
-        rdbg.shutdown_timeline.index("poll_returned")
+    assert timeline_before_rescue.index("coordinator_closing_entered") < (
+        timeline_before_rescue.index("transport_invalidated")
     )
-    assert rdbg.shutdown_timeline.index("poll_returned") < (
-        rdbg.shutdown_timeline.index("event_consumer_joined")
+    assert timeline_before_rescue.index("transport_invalidated") < (
+        timeline_before_rescue.index("event_consumer_join_entered")
     )
-    assert rdbg.shutdown_timeline.index("event_consumer_joined") < (
-        rdbg.shutdown_timeline.index("pin_quarantine")
+    assert timeline_before_rescue.index("event_consumer_join_returned_true") < (
+        timeline_before_rescue.index("pin_quarantine")
     )
-    assert rdbg.shutdown_timeline.index("pin_quarantine") < (
-        rdbg.shutdown_timeline.index("session_close_returned")
+    assert timeline_before_rescue.index("pin_quarantine") < (
+        timeline_before_rescue.index("session_close_returned")
     )
+    assert rdbg.shutdown_cleanup_dispatches == 0
+    assert timeline_before_rescue.count("pin_quarantine") == 1
     assert not closer.is_alive()
 
 

@@ -3,7 +3,13 @@ from __future__ import annotations
 import ast
 from contextlib import contextmanager
 from dataclasses import FrozenInstanceError
+from datetime import datetime, timedelta, timezone
+import json
 from inspect import getmembers, getsource, isfunction
+import os
+import re
+import subprocess
+import sys
 from threading import Event, Lock, RLock, Thread, current_thread
 from time import monotonic, sleep
 from textwrap import dedent
@@ -13,6 +19,7 @@ from uuid import uuid4
 import pytest
 
 from onec_runtime.capture_evaluation import (
+    CaptureCleanupLease,
     CaptureEvaluationCoordinator,
     CaptureEvaluationKind,
     CaptureEvaluationOutcome,
@@ -21,6 +28,7 @@ from onec_runtime.capture_evaluation import (
     CaptureEvaluationTicket,
     CaptureFence,
     CapturePhase,
+    CaptureRemoteStep,
     CaptureStatus,
 )
 from onec_runtime.errors import (
@@ -337,14 +345,29 @@ class ShutdownBlockingCaptureSession(ControlledCaptureSession):
         *,
         wake_on_invalidate: bool,
         result_on_release: bool = False,
+        gate_invalidation: bool = False,
     ) -> None:
         super().__init__()
         self.wake_on_invalidate = wake_on_invalidate
         self.result_on_release = result_on_release
+        self.gate_invalidation = gate_invalidation
         self.shutdown_poll_entered = Event()
         self.shutdown_poll_release = Event()
+        self.shutdown_invalidate_entered = Event()
+        self.shutdown_allow_invalidate = Event()
+        if not gate_invalidation:
+            self.shutdown_allow_invalidate.set()
         self.shutdown_timeline: list[str] = []
         self.shutdown_invalidated = False
+        self.shutdown_cleanup_dispatches = 0
+        self.shutdown_private_values = (
+            'ВызватьИсключение "private BSL expression";',
+            "Контекст.__onec_private_value_handle",
+            "https://private-user:private-password@target.invalid/rdbg",
+            "worker-manifest-" + "f" * 64,
+            "private session and target identity",
+            "private transport exception text",
+        )
 
     def wait_evaluation_event(
         self,
@@ -360,13 +383,16 @@ class ShutdownBlockingCaptureSession(ControlledCaptureSession):
         self.shutdown_timeline.append("poll_returned")
         if self.result_on_release:
             return EvaluationResult(pending.result_id, "Число", "901", False)
-        raise TargetLost("synthetic shutdown invalidated the target")
+        raise TargetLost(self.shutdown_private_values[-1])
 
     def invalidate(self) -> None:
         if self.shutdown_invalidated:
             return
         self.shutdown_invalidated = True
         self.shutdown_timeline.append("transport_invalidated")
+        self.shutdown_invalidate_entered.set()
+        if not self.shutdown_allow_invalidate.wait(_JOIN_TIMEOUT_S):
+            raise AssertionError("shutdown test did not release transport invalidation")
         super().invalidate()
         if self.wake_on_invalidate:
             self.shutdown_poll_release.set()
@@ -380,13 +406,31 @@ def start_shutdown_evaluation(
 
     def dispatch(entered):  # type: ignore[no-untyped-def]
         return transport.start_evaluation(
-            "ВыполнитьКод(КонтекстОтладки);",
+            transport.shutdown_private_values[0],
             timeout_s=0.05,
             on_transport_dispatch=entered,
         )
 
     def poll(pending: PendingEvaluation, timeout_s: float):
         return transport.wait_evaluation_event(pending, timeout_s=timeout_s)
+
+    cleanup_pending = PendingEvaluation(TARGET, uuid4(), object())
+
+    def cleanup_dispatch(entered):  # type: ignore[no-untyped-def]
+        transport.shutdown_cleanup_dispatches += 1
+        transport.shutdown_timeline.append("cleanup_remote_dispatched")
+        entered()
+        return cleanup_pending
+
+    def cleanup_poll(pending: PendingEvaluation, _timeout_s: float) -> EvaluationResult:
+        assert pending is cleanup_pending
+        transport.shutdown_timeline.append("cleanup_remote_completed")
+        return EvaluationResult(pending.result_id, "Булево", "Истина", False)
+
+    cleanup = CaptureCleanupLease(
+        transport.shutdown_private_values[1],
+        CaptureRemoteStep(cleanup_dispatch, cleanup_poll),
+    )
 
     ticket = owner.submit_evaluation(CaptureEvaluationRequest(
         _owner_fence(owner),
@@ -397,12 +441,18 @@ def start_shutdown_evaluation(
         pin_lease=lambda disposition: transport.shutdown_timeline.append(
             "pin_" + disposition
         ),
+        cleanup_leases=(cleanup,),
     ))
     assert transport.shutdown_poll_entered.wait(1), "evaluation poll did not start"
     return owner, ticket
 
 
-def _run_close(invoke, timeline: list[str]):  # type: ignore[no-untyped-def]
+def _run_close(
+    invoke,
+    timeline: list[str],
+    *,
+    daemon: bool = True,
+):  # type: ignore[no-untyped-def]
     finished = Event()
     errors: list[BaseException] = []
 
@@ -415,54 +465,232 @@ def _run_close(invoke, timeline: list[str]):  # type: ignore[no-untyped-def]
             timeline.append("close_returned")
             finished.set()
 
-    thread = Thread(target=run, name="capture-shutdown-caller")
+    thread = Thread(target=run, name="capture-shutdown-caller", daemon=daemon)
     thread.start()
     return thread, finished, errors
 
 
-def observe_shutdown_join(
+def observe_shutdown_control_plane(
     owner: CaptureEvaluationCoordinator,
     timeline: list[str],
 ) -> list[float]:
-    """Record the public join boundary without depending on worker storage."""
+    """Record public close/join boundaries without depending on worker storage."""
 
+    original_begin_close = owner.begin_close
     original = owner.join
     timeouts: list[float] = []
 
+    def observed_begin_close() -> None:
+        timeline.append("coordinator_closing_entered")
+        original_begin_close()
+
     def observed(timeout_s: float) -> bool:
         timeouts.append(timeout_s)
+        timeline.append("event_consumer_join_entered")
         stopped = original(timeout_s)
-        if stopped and "event_consumer_joined" not in timeline:
-            timeline.append("event_consumer_joined")
+        timeline.append("event_consumer_join_returned_" + str(stopped).lower())
         return stopped
 
+    owner.begin_close = observed_begin_close  # type: ignore[method-assign]
     owner.join = observed  # type: ignore[method-assign]
     return timeouts
 
 
-def test_runtime_api_close_begins_before_writer_and_has_a_finite_deadline() -> None:
-    api, controller, transport = _capture_runtime(timeout_s=0.05)
-    owner = _capture_owner(controller)
-    fence = _owner_fence(owner)
-    holder, release_writer, holder_errors = _start_api_lock_holder(api)
-    timeline: list[str] = []
-    closer, finished, close_errors = _run_close(api.close, timeline)
+def attempt_shutdown_submission(
+    owner: CaptureEvaluationCoordinator,
+) -> BaseException | None:
     try:
-        finished_before_rescue = finished.wait(0.4)
-        phase_before_rescue = owner.status(fence).phase
+        owner.submit_evaluation(CaptureEvaluationRequest(
+            _owner_fence(owner),
+            CaptureEvaluationKind.INSPECTION,
+            lambda _entered: (_ for _ in ()).throw(
+                AssertionError("closed coordinator dispatched new work")
+            ),
+            lambda _pending, _timeout: (_ for _ in ()).throw(
+                AssertionError("closed coordinator polled new work")
+            ),
+            lambda _result: None,
+        ))
+    except BaseException as error:
+        return error
+    return None
+
+
+_SHUTDOWN_EVIDENCE_FIELDS = {
+    "evaluation_id",
+    "evaluation_kind",
+    "termination_proven",
+    "elapsed_ms",
+    "pin_disposition",
+    "cleanup_disposition",
+    "cleanup_lease_count",
+}
+
+
+def assert_safe_shutdown_evidence(
+    event,
+    *,
+    event_name: str,
+    evaluation_id: str,
+    termination_proven: bool,
+    pin_disposition: str,
+    cleanup_disposition: str,
+    started_at: datetime,
+    finished_at: datetime,
+    private_values: tuple[str, ...],
+) -> None:  # type: ignore[no-untyped-def]
+    assert event.stream == "capture-evaluation.jsonl"
+    assert event.event == event_name
+    evidence = event.fields
+    assert set(evidence) == _SHUTDOWN_EVIDENCE_FIELDS
+    assert evidence["evaluation_id"] == evaluation_id
+    assert re.fullmatch(r"[0-9a-f]{32}", str(evidence["evaluation_id"]))
+    assert evidence["evaluation_kind"] == CaptureEvaluationKind.USER_BSL.value
+    assert evidence["evaluation_kind"] in {
+        kind.value for kind in CaptureEvaluationKind
+    }
+    assert evidence["termination_proven"] is termination_proven
+    assert type(evidence["elapsed_ms"]) is int
+    assert 0 <= evidence["elapsed_ms"] <= 600_000
+    assert evidence["pin_disposition"] == pin_disposition
+    assert evidence["pin_disposition"] in {"release", "quarantine", "retained"}
+    assert evidence["cleanup_disposition"] == cleanup_disposition
+    assert evidence["cleanup_disposition"] in {
+        "release",
+        "quarantine",
+        "retained",
+    }
+    assert type(evidence["cleanup_lease_count"]) is int
+    assert evidence["cleanup_lease_count"] == 1
+    recorded_at = datetime.fromisoformat(event.timestamp)
+    assert recorded_at.utcoffset() == timedelta(0)
+    assert started_at - timedelta(seconds=1) <= recorded_at
+    assert recorded_at <= finished_at + timedelta(seconds=1)
+    payload = event.as_json()
+    assert set(payload) == {"sequence", "timestamp", "event", *evidence}
+    assert type(event.sequence) is int and event.sequence > 0
+    serialized = json.dumps(payload, ensure_ascii=False)
+    for private in private_values:
+        assert private not in serialized
+        assert private not in repr(event)
+
+
+def runtime_api_writer_shutdown_probe() -> bool:
+    """Run in a watched child so a permanently blocking close cannot hang pytest."""
+
+    transport = ShutdownBlockingCaptureSession(
+        wake_on_invalidate=True,
+        gate_invalidation=True,
+    )
+    journal = RecoveryJournal()
+    controller = captured_controller(
+        transport,
+        command_timeout_s=0.05,
+        journal=journal,
+    )
+    api = PrototypeRuntimeApi(controller, journal=journal)
+    if os.environ.get("ONEC_TEST_PERMANENT_SHUTDOWN_BLOCK") == "1":
+        api.close = lambda: Event().wait()  # type: ignore[method-assign]
+    owner, _ticket = start_shutdown_evaluation(controller, transport)
+    observe_shutdown_control_plane(owner, transport.shutdown_timeline)
+    holder, release_writer, holder_errors = _start_api_lock_holder(api)
+    closer, finished, close_errors = _run_close(
+        api.close,
+        transport.shutdown_timeline,
+        daemon=False,
+    )
+    caught: BaseException | None = None
+    try:
+        invalidation_while_writer_owned = transport.shutdown_invalidate_entered.wait(0.4)
+        timeline_before_writer_release = tuple(transport.shutdown_timeline)
+        caught = attempt_shutdown_submission(owner)
+        transport.shutdown_allow_invalidate.set()
+        release_writer.set()
+        finished_in_deadline = finished.wait(0.6)
     finally:
+        transport.shutdown_allow_invalidate.set()
+        transport.shutdown_poll_release.set()
         release_writer.set()
         holder.join(_JOIN_TIMEOUT_S)
         closer.join(_JOIN_TIMEOUT_S)
         owner.begin_close()
         assert owner.join(_JOIN_TIMEOUT_S)
 
-    assert not holder_errors
-    assert not close_errors
-    assert finished_before_rescue, "RuntimeApi.close waited for its data-plane writer"
-    assert phase_before_rescue is CapturePhase.STALE
-    assert not holder.is_alive()
-    assert not closer.is_alive()
+    return (
+        invalidation_while_writer_owned
+        and timeline_before_writer_release[:2] == (
+            "coordinator_closing_entered",
+            "transport_invalidated",
+        )
+        and isinstance(caught, StaleCaptureError)
+        and finished_in_deadline
+        and not holder_errors
+        and not close_errors
+        and not holder.is_alive()
+        and not closer.is_alive()
+    )
+
+
+def test_runtime_api_close_with_pending_poll_and_busy_writer_is_process_bounded() -> None:
+    code = (
+        "import sys; "
+        "sys.path.insert(0, 'tests/unit'); "
+        "from test_capture_control_plane import runtime_api_writer_shutdown_probe; "
+        "raise SystemExit(0 if runtime_api_writer_shutdown_probe() else 1)"
+    )
+    child = subprocess.Popen([sys.executable, "-c", code])
+    timed_out = False
+    try:
+        try:
+            return_code = child.wait(timeout=4)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            child.terminate()
+            try:
+                return_code = child.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                return_code = child.wait(timeout=2)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=2)
+
+    assert child.poll() is not None, "shutdown watchdog did not reap its child"
+    assert not timed_out, "RuntimeApi.close remained permanently blocked"
+    assert return_code == 0, "shutdown skipped control-plane work while writer was busy"
+
+
+def test_shutdown_watchdog_terminates_and_reaps_permanently_blocked_child() -> None:
+    code = (
+        "import sys; "
+        "sys.path.insert(0, 'tests/unit'); "
+        "from test_capture_control_plane import runtime_api_writer_shutdown_probe; "
+        "raise SystemExit(0 if runtime_api_writer_shutdown_probe() else 1)"
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", code],
+        env={**os.environ, "ONEC_TEST_PERMANENT_SHUTDOWN_BLOCK": "1"},
+    )
+    timed_out = False
+    try:
+        try:
+            child.wait(timeout=0.8)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            child.terminate()
+            try:
+                child.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait(timeout=2)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=2)
+
+    assert timed_out, "permanent-close mutant unexpectedly escaped the watchdog"
+    assert child.poll() is not None, "shutdown watchdog did not reap blocked child"
 
 
 @pytest.mark.parametrize(
@@ -476,6 +704,7 @@ def test_runtime_api_close_invalidates_and_joins_before_pin_disposition(
     transport = ShutdownBlockingCaptureSession(
         wake_on_invalidate=True,
         result_on_release=result_on_release,
+        gate_invalidation=True,
     )
     journal = RecoveryJournal()
     controller = captured_controller(
@@ -485,29 +714,25 @@ def test_runtime_api_close_invalidates_and_joins_before_pin_disposition(
     )
     api = PrototypeRuntimeApi(controller, journal=journal)
     owner, ticket = start_shutdown_evaluation(controller, transport)
-    join_timeouts = observe_shutdown_join(owner, transport.shutdown_timeline)
+    join_timeouts = observe_shutdown_control_plane(owner, transport.shutdown_timeline)
+    started_at = datetime.now(timezone.utc)
     closer, finished, close_errors = _run_close(api.close, transport.shutdown_timeline)
     caught: BaseException | None = None
-    joined_before_rescue = False
     try:
+        invalidation_entered = transport.shutdown_invalidate_entered.wait(0.4)
+        caught = attempt_shutdown_submission(owner)
+        transport.shutdown_allow_invalidate.set()
         finished_in_deadline = finished.wait(0.6)
+        finished_at = datetime.now(timezone.utc)
         close_join_timeouts = tuple(join_timeouts)
-        joined_before_rescue = owner.join(0.05)
-        try:
-            owner.submit_evaluation(CaptureEvaluationRequest(
-                _owner_fence(owner),
-                CaptureEvaluationKind.INSPECTION,
-                lambda _entered: (_ for _ in ()).throw(
-                    AssertionError("closed coordinator dispatched new work")
-                ),
-                lambda _pending, _timeout: (_ for _ in ()).throw(
-                    AssertionError("closed coordinator polled new work")
-                ),
-                lambda _result: None,
-            ))
-        except BaseException as error:
-            caught = error
+        timeline_before_rescue = tuple(transport.shutdown_timeline)
+        disposed = tuple(
+            event
+            for event in journal.events
+            if event.event == "capture_evaluation_shutdown_disposed"
+        )
     finally:
+        transport.shutdown_allow_invalidate.set()
         transport.shutdown_poll_release.set()
         owner.begin_close()
         assert owner.join(_JOIN_TIMEOUT_S)
@@ -515,23 +740,47 @@ def test_runtime_api_close_invalidates_and_joins_before_pin_disposition(
 
     assert finished_in_deadline, "RuntimeApi.close exceeded its configured deadline"
     assert not close_errors
+    assert invalidation_entered, "RuntimeApi.close did not invalidate its transport"
     assert close_join_timeouts
     assert all(0 <= timeout <= 0.05 for timeout in close_join_timeouts)
-    assert joined_before_rescue, "RuntimeApi.close returned before its event consumer stopped"
     assert isinstance(caught, StaleCaptureError)
-    assert transport.shutdown_timeline == [
-        "transport_invalidated",
-        "poll_returned",
-        "event_consumer_joined",
-        "pin_" + disposition,
-        "close_returned",
-    ]
+    assert timeline_before_rescue.index("coordinator_closing_entered") < (
+        timeline_before_rescue.index("transport_invalidated")
+    )
+    assert timeline_before_rescue.index("transport_invalidated") < (
+        timeline_before_rescue.index("event_consumer_join_entered")
+    )
+    assert timeline_before_rescue.index("event_consumer_join_returned_true") < (
+        timeline_before_rescue.index("pin_" + disposition)
+    )
+    assert timeline_before_rescue.index("pin_" + disposition) < (
+        timeline_before_rescue.index("close_returned")
+    )
+    # Target teardown owns the registered temporary value during shutdown;
+    # no cleanup evalExpr may be sent after transport invalidation.
+    assert transport.shutdown_cleanup_dispatches == 0
+    assert timeline_before_rescue.count("pin_" + disposition) == 1
+    assert len(disposed) == 1
+    assert_safe_shutdown_evidence(
+        disposed[0],
+        event_name="capture_evaluation_shutdown_disposed",
+        evaluation_id=ticket.evaluation_id,
+        termination_proven=True,
+        pin_disposition=disposition,
+        cleanup_disposition=disposition,
+        started_at=started_at,
+        finished_at=finished_at,
+        private_values=transport.shutdown_private_values,
+    )
     assert ticket.evaluation_id
     assert not closer.is_alive()
 
 
 def test_runtime_api_close_journals_unproven_poll_without_releasing_its_lease() -> None:
-    transport = ShutdownBlockingCaptureSession(wake_on_invalidate=False)
+    transport = ShutdownBlockingCaptureSession(
+        wake_on_invalidate=False,
+        gate_invalidation=True,
+    )
     journal = RecoveryJournal()
     controller = captured_controller(
         transport,
@@ -540,12 +789,19 @@ def test_runtime_api_close_journals_unproven_poll_without_releasing_its_lease() 
     )
     api = PrototypeRuntimeApi(controller, journal=journal)
     owner, ticket = start_shutdown_evaluation(controller, transport)
-    join_timeouts = observe_shutdown_join(owner, transport.shutdown_timeline)
+    join_timeouts = observe_shutdown_control_plane(owner, transport.shutdown_timeline)
+    started_at = datetime.now(timezone.utc)
     closer, finished, close_errors = _run_close(api.close, transport.shutdown_timeline)
+    caught: BaseException | None = None
     try:
+        invalidation_entered = transport.shutdown_invalidate_entered.wait(0.4)
+        caught = attempt_shutdown_submission(owner)
+        transport.shutdown_allow_invalidate.set()
         finished_in_deadline = finished.wait(0.6)
+        finished_at = datetime.now(timezone.utc)
         close_join_timeouts = tuple(join_timeouts)
         timeline_before_rescue = tuple(transport.shutdown_timeline)
+        status_before_rescue = owner.status(_owner_fence(owner))
         abandoned = tuple(
             event
             for event in journal.events
@@ -561,19 +817,41 @@ def test_runtime_api_close_journals_unproven_poll_without_releasing_its_lease() 
 
     assert finished_in_deadline, "RuntimeApi.close exceeded its configured deadline"
     assert not close_errors
+    assert invalidation_entered, "RuntimeApi.close did not attempt transport invalidation"
+    assert isinstance(caught, StaleCaptureError)
     assert close_join_timeouts
     assert all(0 <= timeout <= 0.05 for timeout in close_join_timeouts)
+    assert timeline_before_rescue.index("coordinator_closing_entered") < (
+        timeline_before_rescue.index("transport_invalidated")
+    )
+    assert timeline_before_rescue.index("transport_invalidated") < (
+        timeline_before_rescue.index("event_consumer_join_entered")
+    )
+    assert timeline_before_rescue.index("event_consumer_join_entered") < (
+        timeline_before_rescue.index("event_consumer_join_returned_false")
+    )
+    assert timeline_before_rescue.index("event_consumer_join_returned_false") < (
+        timeline_before_rescue.index("close_returned")
+    )
     assert "pin_release" not in timeline_before_rescue
     assert "pin_quarantine" not in timeline_before_rescue
+    assert transport.shutdown_cleanup_dispatches == 0
+    assert status_before_rescue.phase is CapturePhase.STALE
+    assert status_before_rescue.pending_evaluation_id is None
+    for private in transport.shutdown_private_values:
+        assert private not in repr(status_before_rescue)
     assert len(abandoned) == 1
-    evidence = abandoned[0].fields
-    assert evidence["evaluation_id"] == ticket.evaluation_id
-    assert evidence["evaluation_kind"] == CaptureEvaluationKind.USER_BSL.value
-    assert evidence["termination_proven"] is False
-    assert isinstance(evidence["elapsed_ms"], int)
-    assert 0 <= evidence["elapsed_ms"] <= 600_000
-    assert "source" not in evidence
-    assert "value" not in evidence
+    assert_safe_shutdown_evidence(
+        abandoned[0],
+        event_name="capture_evaluation_shutdown_abandoned",
+        evaluation_id=ticket.evaluation_id,
+        termination_proven=False,
+        pin_disposition="retained",
+        cleanup_disposition="retained",
+        started_at=started_at,
+        finished_at=finished_at,
+        private_values=transport.shutdown_private_values,
+    )
     assert not closer.is_alive()
 
 
