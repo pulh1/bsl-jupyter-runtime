@@ -491,6 +491,30 @@ def test_native_trace_keeps_direct_platform_coordinates_without_map() -> None:
     assert frame.visible_location is None
 
 
+@pytest.mark.parametrize("pinned_artifacts", ([], {}, "", 0))
+def test_trace_rejects_falsey_non_tuple_pinned_artifacts_without_manifest(
+    pinned_artifacts: object,
+) -> None:
+    with pytest.raises(ValueError, match="pinned artifacts"):
+        normalize_platform_diagnostic_trace(
+            parse_platform_diagnostic("native frame"),
+            stage=DiagnosticStage.EXECUTION,
+            pinned_artifacts=pinned_artifacts,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize("pinned_manifest_sha256", (b"", 0, [], {}))
+def test_trace_rejects_non_string_pinned_manifest_identity(
+    pinned_manifest_sha256: object,
+) -> None:
+    with pytest.raises(ValueError, match="manifest identity"):
+        normalize_platform_diagnostic_trace(
+            parse_platform_diagnostic("native frame"),
+            stage=DiagnosticStage.EXECUTION,
+            pinned_manifest_sha256=pinned_manifest_sha256,  # type: ignore[arg-type]
+        )
+
+
 def test_trace_order_does_not_redefine_legacy_primary_location() -> None:
     source = "Результат = 1;"
     diagnostic = remap_platform_diagnostic(

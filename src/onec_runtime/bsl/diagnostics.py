@@ -1048,6 +1048,10 @@ def normalize_platform_diagnostic_trace(
         raise ValueError("visible_source_context must be a VisibleSourceContext")
     if executed is None and visible_source_context is not None:
         raise ValueError("visible source context requires an executed artifact")
+    if pinned_manifest_sha256 is not None and type(pinned_manifest_sha256) is not str:
+        raise ValueError("pinned manifest identity must be a string or None")
+    if type(pinned_artifacts) is not tuple:
+        raise ValueError("pinned artifacts must be an immutable tuple")
     if pinned_manifest_sha256 is None:
         if pinned_artifacts:
             raise ValueError("pinned artifacts require a manifest identity")
