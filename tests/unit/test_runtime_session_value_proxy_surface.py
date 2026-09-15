@@ -18,6 +18,7 @@ from onec_runtime.bsl import (
 )
 from onec_runtime.session import RuntimeSession
 from onec_runtime.worker_breakpoints import WorkerBreakpointReloadPolicy
+from onec_runtime.worker_universe import WorkerGenerationHandle
 
 
 class FakeRuntimeApi:
@@ -25,6 +26,8 @@ class FakeRuntimeApi:
         self.calls: list[tuple[str, str, object, dict[str, object]]] = []
         self.guard_calls: list[str] = []
         self.forbidden_handles: set[str] = set()
+        self.handle = WorkerGenerationHandle(1, 1, 1, "a" * 64)
+        self.active_units: dict[str, WorkerModuleUnit] = {}
 
     def require_public_value_handle(self, handle: str) -> None:
         self.guard_calls.append(handle)
@@ -49,12 +52,12 @@ class FakeRuntimeApi:
 
     def load_worker_modules(
         self,
-        units: object,
+        units: tuple[WorkerModuleUnit, ...],
         *,
         common_modules: object,
         breakpoint_policy: object = None,
         profiler: object = None,
-    ) -> object:
+    ) -> WorkerGenerationHandle:
         self.calls.append(
             (
                 "load_worker_modules",
@@ -67,7 +70,14 @@ class FakeRuntimeApi:
                 },
             )
         )
-        return "generation"
+        self.active_units.update((unit.logical_name.casefold(), unit) for unit in units)
+        return self.handle
+
+    def confirmed_worker_module_units(
+        self, handle: WorkerGenerationHandle,
+    ) -> tuple[WorkerModuleUnit, ...]:
+        assert handle is self.handle and self.active_units
+        return tuple(self.active_units[name] for name in sorted(self.active_units))
 
     def release_worker_generation(self, handle: object) -> None:
         self.calls.append(("release_worker_generation", "", handle, {}))
@@ -141,8 +151,8 @@ def test_runtime_session_forwards_worker_universe_descriptors() -> None:
     )
     session._common_module_catalog = catalog_manager
 
-    assert session.load_worker_modules(units) == "generation"
-    session.release_worker_generation("generation")
+    assert session.load_worker_modules(units) is api.handle
+    session.release_worker_generation(api.handle)
 
     assert api.calls == [
         (
@@ -155,7 +165,7 @@ def test_runtime_session_forwards_worker_universe_descriptors() -> None:
                 "profiler": None,
             },
         ),
-        ("release_worker_generation", "", "generation", {}),
+        ("release_worker_generation", "", api.handle, {}),
     ]
 
 

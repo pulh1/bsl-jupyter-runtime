@@ -9,6 +9,7 @@ from xml.etree import ElementTree
 import httpx
 import pytest
 
+from onec_runtime.bsl import WorkerModuleUnit
 from onec_runtime.rdbg.session import SessionState
 from onec_runtime.rdbg.transport import RdbgTransport
 from onec_runtime.rdbg.xml_codec import RDBG_NS
@@ -23,11 +24,19 @@ from tests.unit.test_extension_session import _Closeable, _worker_unit, session_
 class ModuleApi:
     def __init__(self) -> None:
         self.handle = WorkerGenerationHandle(1, 1, 1, "a" * 64)
+        self.active_units: dict[str, WorkerModuleUnit] = {}
 
     def load_worker_modules(self, units, *, common_modules, **kwargs):
         assert len(units) == 1 and units[0].logical_name == "Probe"
         assert common_modules is not None
+        self.active_units.update((unit.logical_name.casefold(), unit) for unit in units)
         return self.handle
+
+    def confirmed_worker_module_units(
+        self, handle: WorkerGenerationHandle,
+    ) -> tuple[WorkerModuleUnit, ...]:
+        assert handle is self.handle and self.active_units
+        return tuple(self.active_units[name] for name in sorted(self.active_units))
 
 
 def runtime_session(tmp_path: Path, http, *, breakpoints=()):
