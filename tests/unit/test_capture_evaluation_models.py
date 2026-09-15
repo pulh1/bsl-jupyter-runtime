@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, fields
 from datetime import datetime, timezone
+from typing import get_type_hints
 
 import pytest
 
@@ -15,6 +16,7 @@ from onec_runtime.capture_evaluation import (
     CaptureFailureDiagnostic,
     CapturePhase,
     CaptureStatus,
+    _enum,
 )
 from onec_runtime.errors import (
     CaptureBusyError,
@@ -48,6 +50,11 @@ def test_safe_enums_have_the_public_wire_values() -> None:
         "failed",
         "unknown",
     }
+
+
+def test_enum_helper_annotations_are_resolvable() -> None:
+    hints = get_type_hints(_enum)
+    assert "return" in hints
 
 
 def test_timing_is_bounded_rounded_and_does_not_retain_private_data() -> None:

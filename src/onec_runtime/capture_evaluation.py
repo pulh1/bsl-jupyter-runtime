@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
 from math import isfinite
+from typing import TypeVar
 
 
 # These limits are part of the public safety boundary.  Timing is intentionally
@@ -55,6 +56,7 @@ _INTERNAL_EVALUATION_KINDS = frozenset(
         CaptureEvaluationKind.MATERIALIZATION_HELPER,
     }
 )
+_EnumT = TypeVar("_EnumT", bound=StrEnum)
 
 
 def _safe_text(value: object, *, name: str, limit: int, allow_empty: bool = True) -> str:
@@ -78,7 +80,7 @@ def _identifier(value: object, *, name: str = "evaluation_id") -> str:
     )
 
 
-def _enum(value: object, enum_type: type[StrEnum], *, name: str) -> Any:
+def _enum(value: object, enum_type: type[_EnumT], *, name: str) -> _EnumT:
     if isinstance(value, enum_type):
         return value
     if isinstance(value, str):
