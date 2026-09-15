@@ -30,7 +30,7 @@ from onec_runtime.errors import (
     TargetLost,
     WorkerPromotionOutcomeUnknown,
 )
-from onec_runtime.prototype_runtime import OperationState
+from onec_runtime.prototype_runtime import ContinuationAttemptSpec, OperationState
 from onec_runtime.rdbg.models import EvaluationResult, PendingEvaluation
 from onec_runtime.runtime_api import PrototypeRuntimeApi, RuntimeStatus
 from onec_runtime.session import RuntimeSession
@@ -1348,4 +1348,147 @@ def test_busy_session_resume_preserves_the_active_capture_ticket() -> None:
         assert failures == []
     finally:
         _finish_pending(initiator, transport)
+        close_owner(controller, transport)
+
+
+def test_continuation_admission_respects_capture_completion_reservation() -> None:
+    api, controller, transport = _capture_runtime()
+    owner = _capture_owner(controller)
+    original_finalize = api._finalize_namespace_reply
+    completion_entered = Event()
+    release_completion = Event()
+    initiator: Thread | None = None
+
+    def blocked_finalize(*args, **kwargs):  # type: ignore[no-untyped-def]
+        completion_entered.set()
+        assert release_completion.wait(_JOIN_TIMEOUT_S)
+        return original_finalize(*args, **kwargs)
+
+    try:
+        api._finalize_namespace_reply = blocked_finalize  # type: ignore[method-assign]
+        initiator, _finished, failures = _start_pending_capture(
+            lambda: api.execute_bsl("РезультатИнструкции = 901;"),
+            transport.accepted,
+        )
+        pending_id = api.current_capture().status().pending_evaluation_id
+        transport.complete()
+        assert completion_entered.wait(1), "completion barrier was not reached"
+        assert controller.state is OperationState.CAPTURED
+        assert owner.status(owner._fence).phase is CapturePhase.EVALUATING
+
+        registry_before = controller.registry
+        controller_points_before = controller.capture_points
+        workspace_before = controller._breakpoint_workspace
+        confirmed_before = controller.breakpoint_workspace_owner.confirmed_snapshot
+        attempts_before = dict(controller._continuation_attempts)
+        active_attempt_before = controller._active_continuation_attempt_id
+        journal_before = controller.journal.events
+        workspace_calls_before = transport.workspace_call_count
+        api_points_before = api._capture_points
+        ticket_before = api._capture_ticket
+        attempt = ContinuationAttemptSpec(
+            "task5-r3-completion",
+            max(1, controller.stop_sequence),
+            "task5-r3-request",
+            (),
+        )
+
+        with pytest.raises(CaptureBusyError) as caught:
+            api.begin_continuation_admission(attempt, (CAPTURE_A,))
+
+        assert pending_id is not None
+        assert caught.value.evaluation_id == pending_id
+        assert controller.registry is registry_before
+        assert controller.capture_points == controller_points_before
+        assert controller._breakpoint_workspace == workspace_before
+        assert controller.breakpoint_workspace_owner.confirmed_snapshot == confirmed_before
+        assert controller._continuation_attempts == attempts_before
+        assert controller._active_continuation_attempt_id == active_attempt_before
+        assert controller.journal.events == journal_before
+        assert transport.workspace_call_count == workspace_calls_before
+        assert api._capture_points == api_points_before
+        assert api._capture_ticket is ticket_before
+        assert failures == []
+    finally:
+        release_completion.set()
+        api._finalize_namespace_reply = original_finalize  # type: ignore[method-assign]
+        if initiator is not None:
+            initiator.join(_JOIN_TIMEOUT_S)
+            assert not initiator.is_alive(), "continuation initiator leaked"
+        close_owner(controller, transport)
+
+
+@pytest.mark.parametrize("route", ("add", "remove", "disable"))
+def test_worker_breakpoint_mutation_respects_capture_completion_reservation(
+    tmp_path,
+    route: str,
+) -> None:  # type: ignore[no-untyped-def]
+    api, controller, transport = controlled_notebook_runtime(tmp_path)
+    original_finalize = api._finalize_namespace_reply
+    completion_entered = Event()
+    release_completion = Event()
+    initiator: Thread | None = None
+
+    def blocked_finalize(*args, **kwargs):  # type: ignore[no-untyped-def]
+        completion_entered.set()
+        assert release_completion.wait(_JOIN_TIMEOUT_S)
+        return original_finalize(*args, **kwargs)
+
+    try:
+        assert api.execute_bsl(UPDATE).succeeded
+        assert api.execute_bsl("Результат = Б();").kind.value == "captured"
+        owner = _capture_owner(controller)
+        view = api._worker_universe._retained_debug_views()[0]
+        module = view.modules[0]
+        existing_id = None
+        if route != "add":
+            existing_id = api.add_worker_breakpoint(
+                module.source_unit,
+                module.canonical_module,
+                2,
+            ).breakpoint.id
+
+        api._finalize_namespace_reply = blocked_finalize  # type: ignore[method-assign]
+        initiator, _finished, failures = _start_pending_capture(
+            lambda: api.execute_bsl("РезультатИнструкции = Б();"),
+            transport.accepted,
+        )
+        pending_id = api.current_capture().status().pending_evaluation_id
+        transport.complete()
+        assert completion_entered.wait(1), "completion barrier was not reached"
+        assert controller.state is OperationState.CAPTURED
+        assert owner.status(owner._fence).phase is CapturePhase.EVALUATING
+
+        catalog_before = api._worker_breakpoints.snapshot()
+        statuses_before = api.list_worker_breakpoints()
+        workspace_before = controller.breakpoint_workspace_owner.confirmed_snapshot
+        physical_calls_before = transport.workspace_call_count
+
+        with pytest.raises(CaptureBusyError) as caught:
+            if route == "add":
+                api.add_worker_breakpoint(
+                    module.source_unit,
+                    module.canonical_module,
+                    3,
+                )
+            elif route == "remove":
+                assert existing_id is not None
+                api.remove_worker_breakpoint(existing_id)
+            else:
+                assert existing_id is not None
+                api.set_worker_breakpoint_enabled(existing_id, False)
+
+        assert pending_id is not None
+        assert caught.value.evaluation_id == pending_id
+        assert api._worker_breakpoints.snapshot() == catalog_before
+        assert api.list_worker_breakpoints() == statuses_before
+        assert controller.breakpoint_workspace_owner.confirmed_snapshot == workspace_before
+        assert transport.workspace_call_count == physical_calls_before
+        assert failures == []
+    finally:
+        release_completion.set()
+        api._finalize_namespace_reply = original_finalize  # type: ignore[method-assign]
+        if initiator is not None:
+            initiator.join(_JOIN_TIMEOUT_S)
+            assert not initiator.is_alive(), "breakpoint initiator leaked"
         close_owner(controller, transport)
