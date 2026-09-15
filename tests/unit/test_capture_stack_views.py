@@ -747,6 +747,110 @@ def test_common_source_is_repinned_after_notebook_publication_and_history_surviv
     assert historical_frame._resolved.version.generation == first_handle.generation
 
 
+def test_shared_source_unit_keeps_distinct_common_and_notebook_physical_owners(
+    tmp_path,
+) -> None:
+    from test_runtime_api import (
+        _common_module_catalog, _semantic_snapshot_runtime, _worker_module_unit,
+    )
+    from onec_runtime.bsl.source_maps import SourceUnitKind, SourceUnitRef, source_sha256
+    from onec_runtime.worker_breakpoints import resolve_source_line
+
+    catalog = _common_module_catalog("МодульА")
+    common_unit = _worker_module_unit("МодульА", 1, catalog)
+    shared_source = common_unit.mapped_source.text
+    shared_ref = common_unit.mapped_source.source_map.map_offset(0).unit
+    assert shared_ref is not None
+    worker_runtime = _semantic_snapshot_runtime(tmp_path, catalog)
+    worker_runtime.load_worker_modules((common_unit,), common_modules=catalog)
+    historical_pin = worker_runtime._worker_universe.pin_active()
+
+    worker_runtime.execute_bsl(shared_source, source_unit=shared_ref)
+    shared_pin = worker_runtime._worker_universe.pin_active()
+    shared_view = worker_runtime._worker_universe._operation_debug_view(shared_pin)
+    common_module = next(
+        module for module in shared_view.modules
+        if module.canonical_module == "модульа"
+    )
+    notebook_module = next(
+        module for module in shared_view.modules
+        if module.canonical_module == "worker"
+    )
+    current_lines = tuple(
+        resolve_source_line(module, shared_ref, 2).generated_line
+        for module in (common_module, notebook_module)
+    )
+    assert all(line is not None for line in current_lines)
+
+    later_source = "Процедура Позже()\n    А = 3;\nКонецПроцедуры;"
+    later_ref = SourceUnitRef(
+        SourceUnitKind.NOTEBOOK_CELL,
+        "PrivateLaterCell",
+        3,
+        source_sha256(later_source),
+    )
+    worker_runtime.execute_bsl(later_source, source_unit=later_ref)
+    _, controller, session = captured_stack_api()
+    worker_runtime._controller = controller
+    worker_runtime._operation_generation_pin = shared_pin
+    session.live_frames = (
+        session.live_frames[0],
+        *(
+            StackFrame(
+                session.live_frames[0].target_id,
+                level,
+                module.registration.module_location(line),
+            )
+            for level, (module, line) in enumerate(
+                zip((common_module, notebook_module), current_lines, strict=True),
+                start=1,
+            )
+            if line is not None
+        ),
+        replace(session.live_frames[2], level=3),
+    )
+
+    current_page = worker_runtime.current_capture().stack[:20].with_methods()
+    current_frames = tuple(
+        frame for frame in current_page.frames if isinstance(frame, api().DebugFrame)
+    )
+
+    historical_module = worker_runtime._worker_universe._operation_debug_view(
+        historical_pin
+    ).modules[0]
+    historical_line = resolve_source_line(
+        historical_module, shared_ref, 2,
+    ).generated_line
+    assert historical_line is not None
+    worker_runtime._operation_generation_pin = historical_pin
+    session.live_frames = (
+        session.live_frames[0],
+        StackFrame(
+            session.live_frames[0].target_id,
+            1,
+            historical_module.registration.module_location(historical_line),
+        ),
+        session.live_frames[2],
+    )
+    historical_frame = worker_runtime.current_capture().stack[0].with_method()
+
+    assert [frame.source for frame in current_frames] == [
+        "МодульА",
+        "ЯчейкаНоутбука",
+    ]
+    assert current_frames[0]._resolved.identity != current_frames[1]._resolved.identity
+    assert [frame.method.name for frame in current_frames] == ["Версия", "Версия"]
+    assert [frame._resolved.version.generation for frame in current_frames] == [
+        shared_pin.handle.generation,
+        shared_pin.handle.generation,
+    ]
+    assert historical_frame.source == "МодульА"
+    assert historical_frame._resolved.version.generation == historical_pin.handle.generation
+    public = repr(current_page) + repr(historical_frame)
+    assert "PrivateLaterCell" not in public
+    assert "SourceUnitRef" not in public and "identity=" not in public
+
+
 @pytest.mark.parametrize(
     "failure",
     (
