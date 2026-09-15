@@ -835,7 +835,7 @@ def test_completion_fields_use_bounded_schema_helper_in_capture_kernel_frame() -
 
     assert ("evaluate_collection", (
         "RuntimeValueTransferServer.ПолучитьДопущенныеИменаСвойствДляПодсказки(Контекст.Данные, Истина, \"\")",
-        0, 128, 2,
+        0, 129, 2,
     )) in session.calls
 
 

@@ -312,9 +312,105 @@ def _build_variant(
     )
 
 
+def _build_table_bound_instrumented_bundle(root: Path, platform: Path):  # type: ignore[no-untyped-def]
+    """Build an exact-source CFE that faults only on an out-of-page cell read."""
+    source = _copy_source(root)
+    module = source / "CommonModules" / "RuntimeTableTransferServer" / "Ext" / "Module.bsl"
+    text = module.read_text(encoding="utf-8-sig")
+    classifier_start = text.index("Функция ОпределитьКомпактнуюСхемуКолонок")
+    before_classifier, classifier = text[:classifier_start], text[classifier_start:]
+    classifier_read = "\t\t\tЗначениеЯчейки = СтрокаТаблицы[Колонка.Имя];"
+    classifier_probe = classifier_read + (
+        "\n\t\t\tЕсли ЗначениеЯчейки = \"__table_bound_sentinel__\" Тогда"
+        "\n\t\t\t\tВызватьИсключение \"out_of_page_classifier_cell_read\";"
+        "\n\t\t\tКонецЕсли;"
+    )
+    assert classifier.count(classifier_read) == 1
+    classifier = classifier.replace(classifier_read, classifier_probe, 1)
+    query_read = (
+        "\t\t\tСтрокаРезультата[КолонкаРезультата.Имя]"
+        "\n\t\t\t\t= ВыборкаДанных[КолонкаРезультата.Имя];"
+    )
+    query_probe = (
+        "\t\t\tЕсли ВыборкаДанных[КолонкаРезультата.Имя]"
+        " = \"__table_bound_sentinel__\" Тогда"
+        "\n\t\t\t\tВызватьИсключение \"out_of_page_query_cell_read\";"
+        "\n\t\t\tКонецЕсли;\n"
+        + query_read
+    )
+    instrumented = before_classifier + classifier
+    assert instrumented.count(query_read) == 1
+    module.write_text(
+        instrumented.replace(query_read, query_probe, 1),
+        encoding="utf-8",
+        newline="\n",
+    )
+    return build_runtime_extension_bundle(
+        source_root=source,
+        output_root=root / "bundle",
+        platform_bin=platform,
+        artifact_version="0.1.3",
+        protocol_version="2",
+    )
+
+
 def _install_cfe(config: RuntimeConfig, cfe: Path, root: Path) -> None:
     load_target_extension_cfe(config, cfe, root / "load.log")
     apply_product_extension(config, root / "apply.log")
+
+
+@pytest.mark.live_1c
+def test_compact_table_bound_is_executed_before_value_table_and_query_sentinel_cells(
+    tmp_path: Path,
+    _track_owned_runtime_processes: _OwnedProcessTracker,
+) -> None:
+    """Opt-in live qualification of the instrumented product BSL CFE, not a unit model."""
+    platform = _platform_bin()
+    bundle = _build_table_bound_instrumented_bundle(tmp_path / "instrumented", platform)
+    config = _config(tmp_path / "target", platform)
+    create_empty_infobase(config)
+    _install_cfe(config, bundle.cfe_path, tmp_path / "install")
+    session, _profile = _start(config, tmp_path / "evidence")
+    try:
+        reply = session.execute_bsl('''
+Таблица = Новый ТаблицаЗначений;
+Таблица.Колонки.Добавить("Значение", Новый ОписаниеТипов("Строка"));
+Для Номер = 0 По 9999 Цикл
+    СтрокаТаблицы = Таблица.Добавить();
+    СтрокаТаблицы.Значение = ?(Номер = 3, "__table_bound_sentinel__", "safe");
+КонецЦикла;
+
+ПроверкаТаблицыЗначений = "";
+Попытка
+    Материализация = RuntimeTableTransferServer.СериализоватьКомпактнуюТаблицу(
+        Таблица, "presentation", Новый Соответствие, Новый Массив, 3, 1000000);
+    ПроверкаТаблицыЗначений = ?(Материализация.Доступ, "unexpected_success", "denied");
+Исключение
+    ПроверкаТаблицыЗначений = ?(
+        СтрНайти(ИнформацияОбОшибке().Описание, "out_of_page_") > 0,
+        "sentinel", "bounded");
+КонецПопытки;
+
+Запрос = Новый Запрос;
+Запрос.УстановитьПараметр("ИсходнаяТаблица", Таблица);
+Запрос.Текст = "ВЫБРАТЬ ИсходнаяТаблица.Значение КАК Значение ИЗ &ИсходнаяТаблица КАК ИсходнаяТаблица";
+ПроверкаЗапроса = "";
+Попытка
+    МатериализацияЗапроса = RuntimeTableTransferServer.СериализоватьКомпактнуюТаблицу(
+        Запрос.Выполнить(), "presentation", Новый Соответствие, Новый Массив, 3, 1000000);
+    ПроверкаЗапроса = ?(МатериализацияЗапроса.Доступ, "bounded", "denied");
+Исключение
+    ПроверкаЗапроса = ?(
+        СтрНайти(ИнформацияОбОшибке().Описание, "out_of_page_") > 0,
+        "sentinel", "failed");
+КонецПопытки;
+Результат = ПроверкаТаблицыЗначений + "|" + ПроверкаЗапроса;''')
+    finally:
+        session.close()
+
+    assert reply.succeeded
+    assert reply.result == "bounded|bounded"
+    _assert_no_owned_1c_process(config, _track_owned_runtime_processes)
 
 
 def test_minimal_first_install_then_structural_fast_path(

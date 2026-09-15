@@ -23,6 +23,8 @@ class Controller:
         self.admission_sources = []
         self.target_requests = []
         self.admission_outcome = "R"
+        self.collection_size_override = None
+        self.collection_row_limit = None
 
     def execute_system_main(self, source):
         self.admission_sources.append(source)
@@ -41,16 +43,20 @@ class Controller:
                     CollectionCell("Имя", "Строка", "", value_string=""),
                 )),),
             )
+        rows = (CollectionRow(0, (
+            CollectionCell("Состояние", "Строка", "", value_string="R"),
+            CollectionCell("Имя", "Строка", "", value_string=""),
+        )),) + tuple(CollectionRow(index + 1, (
+            CollectionCell("Состояние", "Строка", "", value_string="R"),
+            CollectionCell("Имя", "Строка", "", value_string=name),
+        )) for index, name in enumerate(self.fields))
+        if self.collection_row_limit is not None:
+            rows = rows[:self.collection_row_limit]
         return EvaluationResult(
             UUID(int=1), "ТаблицаЗначений", "", False,
-            collection_size=len(self.fields) + 1,
-            collection_rows=(CollectionRow(0, (
-                CollectionCell("Состояние", "Строка", "", value_string="R"),
-                CollectionCell("Имя", "Строка", "", value_string=""),
-            )),) + tuple(CollectionRow(index + 1, (
-                CollectionCell("Состояние", "Строка", "", value_string="R"),
-                CollectionCell("Имя", "Строка", "", value_string=name),
-            )) for index, name in enumerate(self.fields)),
+            collection_size=(len(self.fields) + 1 if self.collection_size_override is None
+                             else self.collection_size_override),
+            collection_rows=rows,
         )
 
 
@@ -106,6 +112,25 @@ def test_completion_is_one_consumer_owned_admission_and_schema_request():
     assert controller.state is OperationState.FAILED and controller.operation_id == 7
     assert controller.target_requests == [("completion", "Контекст.Данные")]
     assert controller.calls[-1][-1] == ()
+
+
+def test_completion_preserves_the_marker_and_all_128_admitted_names():
+    controller = Controller()
+    controller.fields = tuple(f"Поле{index}" for index in range(128))
+
+    fields = PrototypeRuntimeApi(controller).completion_fields("Контекст.Данные")
+
+    assert fields == controller.fields
+    assert len(fields) == 128
+
+
+def test_completion_rejects_a_truncated_marker_plus_128_name_result():
+    controller = Controller()
+    controller.fields = tuple(f"Поле{index}" for index in range(128))
+    controller.collection_row_limit = 128
+
+    with pytest.raises(ProtocolError, match="Invalid completion field schema"):
+        PrototypeRuntimeApi(controller).completion_fields("Контекст.Данные")
 
 
 @pytest.mark.parametrize(
