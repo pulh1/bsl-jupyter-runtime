@@ -2087,6 +2087,10 @@ class RuntimeSession:
         finally:
             self._operation_lock.release()
 
+    @property
+    def is_closed(self) -> bool:
+        return self._closed
+
     def close(self) -> None:
         self._close(shutdown=False)
 
@@ -2099,122 +2103,136 @@ class RuntimeSession:
         self._close(shutdown=self.config.runtime.is_server_infobase)
 
     def _close(self, *, shutdown: bool, _supervised: bool = False) -> None:
-        with self._close_lock:
-            if self._closed:
-                return
-            self._heartbeat_stop.set()
-            if current_thread() is not self._heartbeat_thread:
-                self._heartbeat_thread.join(timeout=2.0)
-            errors: list[BaseException] = []
-            if shutdown:
-                close_capture = getattr(
-                    self.runtime_api,
-                    "_close_capture_control_plane",
-                    None,
-                )
-                if callable(close_capture):
-                    try:
-                        close_capture()
-                    except BaseException as error:
-                        errors.append(error)
-            elif not self._runtime_api_closed:
-                close_runtime_api = getattr(self.runtime_api, "close", None)
-                if not callable(close_runtime_api):
-                    self._runtime_api_closed = True
-                else:
-                    try:
-                        close_runtime_api()
-                    except BaseException as error:
-                        errors.append(error)
-                    else:
-                        self._runtime_api_closed = True
-            acquired_operation = (
-                self._operation_lock.acquire()
-                if _supervised
-                else self._operation_lock.acquire(
-                    timeout=self._close_operation_timeout_s()
-                )
+        acquired_close = (
+            self._close_lock.acquire()
+            if _supervised
+            else self._close_lock.acquire(
+                timeout=self._close_operation_timeout_s()
             )
-            if not acquired_operation:
-                self._start_supervised_close_locked(shutdown)
-                if errors:
-                    raise ProtocolError(
-                        "ZUP demo cleanup failed: "
-                        + ", ".join(type(error).__name__ for error in errors)
-                    ) from errors[0]
-                return
-            try:
-                if self.config.runtime.is_server_infobase:
-                    if not self._server_session_terminated:
-                        try:
-                            self._native_client_termination_requested = self._rdbg.terminate_bound_server_session()
-                        except RdbgDebugUiNotRegistered:
-                            # The UI is gone; fall back to closing our owned client.
-                            self._server_session_terminated = True
-                        except BaseException as error:
-                            errors.append(error)
-                        else:
-                            self._server_session_terminated = True
-                    # Server termination needs the owned client connection alive.
-                    # The cluster debugger belongs to the service, not this session.
-                    if self._server_session_terminated and not self._processes_closed:
-                        try:
-                            if self._native_client_termination_requested:
-                                self._processes.close(graceful_client_timeout_s=3.0)
-                            else:
-                                self._processes.close()
-                        except BaseException as error:
-                            errors.append(error)
-                        else:
-                            self._processes_closed = True
-                    if self._processes_closed and not self._debug_ui_detached:
-                        try:
-                            self._rdbg.detach()
-                        except BaseException as error:
-                            errors.append(error)
-                        else:
-                            self._debug_ui_detached = True
-                if not self._transport_closed and (
-                    not self.config.runtime.is_server_infobase
-                    or self._debug_ui_detached
-                ):
-                    try:
-                        self._transport.close()
-                    except BaseException as error:
-                        errors.append(error)
-                    else:
-                        self._transport_closed = True
-                if not self.config.runtime.is_server_infobase and not self._processes_closed:
-                    try:
-                        self._processes.close()
-                    except BaseException as error:
-                        errors.append(error)
-                    else:
-                        self._processes_closed = True
-                if (
-                    shutdown
-                    and self._server_session_terminated
-                    and self._processes_closed
-                    and self._debug_ui_detached
-                    and self._transport_closed
-                ):
-                    # Local Worker generations die with this kernel. The
-                    # authenticated server target and client have been closed.
+        )
+        if not acquired_close:
+            return
+        try:
+            self._close_locked(
+                shutdown=shutdown,
+                operation_owned=_supervised,
+            )
+        finally:
+            self._close_lock.release()
+
+    def _close_locked(self, *, shutdown: bool, operation_owned: bool) -> None:
+        if self._closed:
+            return
+        self._heartbeat_stop.set()
+        if current_thread() is not self._heartbeat_thread:
+            self._heartbeat_thread.join(timeout=2.0)
+        errors: list[BaseException] = []
+        if shutdown:
+            close_capture = getattr(
+                self.runtime_api,
+                "_close_capture_control_plane",
+                None,
+            )
+            if callable(close_capture):
+                try:
+                    close_capture()
+                except BaseException as error:
+                    errors.append(error)
+        elif not self._runtime_api_closed:
+            close_runtime_api = getattr(self.runtime_api, "close", None)
+            if not callable(close_runtime_api):
+                self._runtime_api_closed = True
+            else:
+                try:
+                    close_runtime_api()
+                except BaseException as error:
+                    errors.append(error)
+                else:
                     self._runtime_api_closed = True
-            finally:
-                self._operation_lock.release()
-            if (
-                self._runtime_api_closed
-                and self._debug_ui_detached
-                and self._transport_closed
-                and self._processes_closed
-            ):
-                self._closed = True
+        acquired_operation = operation_owned or self._operation_lock.acquire(
+            timeout=self._close_operation_timeout_s()
+        )
+        if not acquired_operation:
+            self._start_supervised_close_locked(shutdown)
             if errors:
                 raise ProtocolError(
                     "ZUP demo cleanup failed: "
                     + ", ".join(type(error).__name__ for error in errors)
                 ) from errors[0]
+            return
+        try:
+            if self.config.runtime.is_server_infobase:
+                if not self._server_session_terminated:
+                    try:
+                        self._native_client_termination_requested = self._rdbg.terminate_bound_server_session()
+                    except RdbgDebugUiNotRegistered:
+                        # The UI is gone; fall back to closing our owned client.
+                        self._server_session_terminated = True
+                    except BaseException as error:
+                        errors.append(error)
+                    else:
+                        self._server_session_terminated = True
+                # Server termination needs the owned client connection alive.
+                # The cluster debugger belongs to the service, not this session.
+                if self._server_session_terminated and not self._processes_closed:
+                    try:
+                        if self._native_client_termination_requested:
+                            self._processes.close(graceful_client_timeout_s=3.0)
+                        else:
+                            self._processes.close()
+                    except BaseException as error:
+                        errors.append(error)
+                    else:
+                        self._processes_closed = True
+                if self._processes_closed and not self._debug_ui_detached:
+                    try:
+                        self._rdbg.detach()
+                    except BaseException as error:
+                        errors.append(error)
+                    else:
+                        self._debug_ui_detached = True
+            if not self._transport_closed and (
+                not self.config.runtime.is_server_infobase
+                or self._debug_ui_detached
+            ):
+                try:
+                    self._transport.close()
+                except BaseException as error:
+                    errors.append(error)
+                else:
+                    self._transport_closed = True
+            if not self.config.runtime.is_server_infobase and not self._processes_closed:
+                try:
+                    self._processes.close()
+                except BaseException as error:
+                    errors.append(error)
+                else:
+                    self._processes_closed = True
+            if (
+                shutdown
+                and self._server_session_terminated
+                and self._processes_closed
+                and self._debug_ui_detached
+                and self._transport_closed
+            ):
+                # Local Worker generations die with this kernel. The
+                # authenticated server target and client have been closed.
+                self._runtime_api_closed = True
+        finally:
+            if not operation_owned:
+                self._operation_lock.release()
+        if (
+            self._runtime_api_closed
+            and self._debug_ui_detached
+            and self._transport_closed
+            and self._processes_closed
+        ):
+            self._closed = True
+        if errors:
+            raise ProtocolError(
+                "ZUP demo cleanup failed: "
+                + ", ".join(type(error).__name__ for error in errors)
+            ) from errors[0]
 
     def _close_operation_timeout_s(self) -> float:
         controller = getattr(self.runtime_api, "_controller", None)
@@ -2234,6 +2252,7 @@ class RuntimeSession:
             return
 
         def finish() -> None:
+            self._operation_lock.acquire()
             try:
                 self._close(shutdown=shutdown, _supervised=True)
             except BaseException as error:
@@ -2241,6 +2260,8 @@ class RuntimeSession:
                     "Supervised runtime cleanup failed: "
                     + type(error).__name__
                 )
+            finally:
+                self._operation_lock.release()
 
         thread = Thread(
             target=finish,

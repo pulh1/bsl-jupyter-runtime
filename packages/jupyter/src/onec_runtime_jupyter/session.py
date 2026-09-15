@@ -90,6 +90,11 @@ class InteractiveRuntimeSession:
                 shutdown_close()
             else:
                 self.runtime.close()
+            if (
+                isinstance(self.runtime, RuntimeSession)
+                and not self.runtime.is_closed
+            ):
+                return
             if self._guardian is not None:
                 self._guardian.stop()
             self._closed = True
