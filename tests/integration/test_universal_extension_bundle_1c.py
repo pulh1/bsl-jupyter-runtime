@@ -312,13 +312,26 @@ def _build_variant(
     )
 
 
-def _build_table_bound_instrumented_bundle(root: Path, platform: Path):  # type: ignore[no-untyped-def]
-    """Build an exact-source CFE that faults only on an out-of-page cell read."""
+def _build_table_bound_instrumented_bundle(
+    root: Path,
+    platform: Path,
+    *,
+    move_serializer_guard_after_read: bool,
+):  # type: ignore[no-untyped-def]
+    """Build an exact-source CFE with probes after each bounded BSL cell read."""
     source = _copy_source(root)
     module = source / "CommonModules" / "RuntimeTableTransferServer" / "Ext" / "Module.bsl"
     text = module.read_text(encoding="utf-8-sig")
     classifier_start = text.index("Функция ОпределитьКомпактнуюСхемуКолонок")
     before_classifier, classifier = text[:classifier_start], text[classifier_start:]
+    serializer_read = "\t\t\tЗначениеЯчейки = СтрокаТаблицы[Колонка.Имя];"
+    serializer_probe = serializer_read + (
+        "\n\t\t\tЕсли ЗначениеЯчейки = \"__table_bound_sentinel__\" Тогда"
+        "\n\t\t\t\tВызватьИсключение \"out_of_page_serializer_cell_read\";"
+        "\n\t\t\tКонецЕсли;"
+    )
+    assert before_classifier.count(serializer_read) == 1
+    before_classifier = before_classifier.replace(serializer_read, serializer_probe, 1)
     classifier_read = "\t\t\tЗначениеЯчейки = СтрокаТаблицы[Колонка.Имя];"
     classifier_probe = classifier_read + (
         "\n\t\t\tЕсли ЗначениеЯчейки = \"__table_bound_sentinel__\" Тогда"
@@ -339,6 +352,23 @@ def _build_table_bound_instrumented_bundle(root: Path, platform: Path):  # type:
         + query_read
     )
     instrumented = before_classifier + classifier
+    if move_serializer_guard_after_read:
+        serializer_guard = (
+            "\t\tЕсли МаксимумСтрок > 0 И КоличествоСтрокJSONL >= МаксимумСтрок Тогда\n"
+            "\t\t\tВызватьИсключение \"Превышен лимит строк компактной таблицы\";\n"
+            "\t\tКонецЕсли;\n"
+        )
+        moved_guard = (
+            "\n\t\t\tЕсли МаксимумСтрок > 0 И КоличествоСтрокJSONL >= МаксимумСтрок Тогда\n"
+            "\t\t\t\tВызватьИсключение \"Превышен лимит строк компактной таблицы\";\n"
+            "\t\t\tКонецЕсли;"
+        )
+        assert instrumented.count(serializer_guard) == 1
+        instrumented = instrumented.replace(serializer_guard, "", 1)
+        assert instrumented.count(serializer_probe) == 1
+        instrumented = instrumented.replace(
+            serializer_probe, serializer_probe + moved_guard, 1
+        )
     assert instrumented.count(query_read) == 1
     module.write_text(
         instrumented.replace(query_read, query_probe, 1),
@@ -399,9 +429,14 @@ def test_compact_table_bound_is_executed_before_value_table_and_query_sentinel_c
         Таблица, "presentation", Новый Соответствие, Новый Массив, 3, 1000000);
     ПроверкаТаблицыЗначений = ?(Материализация.Доступ, "unexpected_success", "denied");
 Исключение
-    ПроверкаТаблицыЗначений = ?(
-        СтрНайти(ИнформацияОбОшибке().Описание, "out_of_page_") > 0,
-        "sentinel", "bounded");
+    ОписаниеОшибки = ИнформацияОбОшибке().Описание;
+    Если ОписаниеОшибки = "Превышен лимит строк компактной таблицы" Тогда
+        ПроверкаТаблицыЗначений = "bounded";
+    ИначеЕсли ОписаниеОшибки = "out_of_page_serializer_cell_read" Тогда
+        ПроверкаТаблицыЗначений = "serializer_probe";
+    Иначе
+        ПроверкаТаблицыЗначений = "failed";
+    КонецЕсли;
 КонецПопытки;
 
 Запрос = Новый Запрос;
@@ -422,9 +457,7 @@ def test_compact_table_bound_is_executed_before_value_table_and_query_sentinel_c
         Запрос.Выполнить(), "presentation", Новый Соответствие, Новый Массив, 3, 1000000);
     ПроверкаЗапроса = ?(МатериализацияЗапроса.Доступ, "bounded", "denied");
 Исключение
-    ПроверкаЗапроса = ?(
-        СтрНайти(ИнформацияОбОшибке().Описание, "out_of_page_") > 0,
-        "sentinel", "failed");
+    ПроверкаЗапроса = "failed";
 КонецПопытки;
 Результат = ПроверкаТаблицыЗначений + "|" + ПроверкаЗапроса;''')
     finally:

@@ -116,22 +116,31 @@ was not a validation gate.
   raises `ProtocolError` rather than silently omitting `Поле127`.
 - The former independent Python sentinel model has been replaced by an opt-in
   `live_1c` integration qualification. It builds a disposable CFE from the
-  product source with two local fault probes: one immediately after the actual
-  classifier cell read and one immediately before the actual query-result
-  cell copy. The test installs that CFE in a disposable empty infobase, passes
-  a 10,000-row `ТаблицаЗначений` with a sentinel immediately after
-  `max_rows=3`, and also serializes a real `РезультатЗапроса` whose fourth
-  row is the sentinel. The observed `bounded|bounded` result means neither
-  real BSL probe was reached.
+  product source with three local fault probes: immediately after the actual
+  serializer-loop cell read, immediately after the classifier cell read, and
+  immediately before the actual query-result cell copy. The test installs
+  that CFE in a disposable empty infobase, passes a 10,000-row
+  `ТаблицаЗначений` with a sentinel immediately after `max_rows=3`, and also
+  serializes a real `РезультатЗапроса` whose fourth row is the sentinel. The
+  normal handler records `bounded` only when `ИнформацияОбОшибке().Описание`
+  exactly equals `Превышен лимит строк компактной таблицы`; every other
+  exception or probe is a failure.
+
+  The same integration test has a controlled mutation variant which moves the
+  real serializer row-limit guard after its cell read. That variant produces
+  `serializer_probe|bounded`, while the unmodified ordering produces
+  `bounded|bounded`; the live test therefore fails if the serializer guard is
+  moved after the read it must protect.
 
 The opt-in live qualification ran with
 `ONEC_RUN_EXTENSION_BUNDLE_INTEGRATION=1`: `1 passed, 6 deselected in 51.34
-seconds`. This is live 1C evidence against a temporary infobase; it is not a
-claim about the static unit suite. The released product BSL sources did not
-change in this P2 pass, so the checked-in protocol-2/artifact-0.1.3 CFE and
-manifest remain the bundle recorded above.
+seconds` in the initial probe and `2 passed, 6 deselected in 103.77 seconds`
+with the final sensitivity mutation. This is live 1C evidence against a
+temporary infobase; it is not a claim about the static unit suite. The
+released product BSL sources did not change in this P2 pass, so the checked-in
+protocol-2/artifact-0.1.3 CFE and manifest remain the bundle recorded above.
 
-The final focused suite completed with `137 passed, 7 skipped` in 4.13
+The final direct harness suite completed with `131 passed, 8 skipped` in 2.80
 seconds. The broader affected unit suite completed with `571 passed` in 36.76
 seconds. `python -m compileall -q src/onec_runtime packages/jupyter
 packages/mcp` and `git diff --check` pass after the final change.
