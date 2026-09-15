@@ -220,13 +220,15 @@ detailed = stack.with_methods()
 `with_methods()` does not reread RDBG. It enriches the frames already present
 in the saved page and returns a new immutable page. It deduplicates modules,
 uses the shared syntax registry first and parses only missing source versions.
-Source enrichment has a finite timeout capped by the runtime command timeout.
-Source enrichment is local work and does not change CAPTURE lifecycle state. If
-its deadline expires, `with_methods()` returns a new partial page: frames
-already resolved remain enriched and unresolved frames stay in module-and-line
-form with `method_status="timeout"`. A missing or unparsable source similarly
-falls back with its specific status instead of raising
-`CaptureInspectionTimeout`.
+Source enrichment has a soft work budget capped by the runtime command timeout
+and a separate maximum source-file size. The deadline is checked before and
+after each file read and synchronous parser call; version one does not claim to
+preempt one parser invocation already in progress. When the budget is exhausted,
+`with_methods()` returns a new partial page: frames already resolved remain
+enriched and unresolved frames stay in module-and-line form with
+`method_status="timeout"`. Source enrichment is local work and does not change
+CAPTURE lifecycle state. A missing or unparsable source similarly falls back
+with its specific status instead of raising `CaptureInspectionTimeout`.
 
 A single frame can be enriched independently:
 
@@ -388,9 +390,15 @@ The resolver supports the two source layouts already accepted by the runtime:
 
 Root normalization and layout detection are shared with the existing
 Designer/EDT common-module catalog. A root containing both a direct metadata
-tree and an EDT `src` metadata tree is rejected as ambiguous. Format-native
-configuration metadata supplies base/extension identity; a file-name pattern
-alone never decides that identity.
+tree and an EDT `src` metadata tree is rejected as ambiguous. Configuration
+creates an immutable `SourceRootBinding` containing project, configured and
+normalized roots, detected layout, resolved layer (`base` or `extension`) and
+an extension name for the extension layer. The input layer may be `auto`,
+`base` or `extension`; `extension` requires an explicit name. `auto` discovers
+the layer and extension name once from format-native configuration metadata.
+Explicit input is verified against the same metadata. A mismatch rejects the
+binding without falling back to another layer, and a file-name pattern alone
+never decides identity.
 
 The resolver does not build a complete configuration index at startup. For a
 stack page it collects the distinct unresolved physical module identities and
@@ -582,6 +590,12 @@ must submit their target-side evaluation through the same coordinator. Direct
 calls to `RdbgSession.evaluate()` from these paths are prohibited. At most one
 coordinator record may own a pending RDBG capability for a capture.
 
+The same coordinator worker owns the target-side steps of a resume plan so
+CAPTURE evaluation, writeback and Continue cannot compete for the RDBG stream.
+Resume is a distinct `CaptureResumeRequest`, not an evaluation kind and not a
+`CaptureEvaluationRecord`; evaluation status and retained evaluation outcomes
+therefore keep their existing meaning.
+
 Internal call sites pass `evaluation_kind` explicitly; the coordinator never
 infers it by inspecting generated BSL text. Pin installation/cleanup and generic
 transfer plumbing use `materialization_helper` unless a more specific caller
@@ -594,6 +608,20 @@ workspace restoration. Synchronous `%%bsl`, proxy and inspection calls are
 waiters on that operation. They must not hold the runtime single-writer lock
 while blocked on its future. A Python `KeyboardInterrupt` therefore cannot
 cancel the coordinator halfway through dispatch or cleanup.
+
+Worker-universe and transfer components must separate local ledger transitions
+from remote steps. `ServerWorkerUniverseRegistry`/target locks may create a
+staged reservation and later commit or abort it, but no caller holds those locks
+while calling coordinator submission, waiting on a ticket or performing RDBG
+I/O. A generation-pin slot is detached under its narrow lock and the resulting
+lease is released or quarantined only after that lock is released. Completion
+callbacks reacquire a Worker ledger lock only for a short local transition.
+
+A coordinator result policy, mandatory cleanup or resume plan executes another
+remote step through a private inline step executor on the same record. It never
+calls public `submit()` and wait recursively. This rule applies to prepared
+CAPTURE hypotheses, hot-reload preparation/publication, value transfer and
+temporary-handle cleanup as well as visible `%%bsl`.
 
 Before an operation can reach a transport dispatch, the coordinator creates a
 `CaptureEvaluationRecord` containing:
@@ -641,12 +669,15 @@ published when cleanup cannot safely run or complete, but records explicit
 `cleanup_status` (`not_started`, `unknown` or `failed`), keeps its cleanup leases
 quarantined and prohibits inspection/resume until shutdown or recovery.
 
-Temporary context values use coordinator-owned cleanup leases. When a waiter
-unwinds after timeout or `KeyboardInterrupt`, its caller-side `finally` block
-transfers the lease to the record and must not call `drop_context_value()` or
-dispatch any other cleanup evaluation. The coordinator removes the value only
-after the current capability settles and the next required remote step can be
-started safely.
+Temporary context values use coordinator-owned cleanup leases. Every key and
+cleanup plan is registered on the record before the first dispatch that can
+create or expose that temporary value. A caller-side `finally` block may only
+detach the initiating waiter and abandon its optional continuation; it never
+transfers ownership or dispatches cleanup. The coordinator removes the value
+only after the current capability settles and the next required remote step can
+be started safely. It cannot publish `paused` until every required cleanup lease
+has settled. This remains true if the late result arrives before the initiating
+call stack finishes unwinding.
 
 The evaluation-generation pin and restoration responsibility belong to the
 record, not to any initiating or observing caller. The record remains the
@@ -746,6 +777,15 @@ waiting for the next stop later times out. A new stop creates a new fence and
 view. A failed writeback before any mutation may return to `paused` only when
 the controller can prove no staged root changed; partial writeback, uncertain
 cleanup or uncertain Continue enters `recovery_required`.
+
+Stale capture identity does not mean the runtime is ready for another MAIN.
+After Continue acknowledgement the previous MAIN is still active, so new MAIN
+admission remains closed while the controller-owned resume plan waits for its
+next event. A terminal MAIN completion changes runtime state to a normal
+MAIN-ready state; a new CAPTURE stop creates a new `CaptureView`; a user
+breakpoint remains stopped until separately resumed. `RuntimeSession.status()`
+uses the same lock-independent control-plane snapshot so a later notebook cell
+can distinguish these cases while the original resume waiter is detached.
 
 ### Control-plane diagnostics and timing
 
@@ -1077,14 +1117,26 @@ Required tests cover:
   safe internal outcome remains repeatable until its bounded slot is replaced;
 - one active record across user BSL, guard, inspection and materialization
   helper kinds, including bounded mandatory cleanup steps;
-- transfer of temporary-handle cleanup leases on waiter detachment, with no
-  cleanup `evalExpr` until the acknowledged capability settles;
+- pre-registration of temporary-handle cleanup leases before dispatch and
+  preservation of coordinator ownership after waiter detachment, with no cleanup
+  `evalExpr` until the acknowledged capability settles, plus a barrier race where
+  the late result arrives before caller unwinding and `paused` is not published
+  before cleanup;
+- CAPTURE hot reload and prepared-hypothesis execution with no Worker target
+  lock held across coordinator submission/wait, including late completion and
+  cross-thread generation-pin cleanup;
+- private inline remote steps for result policy and cleanup, with no recursive
+  coordinator submission;
 - immutable, idempotent completed/failed/unknown outcomes and a pending outcome
   on wait timeout;
 - lock-independent `current_capture()`, `status()` and `wait()` while data-plane
   evaluation and Worker pins remain active;
 - atomic transition to `resuming`, caller detachment, successful Continue making
   the old view stale, and partial/uncertain writeback requiring recovery;
+- interruption at each resume boundary (root export, frame modification,
+  CAPTURE cleanup, Continue and next-stop wait), with the controller worker
+  retaining the plan and new MAIN admission remaining closed until terminal
+  completion;
 - bounded shutdown of a coordinator with an indefinitely pending evaluation;
 - indefinitely pending synthetic polling that never exceeds the fixed maximum
   journal progress-event count while `status().evaluation_timing.last_poll_ms`
