@@ -1117,6 +1117,178 @@ def test_target_death_finalizes_real_worker_after_abandoned_publication_retry(
             wrapper.close()
 
 
+@pytest.mark.parametrize("first_entry", ("normal", "kernel"))
+@pytest.mark.parametrize("fact_order", ("capture_then_target", "target_then_capture"))
+def test_concurrent_target_and_capture_publication_finalizes_real_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    first_entry: str,
+    fact_order: str,
+) -> None:
+    """The second monotonic shutdown fact must finish local ownership itself."""
+
+    rdbg = _ServerShutdownCaptureSession(wake_on_invalidate=False)
+    journal = _FailFirstAbandonedJournal()
+    controller = captured_controller(
+        rdbg,
+        command_timeout_s=0.05,
+        journal=journal,
+    )
+    api, target, handle = _real_worker_shutdown_api(tmp_path, controller, journal)
+    host = api._worker_universe
+    target_registry = api._worker_universe_target
+    registration_keys = tuple(sorted(target_registry._registrations, key=str.casefold))
+    assert len(registration_keys) == 2
+    pin = api._pin_capture_evaluation_locked()
+    assert pin is not None and pin.handle is handle
+    pin_lease = api._detach_capture_evaluation_pin_locked()
+    assert set(host._leases) == {pin.lease_id}
+    assert {name: host.registration_refcount(name) for name in registration_keys} == {
+        name: 2 for name in registration_keys
+    }
+    target_calls_before_close = tuple(target.sources)
+    capture_owner, ticket, cleanup_probe = start_shutdown_evaluation(
+        controller,
+        rdbg,
+        pin_lease=pin_lease,
+    )
+    evaluation_id = ticket.evaluation_id
+    del ticket, pin_lease
+    runtime = _shutdown_runtime_session(rdbg, api, server=True)
+    stopped: list[str] = []
+    wrapper = InteractiveRuntimeSession(
+        runtime,
+        SimpleNamespace(stop=lambda: stopped.append("stopped")),
+    )
+    shell = InteractiveShell()
+    wrapper._register_shutdown(shell)
+    first = wrapper.close if first_entry == "normal" else wrapper._close_at_shutdown
+    snapshot_taken = Event()
+    direct_finished = Event()
+    target_published = Event()
+    direct_errors: list[BaseException] = []
+    original_mark_target_terminated = api._mark_target_terminated
+
+    def gated_mark_target_terminated() -> None:
+        if fact_order == "target_then_capture":
+            original_mark_target_terminated()
+            target_published.set()
+            snapshot_taken.set()
+            assert direct_finished.wait(1), "direct close did not finish"
+            return
+        snapshot_taken.set()
+        assert direct_finished.wait(1), "direct close did not finish"
+        assert api._capture_shutdown_finished is True
+        assert api._target_terminated is False
+        assert api._data_plane_finalized is False
+        assert capture_owner.join(0) is False, "coordinator worker exited early"
+        original_mark_target_terminated()
+        target_published.set()
+
+    monkeypatch.setattr(api, "_mark_target_terminated", gated_mark_target_terminated)
+
+    def direct_close() -> None:
+        try:
+            api.close()
+        except BaseException as error:
+            direct_errors.append(error)
+        finally:
+            direct_finished.set()
+
+    session_thread, session_finished, session_errors = _start_shutdown_thread(
+        first,
+        rdbg.shutdown_timeline,
+    )
+    direct_thread: Thread | None = None
+    worker_released = False
+    try:
+        assert snapshot_taken.wait(1), "Session did not read its post-teardown state"
+        direct_thread = Thread(
+            target=direct_close,
+            name="direct-runtime-api-close",
+            daemon=True,
+        )
+        direct_thread.start()
+        assert direct_finished.wait(1), "direct API close exceeded its deadline"
+        assert target_published.wait(1), "Session did not publish target death"
+        assert session_finished.wait(1), "Session close did not return"
+        direct_thread.join(1)
+        session_thread.join(1)
+        assert not direct_thread.is_alive()
+        assert not session_thread.is_alive()
+
+        if first_entry == "normal":
+            assert len(session_errors) == 1
+            assert isinstance(session_errors[0], ProtocolError)
+            assert "private transient shutdown journal failure" not in (
+                str(session_errors[0]) + repr(session_errors[0])
+            )
+        else:
+            assert session_errors == []
+        assert direct_errors == []
+        assert journal.abandoned_attempts == 2
+        assert api._target_terminated is True
+        assert api._capture_shutdown_finished is True
+        assert api._capture_shutdown_termination_proven is False
+        assert api._data_plane_finalized is True
+        assert runtime.is_closed is True
+        assert host.state is WorkerUniverseState.CLOSED
+        assert host._leases == {}
+        assert host._registration_refcounts == {}
+        assert target_registry._registrations == {}
+        assert target_registry._broken is True
+        assert api._worker_generation_handle is None
+        assert api._api_owned_worker_generation_handle is None
+        assert api._operation_generation_pin is None
+        assert api._preparing_generation_pin is None
+        assert api._evaluation_generation_pin is None
+        assert api._worker_module_artifacts == {}
+        assert api._worker_generation_diagnostics == {}
+        assert api._worker_active_modules == {}
+        assert api._prepared_source_units == {}
+        assert tuple(target.sources) == target_calls_before_close
+        assert target.disconnects == []
+        assert cleanup_probe.dispositions == []
+        assert cleanup_probe.is_product_owned
+        assert rdbg.shutdown_cleanup_dispatches == 0
+        abandoned = [
+            event
+            for event in journal.events
+            if event.event == "capture_evaluation_shutdown_abandoned"
+        ]
+        assert len(abandoned) == 1
+        assert abandoned[0].fields["evaluation_id"] == evaluation_id
+        assert abandoned[0].fields["termination_proven"] is False
+        for private in rdbg.shutdown_private_values:
+            assert private not in repr(abandoned[0])
+
+        # No third core close was needed above. Repeated public owners are
+        # idempotent, and the wrapper may now consume the terminal Session.
+        api.close()
+        if not wrapper._closed:
+            wrapper.close()
+        wrapper._close_at_shutdown()
+        assert wrapper._closed is True
+        assert stopped == ["stopped"]
+        assert wrapper._shutdown_shell is None
+        assert journal.abandoned_attempts == 2
+    finally:
+        rdbg.shutdown_poll_release.set()
+        worker_released = True
+        capture_owner.begin_close()
+        assert capture_owner.join(2)
+        if direct_thread is not None:
+            direct_thread.join(2)
+        session_thread.join(2)
+        if not runtime.is_closed:
+            try:
+                runtime.close_for_kernel_shutdown()
+            except ProtocolError:
+                pass
+        if not wrapper._closed:
+            wrapper.close()
+
+
 def test_jupyter_shutdown_from_another_thread_joins_pending_capture_consumer() -> None:
     rdbg = _ServerShutdownCaptureSession(wake_on_invalidate=True)
     journal = RecoveryJournal()
