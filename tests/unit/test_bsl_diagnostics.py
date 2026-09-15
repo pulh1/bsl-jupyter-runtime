@@ -1409,7 +1409,132 @@ def test_runtime_compound_worker_frames_preserve_known_and_unknown_order() -> No
         MappingConfidence.UNKNOWN,
         MappingConfidence.EXACT,
     ]
+    assert [frame.logical_name for frame in diagnostic.frames] == [
+        "МодульБ",
+        None,
+        None,
+        "МодульА",
+    ]
+    assert [frame.platform_location.module_name for frame in diagnostic.frames] == [
+        item.location.module_name for item in parse_platform_diagnostic(raw).frames
+    ]
     assert diagnostic.platform_diagnostic == raw
+
+
+def test_mixed_trace_maps_worker_main_and_native_frames_in_order() -> None:
+    """Break caught: trace mapping must admit each pinned Worker separately."""
+    manifest = "c" * 64
+    worker = _worker_diagnostic_artifact(
+        "МодульБ",
+        18,
+        "OnecRuntime_bbbbbbbb_bbbbbbbbbbbbbbbb",
+        "b" * 64,
+        manifest,
+    )
+    source = "Результат = 1;"
+    raw = (
+        f"{{ВнешняяОбработка.{worker.registration_name}.МодульОбъекта(2,1)}}: worker\n"
+        "{ОбщийМодуль.Сервис.Модуль(7,3)}: native\n"
+        "{<Неизвестный модуль>(1,1)}: main"
+    )
+
+    diagnostic = normalize_platform_diagnostic_trace(
+        parse_platform_diagnostic(raw),
+        stage=DiagnosticStage.EXECUTION,
+        executed=_wrapped(source),
+        visible_source_context=_visible_context(source),
+        pinned_manifest_sha256=manifest,
+        pinned_artifacts=(worker,),
+    )
+
+    assert [frame.origin for frame in diagnostic.frames] == [
+        ErrorTraceFrameOrigin.WORKER_ARTIFACT,
+        ErrorTraceFrameOrigin.NATIVE_MODULE,
+        ErrorTraceFrameOrigin.EXECUTED_ARTIFACT,
+    ]
+    assert diagnostic.frames[0].logical_name == "МодульБ"
+    assert diagnostic.frames[0].mapping_confidence is MappingConfidence.EXACT
+    assert diagnostic.frames[1].mapping_confidence is MappingConfidence.UNKNOWN
+    assert diagnostic.frames[2].mapping_confidence is MappingConfidence.EXACT
+
+
+def test_stale_worker_frame_degrades_without_hiding_other_frames() -> None:
+    """Break caught: stale Worker identity must not discard following frames."""
+    manifest = "c" * 64
+    worker = _worker_diagnostic_artifact(
+        "МодульА",
+        17,
+        "OnecRuntime_aaaaaaaa_aaaaaaaaaaaaaaaa",
+        "a" * 64,
+        manifest,
+    )
+    stale = "OnecRuntime_deadbeef_deadbeefdeadbeef"
+    raw = (
+        f"{{ВнешняяОбработка.{stale}.МодульОбъекта(1,1)}}: stale\n"
+        f"{{ВнешняяОбработка.{worker.registration_name}.МодульОбъекта(2,1)}}: current"
+    )
+
+    diagnostic = remap_worker_runtime_diagnostic(
+        parse_platform_diagnostic(raw),
+        pinned_manifest_sha256=manifest,
+        pinned_artifacts=(worker,),
+    )
+
+    assert [frame.origin for frame in diagnostic.frames] == [
+        ErrorTraceFrameOrigin.UNKNOWN,
+        ErrorTraceFrameOrigin.WORKER_ARTIFACT,
+    ]
+    assert diagnostic.frames[0].registration_name == stale
+    assert diagnostic.frames[0].mapping_confidence is MappingConfidence.UNKNOWN
+    assert diagnostic.frames[1].mapping_confidence is MappingConfidence.EXACT
+
+
+def test_one_worker_mapping_failure_does_not_remove_later_frames(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: a single Worker mapper error must stay frame-local."""
+    import onec_runtime.bsl.diagnostics as diagnostics_module
+
+    manifest = "c" * 64
+    broken = _worker_diagnostic_artifact(
+        "Сломанный",
+        1,
+        "OnecRuntime_aaaaaaaa_aaaaaaaaaaaaaaaa",
+        "a" * 64,
+        manifest,
+    )
+    healthy = _worker_diagnostic_artifact(
+        "Рабочий",
+        2,
+        "OnecRuntime_bbbbbbbb_bbbbbbbbbbbbbbbb",
+        "b" * 64,
+        manifest,
+    )
+    real_mapper = diagnostics_module._worker_runtime_frame
+
+    def fail_selected_frame(location, artifact, observed_registration):
+        if artifact.logical_name == "Сломанный":
+            raise ValueError("injected per-frame failure")
+        return real_mapper(location, artifact, observed_registration)
+
+    monkeypatch.setattr(
+        diagnostics_module,
+        "_worker_runtime_frame",
+        fail_selected_frame,
+    )
+    diagnostic = remap_worker_runtime_diagnostic(
+        parse_platform_diagnostic(
+            f"{{ВнешняяОбработка.{broken.registration_name}.МодульОбъекта(2,1)}}: broken\n"
+            f"{{ВнешняяОбработка.{healthy.registration_name}.МодульОбъекта(2,1)}}: healthy"
+        ),
+        pinned_manifest_sha256=manifest,
+        pinned_artifacts=(broken, healthy),
+    )
+
+    assert [frame.mapping_confidence for frame in diagnostic.frames] == [
+        MappingConfidence.UNKNOWN,
+        MappingConfidence.EXACT,
+    ]
 
 
 def test_runtime_canonical_line_only_worker_frames_map_exactly_in_order() -> None:

@@ -721,7 +721,7 @@ def remap_worker_stage_diagnostic(
     return _with_dependency_binding(diagnostic, artifact.mapped_source)
 
 
-def remap_worker_runtime_diagnostic(
+def _remap_worker_runtime_primary(
     parsed: ParsedPlatformDiagnostic,
     *,
     pinned_manifest_sha256: str,
@@ -738,42 +738,28 @@ def remap_worker_runtime_diagnostic(
         worker_location = location.worker_artifact_location
         if worker_location is None:
             if location.module_name in _UNKNOWN_MODULES:
-                frames.append(
-                    WorkerRuntimeFrameDiagnostic(
-                        location.module_name,
-                        None,
-                        None,
-                        None,
-                        MappingConfidence.UNKNOWN,
-                    )
-                )
+                frames.append(_unknown_worker_projection(location.module_name))
             continue
-        matches = tuple(
-            artifact
-            for artifact in pinned_artifacts
-            if artifact.manifest_sha256 == pinned_manifest_sha256
-            and worker_location.registration_name.casefold()
-            == artifact.registration_name.casefold()
+        artifact = _pinned_worker_artifact(
+            worker_location.registration_name,
+            pinned_manifest_sha256,
+            pinned_artifacts,
         )
-        if len(matches) != 1:
+        if artifact is None:
+            frames.append(_unknown_worker_projection(worker_location.registration_name))
+            continue
+        try:
             frames.append(
-                WorkerRuntimeFrameDiagnostic(
+                _worker_runtime_frame(
+                    location,
+                    artifact,
                     worker_location.registration_name,
-                    None,
-                    None,
-                    None,
-                    MappingConfidence.UNKNOWN,
                 )
             )
-            continue
-        artifact = matches[0]
-        frames.append(
-            _worker_runtime_frame(
-                location,
-                artifact,
-                worker_location.registration_name,
+        except BaseException:
+            frames.append(
+                _unknown_worker_projection(worker_location.registration_name)
             )
-        )
     if not frames:
         return _unmapped_worker_diagnostic(
             parsed,
@@ -998,6 +984,159 @@ def _unknown_trace_frame(
     )
 
 
+def _unknown_worker_projection(
+    observed_registration: str,
+) -> WorkerRuntimeFrameDiagnostic:
+    return WorkerRuntimeFrameDiagnostic(
+        observed_registration,
+        None,
+        None,
+        None,
+        MappingConfidence.UNKNOWN,
+    )
+
+
+def _pinned_worker_artifact(
+    registration_name: str,
+    manifest_sha256: str,
+    artifacts: tuple[WorkerDiagnosticArtifact, ...],
+) -> WorkerDiagnosticArtifact | None:
+    matches = tuple(
+        artifact
+        for artifact in artifacts
+        if artifact.manifest_sha256 == manifest_sha256
+        and artifact.registration_name.casefold() == registration_name.casefold()
+    )
+    return matches[0] if len(matches) == 1 else None
+
+
+def _worker_trace_frame(
+    frame: ParsedDiagnosticFrame,
+    artifact: WorkerDiagnosticArtifact,
+    observed_registration: str,
+) -> tuple[ErrorTraceFrame, WorkerRuntimeFrameDiagnostic]:
+    legacy = _worker_runtime_frame(
+        frame.location,
+        artifact,
+        observed_registration,
+    )
+    visible_line = (
+        None
+        if legacy.visible_location is None
+        or artifact.visible_source_context is None
+        else artifact.visible_source_context.line_range(
+            legacy.visible_location.source_unit,
+            legacy.visible_location.line,
+        )
+    )
+    return (
+        ErrorTraceFrame(
+            ordinal=frame.ordinal,
+            cause_ordinal=frame.cause_ordinal,
+            origin=ErrorTraceFrameOrigin.WORKER_ARTIFACT,
+            platform_location=frame.location,
+            block_span=frame.block_span,
+            detail_span=frame.detail_span,
+            mapping_confidence=legacy.mapping_confidence,
+            registration_name=observed_registration,
+            logical_name=legacy.logical_name,
+            revision=legacy.revision,
+            artifact_sha256=legacy.artifact_sha256,
+            source_unit=legacy.source_unit,
+            visible_location=legacy.visible_location,
+            visible_line_span=visible_line,
+            related_visible_span=legacy.related_visible_span,
+            lowered_location=legacy.lowered_location,
+            synthetic_region=legacy.synthetic_region,
+            dependency_anchor=legacy.dependency_anchor,
+            method_anchor=legacy.method_anchor,
+        ),
+        legacy,
+    )
+
+
+def _normalize_trace_frames(
+    parsed: ParsedPlatformDiagnostic,
+    *,
+    executed: MappedSource | None,
+    visible_source_context: VisibleSourceContext | None,
+    pinned_manifest_sha256: str | None,
+    pinned_artifacts: tuple[WorkerDiagnosticArtifact, ...],
+) -> tuple[
+    tuple[ErrorTraceFrame, ...],
+    tuple[WorkerRuntimeFrameDiagnostic, ...],
+]:
+    frames: list[ErrorTraceFrame] = []
+    worker_frames: list[WorkerRuntimeFrameDiagnostic] = []
+    include_worker_projection = pinned_manifest_sha256 is not None
+    for item in parsed.frames:
+        worker_location = item.location.worker_artifact_location
+        observed_registration = (
+            None if worker_location is None else worker_location.registration_name
+        )
+        try:
+            if worker_location is not None and pinned_manifest_sha256 is not None:
+                artifact = _pinned_worker_artifact(
+                    worker_location.registration_name,
+                    pinned_manifest_sha256,
+                    pinned_artifacts,
+                )
+                if artifact is None:
+                    normalized = _unknown_trace_frame(
+                        item,
+                        registration_name=worker_location.registration_name,
+                    )
+                    legacy = _unknown_worker_projection(
+                        worker_location.registration_name
+                    )
+                else:
+                    normalized, legacy = _worker_trace_frame(
+                        item,
+                        artifact,
+                        worker_location.registration_name,
+                    )
+                frames.append(normalized)
+                worker_frames.append(legacy)
+                continue
+            if worker_location is not None:
+                frames.append(
+                    _unknown_trace_frame(
+                        item,
+                        registration_name=worker_location.registration_name,
+                    )
+                )
+                continue
+            if item.location.module_name in _UNKNOWN_MODULES:
+                frames.append(
+                    _main_trace_frame(item, executed, visible_source_context)
+                    if executed is not None
+                    else _unknown_trace_frame(item)
+                )
+                if include_worker_projection:
+                    worker_frames.append(
+                        _unknown_worker_projection(item.location.module_name)
+                    )
+                continue
+            frames.append(_native_trace_frame(item))
+        except BaseException:
+            frames.append(
+                _unknown_trace_frame(
+                    item,
+                    registration_name=observed_registration,
+                )
+            )
+            if include_worker_projection and (
+                worker_location is not None
+                or item.location.module_name in _UNKNOWN_MODULES
+            ):
+                worker_frames.append(
+                    _unknown_worker_projection(
+                        observed_registration or item.location.module_name
+                    )
+                )
+    return tuple(frames), tuple(worker_frames)
+
+
 def _generic_trace_base(
     parsed: ParsedPlatformDiagnostic,
     stage: DiagnosticStage,
@@ -1061,16 +1200,21 @@ def normalize_platform_diagnostic_trace(
             pinned_manifest_sha256,
             pinned_artifacts,
         )
-    base = (
-        _remap_platform_primary(
+    if executed is not None:
+        base = _remap_platform_primary(
             parsed,
             executed,
             stage=stage,
             visible_source_context=visible_source_context,
         )
-        if executed is not None
-        else _generic_trace_base(parsed, stage)
-    )
+    elif pinned_manifest_sha256 is not None:
+        base = _remap_worker_runtime_primary(
+            parsed,
+            pinned_manifest_sha256=pinned_manifest_sha256,
+            pinned_artifacts=pinned_artifacts,
+        )
+    else:
+        base = _generic_trace_base(parsed, stage)
     causes = tuple(
         ErrorTraceCause(
             item.ordinal,
@@ -1080,35 +1224,40 @@ def normalize_platform_diagnostic_trace(
         )
         for item in parsed.causes
     )
-    frames: list[ErrorTraceFrame] = []
-    for item in parsed.frames:
-        try:
-            if item.location.module_name in _UNKNOWN_MODULES and executed is not None:
-                normalized = _main_trace_frame(
-                    item,
-                    executed,
-                    visible_source_context,
-                )
-            elif item.location.worker_artifact_location is not None:
-                normalized = _unknown_trace_frame(
-                    item,
-                    registration_name=(
-                        item.location.worker_artifact_location.registration_name
-                    ),
-                )
-            elif item.location.module_name in _UNKNOWN_MODULES:
-                normalized = _unknown_trace_frame(item)
-            else:
-                normalized = _native_trace_frame(item)
-        except BaseException:
-            normalized = _unknown_trace_frame(item)
-        frames.append(normalized)
+    normalized_frames, normalized_worker_frames = _normalize_trace_frames(
+        parsed,
+        executed=executed,
+        visible_source_context=visible_source_context,
+        pinned_manifest_sha256=pinned_manifest_sha256,
+        pinned_artifacts=pinned_artifacts,
+    )
+    compatibility_frames = (
+        base.worker_frames
+        if executed is None and pinned_manifest_sha256 is not None
+        else normalized_worker_frames
+    )
     return replace(
         base,
         causes=causes,
-        frames=tuple(frames),
+        frames=normalized_frames,
         frames_truncated=parsed.frames_truncated,
         causes_truncated=parsed.causes_truncated,
+        worker_frames=compatibility_frames,
+    )
+
+
+def remap_worker_runtime_diagnostic(
+    parsed: ParsedPlatformDiagnostic,
+    *,
+    pinned_manifest_sha256: str,
+    pinned_artifacts: tuple[WorkerDiagnosticArtifact, ...],
+) -> NormalizedDiagnostic:
+    """Resolve every Worker stack frame through one immutable operation pin."""
+    return normalize_platform_diagnostic_trace(
+        parsed,
+        stage=DiagnosticStage.EXECUTION,
+        pinned_manifest_sha256=pinned_manifest_sha256,
+        pinned_artifacts=pinned_artifacts,
     )
 
 

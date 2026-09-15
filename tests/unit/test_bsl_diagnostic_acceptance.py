@@ -1184,6 +1184,15 @@ def test_delta_lowering_compile_line_only_and_runtime_two_frame_diagnostics_matc
             pinned_artifacts=artifacts(full.mapped_source),
         )
         assert actual == expected
+        assert len(actual.frames) == len(actual.worker_frames)
+        assert [frame.logical_name for frame in actual.frames] == [
+            frame.logical_name for frame in actual.worker_frames
+        ]
+        assert [frame.mapping_confidence for frame in actual.frames] == [
+            frame.mapping_confidence for frame in actual.worker_frames
+        ]
+        assert actual.diagnostic_id == expected.diagnostic_id
+        assert actual.visible_location == expected.visible_location
         assert actual.worker_frames
         assert all(
             frame.mapping_confidence.value == "exact"
