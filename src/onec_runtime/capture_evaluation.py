@@ -22,6 +22,7 @@ MAX_CAPTURE_DIAGNOSTIC_MESSAGE_CODEPOINTS = 1_024
 MAX_CAPTURE_MESSAGES = 100
 MAX_CAPTURE_MESSAGE_CODEPOINTS = 1_024
 MAX_CAPTURE_IDENTIFIER_CODEPOINTS = 256
+_MESSAGE_TRUNCATION_NOTE = "Messages truncated to the first 100 entries."
 
 
 class CapturePhase(StrEnum):
@@ -256,6 +257,8 @@ class CaptureStatus:
             selected_id = self.pending_evaluation_id or self.last_evaluation_id
             if selected_id is None or self.evaluation_timing.evaluation_id != selected_id:
                 raise ValueError("evaluation_timing does not match selected evaluation")
+        if self.phase is CapturePhase.OUTCOME_UNKNOWN and self.last_evaluation_id is None:
+            raise ValueError("outcome_unknown phase requires last_evaluation_id")
 
     @property
     def can_inspect(self) -> bool:
@@ -313,13 +316,20 @@ class CaptureEvaluationOutcome:
             object.__setattr__(self, "result", _public_result(self.result))
         if isinstance(self.messages, str) or not isinstance(self.messages, (tuple, list)):
             raise ValueError("messages must be a sequence of strings")
+        raw_messages = tuple(self.messages)
+        messages_truncated = len(raw_messages) > MAX_CAPTURE_MESSAGES
         messages = tuple(
             _safe_text(
                 message,
                 name="message",
                 limit=MAX_CAPTURE_MESSAGE_CODEPOINTS,
             )
-            for message in self.messages[:MAX_CAPTURE_MESSAGES]
+            for message in raw_messages[:MAX_CAPTURE_MESSAGES]
+        )
+        messages_truncated = messages_truncated or any(
+            len(message) > MAX_CAPTURE_MESSAGE_CODEPOINTS
+            for message in raw_messages[:MAX_CAPTURE_MESSAGES]
+            if isinstance(message, str)
         )
         object.__setattr__(self, "messages", messages)
         if self.error is not None:
@@ -336,6 +346,12 @@ class CaptureEvaluationOutcome:
             self.diagnostic, CaptureFailureDiagnostic
         ):
             raise ValueError("diagnostic is invalid")
+        if messages_truncated:
+            object.__setattr__(
+                self,
+                "diagnostic",
+                _message_truncation_diagnostic(self.diagnostic),
+            )
         if self.timing is not None and not isinstance(self.timing, CaptureEvaluationTiming):
             raise ValueError("timing is invalid")
         if self.timing is not None and self.timing.evaluation_id != self.evaluation_id:
@@ -349,7 +365,9 @@ class CaptureEvaluationOutcome:
             ):
                 raise ValueError("pending outcome has incompatible state payload")
         elif self.state is CaptureEvaluationState.COMPLETED:
-            if self.error is not None or self.diagnostic is not None:
+            if self.error is not None or (
+                self.diagnostic is not None and not messages_truncated
+            ):
                 raise ValueError("completed outcome has incompatible state payload")
         elif self.state is CaptureEvaluationState.FAILED:
             if self.result is not None:
@@ -382,14 +400,40 @@ def _public_result(value: object) -> object:
             raise ValueError("public result must be finite")
         return value
     if type(value) is str:
-        return _safe_text(
-            value,
-            name="public result",
-            limit=MAX_CAPTURE_MESSAGE_CODEPOINTS,
-        )
+        # Result values have already passed the public-value admission guard.
+        # Preserve that admitted scalar byte-for-byte, including controls and
+        # length, so a late outcome is observationally identical to a direct
+        # evaluation result.
+        return value
     if type(value) is tuple:
         return tuple(_public_result(item) for item in value)
     raise ValueError("public result must be an immutable scalar or tuple")
+
+
+def _message_truncation_diagnostic(
+    existing: CaptureFailureDiagnostic | None,
+) -> CaptureFailureDiagnostic:
+    if existing is None:
+        return CaptureFailureDiagnostic(
+            code="messages_truncated",
+            message=_MESSAGE_TRUNCATION_NOTE,
+            recommended_action="inspect capture.wait()",
+        )
+    # Keep the existing stable code and action, while reserving enough room
+    # for an explicit marker even when the original message used its bound.
+    separator = " "
+    available = max(
+        0,
+        MAX_CAPTURE_DIAGNOSTIC_MESSAGE_CODEPOINTS
+        - len(separator)
+        - len(_MESSAGE_TRUNCATION_NOTE),
+    )
+    message = existing.message[:available] + separator + _MESSAGE_TRUNCATION_NOTE
+    return CaptureFailureDiagnostic(
+        code=existing.code,
+        message=message,
+        recommended_action=existing.recommended_action,
+    )
 
 
 __all__ = [

@@ -132,6 +132,9 @@ def test_status_capabilities_follow_phase_and_retained_outcome(
             if phase is CapturePhase.EVALUATING
             else None
         ),
+        last_evaluation_id=(
+            "eval-unknown" if phase is CapturePhase.OUTCOME_UNKNOWN else None
+        ),
     )
 
     assert status.can_inspect is can_inspect
@@ -205,6 +208,24 @@ def test_status_requires_timing_to_describe_selected_evaluation() -> None:
             last_evaluation_id="eval-last",
             evaluation_timing=timing,
         )
+
+
+def test_outcome_unknown_requires_a_retained_evaluation() -> None:
+    with pytest.raises(ValueError, match="last_evaluation_id"):
+        CaptureStatus(
+            operation_id=7,
+            capture_generation=3,
+            stop_sequence=11,
+            phase=CapturePhase.OUTCOME_UNKNOWN,
+        )
+
+    recovery = CaptureStatus(
+        operation_id=7,
+        capture_generation=3,
+        stop_sequence=11,
+        phase=CapturePhase.RECOVERY_REQUIRED,
+    )
+    assert recovery.can_wait is False
 
 
 @pytest.mark.parametrize(
@@ -298,6 +319,53 @@ def test_outcome_accepts_state_appropriate_payloads(
         **kwargs,
     )
     assert outcome.state is state
+
+
+def test_outcome_preserves_an_admitted_user_string_exactly() -> None:
+    value = "line 1\n" + ("x" * 2_000) + "\r\nline 3\x00"
+    outcome = CaptureEvaluationOutcome(
+        evaluation_id="eval-1",
+        evaluation_kind=CaptureEvaluationKind.USER_BSL,
+        state=CaptureEvaluationState.COMPLETED,
+        result=value,
+    )
+    assert outcome.result == value
+
+
+def test_outcome_reports_message_count_truncation() -> None:
+    outcome = CaptureEvaluationOutcome(
+        evaluation_id="eval-1",
+        evaluation_kind=CaptureEvaluationKind.USER_BSL,
+        state=CaptureEvaluationState.COMPLETED,
+        messages=tuple(f"message-{index}" for index in range(101)),
+    )
+
+    assert len(outcome.messages) == 100
+    assert outcome.diagnostic is not None
+    assert outcome.diagnostic.code == "messages_truncated"
+    assert "truncated" in outcome.diagnostic.message.casefold()
+
+
+def test_outcome_preserves_failure_diagnostic_while_reporting_message_truncation() -> None:
+    existing = CaptureFailureDiagnostic(
+        "remote_failure",
+        "remote operation failed",
+        "retry after recovery",
+    )
+    outcome = CaptureEvaluationOutcome(
+        evaluation_id="eval-1",
+        evaluation_kind=CaptureEvaluationKind.USER_BSL,
+        state=CaptureEvaluationState.FAILED,
+        messages=tuple(f"message-{index}" for index in range(101)),
+        error="failed",
+        diagnostic=existing,
+    )
+
+    assert outcome.diagnostic is not None
+    assert outcome.diagnostic.code == existing.code
+    assert outcome.diagnostic.recommended_action == existing.recommended_action
+    assert existing.message in outcome.diagnostic.message
+    assert "truncated" in outcome.diagnostic.message.casefold()
 
 
 @pytest.mark.parametrize(
