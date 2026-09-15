@@ -2,6 +2,7 @@ from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from uuid import UUID
 
+import httpx
 import pytest
 
 from onec_runtime.bsl.full_ast_worker_projection import (
@@ -287,6 +288,49 @@ def test_enrichment_parses_one_missing_exact_version_without_rereading_saved_fra
     assert page.frames[0].with_method().method.name == "RunFixture"
     assert calls == [SOURCE]
     assert backend.phase == "CAPTURE"
+
+
+def test_evicted_saved_page_reparses_exact_source_without_fast_work(monkeypatch):
+    registry = ModuleSyntaxRegistry(capacity=1)
+    original_index = parse_full_ast_module(SOURCE).syntax_index
+    registry.publish(IDENTITY, original_index)
+    parse_calls = []
+    source_reads = []
+    original_read = SourceVersionRef.read_text
+
+    def observed_parse(text):
+        parse_calls.append(text)
+        return parse_full_ast_module(text)
+
+    def observed_read(version):
+        source_reads.append(version)
+        return original_read(version)
+
+    monkeypatch.setattr(SourceVersionRef, "read_text", observed_read)
+    adapter, backend, _ = setup_stack(parser=observed_parse, registry=registry)
+
+    saved_page = adapter.stack[:4]
+    assert parse_calls == []
+    assert source_reads == []
+
+    other_source = SOURCE.replace("RunFixture", "OtherFixture")
+    registry.publish(
+        replace(IDENTITY, object_id="other"),
+        parse_full_ast_module(other_source).syntax_index,
+    )
+    assert registry.get(
+        IDENTITY, original_index.source_sha256, original_index.parser_identity
+    ) is None
+    backend.fence = object()
+
+    detailed = saved_page.with_methods()
+
+    assert parse_calls == [SOURCE]
+    assert len(source_reads) == 1
+    assert all(frame.method.name == "RunFixture" for frame in detailed.frames)
+    assert registry.get(
+        IDENTITY, original_index.source_sha256, original_index.parser_identity
+    ) is not None
 
 
 def test_existing_registry_version_and_old_worker_pin_need_no_parse():
@@ -617,10 +661,19 @@ def test_public_stack_maps_command_deadline_to_sanitized_inspection_timeout() ->
     assert private_evidence not in rendered
 
 
-def test_public_stack_maps_actual_rdbg_http_deadline_to_inspection_timeout() -> None:
+@pytest.mark.parametrize(
+    "http_timeout_type",
+    (
+        pytest.param(httpx.ReadTimeout, id="read"),
+        pytest.param(httpx.ConnectTimeout, id="connect"),
+        pytest.param(httpx.WriteTimeout, id="write"),
+        pytest.param(httpx.PoolTimeout, id="pool"),
+    ),
+)
+def test_public_stack_maps_actual_rdbg_http_deadline_to_inspection_timeout(
+    http_timeout_type,
+) -> None:
     import traceback
-
-    import httpx
 
     import onec_runtime.errors as runtime_errors
     from onec_runtime.privacy import public_artifact_value
@@ -628,14 +681,18 @@ def test_public_stack_maps_actual_rdbg_http_deadline_to_inspection_timeout() -> 
     from onec_runtime.rdbg.session import RdbgSession, SessionState
     from onec_runtime.rdbg.transport import RdbgTransport
 
-    timeout_type = getattr(runtime_errors, "CaptureInspectionTimeout", None)
-    assert isinstance(timeout_type, type), "CaptureInspectionTimeout is not public"
+    inspection_timeout_type = getattr(
+        runtime_errors, "CaptureInspectionTimeout", None
+    )
+    assert isinstance(
+        inspection_timeout_type, type
+    ), "CaptureInspectionTimeout is not public"
 
     private_url = "file:///private/customer/CommonModules/Payroll/Ext/Module.bsl"
     private_source = "СекретныйРасчет = ЗарплатаСотрудника;"
 
     def timeout(request: httpx.Request) -> httpx.Response:
-        raise httpx.ReadTimeout(
+        raise http_timeout_type(
             f"deadline at {private_url}: {private_source}",
             request=request,
         )
@@ -654,7 +711,7 @@ def test_public_stack_maps_actual_rdbg_http_deadline_to_inspection_timeout() -> 
     runtime = PrototypeRuntimeApi(controller)
 
     try:
-        with pytest.raises(timeout_type) as caught:
+        with pytest.raises(inspection_timeout_type) as caught:
             runtime.current_capture().stack[:20]
     finally:
         client.close()

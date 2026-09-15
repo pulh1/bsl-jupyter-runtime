@@ -77,6 +77,43 @@ def test_registry_keeps_exact_module_hash_and_both_parser_identities() -> None:
     assert registry.get(module, first.source_sha256, first.parser_identity) is first
 
 
+def test_registry_lru_bounds_unique_versions_and_refreshes_recent_lookup() -> None:
+    syntax = _syntax_api()
+    registry = syntax.ModuleSyntaxRegistry(capacity=3)
+    module = syntax.ModuleIdentity(
+        "project-binding", "configuration", "CommonModule", "A", "Module"
+    )
+    indexes = tuple(
+        parse_full_ast_module(
+            f"Процедура P{revision}()\nКонецПроцедуры"
+        ).syntax_index
+        for revision in range(5)
+    )
+
+    for index in indexes[:3]:
+        registry.publish(module, index)
+    assert registry.get(
+        module, indexes[0].source_sha256, indexes[0].parser_identity
+    ) is indexes[0]
+
+    registry.publish(module, indexes[3])
+    assert registry.get(
+        module, indexes[1].source_sha256, indexes[1].parser_identity
+    ) is None
+    assert registry.get(
+        module, indexes[0].source_sha256, indexes[0].parser_identity
+    ) is indexes[0]
+
+    registry.publish(module, indexes[4])
+    assert len(registry._entries) == 3
+    assert registry.get(
+        module, indexes[2].source_sha256, indexes[2].parser_identity
+    ) is None
+    assert registry.get(
+        module, indexes[0].source_sha256, indexes[0].parser_identity
+    ) is indexes[0]
+
+
 def test_publication_is_immutable_and_rejects_conflicting_source_facts() -> None:
     """A same-key overwrite must not change an already published stack's facts."""
     syntax = _syntax_api()

@@ -4619,6 +4619,47 @@ def test_syntax_candidates_activate_only_after_confirmed_worker_publication(
     assert profiler.parser_calls.full_module_parses == 1
 
 
+def test_syntax_registry_stays_bounded_across_successful_and_failed_hot_reload(
+    tmp_path: Path,
+) -> None:
+    from onec_runtime.bsl.module_syntax import ModuleSyntaxRegistry
+
+    capacity = 4
+    catalog = _common_module_catalog("МодульА")
+    target = _SemanticSnapshotFailureTarget()
+    api = _semantic_snapshot_runtime(tmp_path, catalog, target=target)
+    registry = ModuleSyntaxRegistry(capacity=capacity)
+    api._module_syntax_registry = registry
+
+    current = None
+    for revision in range(1, capacity * 2 + 1):
+        unit = _worker_module_unit("МодульА", revision, catalog)
+        current = api.load_worker_modules((unit,), common_modules=catalog)
+        assert len(registry._entries) <= capacity
+
+    assert current is not None
+    current_index = api._worker_module_syntax("МодульА", generation=current)
+    assert current_index is not None
+    assert current_index.method_at_line(1).name == "Версия"
+    assert registry.get(
+        api._worker_module_identity(unit),
+        unit.mapped_source.artifact.source_sha256,
+        current_index.parser_identity,
+    ) is current_index
+
+    target.failure = "wire"
+    for revision in range(capacity * 2 + 1, capacity * 5 + 1):
+        with pytest.raises(BslExecutionError):
+            api.load_worker_modules(
+                (_worker_module_unit("МодульА", revision, catalog),),
+                common_modules=catalog,
+            )
+        assert len(registry._entries) <= capacity
+
+    assert api.worker_generation_handle is current
+    assert api._worker_module_syntax("МодульА", generation=current) is current_index
+
+
 def test_main_later_stop_keeps_g1_syntax_after_g2_and_next_main_uses_g2(tmp_path: Path) -> None:
     """Default capture lookup must follow the operation pin, never latest source."""
     catalog = _common_module_catalog("МодульА")
