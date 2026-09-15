@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import FrozenInstanceError
+from inspect import getmembers, isfunction
 from threading import Event, Lock, RLock, Thread, current_thread
 from time import monotonic, sleep
 from types import SimpleNamespace
@@ -30,6 +31,7 @@ from onec_runtime.errors import (
     TargetLost,
     WorkerPromotionOutcomeUnknown,
 )
+from onec_runtime.observation import ManagerOrigin
 from onec_runtime.prototype_runtime import ContinuationAttemptSpec, OperationState
 from onec_runtime.rdbg.models import EvaluationResult, PendingEvaluation
 from onec_runtime.runtime_api import PrototypeRuntimeApi, RuntimeStatus
@@ -46,10 +48,79 @@ from test_prototype_runtime import (
     TARGET,
     captured_controller,
 )
-from test_runtime_api import FakeController
+from test_runtime_api import (
+    FakeController,
+    _common_module_catalog,
+    _worker_module_unit,
+)
 
 
 _JOIN_TIMEOUT_S = 2.0
+
+
+_CAPTURE_DATA_PLANE_ROUTES = frozenset(
+    {
+        "activate_prepared_main_for_capture",
+        "add_worker_breakpoint",
+        "begin_continuation_admission",
+        "capture_frame",
+        "capture_frame_variables",
+        "capture_stack",
+        "capture_temporary_tables",
+        "completion_fields",
+        "configure_capture_points",
+        "configure_continuation_capture_points",
+        "discard_prepared_main_for_capture",
+        "execute_bsl",
+        "execute_prepared_capture_hypothesis",
+        "execute_prepared_main_for_capture",
+        "invalidate_capture_inspection",
+        "load_worker_modules",
+        "materialization_kind",
+        "materialize_table",
+        "materialize_table_payload",
+        "materialize_value",
+        "materialize_value_payload",
+        "prepare_capture_hypothesis",
+        "prepare_capture_ticket",
+        "prepare_main_for_capture",
+        "project_to_df",
+        "project_value",
+        "project_value_payload",
+        "release_worker_generation",
+        "remove_worker_breakpoint",
+        "require_public_value_handle",
+        "require_public_value_handles",
+        "resolve_capture_manager_origin",
+        "resume_capture",
+        "resume_debug_stop",
+        "set_worker_breakpoint_enabled",
+    }
+)
+
+_CAPTURE_CONTROL_PLANE_ROUTES = frozenset({"current_capture", "status"})
+
+_LOCAL_READ_ONLY_ROUTES = frozenset(
+    {
+        "activated_main_worker_generation",
+        "continuation_admission_is_uncertain",
+        "continuation_attempt_evidence",
+        "last_worker_breakpoint_reload_report",
+        "list_worker_breakpoints",
+        "namespace_snapshot",
+        "prepared_capture_hypothesis_provenance",
+        "prepared_main_execution_provenance",
+        "prepared_main_worker_generation",
+        "worker_breakpoint_status",
+    }
+)
+
+_SPECIAL_PUBLIC_ROUTES = frozenset(
+    {
+        "capture_session_caller_handoff",
+        "close",
+    }
+)
 
 
 class _CrossThreadRejectingLock:
@@ -1491,4 +1562,286 @@ def test_worker_breakpoint_mutation_respects_capture_completion_reservation(
         if initiator is not None:
             initiator.join(_JOIN_TIMEOUT_S)
             assert not initiator.is_alive(), "breakpoint initiator leaked"
+        close_owner(controller, transport)
+
+
+def _invoke_capture_data_plane_route(
+    api: PrototypeRuntimeApi,
+    route: str,
+) -> None:
+    if route == "activate_prepared_main_for_capture":
+        api.activate_prepared_main_for_capture(object())
+    elif route == "add_worker_breakpoint":
+        api.add_worker_breakpoint(object(), "Модуль", 1)  # type: ignore[arg-type]
+    elif route == "begin_continuation_admission":
+        api.begin_continuation_admission(
+            ContinuationAttemptSpec("inventory", 1, "request", ()),
+            (CAPTURE_A,),
+        )
+    elif route == "capture_frame":
+        api.capture_frame(level=0, cursor=0, limit=1)
+    elif route == "capture_frame_variables":
+        api.capture_frame_variables(filters={}, cursor=0, limit=1)
+    elif route == "capture_stack":
+        api.capture_stack(cursor=0, limit=1)
+    elif route == "capture_temporary_tables":
+        api.capture_temporary_tables(
+            "capture_manager_inventory",
+            names=None,
+            cursor=0,
+            limit=1,
+            selection=None,
+        )
+    elif route == "completion_fields":
+        api.completion_fields("Контекст.Результат")
+    elif route == "configure_capture_points":
+        api.configure_capture_points((CAPTURE_A,))
+    elif route == "configure_continuation_capture_points":
+        api.configure_continuation_capture_points((CAPTURE_A,))
+    elif route == "discard_prepared_main_for_capture":
+        api.discard_prepared_main_for_capture(object())
+    elif route == "execute_bsl":
+        api.execute_bsl("РезультатИнструкции = 902;")
+    elif route == "execute_prepared_capture_hypothesis":
+        api.execute_prepared_capture_hypothesis(object())
+    elif route == "execute_prepared_main_for_capture":
+        api.execute_prepared_main_for_capture(object())
+    elif route == "invalidate_capture_inspection":
+        api.invalidate_capture_inspection()
+    elif route == "load_worker_modules":
+        api.load_worker_modules((), common_modules=object())  # type: ignore[arg-type]
+    elif route == "materialization_kind":
+        api.materialization_kind("Контекст.Результат")
+    elif route == "materialize_table":
+        api.materialize_table("Контекст.Результат")
+    elif route == "materialize_table_payload":
+        api.materialize_table_payload("Контекст.Результат")
+    elif route == "materialize_value":
+        api.materialize_value("Контекст.Результат")
+    elif route == "materialize_value_payload":
+        api.materialize_value_payload(
+            "Контекст.Результат",
+            max_depth=1,
+            max_items=1,
+            max_bytes=1024,
+        )
+    elif route == "prepare_capture_hypothesis":
+        api.prepare_capture_hypothesis("РезультатИнструкции = 902;")
+    elif route == "prepare_capture_ticket":
+        api.prepare_capture_ticket()
+    elif route == "prepare_main_for_capture":
+        api.prepare_main_for_capture("Результат = 902;")
+    elif route == "project_to_df":
+        api.project_to_df("Контекст.Результат", {"offset": 0, "limit": 1})
+    elif route == "project_value":
+        api.project_value("Контекст.Результат", {"offset": 0, "limit": 1})
+    elif route == "project_value_payload":
+        api.project_value_payload(
+            "Контекст.Результат",
+            kind="slice",
+            offset=0,
+            limit=1,
+            columns=(),
+            names=(),
+            max_depth=1,
+            max_items=1,
+            max_rows=1,
+            max_bytes=1024,
+        )
+    elif route == "release_worker_generation":
+        api.release_worker_generation(object())  # type: ignore[arg-type]
+    elif route == "remove_worker_breakpoint":
+        api.remove_worker_breakpoint(uuid4())
+    elif route == "require_public_value_handle":
+        api.require_public_value_handle("Контекст.Результат")
+    elif route == "require_public_value_handles":
+        api.require_public_value_handles(("Контекст.Результат",))
+    elif route == "resolve_capture_manager_origin":
+        api.resolve_capture_manager_origin(ManagerOrigin("frame", "Запрос", ()))
+    elif route == "resume_capture":
+        api.resume_capture()
+    elif route == "resume_debug_stop":
+        api.resume_debug_stop()
+    elif route == "set_worker_breakpoint_enabled":
+        api.set_worker_breakpoint_enabled(uuid4(), False)
+    else:  # pragma: no cover - the exhaustive classification test owns this fence
+        raise AssertionError(f"missing data-plane route invocation: {route}")
+
+
+def test_public_runtime_routes_have_an_exhaustive_capture_classification() -> None:
+    public_methods = {
+        name
+        for name, value in getmembers(PrototypeRuntimeApi, isfunction)
+        if not name.startswith("_")
+    }
+    classified = (
+        _CAPTURE_DATA_PLANE_ROUTES
+        | _CAPTURE_CONTROL_PLANE_ROUTES
+        | _LOCAL_READ_ONLY_ROUTES
+        | _SPECIAL_PUBLIC_ROUTES
+    )
+
+    assert public_methods == classified
+    assert not (
+        (_CAPTURE_DATA_PLANE_ROUTES & _CAPTURE_CONTROL_PLANE_ROUTES)
+        or (_CAPTURE_DATA_PLANE_ROUTES & _LOCAL_READ_ONLY_ROUTES)
+        or (_CAPTURE_DATA_PLANE_ROUTES & _SPECIAL_PUBLIC_ROUTES)
+        or (_CAPTURE_CONTROL_PLANE_ROUTES & _LOCAL_READ_ONLY_ROUTES)
+        or (_CAPTURE_CONTROL_PLANE_ROUTES & _SPECIAL_PUBLIC_ROUTES)
+        or (_LOCAL_READ_ONLY_ROUTES & _SPECIAL_PUBLIC_ROUTES)
+    )
+
+
+@pytest.mark.parametrize("route", sorted(_CAPTURE_DATA_PLANE_ROUTES))
+def test_every_public_capture_data_plane_route_respects_completion_reservation(
+    route: str,
+) -> None:
+    api, controller, transport = _capture_runtime()
+    owner = _capture_owner(controller)
+    original_finalize = api._finalize_namespace_reply
+    original_require_available = api._require_available
+    original_invalidate = controller.invalidate_capture_inspection
+    completion_entered = Event()
+    release_completion = Event()
+    forbidden_calls: list[str] = []
+    initiator: Thread | None = None
+
+    def blocked_finalize(*args, **kwargs):  # type: ignore[no-untyped-def]
+        completion_entered.set()
+        assert release_completion.wait(_JOIN_TIMEOUT_S)
+        return original_finalize(*args, **kwargs)
+
+    def forbidden_available() -> None:
+        forbidden_calls.append("require_available")
+        raise AssertionError("data-plane route passed coordinator admission")
+
+    def forbidden_invalidate() -> None:
+        forbidden_calls.append("invalidate_capture_inspection")
+        raise AssertionError("capture invalidation passed coordinator admission")
+
+    try:
+        api._finalize_namespace_reply = blocked_finalize  # type: ignore[method-assign]
+        initiator, _finished, failures = _start_pending_capture(
+            lambda: api.execute_bsl("РезультатИнструкции = 902;"),
+            transport.accepted,
+        )
+        pending_status = api.current_capture().status()
+        transport.complete()
+        assert completion_entered.wait(1), "completion barrier was not reached"
+        assert controller.state is OperationState.CAPTURED
+        assert owner.status(owner._fence).phase is CapturePhase.EVALUATING
+        dispatches_before = transport.capture_start_count
+        workspace_calls_before = transport.workspace_call_count
+        api._require_available = forbidden_available  # type: ignore[method-assign]
+        controller.invalidate_capture_inspection = forbidden_invalidate  # type: ignore[method-assign]
+
+        with pytest.raises(CaptureBusyError) as caught:
+            _invoke_capture_data_plane_route(api, route)
+
+        assert pending_status.pending_evaluation_id is not None
+        assert caught.value.evaluation_id == pending_status.pending_evaluation_id
+        assert caught.value.evaluation_kind is CaptureEvaluationKind.USER_BSL
+        assert caught.value.phase is CapturePhase.EVALUATING
+        assert forbidden_calls == []
+        assert transport.capture_start_count == dispatches_before
+        assert transport.workspace_call_count == workspace_calls_before
+        assert failures == []
+    finally:
+        api._require_available = original_require_available  # type: ignore[method-assign]
+        controller.invalidate_capture_inspection = original_invalidate  # type: ignore[method-assign]
+        release_completion.set()
+        api._finalize_namespace_reply = original_finalize  # type: ignore[method-assign]
+        if initiator is not None:
+            initiator.join(_JOIN_TIMEOUT_S)
+            assert not initiator.is_alive(), f"{route} initiator leaked"
+        close_owner(controller, transport)
+
+
+@pytest.mark.parametrize("route", ("load", "release"))
+def test_worker_lifecycle_respects_capture_completion_reservation(
+    tmp_path,
+    route: str,
+) -> None:  # type: ignore[no-untyped-def]
+    api, controller, transport = controlled_notebook_runtime(tmp_path)
+    original_finalize = api._finalize_namespace_reply
+    original_publish = api._publish_worker_artifacts_locked
+    original_release = api._release_worker_lifecycle_locked
+    completion_entered = Event()
+    release_completion = Event()
+    lifecycle_calls: list[str] = []
+    initiator: Thread | None = None
+
+    def blocked_finalize(*args, **kwargs):  # type: ignore[no-untyped-def]
+        completion_entered.set()
+        assert release_completion.wait(_JOIN_TIMEOUT_S)
+        return original_finalize(*args, **kwargs)
+
+    def forbidden_publish(*args, **kwargs):  # type: ignore[no-untyped-def]
+        lifecycle_calls.append("publish")
+        raise AssertionError("Worker publication passed coordinator admission")
+
+    def forbidden_release(*args, **kwargs):  # type: ignore[no-untyped-def]
+        lifecycle_calls.append("release")
+        raise AssertionError("Worker release passed coordinator admission")
+
+    try:
+        assert api.execute_bsl(UPDATE).succeeded
+        catalog = _common_module_catalog("МодульА", "МодульБ")
+        module_a = _worker_module_unit("МодульА", 17, catalog)
+        module_b = _worker_module_unit("МодульБ", 17, catalog)
+        handle = api.load_worker_modules((module_a,), common_modules=catalog)
+        assert api.execute_bsl("Результат = Б();").kind.value == "captured"
+        owner = _capture_owner(controller)
+        api._finalize_namespace_reply = blocked_finalize  # type: ignore[method-assign]
+        initiator, _finished, failures = _start_pending_capture(
+            lambda: api.execute_bsl("РезультатИнструкции = Б();"),
+            transport.accepted,
+        )
+        pending_status = api.current_capture().status()
+        transport.complete()
+        assert completion_entered.wait(1), "completion barrier was not reached"
+        assert controller.state is OperationState.CAPTURED
+        assert owner.status(owner._fence).phase is CapturePhase.EVALUATING
+
+        generation_before = api.worker_generation_handle
+        api_owned_before = api._api_owned_worker_generation_handle
+        active_modules_before = dict(api._worker_active_modules)
+        artifacts_before = dict(api._worker_module_artifacts)
+        catalog_before = api._worker_catalog_snapshot
+        retained_before = api._worker_universe._retained_debug_views()
+        breakpoints_before = api._worker_breakpoints.snapshot()
+        workspace_before = controller.breakpoint_workspace_owner.confirmed_snapshot
+        workspace_calls_before = transport.workspace_call_count
+        api._publish_worker_artifacts_locked = forbidden_publish  # type: ignore[method-assign]
+        api._release_worker_lifecycle_locked = forbidden_release  # type: ignore[method-assign]
+
+        with pytest.raises(CaptureBusyError) as caught:
+            if route == "load":
+                api.load_worker_modules((module_b,), common_modules=catalog)
+            else:
+                api.release_worker_generation(handle)
+
+        assert pending_status.pending_evaluation_id is not None
+        assert caught.value.evaluation_id == pending_status.pending_evaluation_id
+        assert caught.value.evaluation_kind is CaptureEvaluationKind.USER_BSL
+        assert caught.value.phase is CapturePhase.EVALUATING
+        assert lifecycle_calls == []
+        assert api.worker_generation_handle is generation_before
+        assert api._api_owned_worker_generation_handle is api_owned_before
+        assert api._worker_active_modules == active_modules_before
+        assert api._worker_module_artifacts == artifacts_before
+        assert api._worker_catalog_snapshot is catalog_before
+        assert api._worker_universe._retained_debug_views() == retained_before
+        assert api._worker_breakpoints.snapshot() == breakpoints_before
+        assert controller.breakpoint_workspace_owner.confirmed_snapshot == workspace_before
+        assert transport.workspace_call_count == workspace_calls_before
+        assert failures == []
+    finally:
+        api._publish_worker_artifacts_locked = original_publish  # type: ignore[method-assign]
+        api._release_worker_lifecycle_locked = original_release  # type: ignore[method-assign]
+        release_completion.set()
+        api._finalize_namespace_reply = original_finalize  # type: ignore[method-assign]
+        if initiator is not None:
+            initiator.join(_JOIN_TIMEOUT_S)
+            assert not initiator.is_alive(), f"Worker {route} initiator leaked"
         close_owner(controller, transport)
