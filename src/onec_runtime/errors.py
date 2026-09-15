@@ -1,6 +1,15 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from onec_runtime.bsl.diagnostics import NormalizedDiagnostic
+
+if TYPE_CHECKING:
+    from onec_runtime.capture_evaluation import (
+        CaptureEvaluationKind,
+        CaptureFailureDiagnostic,
+        CapturePhase,
+    )
 
 
 class RuntimeProbeError(Exception):
@@ -37,6 +46,163 @@ class ExtensionNotInstalled(RuntimeProbeError):
 
 class ProtocolError(RuntimeProbeError):
     """The RDBG peer returned an invalid or unsuccessful response."""
+
+
+def _safe_error_text(value: object, *, default: str) -> str:
+    if not isinstance(value, str):
+        return default
+    cleaned = "".join(character if ord(character) >= 0x20 else " " for character in value)
+    cleaned = " ".join(cleaned.split())
+    return cleaned[:1024] or default
+
+
+class CaptureEvaluationPendingError(ProtocolError):
+    """An acknowledged CAPTURE evaluation outlived its initiating waiter."""
+
+    __slots__ = ("evaluation_id", "evaluation_kind")
+
+    def __init__(self, evaluation_id: str, evaluation_kind: CaptureEvaluationKind) -> None:
+        from onec_runtime.capture_evaluation import CaptureEvaluationKind as Kind
+
+        if not isinstance(evaluation_id, str) or not evaluation_id:
+            raise ValueError("evaluation_id is invalid")
+        try:
+            kind = evaluation_kind if isinstance(evaluation_kind, Kind) else Kind(evaluation_kind)
+        except (TypeError, ValueError) as error:
+            raise ValueError("evaluation_kind is invalid") from error
+        self.evaluation_id = _safe_error_text(evaluation_id, default="<unknown>")
+        self.evaluation_kind = kind
+        super().__init__(
+            "CAPTURE evaluation remains pending "
+            f"(evaluation_id={self.evaluation_id}, kind={kind.value}); "
+            "use capture.wait()"
+        )
+
+
+class CaptureBusyError(ProtocolError):
+    """The current capture is owned by another acknowledged evaluation."""
+
+    __slots__ = ("evaluation_id", "evaluation_kind", "phase")
+
+    def __init__(
+        self,
+        evaluation_id: str,
+        evaluation_kind: CaptureEvaluationKind,
+        phase: CapturePhase,
+    ) -> None:
+        from onec_runtime.capture_evaluation import (
+            CaptureEvaluationKind as Kind,
+            CapturePhase as Phase,
+        )
+
+        if not isinstance(evaluation_id, str) or not evaluation_id:
+            raise ValueError("evaluation_id is invalid")
+        try:
+            kind = evaluation_kind if isinstance(evaluation_kind, Kind) else Kind(evaluation_kind)
+            current_phase = phase if isinstance(phase, Phase) else Phase(phase)
+        except (TypeError, ValueError) as error:
+            raise ValueError("capture lifecycle identity is invalid") from error
+        self.evaluation_id = _safe_error_text(evaluation_id, default="<unknown>")
+        self.evaluation_kind = kind
+        self.phase = current_phase
+        super().__init__(
+            "CAPTURE is busy "
+            f"(evaluation_id={self.evaluation_id}, kind={kind.value}, phase={current_phase.value})"
+        )
+
+
+class CaptureOutcomeUnknownError(ProtocolError):
+    """The remote outcome of a CAPTURE evaluation cannot be established."""
+
+    __slots__ = ("evaluation_id", "diagnostic")
+
+    def __init__(
+        self,
+        evaluation_id: str | None = None,
+        diagnostic: CaptureFailureDiagnostic | str | None = None,
+    ) -> None:
+        from onec_runtime.capture_evaluation import CaptureFailureDiagnostic
+
+        self.evaluation_id = (
+            _safe_error_text(evaluation_id, default="<unknown>")
+            if evaluation_id is not None
+            else None
+        )
+        self.diagnostic = _coerce_diagnostic(diagnostic, default_code="outcome_unknown")
+        super().__init__(_diagnostic_message("CAPTURE evaluation outcome is unknown", self.diagnostic))
+
+
+class CaptureRecoveryRequiredError(ProtocolError):
+    """The CAPTURE controller requires recovery before data-plane operations."""
+
+    __slots__ = ("diagnostic",)
+
+    def __init__(self, diagnostic: CaptureFailureDiagnostic | str | None = None) -> None:
+        self.diagnostic = _coerce_diagnostic(diagnostic, default_code="recovery_required")
+        super().__init__(_diagnostic_message("CAPTURE recovery is required", self.diagnostic))
+
+
+class NoActiveCaptureError(ProtocolError):
+    """No current CAPTURE fence is available."""
+
+    __slots__ = ("runtime_state",)
+
+    def __init__(self, runtime_state: str | None = None) -> None:
+        self.runtime_state = (
+            _safe_error_text(runtime_state, default="<unknown>")
+            if runtime_state is not None
+            else None
+        )
+        suffix = f" (state={self.runtime_state})" if self.runtime_state else ""
+        super().__init__(f"No active CAPTURE{suffix}")
+
+
+class NoCaptureEvaluationError(ProtocolError):
+    """No matching retained or pending evaluation exists for the capture."""
+
+    __slots__ = ("evaluation_id",)
+
+    def __init__(self, evaluation_id: str | None = None) -> None:
+        self.evaluation_id = (
+            _safe_error_text(evaluation_id, default="<unknown>")
+            if evaluation_id is not None
+            else None
+        )
+        suffix = f" (evaluation_id={self.evaluation_id})" if self.evaluation_id else ""
+        super().__init__(f"No CAPTURE evaluation is available{suffix}")
+
+
+class StaleCaptureError(ProtocolError):
+    """The supplied CAPTURE view no longer names the current stop."""
+
+    __slots__ = ()
+
+    def __init__(self, message: str = "CAPTURE view is stale") -> None:
+        super().__init__(_safe_error_text(message, default="CAPTURE view is stale"))
+
+
+def _coerce_diagnostic(
+    diagnostic: CaptureFailureDiagnostic | str | None,
+    *,
+    default_code: str,
+) -> CaptureFailureDiagnostic | None:
+    from onec_runtime.capture_evaluation import CaptureFailureDiagnostic
+
+    if diagnostic is None:
+        return None
+    if isinstance(diagnostic, CaptureFailureDiagnostic):
+        return diagnostic
+    return CaptureFailureDiagnostic(
+        code=default_code,
+        message=_safe_error_text(diagnostic, default="controller diagnostic unavailable"),
+        recommended_action="inspect capture.status()",
+    )
+
+
+def _diagnostic_message(prefix: str, diagnostic: CaptureFailureDiagnostic | None) -> str:
+    if diagnostic is None:
+        return prefix
+    return f"{prefix}: {diagnostic.code}: {diagnostic.message}"[:1024]
 
 
 class RdbgDebugUiNotRegistered(ProtocolError):
