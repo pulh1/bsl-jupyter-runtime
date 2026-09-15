@@ -138,8 +138,8 @@ def environment():
     drivers = []
     threads = []
 
-    def create():
-        journal = RecoveryJournal()
+    def create(*, journal=None):
+        journal = journal if journal is not None else RecoveryJournal()
         coordinator = CaptureEvaluationCoordinator(
             FENCE, poll_interval_s=0.01, journal=journal,
         )
@@ -294,6 +294,7 @@ def test_all_evidence_is_safe_and_poll_journaling_is_bounded(environment):
     assert len(journal.events) == events_before
     driver.result()
     outcome = coordinator.wait(FENCE, None, 1)
+    eventually(lambda: any(event.event.endswith("outcome_published") for event in journal.events))
     events = journal.events
     assert {event.event for event in events} == {
         "capture_evaluation_record_created", "capture_evaluation_dispatch_entered",
@@ -390,6 +391,7 @@ def test_failure_boundaries_keep_result_and_cleanup_distinct(
     if boundary not in {"before_dispatch", "dispatch"}:
         driver.result()
     outcome = coordinator.wait(FENCE, ticket.evaluation_id, 1)
+    eventually(lambda: any(event.event.endswith("outcome_published") for event in journal.events))
     assert (outcome.state, outcome.result, outcome.diagnostic.code) == (state, None, code)
     assert coordinator.status(FENCE).phase is phase
     assert driver.dispositions == [disposition]
@@ -435,6 +437,7 @@ def test_unexpected_stop_requires_recovery_without_nested_capture(environment):
     assert coordinator.status(FENCE).phase is Phase.RECOVERY_REQUIRED
     assert driver.restore_count == driver.cleanup_count == 0
     assert driver.dispositions == ["quarantine"]
+    eventually(lambda: any(event.event.endswith("outcome_published") for event in journal.events))
     assert journal.events[-1].fields["cleanup_status"] == "not_started"
 
 
@@ -684,3 +687,260 @@ def test_delivery_error_bounds_and_sanitizes_its_diagnostic():
     assert "\n" not in str(error)
     assert error.diagnostic.code == "result_delivery_failed"
     assert len(error.diagnostic.message) <= 1024
+
+
+@pytest.mark.parametrize("boundary", ["deadline", "condition_entry"])
+def test_pre_entry_interrupt_detaches_acknowledged_initiator(environment, monkeypatch, boundary):
+    import onec_runtime.capture_evaluation as module
+
+    create, _ = environment
+    coordinator, driver, journal = create()
+    ticket = coordinator.submit_evaluation(driver.request(
+        kind=Kind.PUBLIC_VALUE_GUARD, continuation=driver.continuation,
+    ))
+    assert driver.polling.wait(1)
+    caller = current_thread().ident
+    armed = True
+    original_deadline = module._deadline
+    condition_type = type(coordinator._condition)
+    original_enter = condition_type.__enter__
+
+    def deadline(timeout_s):
+        nonlocal armed
+        if current_thread().ident == caller and armed:
+            armed = False
+            raise KeyboardInterrupt
+        return original_deadline(timeout_s)
+
+    def enter(condition):
+        nonlocal armed
+        if condition is coordinator._condition and current_thread().ident == caller and armed:
+            armed = False
+            raise KeyboardInterrupt
+        return original_enter(condition)
+
+    if boundary == "deadline":
+        monkeypatch.setattr(module, "_deadline", deadline)
+    else:
+        monkeypatch.setattr(condition_type, "__enter__", enter)
+    with pytest.raises(KeyboardInterrupt):
+        ticket.wait_initiator(1)
+    pending = coordinator.status(FENCE)
+    assert pending.phase is Phase.EVALUATING
+    assert pending.evaluation_timing.initiating_waiter_detached_ms is not None
+    driver.result(0)
+    outcome = coordinator.wait(FENCE, None, 1)
+    eventually(lambda: any(event.event.endswith("outcome_published") for event in journal.events))
+    assert outcome.state is State.COMPLETED
+    assert driver.continuation_count == 0
+    assert driver.restore_count == driver.cleanup_count == 1
+    assert driver.dispositions == ["release"]
+    names = [event.event for event in journal.events]
+    assert names.index("capture_evaluation_initiating_waiter_detached") < names.index("capture_evaluation_outcome_published")
+
+
+@pytest.mark.parametrize("kind", [Kind.USER_BSL, Kind.PUBLIC_VALUE_GUARD])
+def test_delayed_delivery_interrupt_cannot_replace_newer_retained_outcome(environment, monkeypatch, kind):
+    create, threads = environment
+    coordinator, older, journal = create()
+    older_ticket = coordinator.submit_evaluation(older.request(kind=kind))
+    coordinator.wait(FENCE, None, 0)  # Both kinds are publicly retained.
+    older.result(1)
+    older_outcome = coordinator.wait(FENCE, None, 1)
+    entered_delivery = Event()
+    interrupt_delivery = Event()
+    interrupted = Queue()
+    original_require = coordinator._require_fence_locked
+
+    def hold_delivery(fence):
+        if current_thread() is delivery_thread:
+            # Emulate a descheduled original waiter without blocking other
+            # callers' condition access. The interrupt is still delivered at
+            # the original completed ticket's fence-check boundary.
+            entered_delivery.set()
+            assert coordinator._condition.wait_for(interrupt_delivery.is_set, timeout=2)
+            raise KeyboardInterrupt
+        return original_require(fence)
+
+    def deliver():
+        try:
+            older_ticket.wait_initiator(1)
+        except KeyboardInterrupt:
+            interrupted.put(True)
+
+    delivery_thread = Thread(target=deliver)
+    threads.append(delivery_thread)
+    monkeypatch.setattr(coordinator, "_require_fence_locked", hold_delivery)
+    delivery_thread.start()
+    assert entered_delivery.wait(1)
+    try:
+        newer = Driver()
+        newer_ticket = coordinator.submit_evaluation(newer.request(kind=kind))
+        coordinator.wait(FENCE, None, 0)
+        newer.result(2)
+        newer_outcome = coordinator.wait(FENCE, None, 1)
+    finally:
+        interrupt_delivery.set()
+        with coordinator._condition:
+            coordinator._condition.notify_all()
+    assert interrupted.get(timeout=1)
+    assert coordinator.wait(FENCE, None, 0) is newer_outcome
+    assert coordinator.wait(FENCE, newer_ticket.evaluation_id, 0) is newer_outcome
+    assert coordinator.status(FENCE).last_evaluation_id == newer_ticket.evaluation_id
+    if kind is Kind.USER_BSL:
+        assert coordinator.status(FENCE).last_user_evaluation_id == newer_ticket.evaluation_id
+    assert older_outcome.timing.initiating_waiter_detached_ms is None
+    assert older_ticket._record.initiator_attached
+    eventually(lambda: len([event for event in journal.events if event.event.endswith("outcome_published")]) == 2)
+    assert not any(event.event.endswith("initiating_waiter_detached") for event in journal.events)
+    # No late detachment event may be stranded when the worker becomes idle.
+    with coordinator._condition:
+        assert not coordinator._events
+    coordinator.begin_close()
+    assert coordinator.join(1)
+    assert not any(event.event.endswith("initiating_waiter_detached") for event in journal.events)
+
+
+def test_delayed_retention_of_detached_internal_record_preserves_settlement_order(environment):
+    create, _ = environment
+    coordinator, older, _ = create()
+    older_ticket = coordinator.submit_evaluation(older.request(kind=Kind.PUBLIC_VALUE_GUARD))
+    assert older.polling.wait(1)
+    with pytest.raises(CaptureEvaluationPendingError):
+        older_ticket.wait_initiator(0)
+    older.result(1)
+    coordinator.wait(FENCE, None, 1)
+    newer = Driver()
+    newer_ticket = coordinator.submit_evaluation(newer.request(kind=Kind.INSPECTION))
+    coordinator.wait(FENCE, None, 0)
+    newer.result(2)
+    newer_outcome = coordinator.wait(FENCE, None, 1)
+    # Replay an older qualifying retention notification after the newer one;
+    # the observable default and explicit-ID slots must remain chronological.
+    with coordinator._condition:
+        coordinator._retain_locked(older_ticket._record)
+    assert coordinator.wait(FENCE, None, 0) is newer_outcome
+    assert coordinator.wait(FENCE, newer_ticket.evaluation_id, 0) is newer_outcome
+
+
+class PublicationBarrierJournal(RecoveryJournal):
+    def __init__(self):
+        super().__init__()
+        self.entered = Event()
+        self.release = Event()
+        self.recorded = Event()
+
+    def record(self, stream, event, **fields):
+        if event == "capture_evaluation_outcome_published":
+            self.entered.set()
+            assert self.release.wait(2)
+        result = super().record(stream, event, **fields)
+        if event == "capture_evaluation_outcome_published":
+            self.recorded.set()
+        return result
+
+
+@pytest.mark.parametrize("close_at_barrier", [False, True])
+def test_terminal_state_and_timing_are_visible_before_journal_io(environment, close_at_barrier):
+    create, _ = environment
+    journal = PublicationBarrierJournal()
+    coordinator, driver, _ = create(journal=journal)
+    ticket = coordinator.submit_evaluation(driver.request(kind=Kind.PUBLIC_VALUE_GUARD))
+    coordinator.wait(FENCE, None, 0)
+    driver.result(42)
+    assert journal.entered.wait(1)
+    try:
+        status = coordinator.status(FENCE)
+        assert status.phase is Phase.PAUSED
+        assert status.pending_evaluation_id is None
+        assert status.last_evaluation_id == ticket.evaluation_id
+        outcome = coordinator.wait(FENCE, None, 0)
+        assert outcome.state is State.COMPLETED
+        assert outcome.timing is status.evaluation_timing
+        assert outcome.timing.elapsed_ms == outcome.timing.outcome_published_ms
+        assert outcome.timing.initiating_waiter_detached_ms is None
+        assert ticket.wait_initiator(0) == 42
+        if close_at_barrier:
+            coordinator.begin_close()
+            assert not coordinator.join(0.01)
+    finally:
+        journal.release.set()
+    assert journal.recorded.wait(1)
+    if close_at_barrier:
+        assert coordinator.join(1)
+    else:
+        assert coordinator.wait(FENCE, None, 0) is outcome
+    assert journal.events[-1].event == "capture_evaluation_outcome_published"
+    assert journal.events[-1].fields["state"] == "completed"
+    assert not any(event.event.endswith("initiating_waiter_detached") for event in journal.events)
+
+
+def test_pending_detachment_is_included_in_atomic_terminal_timing(environment):
+    create, _ = environment
+    coordinator, driver, journal = create()
+    disposing_pin = Event()
+    release_pin = Event()
+
+    def pin(disposition):
+        disposing_pin.set()
+        assert release_pin.wait(2)
+        driver.pin(disposition)
+
+    ticket = coordinator.submit_evaluation(driver.request(
+        kind=Kind.PUBLIC_VALUE_GUARD, pin_lease=pin,
+    ))
+    driver.result(0)
+    assert disposing_pin.wait(1)
+    try:
+        with pytest.raises(CaptureEvaluationPendingError):
+            ticket.wait_initiator(0)
+        pending = coordinator.status(FENCE)
+        assert pending.phase is Phase.EVALUATING
+        assert pending.evaluation_timing.outcome_published_ms is None
+        detached_ms = pending.evaluation_timing.initiating_waiter_detached_ms
+        assert detached_ms is not None
+        assert detached_ms <= pending.evaluation_timing.elapsed_ms
+    finally:
+        release_pin.set()
+    outcome = coordinator.wait(FENCE, None, 1)
+    assert outcome.state is State.COMPLETED
+    assert outcome.timing.initiating_waiter_detached_ms == detached_ms
+    assert detached_ms <= outcome.timing.outcome_published_ms == outcome.timing.elapsed_ms
+    eventually(lambda: any(event.event.endswith("outcome_published") for event in journal.events))
+    names = [event.event for event in journal.events]
+    assert names.index("capture_evaluation_initiating_waiter_detached") < names.index("capture_evaluation_outcome_published")
+    assert journal.events[-1].fields["initiating_waiter_detached_ms"] == detached_ms
+    assert journal.events[-1].fields["state"] == "completed"
+
+
+def test_close_drains_queued_evidence_in_order_after_publication_barrier(environment):
+    create, _ = environment
+    journal = PublicationBarrierJournal()
+    coordinator, first, _ = create(journal=journal)
+    first_ticket = coordinator.submit_evaluation(first.request())
+    first.result(1)
+    assert journal.entered.wait(1)
+    queued = Driver()
+    try:
+        assert coordinator.wait(FENCE, None, 0).state is State.COMPLETED
+        queued_ticket = coordinator.submit_evaluation(queued.request(kind=Kind.INSPECTION))
+        coordinator.begin_close()
+        assert not coordinator.join(0.01)
+    finally:
+        journal.release.set()
+    assert coordinator.join(1)
+    assert queued.dispatch_count == 0
+    assert queued.dispositions == ["release"]
+    events = journal.events
+    first_published = next(index for index, event in enumerate(events) if (
+        event.event.endswith("outcome_published") and event.fields["evaluation_id"] == first_ticket.evaluation_id
+    ))
+    queued_created = next(index for index, event in enumerate(events) if (
+        event.event.endswith("record_created") and event.fields["evaluation_id"] == queued_ticket.evaluation_id
+    ))
+    assert first_published < queued_created
+    assert events[-1].fields["evaluation_id"] == queued_ticket.evaluation_id
+    assert events[-1].event == "capture_evaluation_outcome_published"
+    assert events[-1].fields["state"] == "failed"
+    with coordinator._condition:
+        assert not coordinator._events

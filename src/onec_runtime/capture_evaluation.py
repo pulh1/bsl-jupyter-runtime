@@ -573,6 +573,7 @@ class _CaptureEvaluationRecord:
     observed: bool = False
     continuation_started: bool = False
     cleanup_status: str = "not_started"
+    settlement_order: int = 0
     outcome: CaptureEvaluationOutcome | None = None
     # These never enter a public snapshot, repr, journal, or observer outcome.
     private_result: object = None
@@ -628,6 +629,10 @@ class CaptureEvaluationCoordinator:
         self._last_user: CaptureEvaluationOutcome | None = None
         self._last_internal: CaptureEvaluationOutcome | None = None
         self._last: CaptureEvaluationOutcome | None = None
+        self._settlement_order = 0
+        self._last_user_order = 0
+        self._last_internal_order = 0
+        self._last_order = 0
         self._quarantined: _CaptureEvaluationRecord | None = None
         self._closing = False
         self._events: deque[tuple[str, dict[str, object]]] = deque()
@@ -746,11 +751,11 @@ class CaptureEvaluationCoordinator:
         raise NoCaptureEvaluationError(evaluation_id)
 
     def _wait_initiator(self, record: _CaptureEvaluationRecord, timeout_s: float | None) -> object:
-        if current_thread() is self._worker:
-            raise ProtocolError("CAPTURE worker cannot wait on its own outcome")
-        deadline = _deadline(timeout_s)
-        with self._condition:
-            try:
+        try:
+            if current_thread() is self._worker:
+                raise ProtocolError("CAPTURE worker cannot wait on its own outcome")
+            deadline = _deadline(timeout_s)
+            with self._condition:
                 while record.outcome is None:
                     self._require_fence_locked(record.request.fence)
                     remaining = _remaining(deadline)
@@ -766,18 +771,18 @@ class CaptureEvaluationCoordinator:
                 if record.initiating_error is not None:
                     raise record.initiating_error
                 return record.private_result
-            except KeyboardInterrupt:
+        except KeyboardInterrupt:
+            # Setup and condition acquisition can both be interrupted. The
+            # condition may never have been acquired, or publication may have
+            # won the race before this handler reacquires it.
+            with self._condition:
                 self._detach_locked(record, "interrupt")
-                raise
+            raise
 
     def _detach_locked(self, record: _CaptureEvaluationRecord, reason: str) -> None:
-        if record.initiator_attached:
+        if record.outcome is None and record.initiator_attached:
             record.initiator_attached = False
             self._evidence_locked(record, "initiating_waiter_detached", reason=reason)
-            # Completion may have won the race with an interrupt during delivery.
-            # Preserve an internal outcome if detachment happens at that boundary.
-            if record.outcome is not None:
-                self._retain_locked(record)
             self._condition.notify_all()
 
     def _run(self) -> None:
@@ -997,14 +1002,16 @@ class CaptureEvaluationCoordinator:
                                   error_category=diagnostic.code if diagnostic else (
                                       candidate.diagnostic.code if candidate.diagnostic else None))
             timing = self._timing_locked(record)
-            # Journal the terminal aggregate before observers can see completion.
+            # Terminal timing, waiter state, outcome, retention and admission
+            # become visible at one condition boundary. A delivery-time
+            # interrupt after this point cannot retroactively detach a waiter.
             # Reapply the original sealed message snapshot, not an already
             # truncated payload with a completed-state diagnostic. This keeps
             # the immutable model's strict state validation intact.
             outcome = replace(candidate, timing=timing, messages=messages, diagnostic=diagnostic)
-        self._flush_evidence()
-        with self._condition:
             record.outcome = outcome
+            self._settlement_order += 1
+            record.settlement_order = self._settlement_order
             self._retain_locked(record)
             self._phase = CapturePhase.STALE if self._closing else phase
             self._failure = diagnostic if self._phase in {
@@ -1012,16 +1019,29 @@ class CaptureEvaluationCoordinator:
             } else None
             self._active = None
             self._condition.notify_all()
+        # Evidence was queued in the same critical section, in transition
+        # order. Only the worker drains it, before it can become idle or exit.
+        # Journal latency never leaves a pending snapshot with final timing.
+        self._flush_evidence()
 
     def _retain_locked(self, record: _CaptureEvaluationRecord) -> None:
         assert record.outcome is not None
+        assert record.settlement_order > 0
         if record.request.evaluation_kind is CaptureEvaluationKind.USER_BSL:
+            if record.settlement_order <= self._last_user_order:
+                return
             self._last_user = record.outcome
+            self._last_user_order = record.settlement_order
         elif record.observed or not record.initiator_attached or record.outcome.state is not CaptureEvaluationState.COMPLETED:
+            if record.settlement_order <= self._last_internal_order:
+                return
             self._last_internal = record.outcome
+            self._last_internal_order = record.settlement_order
         else:
             return
-        self._last = record.outcome
+        if record.settlement_order > self._last_order:
+            self._last = record.outcome
+            self._last_order = record.settlement_order
 
     def _timing_locked(self, record: _CaptureEvaluationRecord) -> CaptureEvaluationTiming:
         elapsed = record.offsets.get("outcome_published_ms", self._offset(record))
