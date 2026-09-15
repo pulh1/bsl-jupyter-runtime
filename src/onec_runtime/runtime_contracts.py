@@ -252,7 +252,7 @@ def _bounded_trace_origin(frame: ErrorTraceFrame) -> bool:
         return worker
     if frame.origin is ErrorTraceFrameOrigin.NATIVE_MODULE:
         return not unknown and not worker
-    return frame.origin is ErrorTraceFrameOrigin.UNKNOWN and (unknown or worker)
+    return frame.origin is ErrorTraceFrameOrigin.UNKNOWN
 
 
 def _bounded_optional_label(value: object, *, maximum: int = 256) -> bool:
@@ -364,6 +364,110 @@ def _bounded_trace_frame_fields(frame: ErrorTraceFrame) -> bool:
     return True
 
 
+def _frame_has_no_generated_mapping(frame: ErrorTraceFrame) -> bool:
+    return all(
+        value is None
+        for value in (
+            frame.source_unit,
+            frame.visible_location,
+            frame.visible_line_span,
+            frame.related_visible_span,
+            frame.lowered_location,
+            frame.synthetic_region,
+            frame.dependency_anchor,
+            frame.method_anchor,
+        )
+    )
+
+
+def _frame_has_no_worker_provenance(frame: ErrorTraceFrame) -> bool:
+    return all(
+        value is None
+        for value in (
+            frame.registration_name,
+            frame.logical_name,
+            frame.revision,
+            frame.artifact_sha256,
+        )
+    )
+
+
+def _matches_worker_projection(
+    frame: ErrorTraceFrame,
+    projection: WorkerRuntimeFrameDiagnostic,
+) -> bool:
+    return (
+        frame.registration_name is not None
+        and frame.registration_name.casefold()
+        == projection.registration_name.casefold()
+        and frame.logical_name == projection.logical_name
+        and frame.revision == projection.revision
+        and frame.artifact_sha256 == projection.artifact_sha256
+        and frame.mapping_confidence is projection.mapping_confidence
+        and frame.source_unit == projection.source_unit
+        and frame.visible_location == projection.visible_location
+        and frame.related_visible_span == projection.related_visible_span
+        and frame.lowered_location == projection.lowered_location
+        and frame.synthetic_region == projection.synthetic_region
+        and frame.dependency_anchor == projection.dependency_anchor
+        and frame.method_anchor == projection.method_anchor
+    )
+
+
+def _bounded_origin_specific_trace_fields(
+    frame: ErrorTraceFrame,
+    worker_frames: tuple[WorkerRuntimeFrameDiagnostic, ...],
+) -> bool:
+    location = frame.platform_location
+    if frame.origin is ErrorTraceFrameOrigin.NATIVE_MODULE:
+        return (
+            frame.mapping_confidence is MappingConfidence.UNKNOWN
+            and _frame_has_no_generated_mapping(frame)
+            and _frame_has_no_worker_provenance(frame)
+        )
+    if frame.origin is ErrorTraceFrameOrigin.EXECUTED_ARTIFACT:
+        return _frame_has_no_worker_provenance(frame)
+    if frame.origin is ErrorTraceFrameOrigin.WORKER_ARTIFACT:
+        worker_location = location.worker_artifact_location
+        if (
+            worker_location is None
+            or frame.registration_name is None
+            or frame.logical_name is None
+            or frame.revision is None
+            or frame.artifact_sha256 is None
+            or worker_location.registration_name.casefold()
+            != frame.registration_name.casefold()
+        ):
+            return False
+        return any(
+            _matches_worker_projection(frame, projection)
+            for projection in worker_frames
+        )
+    if frame.origin is ErrorTraceFrameOrigin.UNKNOWN:
+        if (
+            frame.mapping_confidence is not MappingConfidence.UNKNOWN
+            or not _frame_has_no_generated_mapping(frame)
+            or any(
+                value is not None
+                for value in (
+                    frame.logical_name,
+                    frame.revision,
+                    frame.artifact_sha256,
+                )
+            )
+        ):
+            return False
+        worker_location = location.worker_artifact_location
+        if worker_location is None:
+            return frame.registration_name is None
+        return (
+            frame.registration_name is not None
+            and frame.registration_name.casefold()
+            == worker_location.registration_name.casefold()
+        )
+    return False
+
+
 def _bounded_worker_frame(value: object) -> bool:
     if not isinstance(value, WorkerRuntimeFrameDiagnostic):
         return False
@@ -384,6 +488,31 @@ def _bounded_worker_frame(value: object) -> bool:
     if value.artifact_sha256 is not None and (
         type(value.artifact_sha256) is not str
         or _SHA256_RE.fullmatch(value.artifact_sha256) is None
+    ):
+        return False
+    identity_values = (
+        value.logical_name,
+        value.revision,
+        value.artifact_sha256,
+    )
+    if any(item is None for item in identity_values) and any(
+        item is not None for item in identity_values
+    ):
+        return False
+    if all(item is None for item in identity_values) and (
+        value.mapping_confidence is not MappingConfidence.UNKNOWN
+        or any(
+            item is not None
+            for item in (
+                value.source_unit,
+                value.visible_location,
+                value.related_visible_span,
+                value.lowered_location,
+                value.synthetic_region,
+                value.dependency_anchor,
+                value.method_anchor,
+            )
+        )
     ):
         return False
     if value.source_unit is not None and not _bounded_source_unit(value.source_unit):
@@ -484,6 +613,10 @@ def _bounded_trace(
             or not _bounded_platform_location(frame.platform_location)
             or not _bounded_trace_origin(frame)
             or not _bounded_trace_frame_fields(frame)
+            or not _bounded_origin_specific_trace_fields(
+                frame,
+                value.worker_frames,
+            )
             or not _bounded_diagnostic_span(frame.block_span, text_length)
             or (
                 frame.detail_span is not None

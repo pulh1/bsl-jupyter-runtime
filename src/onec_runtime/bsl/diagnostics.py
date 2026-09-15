@@ -724,6 +724,7 @@ def remap_worker_stage_diagnostic(
 def _remap_worker_runtime_primary(
     parsed: ParsedPlatformDiagnostic,
     *,
+    stage: DiagnosticStage,
     pinned_manifest_sha256: str,
     pinned_artifacts: tuple[WorkerDiagnosticArtifact, ...],
 ) -> NormalizedDiagnostic:
@@ -763,7 +764,7 @@ def _remap_worker_runtime_primary(
     if not frames:
         return _unmapped_worker_diagnostic(
             parsed,
-            stage=DiagnosticStage.EXECUTION,
+            stage=stage,
             code="worker_runtime_frame_unmapped",
             identity=(pinned_manifest_sha256,),
         )
@@ -787,13 +788,13 @@ def _remap_worker_runtime_primary(
             execution_artifact_sha256 = artifact.mapped_source.artifact.source_sha256
     return NormalizedDiagnostic(
         diagnostic_id=_worker_diagnostic_id(
-            DiagnosticStage.EXECUTION,
+            stage,
             "worker_runtime_frames",
             parsed.platform_diagnostic_sha256,
             (pinned_manifest_sha256, *(frame.registration_name for frame in frames)),
         ),
-        runtime_summary=_summary(DiagnosticStage.EXECUTION),
-        stage=DiagnosticStage.EXECUTION,
+        runtime_summary=_summary(stage),
+        stage=stage,
         mapping_confidence=primary.mapping_confidence,
         code=(
             "dependency_binding"
@@ -1210,6 +1211,7 @@ def normalize_platform_diagnostic_trace(
     elif pinned_manifest_sha256 is not None:
         base = _remap_worker_runtime_primary(
             parsed,
+            stage=stage,
             pinned_manifest_sha256=pinned_manifest_sha256,
             pinned_artifacts=pinned_artifacts,
         )

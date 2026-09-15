@@ -10,7 +10,7 @@
 
 The 1C extension already evaluates `ПодробноеПредставлениеОшибки(ИнформацияОбОшибке())` after a failed BSL operation. That value contains the platform's detailed diagnostic, including nested causes, module locations, stack entries, and platform-provided text fragments. The runtime transports enough text through RDBG, but the Python core currently:
 
-- retains at most 4,096 Python code points;
+- retains one 64 KiB UTF-8-bounded, verbatim evidence value;
 - selects one primary main-cell location;
 - exposes a separate Worker-only frame projection;
 - does not model the cause chain or the complete mixed native/generated stack;
@@ -284,7 +284,7 @@ To keep the tranche independently mergeable, implementation is limited to:
 - `src/onec_runtime/runtime_contracts.py` for validation and the private-text bound;
 - focused diagnostic and contract tests.
 
-It deliberately avoids `errors.py`, runtime orchestration, adapters, configuration resolution, and extension sources.
+It deliberately avoids `errors.py`, runtime orchestration, configuration resolution, RDBG, and extension sources. The approved evidence-bound work may touch privacy and MCP diagnostic transport only to preserve the same verbatim 64 KiB private/expert evidence; it does not change compact/public omission, wire key sets, or adapter rendering.
 
 ## Test strategy
 
@@ -340,5 +340,5 @@ The later runtime integration adds the successful-path zero-call spy and error-p
 - Every eligible generated frame is remapped independently through exact immutable evidence.
 - Native module frames retain their direct 1C locations without requiring a source map or `source_root`.
 - Existing primary fields, Worker compatibility frames, serializer shapes, and deterministic diagnostics remain compatible.
-- No runtime, adapter, resolver, RDBG, or extension file changes are present.
+- No runtime lifecycle, resolver, RDBG, or extension file changes are present. Any privacy/MCP transport change is limited to the approved shared evidence bound and preserves compact/public omission and existing wire key sets.
 - Focused and full static tests pass.

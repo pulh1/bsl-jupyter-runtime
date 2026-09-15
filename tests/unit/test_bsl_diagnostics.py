@@ -1472,6 +1472,8 @@ def test_runtime_compound_worker_frames_preserve_known_and_unknown_order() -> No
 
 def test_mixed_trace_maps_worker_main_and_native_frames_in_order() -> None:
     """Break caught: trace mapping must admit each pinned Worker separately."""
+    from onec_runtime.runtime_contracts import sanitize_normalized_diagnostic
+
     manifest = "c" * 64
     worker = _worker_diagnostic_artifact(
         "МодульБ",
@@ -1505,6 +1507,7 @@ def test_mixed_trace_maps_worker_main_and_native_frames_in_order() -> None:
     assert diagnostic.frames[0].mapping_confidence is MappingConfidence.EXACT
     assert diagnostic.frames[1].mapping_confidence is MappingConfidence.UNKNOWN
     assert diagnostic.frames[2].mapping_confidence is MappingConfidence.EXACT
+    assert sanitize_normalized_diagnostic(diagnostic) is not None
 
 
 def test_stale_worker_frame_degrades_without_hiding_other_frames() -> None:
@@ -1584,6 +1587,79 @@ def test_one_worker_mapping_failure_does_not_remove_later_frames(
         MappingConfidence.UNKNOWN,
         MappingConfidence.EXACT,
     ]
+
+
+def test_native_trace_mapping_failure_degrades_without_hiding_main_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: native conversion errors must use the frame-local fallback."""
+    import onec_runtime.bsl.diagnostics as diagnostics_module
+    from onec_runtime.runtime_contracts import sanitize_normalized_diagnostic
+
+    source = "Результат = 1;"
+    monkeypatch.setattr(
+        diagnostics_module,
+        "_native_trace_frame",
+        lambda frame: (_ for _ in ()).throw(ValueError("injected native failure")),
+    )
+    diagnostic = normalize_platform_diagnostic_trace(
+        parse_platform_diagnostic(
+            "{ОбщийМодуль.Сервис.Модуль(7,3)}: native\n"
+            "{<Неизвестный модуль>(1,1)}: main"
+        ),
+        stage=DiagnosticStage.EXECUTION,
+        executed=_wrapped(source),
+        visible_source_context=_visible_context(source),
+    )
+
+    assert [frame.origin for frame in diagnostic.frames] == [
+        ErrorTraceFrameOrigin.UNKNOWN,
+        ErrorTraceFrameOrigin.EXECUTED_ARTIFACT,
+    ]
+    assert diagnostic.frames[0].mapping_confidence is MappingConfidence.UNKNOWN
+    assert diagnostic.frames[1].source_unit is not None
+    assert sanitize_normalized_diagnostic(diagnostic) is not None
+
+
+def test_pinned_worker_trace_honors_explicit_stage_and_legacy_wrapper_execution() -> None:
+    """Break caught: the Worker primary path previously hard-coded execution."""
+    manifest = "c" * 64
+    worker = _worker_diagnostic_artifact(
+        "МодульБ",
+        18,
+        "OnecRuntime_bbbbbbbb_bbbbbbbbbbbbbbbb",
+        "b" * 64,
+        manifest,
+    )
+    parsed = parse_platform_diagnostic(
+        "{ВнешняяОбработка."
+        f"{worker.registration_name}.МодульОбъекта(1,1)}}: worker"
+    )
+
+    compilation = normalize_platform_diagnostic_trace(
+        parsed,
+        stage=DiagnosticStage.COMPILATION,
+        pinned_manifest_sha256=manifest,
+        pinned_artifacts=(worker,),
+    )
+    explicit_execution = normalize_platform_diagnostic_trace(
+        parsed,
+        stage=DiagnosticStage.EXECUTION,
+        pinned_manifest_sha256=manifest,
+        pinned_artifacts=(worker,),
+    )
+    legacy = remap_worker_runtime_diagnostic(
+        parsed,
+        pinned_manifest_sha256=manifest,
+        pinned_artifacts=(worker,),
+    )
+
+    assert compilation.stage is DiagnosticStage.COMPILATION
+    assert compilation.runtime_summary == "BSL compilation failed"
+    assert compilation.diagnostic_id != explicit_execution.diagnostic_id
+    assert legacy.stage is DiagnosticStage.EXECUTION
+    assert legacy.runtime_summary == "BSL execution failed"
+    assert legacy.diagnostic_id == explicit_execution.diagnostic_id
 
 
 def test_runtime_canonical_line_only_worker_frames_map_exactly_in_order() -> None:

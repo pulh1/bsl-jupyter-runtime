@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a bounded immutable core representation of the complete 1C detailed error, including causes and a source-mapped mixed stack, without touching runtime execution or adapters.
+**Goal:** Build a bounded immutable core representation of the complete 1C detailed error, including causes and a source-mapped mixed stack, without changing runtime execution, RDBG, 1C lifecycle, adapter rendering, or public wire shapes.
 
 **Architecture:** Extend the existing conservative parser in `bsl/diagnostics.py`, retain one private 64 KiB UTF-8 evidence string, and represent causes/frames by spans into that string. Add one pure normalization entry point that maps main and pinned Worker frames independently while preserving every legacy primary field and `worker_frames`; validate the richer object fail-closed in `runtime_contracts.py` while keeping current wire schemas unchanged.
 
@@ -12,8 +12,8 @@
 
 ## Global Constraints
 
-- Work only in `src/onec_runtime/bsl/diagnostics.py`, `src/onec_runtime/runtime_contracts.py`, `tests/unit/test_bsl_diagnostics.py`, `tests/unit/test_bsl_diagnostic_acceptance.py`, and `tests/unit/test_runtime_contract_boundaries.py`.
-- Do not modify `prototype_runtime.py`, `runtime_api.py`, `session.py`, `errors.py`, Jupyter, MCP, VS Code, configuration resolution, RDBG, or the 1C extension.
+- Work is core-led in `src/onec_runtime/bsl/diagnostics.py` and `src/onec_runtime/runtime_contracts.py`; the approved one-bound evidence work may also update privacy/MCP diagnostic transport and its directly affected tests while preserving all wire key sets.
+- Do not modify `prototype_runtime.py`, `runtime_api.py`, `session.py`, `errors.py`, Jupyter rendering, MCP schemas, VS Code, configuration resolution, RDBG, or the 1C extension.
 - Retain at most 64 KiB of UTF-8 diagnostic text, 128 frames, and 32 causes; report each truncation independently.
 - Preserve raw-detail SHA-256 over the complete original UTF-8 input.
 - Preserve existing diagnostic IDs, entrypoint-specific primary selection, `locations`, `worker_frames`, and public/expert wire key sets for existing inputs.
@@ -1598,8 +1598,9 @@ def test_rich_trace_does_not_expand_existing_wire_shapes() -> None:
         "worker_manifest_sha256",
     }
     expert = privacy.diagnostic_to_expert_wire(diagnostic)
-    assert len(expert["platform_diagnostic"]) == 4_096
-    assert expert["platform_diagnostic_truncated"] is True
+    assert expert["platform_diagnostic"] == raw
+    assert expert["platform_diagnostic_truncated"] is False
+    assert expert["platform_diagnostic_redacted"] is False
 ```
 
 - [ ] **Step 2: Run boundary tests and verify malformed values are accepted today**

@@ -28,10 +28,13 @@ from onec_runtime.bsl.diagnostics import (
     PlatformDiagnosticLocation,
     VisibleSourceLocation,
     WorkerArtifactPlatformLocation,
+    WorkerDiagnosticArtifact,
     WorkerRuntimeFrameDiagnostic,
+    VisibleSourceContext,
     _PrivatePlatformEvidence,
     parse_platform_diagnostic,
     remap_platform_diagnostic,
+    remap_worker_runtime_diagnostic,
 )
 from onec_runtime.runtime_contracts import sanitize_normalized_diagnostic
 
@@ -55,6 +58,38 @@ def _valid_trace_diagnostic() -> NormalizedDiagnostic:
         parse_platform_diagnostic("{<Неизвестный модуль>(1,1)}: failure"),
         _one_line_mapped_source(source),
         stage=DiagnosticStage.EXECUTION,
+    )
+
+
+def _valid_worker_trace_diagnostic() -> NormalizedDiagnostic:
+    source = "Результат = 1;"
+    unit = SourceUnitRef(
+        SourceUnitKind.MODULE,
+        "contract-worker",
+        1,
+        source_sha256(source),
+    )
+    visible = mapped_visible_source(source, unit)
+    builder = SourceTransformBuilder(visible)
+    builder.copy(SourceSpan(0, len(source)))
+    mapped = builder.build(SourceArtifactKind.WORKER_PROJECTION)
+    artifact = WorkerDiagnosticArtifact(
+        logical_name="contract-worker",
+        revision=1,
+        artifact_sha256="a" * 64,
+        registration_name="OnecRuntime_aaaaaaaa_aaaaaaaaaaaaaaaa",
+        manifest_sha256="c" * 64,
+        source_map_sha256=mapped.source_map_sha256,
+        mapped_source=mapped,
+        visible_source_context=VisibleSourceContext({unit: source}),
+    )
+    return remap_worker_runtime_diagnostic(
+        parse_platform_diagnostic(
+            "{ВнешняяОбработка."
+            f"{artifact.registration_name}.МодульОбъекта(1,1)}}: failure"
+        ),
+        pinned_manifest_sha256=artifact.manifest_sha256,
+        pinned_artifacts=(artifact,),
     )
 
 
@@ -356,6 +391,80 @@ def test_sanitizer_rejects_unlinked_legacy_worker_mapping_fields() -> None:
     assert sanitize_normalized_diagnostic(
         replace(diagnostic, worker_frames=(worker,))
     ) is None
+
+
+def test_sanitizer_rejects_native_frame_with_generated_mapping() -> None:
+    """Break caught: host stack frames must not borrow executed-source evidence."""
+    diagnostic = _valid_trace_diagnostic()
+    frame = diagnostic.frames[0]
+    native_location = PlatformDiagnosticLocation(
+        "CommonModule.Service.Module",
+        ("CommonModule", "Service", "Module"),
+        None,
+        1,
+        1,
+        DiagnosticCoordinateSpace.HOST_MODULE,
+    )
+
+    malformed = replace(
+        diagnostic,
+        frames=(
+            replace(
+                frame,
+                origin=ErrorTraceFrameOrigin.NATIVE_MODULE,
+                platform_location=native_location,
+            ),
+        ),
+    )
+
+    assert sanitize_normalized_diagnostic(malformed) is None
+
+
+def test_sanitizer_rejects_worker_registration_mismatched_to_locator() -> None:
+    """Break caught: Worker provenance must name the canonical parsed artifact."""
+    diagnostic = _valid_worker_trace_diagnostic()
+    frame = diagnostic.frames[0]
+    assert sanitize_normalized_diagnostic(diagnostic) is not None
+
+    malformed = replace(
+        diagnostic,
+        frames=(
+            replace(
+                frame,
+                registration_name="OnecRuntime_bbbbbbbb_bbbbbbbbbbbbbbbb",
+            ),
+        ),
+    )
+
+    assert sanitize_normalized_diagnostic(malformed) is None
+
+
+@pytest.mark.parametrize("field", ("logical_name", "revision", "artifact_sha256"))
+def test_sanitizer_rejects_worker_frame_missing_immutable_identity(
+    field: str,
+) -> None:
+    """Break caught: a mapped Worker frame can no longer be anonymously forged."""
+    diagnostic = _valid_worker_trace_diagnostic()
+    frame = diagnostic.frames[0]
+
+    malformed = replace(diagnostic, frames=(replace(frame, **{field: None}),))
+
+    assert sanitize_normalized_diagnostic(malformed) is None
+
+
+def test_sanitizer_rejects_legacy_worker_mapping_with_partial_identity() -> None:
+    """Break caught: the legacy Worker projection has the same identity fence."""
+    diagnostic = _valid_worker_trace_diagnostic()
+    worker = diagnostic.worker_frames[0]
+
+    malformed = replace(
+        diagnostic,
+        frames=(),
+        causes=(),
+        worker_frames=(replace(worker, logical_name=None),),
+    )
+
+    assert sanitize_normalized_diagnostic(malformed) is None
 
 
 @pytest.mark.parametrize("mutation", ("reordered", "overlapping", "frame_outside"))
