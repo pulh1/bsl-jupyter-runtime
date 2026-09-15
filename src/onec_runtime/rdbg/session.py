@@ -583,6 +583,11 @@ class RdbgSession:
         *,
         timeout_s: float,
     ) -> EvaluationResult | StopEvent:
+        """Consume one event; interval expiry leaves the capability registered.
+
+        Only a matching result retires it. A coordinator may therefore repeat
+        bounded waits after CommandTimeout without sending another evalExpr.
+        """
         state = self._require_pending_evaluation(pending)
         if state.suspended_stop is not None:
             raise ProtocolError("Pending evaluation stop must be continued first")
@@ -602,7 +607,10 @@ class RdbgSession:
                 del self._pending_evaluation_states[id(pending)]
                 self.state = SessionState.READY
                 return event
-            polled = self._poll(max(0.1, min(6.0, deadline - monotonic())))
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                break
+            polled = self._poll(min(6.0, remaining))
             self._ingest_poll_events(*polled)
         raise CommandTimeout(
             f"Timed out waiting for expression result {pending.result_id}"

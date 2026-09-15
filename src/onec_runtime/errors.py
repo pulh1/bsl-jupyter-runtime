@@ -142,6 +142,16 @@ class CaptureRecoveryRequiredError(ProtocolError):
         super().__init__(_diagnostic_message("CAPTURE recovery is required", self.diagnostic))
 
 
+class CaptureEvaluationDeliveryError(ProtocolError):
+    """A confirmed local result/delivery failure with a safe diagnostic."""
+
+    __slots__ = ("diagnostic",)
+
+    def __init__(self, diagnostic: CaptureFailureDiagnostic | str | None = None) -> None:
+        self.diagnostic = _coerce_diagnostic(diagnostic, default_code="result_delivery_failed")
+        super().__init__(_diagnostic_message("CAPTURE result delivery failed", self.diagnostic))
+
+
 class NoActiveCaptureError(ProtocolError):
     """No current CAPTURE fence is available."""
 

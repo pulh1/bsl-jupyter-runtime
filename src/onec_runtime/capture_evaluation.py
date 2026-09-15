@@ -1,17 +1,39 @@
-"""Immutable, privacy-safe snapshots for the CAPTURE control plane.
+"""Immutable snapshots and single-owner evaluation for the CAPTURE control plane.
 
-The objects in this module are deliberately data-only.  They can be retained
-by a caller after a capture has become stale and their representations never
-include debugger requests, handles, source, or raw exceptions.
+Public snapshots are data-only and can be retained after a capture becomes
+stale. Their representations never include debugger requests, handles, source,
+or raw exceptions. Private coordinator requests live below the snapshot types.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections import deque
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import StrEnum
 from math import isfinite
+from threading import Condition, Lock, Thread, current_thread
+from time import monotonic
 from typing import TypeVar
+from uuid import uuid4
+
+from onec_runtime.errors import (
+    BslExecutionError,
+    CaptureBusyError,
+    CaptureEvaluationDeliveryError,
+    CaptureEvaluationPendingError,
+    CaptureOutcomeUnknownError,
+    CaptureRecoveryRequiredError,
+    CommandTimeout,
+    NoCaptureEvaluationError,
+    ProtocolError,
+    StaleCaptureError,
+    TargetLost,
+    UnexpectedStop,
+)
+from onec_runtime.rdbg.models import EvaluationResult, PendingEvaluation, StopEvent
+from onec_runtime.recovery_journal import RecoveryJournal
 
 
 # These limits are part of the public safety boundary.  Timing is intentionally
@@ -438,6 +460,8 @@ def _message_truncation_diagnostic(
     )
 
 
+# Frontends import these immutable snapshots. The fence, request, ticket and
+# coordinator below are controller-internal contracts, intentionally excluded.
 __all__ = [
     "MAX_CAPTURE_DIAGNOSTIC_CODEPOINTS",
     "MAX_CAPTURE_DIAGNOSTIC_MESSAGE_CODEPOINTS",
@@ -454,3 +478,659 @@ __all__ = [
     "CapturePhase",
     "CaptureStatus",
 ]
+
+
+# Internal ownership types. None of these objects are exported by frontends.
+# Remote-step plans will compose these callbacks on this same worker.
+_MAX_POLL_PROGRESS_EVENTS = 16
+
+
+def _nothing() -> None:
+    pass
+
+
+def _no_messages() -> tuple[str, ...]:
+    return ()
+
+
+def _no_pin(disposition: str) -> None:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureFence:
+    operation_id: int
+    capture_generation: int
+    stop_sequence: int
+    # The owner may bind runtime/target identity without publishing it.
+    identity: object = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        for name in ("operation_id", "capture_generation", "stop_sequence"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureEvaluationRequest:
+    """Transfer all callbacks and leases before any remote work can start.
+
+    dispatch must call its argument immediately before entering transport. An
+    exception before that marker proves there was no dispatch; after it, only
+    a returned PendingEvaluation proves acceptance. All callbacks run outside
+    the condition, exclusively on the worker. pin_lease receives 'release' or
+    'quarantine'; cleanup callbacks remain owned on abnormal termination.
+
+    result_policy admits/normalizes the private RDBG result. For user_bsl its
+    returned value must also fit the public immutable scalar/tuple boundary.
+    Internal results are delivered only through the initiating ticket.
+    continuation is optional downstream work and is abandoned on detachment.
+    """
+
+    fence: CaptureFence = field(repr=False)
+    evaluation_kind: CaptureEvaluationKind
+    dispatch: Callable[[Callable[[], None]], PendingEvaluation] = field(repr=False)
+    poll: Callable[[PendingEvaluation, float], EvaluationResult | StopEvent] = field(repr=False)
+    result_policy: Callable[[EvaluationResult], object] = field(repr=False)
+    restore: Callable[[], None] = field(default=_nothing, repr=False)
+    continuation: Callable[[object], object] | None = field(default=None, repr=False)
+    seal_messages: Callable[[], tuple[str, ...]] = field(default=_no_messages, repr=False)
+    pin_lease: Callable[[str], None] = field(default=_no_pin, repr=False)
+    cleanup_leases: tuple[Callable[[], None], ...] = field(default=(), repr=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.fence, CaptureFence):
+            raise ValueError("capture fence is required")
+        object.__setattr__(self, "evaluation_kind", _enum(
+            self.evaluation_kind, CaptureEvaluationKind, name="evaluation_kind",
+        ))
+        object.__setattr__(self, "cleanup_leases", tuple(self.cleanup_leases))
+        callbacks = (
+            self.dispatch, self.poll, self.result_policy, self.restore,
+            self.seal_messages, self.pin_lease, *self.cleanup_leases,
+        )
+        if not all(callable(callback) for callback in callbacks):
+            raise ValueError("evaluation callbacks must be callable")
+        if self.continuation is not None and not callable(self.continuation):
+            raise ValueError("continuation must be callable")
+
+
+@dataclass(slots=True, repr=False)
+class _CaptureEvaluationRecord:
+    request: CaptureEvaluationRequest
+    evaluation_id: str = field(default_factory=lambda: uuid4().hex)
+    created: float = field(default_factory=monotonic)
+    created_at_utc: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    offsets: dict[str, int] = field(default_factory=dict)
+    remote_step_count: int = 0
+    poll_count: int = 0
+    poll_events: int = 0
+    capability: PendingEvaluation | None = None
+    dispatch_entered: bool = False
+    acknowledged: bool = False
+    initiator_attached: bool = True
+    observed: bool = False
+    continuation_started: bool = False
+    cleanup_status: str = "not_started"
+    outcome: CaptureEvaluationOutcome | None = None
+    # These never enter a public snapshot, repr, journal, or observer outcome.
+    private_result: object = None
+    initiating_error: BaseException | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureEvaluationTicket:
+    evaluation_id: str
+    evaluation_kind: CaptureEvaluationKind
+    _coordinator: CaptureEvaluationCoordinator = field(repr=False)
+    _record: _CaptureEvaluationRecord = field(repr=False)
+
+    def wait_initiator(self, timeout_s: float | None = None) -> object:
+        """Deliver a private result/error; only this wait owns continuation.
+
+        An acknowledged pending timeout raises CaptureEvaluationPendingError.
+        A deadline during dispatch raises plain TimeoutError, since acceptance
+        is not yet known. Both detach the initiator without cancelling work.
+        KeyboardInterrupt propagates only on this caller's stack.
+        """
+        return self._coordinator._wait_initiator(self._record, timeout_s)
+
+
+class CaptureEvaluationCoordinator:
+    """One daemon event consumer and one active logical evaluation.
+
+    The condition protects local records only. Dispatch, polling, restoration,
+    policy, cleanup, pin disposition and journal callbacks run without it.
+    begin_close wakes callers and rejects admission; the controller must then
+    stop/invalidate its transport before bounded join and resource teardown.
+    """
+
+    def __init__(
+        self,
+        fence: CaptureFence,
+        *,
+        poll_interval_s: float = 0.1,
+        journal: RecoveryJournal | None = None,
+    ) -> None:
+        if not isinstance(fence, CaptureFence):
+            raise ValueError("capture fence is required")
+        _timeout(poll_interval_s)
+        if poll_interval_s <= 0 or poll_interval_s > 6:
+            raise ValueError("poll interval must be positive and at most six seconds")
+        self._fence = fence
+        self._poll_interval_s = poll_interval_s
+        self._journal = journal if journal is not None else RecoveryJournal()
+        self._condition = Condition(Lock())
+        self._phase = CapturePhase.PAUSED
+        self._failure: CaptureFailureDiagnostic | None = None
+        self._active: _CaptureEvaluationRecord | None = None
+        self._last_user: CaptureEvaluationOutcome | None = None
+        self._last_internal: CaptureEvaluationOutcome | None = None
+        self._last: CaptureEvaluationOutcome | None = None
+        self._quarantined: _CaptureEvaluationRecord | None = None
+        self._closing = False
+        self._events: deque[tuple[str, dict[str, object]]] = deque()
+        self._worker = Thread(target=self._run, name="capture-evaluation-owner", daemon=True)
+        self._worker.start()
+
+    def submit_evaluation(self, request: CaptureEvaluationRequest) -> CaptureEvaluationTicket:
+        if current_thread() is self._worker:
+            raise ProtocolError("Recursive CAPTURE submission is prohibited")
+        with self._condition:
+            self._require_fence_locked(request.fence)
+            if self._phase is CapturePhase.OUTCOME_UNKNOWN:
+                raise CaptureOutcomeUnknownError(
+                    self._last.evaluation_id if self._last is not None else None, self._failure,
+                )
+            if self._phase is CapturePhase.RECOVERY_REQUIRED:
+                raise CaptureRecoveryRequiredError(self._failure)
+            if self._active is not None:
+                raise CaptureBusyError(
+                    self._active.evaluation_id,
+                    self._active.request.evaluation_kind,
+                    self._phase,
+                )
+            record = _CaptureEvaluationRecord(request)
+            self._active = record
+            self._phase = CapturePhase.EVALUATING
+            self._evidence_locked(record, "record_created")
+            ticket = CaptureEvaluationTicket(
+                record.evaluation_id, request.evaluation_kind, self, record,
+            )
+            self._condition.notify_all()
+            return ticket
+
+    def status(self, fence: CaptureFence) -> CaptureStatus:
+        with self._condition:
+            if fence != self._fence or self._closing or self._phase is CapturePhase.STALE:
+                return CaptureStatus(
+                    fence.operation_id, fence.capture_generation, fence.stop_sequence,
+                    CapturePhase.STALE,
+                )
+            timing = (
+                self._timing_locked(self._active) if self._active is not None
+                else self._last.timing if self._last is not None else None
+            )
+            return CaptureStatus(
+                fence.operation_id, fence.capture_generation, fence.stop_sequence,
+                self._phase,
+                pending_evaluation_id=self._active.evaluation_id if self._active else None,
+                evaluation_kind=self._active.request.evaluation_kind if self._active else None,
+                last_evaluation_id=self._last.evaluation_id if self._last else None,
+                last_user_evaluation_id=self._last_user.evaluation_id if self._last_user else None,
+                evaluation_timing=timing,
+                failure=self._failure,
+            )
+
+    def wait(
+        self,
+        fence: CaptureFence,
+        evaluation_id: str | None = None,
+        timeout_s: float | None = None,
+    ) -> CaptureEvaluationOutcome:
+        if current_thread() is self._worker:
+            raise ProtocolError("CAPTURE worker cannot wait on its own outcome")
+        deadline = _deadline(timeout_s)
+        with self._condition:
+            self._require_fence_locked(fence)
+            record = self._select_locked(evaluation_id)
+            if isinstance(record, CaptureEvaluationOutcome):
+                return record
+            record.observed = True
+            # An interrupted observer simply exits this condition; it never
+            # changes initiating waiter or continuation state.
+            while record.outcome is None:
+                self._require_fence_locked(fence)
+                remaining = _remaining(deadline)
+                if remaining is not None and remaining <= 0:
+                    return CaptureEvaluationOutcome(
+                        record.evaluation_id, record.request.evaluation_kind,
+                        CaptureEvaluationState.PENDING, timing=self._timing_locked(record),
+                    )
+                self._condition.wait(remaining)
+            self._require_fence_locked(fence)
+            return record.outcome
+
+    def begin_close(self) -> None:
+        with self._condition:
+            self._closing = True
+            if self._active is not None:
+                self._active.initiator_attached = False
+            self._condition.notify_all()
+
+    def join(self, timeout_s: float) -> bool:
+        _timeout(timeout_s)
+        if timeout_s is None:
+            raise ValueError("join requires a finite deadline")
+        if current_thread() is self._worker:
+            raise ProtocolError("CAPTURE worker cannot join itself")
+        self._worker.join(timeout_s)
+        return not self._worker.is_alive()
+
+    def _require_fence_locked(self, fence: CaptureFence) -> None:
+        if fence != self._fence or self._closing or self._phase is CapturePhase.STALE:
+            raise StaleCaptureError()
+
+    def _select_locked(
+        self, evaluation_id: str | None,
+    ) -> _CaptureEvaluationRecord | CaptureEvaluationOutcome:
+        if evaluation_id is None:
+            selected = self._active or self._last
+            if selected is not None:
+                return selected
+        else:
+            for selected in (self._active, self._last_user, self._last_internal):
+                if selected is not None and selected.evaluation_id == evaluation_id:
+                    return selected
+        raise NoCaptureEvaluationError(evaluation_id)
+
+    def _wait_initiator(self, record: _CaptureEvaluationRecord, timeout_s: float | None) -> object:
+        if current_thread() is self._worker:
+            raise ProtocolError("CAPTURE worker cannot wait on its own outcome")
+        deadline = _deadline(timeout_s)
+        with self._condition:
+            try:
+                while record.outcome is None:
+                    self._require_fence_locked(record.request.fence)
+                    remaining = _remaining(deadline)
+                    if remaining is not None and remaining <= 0:
+                        self._detach_locked(record, "timeout")
+                        if record.acknowledged:
+                            raise CaptureEvaluationPendingError(
+                                record.evaluation_id, record.request.evaluation_kind,
+                            )
+                        raise TimeoutError("Waiting for CAPTURE dispatch timed out; use capture.wait()")
+                    self._condition.wait(remaining)
+                self._require_fence_locked(record.request.fence)
+                if record.initiating_error is not None:
+                    raise record.initiating_error
+                return record.private_result
+            except KeyboardInterrupt:
+                self._detach_locked(record, "interrupt")
+                raise
+
+    def _detach_locked(self, record: _CaptureEvaluationRecord, reason: str) -> None:
+        if record.initiator_attached:
+            record.initiator_attached = False
+            self._evidence_locked(record, "initiating_waiter_detached", reason=reason)
+            # Completion may have won the race with an interrupt during delivery.
+            # Preserve an internal outcome if detachment happens at that boundary.
+            if record.outcome is not None:
+                self._retain_locked(record)
+            self._condition.notify_all()
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                while self._active is None and not self._closing:
+                    self._condition.wait()
+                if self._closing and self._active is None:
+                    return
+                record = self._active
+            assert record is not None
+            self._flush_evidence()
+            self._execute(record)
+            self._flush_evidence()
+            # Public retention contains only immutable outcomes. Do not keep
+            # the last request/temporary result alive in an idle worker frame.
+            del record
+
+    def _execute(self, record: _CaptureEvaluationRecord) -> None:
+        request = record.request
+        with self._condition:
+            closing = self._closing
+        if closing:
+            self._finish(record, CapturePhase.STALE, CaptureEvaluationState.FAILED,
+                         diagnostic=_diagnostic("coordinator_closed"))
+            return
+
+        def dispatch_entered() -> None:
+            if current_thread() is not self._worker:
+                raise ProtocolError("Dispatch evidence must come from the CAPTURE worker")
+            with self._condition:
+                self._require_fence_locked(request.fence)
+                if record.dispatch_entered:
+                    raise ProtocolError("CAPTURE dispatch was already entered")
+                record.dispatch_entered = True
+                record.remote_step_count = 1
+                self._evidence_locked(record, "dispatch_entered", step_index=1)
+            self._flush_evidence()
+
+        try:
+            capability = request.dispatch(dispatch_entered)
+            if not isinstance(capability, PendingEvaluation):
+                raise ProtocolError("CAPTURE dispatch did not return a pending capability")
+            with self._condition:
+                record.capability = capability
+                record.acknowledged = True
+                self._evidence_locked(record, "rdbg_acknowledged", step_index=1)
+            self._flush_evidence()
+        except TargetLost:
+            self._finish(record, CapturePhase.STALE, CaptureEvaluationState.FAILED,
+                         diagnostic=_diagnostic("target_lost"), quarantine=True)
+            return
+        except BaseException:
+            if record.dispatch_entered:
+                diagnostic = _diagnostic("dispatch_uncertain")
+                self._finish(record, CapturePhase.OUTCOME_UNKNOWN, CaptureEvaluationState.UNKNOWN,
+                             diagnostic=diagnostic, quarantine=True)
+            else:
+                self._finish(record, CapturePhase.PAUSED, CaptureEvaluationState.FAILED,
+                             diagnostic=_diagnostic("pre_dispatch_failed"))
+            return
+
+        while True:
+            with self._condition:
+                closing = self._closing
+            if closing:
+                self._finish(record, CapturePhase.STALE, CaptureEvaluationState.FAILED,
+                             diagnostic=_diagnostic("coordinator_closed"), quarantine=True)
+                return
+            try:
+                event = request.poll(capability, self._poll_interval_s)
+            except CommandTimeout:
+                self._poll_evidence(record)
+                continue
+            except TargetLost:
+                self._finish(record, CapturePhase.STALE, CaptureEvaluationState.FAILED,
+                             diagnostic=_diagnostic("target_lost"), quarantine=True)
+                return
+            except BaseException as error:
+                code = "unexpected_stop" if isinstance(error, UnexpectedStop) else "evaluation_stream_failed"
+                self._finish(record, CapturePhase.RECOVERY_REQUIRED, CaptureEvaluationState.FAILED,
+                             diagnostic=_diagnostic(code), quarantine=True)
+                return
+            self._poll_evidence(record)
+            if isinstance(event, StopEvent):
+                self._finish(record, CapturePhase.RECOVERY_REQUIRED, CaptureEvaluationState.FAILED,
+                             diagnostic=_diagnostic("unexpected_stop"), quarantine=True)
+                return
+            if not isinstance(event, EvaluationResult) or event.result_id != capability.result_id:
+                self._finish(record, CapturePhase.RECOVERY_REQUIRED, CaptureEvaluationState.FAILED,
+                             diagnostic=_diagnostic("evaluation_stream_failed"), quarantine=True)
+                return
+            with self._condition:
+                record.capability = None
+                self._evidence_locked(record, "result_received", step_index=1)
+            self._flush_evidence()
+            break
+
+        try:
+            request.restore()
+        except TargetLost:
+            self._finish(record, CapturePhase.STALE, CaptureEvaluationState.FAILED,
+                         diagnostic=_diagnostic("target_lost"), quarantine=True)
+            return
+        except BaseException:
+            self._finish(record, CapturePhase.RECOVERY_REQUIRED, CaptureEvaluationState.FAILED,
+                         diagnostic=_diagnostic("workspace_restore_failed"), quarantine=True)
+            return
+        with self._condition:
+            self._evidence_locked(record, "workspace_restored")
+        self._flush_evidence()
+
+        value = None
+        private_result = None
+        diagnostic = None
+        messages: tuple[str, ...] = ()
+        state = CaptureEvaluationState.COMPLETED
+        failure_category = "result_policy_failed"
+        try:
+            value = request.result_policy(event)
+            if event.error_occurred:
+                raise BslExecutionError("CAPTURE BSL evaluation failed")
+            if request.evaluation_kind is CaptureEvaluationKind.USER_BSL:
+                value = _public_result(value)
+            private_result = value
+            with self._condition:
+                # This is the linearization point for starting optional work.
+                run_continuation = record.initiator_attached and not self._closing and request.continuation is not None
+                record.continuation_started = run_continuation
+            if run_continuation:
+                assert request.continuation is not None
+                failure_category = "continuation_failed"
+                private_result = request.continuation(value)
+        except TargetLost:
+            self._finish(record, CapturePhase.STALE, CaptureEvaluationState.FAILED,
+                         diagnostic=_diagnostic("target_lost"), quarantine=True)
+            return
+        except BaseException:
+            state = CaptureEvaluationState.FAILED
+            code = "bsl_error" if event.error_occurred else failure_category
+            diagnostic = _diagnostic(code)
+            value = None
+            private_result = None
+
+        try:
+            for cleanup in request.cleanup_leases:
+                cleanup()
+            record.cleanup_status = "completed"
+        except TargetLost:
+            record.cleanup_status = "unknown"
+            self._finish(record, CapturePhase.STALE, CaptureEvaluationState.FAILED,
+                         diagnostic=_diagnostic("target_lost"), quarantine=True)
+            return
+        except BaseException as error:
+            uncertain = isinstance(error, CommandTimeout)
+            record.cleanup_status = "unknown" if uncertain else "failed"
+            self._finish(record, CapturePhase.RECOVERY_REQUIRED, CaptureEvaluationState.FAILED,
+                         diagnostic=_diagnostic("cleanup_uncertain" if uncertain else "cleanup_failed"),
+                         quarantine=True)
+            return
+        try:
+            messages = request.seal_messages()
+            if isinstance(messages, (tuple, list)):
+                messages = tuple(messages)
+            # Validate/copy before publishing or releasing the ownership pin.
+            candidate = CaptureEvaluationOutcome(
+                record.evaluation_id, request.evaluation_kind, state,
+                result=value if request.evaluation_kind is CaptureEvaluationKind.USER_BSL else None,
+                messages=messages, error=diagnostic.message if diagnostic else None,
+                diagnostic=diagnostic,
+            )
+        except BaseException:
+            diagnostic = _diagnostic("result_delivery_failed")
+            messages = ()
+            candidate = CaptureEvaluationOutcome(
+                record.evaluation_id, request.evaluation_kind, CaptureEvaluationState.FAILED,
+                error=diagnostic.message, diagnostic=diagnostic,
+            )
+            private_result = None
+        self._finish(record, CapturePhase.PAUSED, candidate.state, candidate=candidate,
+                     private_result=private_result, diagnostic=diagnostic, messages=messages)
+
+    def _finish(
+        self,
+        record: _CaptureEvaluationRecord,
+        phase: CapturePhase,
+        state: CaptureEvaluationState,
+        *,
+        diagnostic: CaptureFailureDiagnostic | None = None,
+        quarantine: bool = False,
+        private_result: object = None,
+        candidate: CaptureEvaluationOutcome | None = None,
+        messages: tuple[str, ...] = (),
+    ) -> None:
+        # All leases are disposed outside the condition, before outcome visibility.
+        try:
+            record.request.pin_lease("quarantine" if quarantine else "release")
+        except BaseException:
+            quarantine = True
+            phase = CapturePhase.RECOVERY_REQUIRED
+            state = CaptureEvaluationState.FAILED
+            diagnostic = _diagnostic("pin_disposition_failed")
+            candidate = None
+        if candidate is None:
+            candidate = CaptureEvaluationOutcome(
+                record.evaluation_id, record.request.evaluation_kind, state,
+                diagnostic=diagnostic,
+                error=diagnostic.message if diagnostic and state is CaptureEvaluationState.FAILED else None,
+            )
+        with self._condition:
+            record.private_result = private_result
+            record.initiating_error = _initiating_failure(record.evaluation_id, phase, candidate)
+            if quarantine:
+                self._quarantined = record
+            self._evidence_locked(record, "outcome_published", state=state.value,
+                                  cleanup_status=record.cleanup_status,
+                                  error_category=diagnostic.code if diagnostic else (
+                                      candidate.diagnostic.code if candidate.diagnostic else None))
+            timing = self._timing_locked(record)
+            # Journal the terminal aggregate before observers can see completion.
+            # Reapply the original sealed message snapshot, not an already
+            # truncated payload with a completed-state diagnostic. This keeps
+            # the immutable model's strict state validation intact.
+            outcome = replace(candidate, timing=timing, messages=messages, diagnostic=diagnostic)
+        self._flush_evidence()
+        with self._condition:
+            record.outcome = outcome
+            self._retain_locked(record)
+            self._phase = CapturePhase.STALE if self._closing else phase
+            self._failure = diagnostic if self._phase in {
+                CapturePhase.OUTCOME_UNKNOWN, CapturePhase.RECOVERY_REQUIRED,
+            } else None
+            self._active = None
+            self._condition.notify_all()
+
+    def _retain_locked(self, record: _CaptureEvaluationRecord) -> None:
+        assert record.outcome is not None
+        if record.request.evaluation_kind is CaptureEvaluationKind.USER_BSL:
+            self._last_user = record.outcome
+        elif record.observed or not record.initiator_attached or record.outcome.state is not CaptureEvaluationState.COMPLETED:
+            self._last_internal = record.outcome
+        else:
+            return
+        self._last = record.outcome
+
+    def _timing_locked(self, record: _CaptureEvaluationRecord) -> CaptureEvaluationTiming:
+        elapsed = record.offsets.get("outcome_published_ms", self._offset(record))
+        return CaptureEvaluationTiming(
+            record.evaluation_id, record.created_at_utc, elapsed_ms=elapsed,
+            remote_step_count=record.remote_step_count, poll_count=record.poll_count,
+            **record.offsets,
+        )
+
+    @staticmethod
+    def _offset(record: _CaptureEvaluationRecord) -> int:
+        return min(MAX_CAPTURE_TIMING_MS, max(0, int((monotonic() - record.created) * 1000)))
+
+    def _evidence_locked(self, record: _CaptureEvaluationRecord, event: str, **extra: object) -> None:
+        offset = self._offset(record)
+        if event != "record_created" and event != "poll_progress":
+            record.offsets.setdefault(f"{event}_ms", offset)
+        fields: dict[str, object] = {
+            "evaluation_id": record.evaluation_id,
+            "evaluation_kind": record.request.evaluation_kind.value,
+            "operation_id": record.request.fence.operation_id,
+            "capture_generation": record.request.fence.capture_generation,
+            "stop_sequence": record.request.fence.stop_sequence,
+            "elapsed_ms": offset,
+            "poll_count": record.poll_count,
+            "remote_step_count": record.remote_step_count,
+            "state": record.outcome.state.value if record.outcome else "pending",
+            **record.offsets,
+            **extra,
+        }
+        self._events.append((f"capture_evaluation_{event}", fields))
+
+    def _poll_evidence(self, record: _CaptureEvaluationRecord) -> None:
+        with self._condition:
+            record.poll_count = min(MAX_CAPTURE_TIMING_COUNT, record.poll_count + 1)
+            record.offsets["last_poll_ms"] = self._offset(record)
+            if record.poll_events < _MAX_POLL_PROGRESS_EVENTS:
+                record.poll_events += 1
+                self._evidence_locked(record, "poll_progress")
+        self._flush_evidence()
+
+    def _flush_evidence(self) -> None:
+        # The worker alone drains this bounded per-record event queue. No file
+        # sink is flushed here: the owning controller may flush its journal.
+        with self._condition:
+            events = tuple(self._events)
+            self._events.clear()
+        for event, fields in events:
+            self._journal.record("capture-evaluation.jsonl", event, **fields)
+
+
+def _timeout(timeout_s: float | None) -> None:
+    if timeout_s is not None and (
+        type(timeout_s) not in {int, float} or not isfinite(timeout_s) or timeout_s < 0
+    ):
+        raise ValueError("timeout must be a finite non-negative number or None")
+
+
+def _deadline(timeout_s: float | None) -> float | None:
+    _timeout(timeout_s)
+    return None if timeout_s is None else monotonic() + timeout_s
+
+
+def _remaining(deadline: float | None) -> float | None:
+    return None if deadline is None else deadline - monotonic()
+
+
+def _diagnostic(code: str) -> CaptureFailureDiagnostic:
+    # Never derive text or category from a callback's exception or RDBG payload.
+    messages = {
+        "pre_dispatch_failed": "CAPTURE evaluation failed before transport dispatch.",
+        "dispatch_uncertain": "CAPTURE dispatch acceptance could not be established.",
+        "bsl_error": "CAPTURE BSL evaluation failed.",
+        "result_policy_failed": "CAPTURE result policy failed.",
+        "result_delivery_failed": "CAPTURE result delivery failed.",
+        "continuation_failed": "CAPTURE downstream delivery failed.",
+        "workspace_restore_failed": "CAPTURE workspace restoration failed.",
+        "cleanup_failed": "CAPTURE required cleanup failed.",
+        "cleanup_uncertain": "CAPTURE required cleanup could not be confirmed.",
+        "unexpected_stop": "An unexpected debugger stop interrupted CAPTURE evaluation.",
+        "evaluation_stream_failed": "CAPTURE evaluation event consumption failed.",
+        "target_lost": "The CAPTURE debugger target is no longer available.",
+        "coordinator_closed": "The CAPTURE coordinator is closing.",
+        "pin_disposition_failed": "CAPTURE generation pin disposition failed.",
+    }
+    normal_failure = code in {
+        "pre_dispatch_failed", "bsl_error", "result_policy_failed",
+        "result_delivery_failed", "continuation_failed",
+    }
+    return CaptureFailureDiagnostic(
+        code, messages[code], "inspect capture.wait()" if normal_failure else "close and restart the runtime",
+    )
+
+
+def _initiating_failure(
+    evaluation_id: str, phase: CapturePhase, outcome: CaptureEvaluationOutcome,
+) -> BaseException | None:
+    diagnostic = outcome.diagnostic
+    if phase is CapturePhase.STALE:
+        return StaleCaptureError()
+    if phase is CapturePhase.OUTCOME_UNKNOWN:
+        return CaptureOutcomeUnknownError(evaluation_id, diagnostic)
+    if phase is CapturePhase.RECOVERY_REQUIRED:
+        return CaptureRecoveryRequiredError(diagnostic)
+    if outcome.state is not CaptureEvaluationState.FAILED:
+        return None
+    assert diagnostic is not None
+    if diagnostic.code == "bsl_error":
+        return BslExecutionError(diagnostic.message, messages=outcome.messages)
+    if diagnostic.code == "pre_dispatch_failed":
+        return ProtocolError(diagnostic.message)
+    return CaptureEvaluationDeliveryError(diagnostic)

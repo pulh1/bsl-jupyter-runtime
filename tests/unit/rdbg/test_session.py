@@ -764,3 +764,31 @@ def test_modify_rejects_mismatched_result_id(
 
     with pytest.raises(ProtocolError, match="modifyValue result"):
         session.modify("Счетчик", "1")
+
+
+def test_pending_evaluation_survives_interval_timeout_and_consumes_one_late_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An interval timeout must preserve the original capability without redispatch."""
+    transport = FakeTransport()
+    session = ready_session(transport)
+    pending = session.start_evaluation("1")
+    result = EvaluationResult(pending.result_id, "Число", "1", False)
+    intervals = []
+
+    def timed_out(timeout_s):
+        intervals.append(timeout_s)
+        raise CommandTimeout("interval elapsed")
+
+    monkeypatch.setattr(session, "_poll", timed_out)
+    for _ in range(3):
+        with pytest.raises(CommandTimeout):
+            session.wait_evaluation_event(pending, timeout_s=0.025)
+    assert len(session._pending_evaluation_states) == 1
+    assert all(0 < interval <= 0.025 for interval in intervals)
+    monkeypatch.setattr(session, "_poll", lambda timeout_s: ([], [result]))
+    assert session.wait_evaluation_event(pending, timeout_s=0.025) is result
+    with pytest.raises(ProtocolError, match="stale or foreign"):
+        session.wait_evaluation_event(pending, timeout_s=0.025)
+    assert transport.calls.count("evalExpr") == 1
+    assert not session._pending_evaluation_states
