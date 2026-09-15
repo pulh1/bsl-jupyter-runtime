@@ -4572,9 +4572,19 @@ class PrototypeRuntimeApi:
                 self._close_data_plane_locked()
 
     def _mark_target_terminated(self) -> None:
-        """Publish Session's irreversible target-death fact to RuntimeApi."""
+        """Publish target death and converge completed capture publication."""
         with self._close_lock:
             self._target_terminated = True
+            if (
+                self._capture_shutdown_finished
+                and not self._data_plane_finalized
+            ):
+                # Session may have read capture publication before a concurrent
+                # direct close completed it.  The target-death publisher is
+                # then the second monotonic fact and must finish local teardown
+                # before releasing this shared shutdown lock.
+                with self._single_writer():
+                    self._close_data_plane_locked(target_terminated=True)
 
     def _close_after_target_termination(self) -> None:
         """Finish local API teardown after RuntimeSession killed the target."""
