@@ -131,16 +131,16 @@ class _ShutdownAxis(StrEnum):
 class _RuntimeSessionShutdownState:
     """Independent shutdown owners that must all reach a terminal state."""
 
-    local_resources: _ShutdownAxis = _ShutdownAxis.PENDING
-    capture_publication: _ShutdownAxis = _ShutdownAxis.PENDING
-    runtime_api: _ShutdownAxis = _ShutdownAxis.PENDING
+    local_resources_terminal: _ShutdownAxis = _ShutdownAxis.PENDING
+    capture_publication_finalized: _ShutdownAxis = _ShutdownAxis.PENDING
+    runtime_api_data_plane_finalized: _ShutdownAxis = _ShutdownAxis.PENDING
 
     @property
     def terminal(self) -> bool:
         return (
-            self.local_resources is _ShutdownAxis.COMPLETE
-            and self.capture_publication is _ShutdownAxis.COMPLETE
-            and self.runtime_api is _ShutdownAxis.COMPLETE
+            self.local_resources_terminal is _ShutdownAxis.COMPLETE
+            and self.capture_publication_finalized is _ShutdownAxis.COMPLETE
+            and self.runtime_api_data_plane_finalized is _ShutdownAxis.COMPLETE
         )
 
 
@@ -2154,7 +2154,10 @@ class RuntimeSession:
         if current_thread() is not self._heartbeat_thread:
             self._heartbeat_thread.join(timeout=2.0)
         errors: list[BaseException] = []
-        if shutdown and state.capture_publication is not _ShutdownAxis.COMPLETE:
+        if (
+            shutdown
+            and state.capture_publication_finalized is not _ShutdownAxis.COMPLETE
+        ):
             close_capture = getattr(
                 self.runtime_api,
                 "_close_capture_control_plane",
@@ -2166,15 +2169,22 @@ class RuntimeSession:
                 except BaseException as error:
                     errors.append(error)
                 else:
-                    self._mark_shutdown_axes(capture_publication=True)
+                    if not self._runtime_api_has_shutdown_axes():
+                        self._mark_shutdown_axes(
+                            capture_publication_finalized=True,
+                        )
             else:
-                self._mark_shutdown_axes(capture_publication=True)
-        elif not shutdown and state.runtime_api is not _ShutdownAxis.COMPLETE:
+                self._mark_shutdown_axes(capture_publication_finalized=True)
+        elif (
+            not shutdown
+            and state.runtime_api_data_plane_finalized
+            is not _ShutdownAxis.COMPLETE
+        ):
             close_runtime_api = getattr(self.runtime_api, "close", None)
             if not callable(close_runtime_api):
                 self._mark_shutdown_axes(
-                    capture_publication=True,
-                    runtime_api=True,
+                    capture_publication_finalized=True,
+                    runtime_api_data_plane_finalized=True,
                 )
             else:
                 try:
@@ -2182,10 +2192,11 @@ class RuntimeSession:
                 except BaseException as error:
                     errors.append(error)
                 else:
-                    self._mark_shutdown_axes(
-                        capture_publication=True,
-                        runtime_api=True,
-                    )
+                    if not self._runtime_api_has_shutdown_axes():
+                        self._mark_shutdown_axes(
+                            capture_publication_finalized=True,
+                            runtime_api_data_plane_finalized=True,
+                        )
         self._refresh_shutdown_state()
         acquired_operation = operation_owned or self._operation_lock.acquire(
             timeout=self._close_operation_timeout_s()
@@ -2248,9 +2259,10 @@ class RuntimeSession:
                     self._processes_closed = True
             state = self._refresh_shutdown_state()
             if (
-                state.local_resources is _ShutdownAxis.COMPLETE
-                and state.capture_publication is _ShutdownAxis.COMPLETE
-                and state.runtime_api is not _ShutdownAxis.COMPLETE
+                state.local_resources_terminal is _ShutdownAxis.COMPLETE
+                and state.capture_publication_finalized is _ShutdownAxis.COMPLETE
+                and state.runtime_api_data_plane_finalized
+                is not _ShutdownAxis.COMPLETE
             ):
                 close_after_target_termination = getattr(
                     self.runtime_api,
@@ -2263,12 +2275,17 @@ class RuntimeSession:
                     except BaseException as error:
                         errors.append(error)
                     else:
-                        self._mark_shutdown_axes(runtime_api=True)
+                        if not self._runtime_api_has_shutdown_axes():
+                            self._mark_shutdown_axes(
+                                runtime_api_data_plane_finalized=True,
+                            )
                 else:
                     # Compatibility runtimes have no target-side state of
                     # their own. Their local owner is complete once Session
                     # has killed the target and closed the transport.
-                    self._mark_shutdown_axes(runtime_api=True)
+                    self._mark_shutdown_axes(
+                        runtime_api_data_plane_finalized=True,
+                    )
             self._refresh_shutdown_state()
         finally:
             if not operation_owned:
@@ -2284,17 +2301,17 @@ class RuntimeSession:
         if not isinstance(state, _RuntimeSessionShutdownState):
             legacy_closed = bool(getattr(self, "_closed", False))
             state = _RuntimeSessionShutdownState(
-                local_resources=(
+                local_resources_terminal=(
                     _ShutdownAxis.COMPLETE
                     if legacy_closed
                     else _ShutdownAxis.PENDING
                 ),
-                capture_publication=(
+                capture_publication_finalized=(
                     _ShutdownAxis.COMPLETE
                     if legacy_closed
                     else _ShutdownAxis.PENDING
                 ),
-                runtime_api=(
+                runtime_api_data_plane_finalized=(
                     _ShutdownAxis.COMPLETE
                     if legacy_closed
                     else _ShutdownAxis.PENDING
@@ -2309,30 +2326,30 @@ class RuntimeSession:
                 or self._server_session_terminated
             )
         )
-        capture_publication_finished = (
+        capture_publication_finalized = (
             getattr(self.runtime_api, "_capture_shutdown_finished", False)
             is True
         )
-        runtime_api_closed = (
-            getattr(self.runtime_api, "_closed", False) is True
+        runtime_api_data_plane_finalized = (
+            getattr(self.runtime_api, "_data_plane_finalized", False) is True
             or self._runtime_api_closed
         )
         state = replace(
             state,
-            local_resources=(
+            local_resources_terminal=(
                 _ShutdownAxis.COMPLETE
                 if local_resources_closed
-                else state.local_resources
+                else state.local_resources_terminal
             ),
-            capture_publication=(
+            capture_publication_finalized=(
                 _ShutdownAxis.COMPLETE
-                if capture_publication_finished or runtime_api_closed
-                else state.capture_publication
+                if capture_publication_finalized
+                else state.capture_publication_finalized
             ),
-            runtime_api=(
+            runtime_api_data_plane_finalized=(
                 _ShutdownAxis.COMPLETE
-                if runtime_api_closed
-                else state.runtime_api
+                if runtime_api_data_plane_finalized
+                else state.runtime_api_data_plane_finalized
             ),
         )
         return self._store_shutdown_state(state)
@@ -2340,21 +2357,21 @@ class RuntimeSession:
     def _mark_shutdown_axes(
         self,
         *,
-        capture_publication: bool = False,
-        runtime_api: bool = False,
+        capture_publication_finalized: bool = False,
+        runtime_api_data_plane_finalized: bool = False,
     ) -> _RuntimeSessionShutdownState:
         state = self._refresh_shutdown_state()
         state = replace(
             state,
-            capture_publication=(
+            capture_publication_finalized=(
                 _ShutdownAxis.COMPLETE
-                if capture_publication
-                else state.capture_publication
+                if capture_publication_finalized
+                else state.capture_publication_finalized
             ),
-            runtime_api=(
+            runtime_api_data_plane_finalized=(
                 _ShutdownAxis.COMPLETE
-                if runtime_api
-                else state.runtime_api
+                if runtime_api_data_plane_finalized
+                else state.runtime_api_data_plane_finalized
             ),
         )
         return self._store_shutdown_state(state)
@@ -2364,9 +2381,25 @@ class RuntimeSession:
         state: _RuntimeSessionShutdownState,
     ) -> _RuntimeSessionShutdownState:
         self._shutdown_state = state
-        self._runtime_api_closed = state.runtime_api is _ShutdownAxis.COMPLETE
+        self._runtime_api_closed = (
+            state.runtime_api_data_plane_finalized is _ShutdownAxis.COMPLETE
+        )
         self._closed = state.terminal
         return state
+
+    def _runtime_api_has_shutdown_axes(self) -> bool:
+        """Keep legacy test/runtime adapters on their existing close contract."""
+
+        return (
+            isinstance(
+                getattr(self.runtime_api, "_capture_shutdown_finished", None),
+                bool,
+            )
+            and isinstance(
+                getattr(self.runtime_api, "_data_plane_finalized", None),
+                bool,
+            )
+        )
 
     def _close_operation_timeout_s(self) -> float:
         controller = getattr(self.runtime_api, "_controller", None)

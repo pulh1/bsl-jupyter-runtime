@@ -871,6 +871,11 @@ class PrototypeRuntimeApi:
         self._writer_owner: int | None = None
         self._worker_exports: tuple[WorkerExport, ...] = ()
         self._poisoned_error: ProtocolError | None = None
+        # Shutdown has three independent monotonic facts.  Admission closes
+        # before a bounded CAPTURE join, while data-plane ownership may remain
+        # reachable until RuntimeSession has terminated the target.
+        self._admission_closed = False
+        self._data_plane_finalized = False
         self._closed = False
         self._capture_shutdown_finished = False
         self._capture_shutdown_termination_proven = True
@@ -994,7 +999,7 @@ class PrototypeRuntimeApi:
                 }
             )
         )
-        if not capture_controls_state or self._closed:
+        if not capture_controls_state:
             with self._single_writer():
                 self._require_available()
                 return RuntimeStatus(
@@ -4510,6 +4515,10 @@ class PrototypeRuntimeApi:
             return self._close_capture_control_plane_locked()
 
     def _close_capture_control_plane_locked(self) -> bool:
+        # This is an admission fence, not a claim that local Worker ownership
+        # has been finalized.  It must be installed before bounded shutdown
+        # work starts so no new data-plane operation can race it.
+        self._admission_closed = True
         if self._capture_shutdown_finished:
             return self._capture_shutdown_termination_proven
         owner = self._capture_control_owner()
@@ -4543,12 +4552,12 @@ class PrototypeRuntimeApi:
     def close(self) -> None:
         """Release all generation roots, pins and target registrations once."""
         with self._close_lock:
-            if self._closed:
+            self._admission_closed = True
+            if self._data_plane_finalized:
                 return
             if not self._close_capture_control_plane_locked():
                 # The event consumer still owns its pending record and leases.
                 # Process/session teardown is now the only safe cleanup owner.
-                self._closed = True
                 return
             with self._single_writer():
                 self._close_data_plane_locked()
@@ -4556,7 +4565,8 @@ class PrototypeRuntimeApi:
     def _close_after_target_termination(self) -> None:
         """Finish local API teardown after RuntimeSession killed the target."""
         with self._close_lock:
-            if self._closed:
+            self._admission_closed = True
+            if self._data_plane_finalized:
                 return
             if not self._capture_shutdown_finished:
                 raise ProtocolError(
@@ -4566,7 +4576,7 @@ class PrototypeRuntimeApi:
                 self._close_data_plane_locked(target_terminated=True)
 
     def _close_data_plane_locked(self, *, target_terminated: bool = False) -> None:
-        if self._closed:
+        if self._data_plane_finalized:
             return
         try:
             if target_terminated or self._controller.state is OperationState.RECOVERING:
@@ -4601,6 +4611,7 @@ class PrototypeRuntimeApi:
         self._notebook_worker_descriptor = None
         self._worker_exports = ()
         self._prepared_source_units.clear()
+        self._data_plane_finalized = True
         self._closed = True
 
     def _notebook_publication_artifacts(
@@ -5503,7 +5514,7 @@ class PrototypeRuntimeApi:
         return tuple(result.values())
 
     def _require_available(self) -> None:
-        if self._closed:
+        if self._admission_closed or self._data_plane_finalized:
             raise ProtocolError("Runtime API is closed")
         if self._poisoned_error is not None:
             raise self._poisoned_error
