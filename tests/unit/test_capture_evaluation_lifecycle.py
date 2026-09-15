@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from queue import Empty, Queue
-from threading import Event, current_thread
+from threading import Event, Thread, current_thread
 from time import monotonic, sleep
 from uuid import uuid4
 
@@ -917,6 +917,258 @@ def test_transport_entry_without_known_acceptance_is_the_only_outcome_unknown_ca
         assert session.capture_start_count == 1
         assert session.capture_pending is None
         assert controller.breakpoint_workspace_owner.confirmed_snapshot.shielded is True
+    finally:
+        close_owner(controller, session)
+
+
+def test_initiator_error_policy_runs_once_outside_condition_and_can_read_status() -> None:
+    from test_capture_evaluation_coordinator import Driver, FENCE
+
+    owner = CaptureEvaluationCoordinator(FENCE, poll_interval_s=0.01)
+    driver = Driver()
+    condition_free: list[bool] = []
+    observed_phases: list[CapturePhase] = []
+
+    def policy(error: BaseException) -> BaseException:
+        free = owner._condition.acquire(blocking=False)
+        condition_free.append(free)
+        if free:
+            owner._condition.release()
+            observed_phases.append(owner.status(FENCE).phase)
+        return error
+
+    try:
+        ticket = owner.submit_evaluation(driver.request(
+            initiator_error_policy=policy,
+            completion=lambda value, error: value,
+        ))
+        driver.result(failed=True)
+        outcome = owner.wait(FENCE, ticket.evaluation_id, timeout_s=1)
+
+        assert outcome.state is CaptureEvaluationState.FAILED
+        assert condition_free == [True]
+        assert observed_phases == [CapturePhase.EVALUATING]
+    finally:
+        owner.begin_close()
+        driver.closed.set()
+        assert owner.join(2)
+
+
+@pytest.mark.parametrize(
+    "raised",
+    [RuntimeError("accepted submit failure"), KeyboardInterrupt()],
+    ids=("error", "keyboard_interrupt"),
+)
+def test_adopted_submit_exception_keeps_controller_evaluating(
+    tmp_path,
+    raised: BaseException,
+) -> None:  # type: ignore[no-untyped-def]
+    from test_notebook_method_runtime import UPDATE
+
+    api, controller, session = controlled_notebook_runtime(tmp_path)
+    assert api.execute_bsl(UPDATE).succeeded
+    assert api.execute_bsl("Результат = Б();").kind.value == "captured"
+    owner = capture_probe(controller).owner
+    session.polling.clear()
+    session.accepted.clear()
+    notify = owner._condition.notify_all
+    caller = current_thread()
+
+    def interrupted_return() -> None:
+        notify()
+        if current_thread() is caller and owner._active is not None:
+            raise raised
+
+    owner._condition.notify_all = interrupted_return
+    try:
+        with pytest.raises(type(raised), match=(
+            "accepted submit failure" if isinstance(raised, RuntimeError) else None
+        )):
+            api.execute_bsl("КонтекстОтладки.Скаляр = 778;")
+        owner._condition.notify_all = notify
+        assert session.polling.wait(1)
+
+        status = capture_probe(controller).status()
+        assert controller.state.value == "evaluating_capture"
+        assert status.phase is CapturePhase.EVALUATING
+        assert status.pending_evaluation_id is not None
+        assert session.capture_pending is not None
+        assert len(api._worker_universe._leases) == 2
+        assert session.primary_dispatch_count == 1
+    finally:
+        owner._condition.notify_all = notify
+        close_owner(controller, session)
+
+
+@pytest.mark.parametrize("prepared", [False, True])
+def test_primary_execution_records_dirty_roots_before_message_delivery_failure(
+    tmp_path,
+    prepared: bool,
+) -> None:  # type: ignore[no-untyped-def]
+    from test_notebook_method_runtime import UPDATE
+
+    api, controller, session = controlled_notebook_runtime(tmp_path)
+    assert api.execute_bsl(UPDATE).succeeded
+    assert api.execute_bsl("Результат = Б();").kind.value == "captured"
+    original_wait = session.wait_evaluation_event
+
+    def broken_messages(
+        pending: PendingEvaluation,
+        *,
+        timeout_s: float,
+    ) -> EvaluationResult | StopEvent:
+        messages = session._pending_role == "messages"
+        result = original_wait(pending, timeout_s=timeout_s)
+        if messages:
+            return EvaluationResult(
+                pending.result_id,
+                "Строка",
+                '"invalid json"',
+                False,
+            )
+        return result
+
+    session.wait_evaluation_event = broken_messages  # type: ignore[method-assign]
+    source = (
+        'КонтекстОтладки.Скаляр = 778; Сообщить("message"); '
+        "РезультатИнструкции = 1;"
+    )
+    candidate = api.prepare_capture_hypothesis(source) if prepared else None
+    try:
+        with pytest.raises(CaptureEvaluationPendingError) as caught:
+            if candidate is None:
+                api.execute_bsl(source)
+            else:
+                api.execute_prepared_capture_hypothesis(candidate)
+        session.complete()
+        outcome = capture_probe(controller).wait(
+            caught.value.evaluation_id,
+            timeout_s=1,
+        )
+
+        assert outcome.state is CaptureEvaluationState.FAILED
+        assert outcome.diagnostic is not None
+        assert outcome.diagnostic.code == "result_policy_failed"
+        assert tuple(api._pending_dirty_roots.values()) == ("Скаляр",)
+        assert capture_probe(controller).status().phase is CapturePhase.PAUSED
+        assert len(api._worker_universe._leases) == 1
+    finally:
+        close_owner(controller, session)
+
+
+def test_real_runtime_helper_releases_writer_while_coordinator_waits(
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    from test_notebook_method_runtime import UPDATE
+
+    api, controller, session = controlled_notebook_runtime(tmp_path)
+    assert api.execute_bsl(UPDATE).succeeded
+    helper_polling = Event()
+    release_helper = Event()
+    original_wait = session.wait_evaluation_event
+    result: list[object] = []
+    failures: list[BaseException] = []
+
+    def blocking_helper_wait(
+        pending: PendingEvaluation,
+        *,
+        timeout_s: float,
+    ) -> EvaluationResult | StopEvent:
+        if session._pending_role == "helper":
+            helper_polling.set()
+            if not release_helper.wait(2):
+                raise AssertionError("helper barrier was not released")
+        return original_wait(pending, timeout_s=timeout_s)
+
+    def capture_main() -> None:
+        try:
+            result.append(api.execute_bsl("Результат = Б();"))
+        except BaseException as error:
+            failures.append(error)
+
+    session.wait_evaluation_event = blocking_helper_wait  # type: ignore[method-assign]
+    caller = Thread(target=capture_main, name="capture-helper-caller")
+    try:
+        caller.start()
+        assert helper_polling.wait(2)
+        writer_locked_during_remote_wait = api._lock.locked()
+    finally:
+        release_helper.set()
+        caller.join(2)
+        close_owner(controller, session)
+
+    assert not caller.is_alive()
+    assert failures == []
+    assert len(result) == 1
+    assert not writer_locked_during_remote_wait
+
+
+@pytest.mark.parametrize("prepared", [False, True])
+def test_capture_worker_diagnostic_uses_exact_evaluation_generation(
+    tmp_path,
+    prepared: bool,
+) -> None:  # type: ignore[no-untyped-def]
+    from onec_runtime.bsl.diagnostics import (
+        parse_platform_diagnostic,
+        remap_worker_runtime_diagnostic,
+    )
+    from test_notebook_method_runtime import THIRD, UPDATE, runtime
+    from test_prototype_runtime import evaluation
+    from test_runtime_api import LineIndex
+
+    api, controller, session = runtime(tmp_path, captured=True)
+    assert api.execute_bsl(UPDATE).succeeded
+    assert api.execute_bsl("Результат = Б();").kind.value == "captured"
+    suspended_main = api._operation_generation_pin
+    assert suspended_main is not None
+    assert api.execute_bsl(THIRD).succeeded
+    evaluation_generation = api.worker_generation_handle
+    assert evaluation_generation is not None
+    assert evaluation_generation is not suspended_main.handle
+    artifacts = api._worker_generation_diagnostics[
+        evaluation_generation.manifest_sha256
+    ]
+    artifact = artifacts[-1]
+    exact = next(
+        segment
+        for segment in artifact.mapped_source.source_map.segments
+        if segment.relation.value == "exact"
+        and segment.generated.end > segment.generated.start
+    )
+    line, column = LineIndex(artifact.mapped_source.text).offset_to_line_column(
+        exact.generated.start
+    )
+    message = (
+        "{ВнешняяОбработка."
+        + artifact.registration_name
+        + f".МодульОбъекта({line},{column})}}: synthetic worker error"
+    )
+    expected = remap_worker_runtime_diagnostic(
+        parse_platform_diagnostic(message),
+        pinned_manifest_sha256=evaluation_generation.manifest_sha256,
+        pinned_artifacts=artifacts,
+    )
+    assert expected.mapping_confidence.value == "exact"
+    session.capture_evaluations.append(
+        evaluation("Ошибка", "", error=message)
+    )
+    source = "РезультатИнструкции = В();"
+    try:
+        reply = (
+            api.execute_prepared_capture_hypothesis(
+                api.prepare_capture_hypothesis(source)
+            )
+            if prepared
+            else api.execute_bsl(source)
+        )
+
+        assert reply.succeeded is False
+        assert reply.diagnostic is not None
+        assert reply.diagnostic.mapping_confidence.value == "exact"
+        assert reply.diagnostic.source_unit == expected.source_unit
+        public = capture_probe(controller).wait(None, timeout_s=0)
+        assert "synthetic worker error" not in repr(public)
+        assert artifact.registration_name not in repr(public)
     finally:
         close_owner(controller, session)
 
