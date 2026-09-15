@@ -567,6 +567,13 @@ def observe_shutdown_control_plane(
     return timeouts
 
 
+def timeline_contains_order(timeline: tuple[str, ...], *events: str) -> bool:
+    if any(event not in timeline for event in events):
+        return False
+    positions = tuple(timeline.index(event) for event in events)
+    return positions == tuple(sorted(positions)) and len(set(positions)) == len(positions)
+
+
 def attempt_shutdown_submission(
     owner: CaptureEvaluationCoordinator,
 ) -> BaseException | None:
@@ -662,11 +669,20 @@ def runtime_api_writer_shutdown_probe() -> bool:
     api = PrototypeRuntimeApi(controller, journal=journal)
     if os.environ.get("ONEC_TEST_PERMANENT_SHUTDOWN_BLOCK") == "1":
         api.close = lambda: Event().wait()  # type: ignore[method-assign]
-    owner, _ticket, _cleanup_probe = start_shutdown_evaluation(
+    owner, ticket, cleanup_probe = start_shutdown_evaluation(
         controller,
         transport,
     )
-    observe_shutdown_control_plane(owner, transport.shutdown_timeline)
+    del ticket
+    join_timeouts = observe_shutdown_control_plane(
+        owner,
+        transport.shutdown_timeline,
+    )
+    if os.environ.get("ONEC_TEST_SHUTDOWN_WITHOUT_JOIN") == "1":
+        api.close = lambda: (  # type: ignore[method-assign]
+            owner.begin_close(),
+            transport.invalidate(),
+        )
     holder, release_writer, holder_errors = _start_api_lock_holder(api)
     closer, finished, close_errors = _run_close(
         api.close,
@@ -681,6 +697,11 @@ def runtime_api_writer_shutdown_probe() -> bool:
         transport.shutdown_allow_invalidate.set()
         release_writer.set()
         finished_in_deadline = finished.wait(0.6)
+        production_timeline = tuple(transport.shutdown_timeline)
+        production_join_timeouts = tuple(join_timeouts)
+        production_cleanup_dispositions = tuple(cleanup_probe.dispositions)
+        cleanup_owned_after_close = cleanup_probe.is_product_owned
+        production_cleanup_dispatches = transport.shutdown_cleanup_dispatches
     finally:
         transport.shutdown_allow_invalidate.set()
         transport.shutdown_poll_release.set()
@@ -690,6 +711,15 @@ def runtime_api_writer_shutdown_probe() -> bool:
         owner.begin_close()
         assert owner.join(_JOIN_TIMEOUT_S)
 
+    shutdown_order = (
+        "coordinator_closing_entered",
+        "transport_invalidated",
+        "event_consumer_join_entered",
+        "event_consumer_join_returned_true",
+        "pin_quarantine",
+        "cleanup_quarantine",
+        "close_returned",
+    )
     return (
         invalidation_while_writer_owned
         and timeline_before_writer_release[:2] == (
@@ -698,6 +728,15 @@ def runtime_api_writer_shutdown_probe() -> bool:
         )
         and isinstance(caught, StaleCaptureError)
         and finished_in_deadline
+        and timeline_contains_order(production_timeline, *shutdown_order)
+        and all(production_timeline.count(event) == 1 for event in shutdown_order)
+        and bool(production_join_timeouts)
+        and all(0 <= timeout <= 0.05 for timeout in production_join_timeouts)
+        and production_cleanup_dispositions == (
+            (cleanup_probe.lease_identity, "quarantine"),
+        )
+        and cleanup_owned_after_close
+        and production_cleanup_dispatches == 0
         and not holder_errors
         and not close_errors
         and not holder.is_alive()
@@ -765,6 +804,39 @@ def test_shutdown_watchdog_terminates_and_reaps_permanently_blocked_child() -> N
 
     assert timed_out, "permanent-close mutant unexpectedly escaped the watchdog"
     assert child.poll() is not None, "shutdown watchdog did not reap blocked child"
+
+
+def test_writer_shutdown_probe_rejects_close_without_join_or_disposition() -> None:
+    code = (
+        "import sys; "
+        "sys.path.insert(0, 'tests/unit'); "
+        "from test_capture_control_plane import runtime_api_writer_shutdown_probe; "
+        "raise SystemExit(0 if runtime_api_writer_shutdown_probe() else 1)"
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", code],
+        env={**os.environ, "ONEC_TEST_SHUTDOWN_WITHOUT_JOIN": "1"},
+    )
+    timed_out = False
+    try:
+        try:
+            return_code = child.wait(timeout=4)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            child.terminate()
+            try:
+                return_code = child.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                return_code = child.wait(timeout=2)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=2)
+
+    assert child.poll() is not None, "shutdown mutant watchdog did not reap its child"
+    assert not timed_out, "no-join shutdown mutant remained blocked"
+    assert return_code == 1, "probe accepted shutdown without join and disposition"
 
 
 @pytest.mark.parametrize(
