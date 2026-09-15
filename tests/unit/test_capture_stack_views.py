@@ -9,8 +9,11 @@ from onec_runtime.bsl.full_ast_worker_projection import (
 )
 from onec_runtime.bsl.module_syntax import ModuleIdentity, ModuleSyntaxRegistry
 from onec_runtime.capture_source import SourceVersionRef
-from onec_runtime.errors import ProtocolError
-from onec_runtime.rdbg.models import ModuleLocation, StackFrame, TargetId
+from onec_runtime.errors import ProtocolError, StaleCaptureError
+from onec_runtime.rdbg.models import ModuleLocation, StackFrame, StopEvent, TargetId
+from onec_runtime.runtime_api import PrototypeRuntimeApi
+
+from test_prototype_runtime import CAPTURE_A, SERVICE, ScriptedSession, captured_controller
 
 
 SOURCE = "Procedure RunFixture(Arg)\nX = 1;\nEndProcedure"
@@ -410,3 +413,184 @@ def test_configuration_resolver_builds_stable_private_binding_namespaces():
     assert str(root) not in first[0].identity.namespace
     assert first[0].source == "ОбщийМодуль.Общий.Модуль"
     assert first[0].version.source_status == "trusted_export"
+
+
+class FreshStackSession(ScriptedSession):
+    def __init__(self) -> None:
+        super().__init__((CAPTURE_A,), stacks=((CAPTURE_A, LOCATION, SERVICE),))
+        target = self.target.target_id
+        self.live_frames = (
+            StackFrame(target, 0, CAPTURE_A),
+            StackFrame(target, 1, LOCATION),
+            StackFrame(target, 2, SERVICE),
+        )
+        self.stack_reads = 0
+
+    def read_current_stack(self, *, timeout_s: float) -> StopEvent:
+        assert timeout_s > 0
+        self.stack_reads += 1
+        locations = tuple(frame.location for frame in self.live_frames)
+        return StopEvent(
+            self.live_frames[0].target_id, locations[0], "recoveredCallStack", stack=locations,
+            stack_frames=self.live_frames,
+        )
+
+
+def captured_stack_api() -> tuple[PrototypeRuntimeApi, object, FreshStackSession]:
+    session = FreshStackSession()
+    controller = captured_controller(session)
+    return PrototypeRuntimeApi(controller), controller, session
+
+
+def test_runtime_capture_view_attaches_fresh_visible_and_native_stack_pages() -> None:
+    runtime, _, session = captured_stack_api()
+    capture = runtime.current_capture()
+
+    first = capture.stack[:20]
+    session.live_frames = (
+        session.live_frames[0],
+        replace(session.live_frames[1], location=replace(LOCATION, line=8)),
+        session.live_frames[2],
+    )
+    second = capture.stack[:20]
+    native = capture.stack.native[:20]
+
+    assert session.stack_reads == 3
+    assert first.total == second.total == 1
+    first_frame = next(frame for frame in first.frames if isinstance(frame, api().DebugFrame))
+    second_frame = next(frame for frame in second.frames if isinstance(frame, api().DebugFrame))
+    assert first_frame.native_level == second_frame.native_level == 1
+    assert first_frame.line == 2 and second_frame.line == 8
+    assert native.total == 3
+    assert [frame.native_level for frame in native.frames] == [0, 1, 2]
+    assert native.frames[0].runtime_kernel and native.frames[2].runtime_kernel
+
+
+def test_runtime_stack_validates_the_exact_capture_fence_before_rdbg() -> None:
+    runtime, controller, session = captured_stack_api()
+    capture = runtime.current_capture()
+    controller.stop_sequence += 1
+
+    with pytest.raises(StaleCaptureError):
+        capture.stack[:1]
+
+    assert session.stack_reads == 0
+
+
+def test_runtime_native_stack_bypasses_config_source_resolution_and_ast() -> None:
+    runtime, _, session = captured_stack_api()
+    source_calls = []
+    runtime._capture_stack_source_resolver = (
+        lambda frames: source_calls.append(frames) or (None,) * len(frames)
+    )
+
+    page = runtime.current_capture().stack.native[:20]
+
+    assert page.total == 3 and session.stack_reads == 1
+    assert source_calls == []
+
+
+def test_session_current_capture_binds_sources_methods_and_frame_value_scope() -> None:
+    from onec_runtime.capture_inspection import ResolvedFrameSource
+    from onec_runtime.capture_values import (
+        CaptureValuePolicy, LocalCaptureValueAdapter, PrivateValueProjection,
+    )
+    from onec_runtime.session import RuntimeSession
+
+    runtime, _, session = captured_stack_api()
+    pin = SourceVersionRef.worker(
+        artifact_id="binding-fixture", generation=1, source_text=SOURCE,
+    )
+    resolved = ResolvedFrameSource("Common.RunFixture", 2, IDENTITY, pin)
+
+    class ValueBackend:
+        def validate_inspection(self, fence):
+            return None
+        def project_values(self, fence, request):
+            return PrivateValueProjection((), 0, None)
+        def resolve_value(self, fence, path):
+            raise AssertionError("not used")
+        def discover_table_columns(self, fence, path, limit):
+            raise AssertionError("not used")
+
+    values = LocalCaptureValueAdapter(
+        ValueBackend(), object(),
+        policy=CaptureValuePolicy(lambda fence, handle: False),
+        resolve_parameters=lambda root: ("Arg",),
+    )
+    core = object.__new__(RuntimeSession)
+    core.runtime_api = runtime
+    core._capture_stack_source_resolver = (
+        lambda frames: tuple(resolved if frame.level == 1 else None for frame in frames)
+    )
+    core._capture_stack_frame_binder = values.bind_frame
+
+    capture = core.current_capture()
+    frame = capture.stack[0]
+    detailed = frame.with_method()
+
+    assert session.stack_reads == 1
+    assert detailed.method.name == "RunFixture"
+    assert detailed.method.parameters == ("Arg",)
+    assert frame.variables._root.native_level == 1
+    assert frame.parameters._root.native_level == 1
+    assert frame.locals._root.native_level == 1
+
+
+def test_stack_views_keep_target_urls_and_physical_ids_out_of_ordinary_repr() -> None:
+    runtime, _, _ = captured_stack_api()
+    capture = runtime.current_capture()
+    page = capture.stack[:20]
+    public = repr(capture) + repr(page) + repr(page.frames[0])
+
+    assert "private-alias" not in public
+    assert LOCATION.url not in public
+    assert str(LOCATION.object_id) not in public
+    assert str(LOCATION.property_id) not in public
+    assert "identity=" not in public and "_resolved" not in public
+
+
+def test_runtime_stack_uses_main_pinned_worker_source_and_shared_syntax(tmp_path) -> None:
+    from test_runtime_api import (
+        _common_module_catalog, _semantic_snapshot_runtime, _worker_module_unit,
+    )
+    from onec_runtime.worker_breakpoints import resolve_source_line
+
+    catalog = _common_module_catalog("МодульА")
+    first_unit = _worker_module_unit("МодульА", 1, catalog)
+    second_unit = _worker_module_unit("МодульА", 2, catalog)
+    worker_runtime = _semantic_snapshot_runtime(tmp_path, catalog)
+    first_generation = worker_runtime.load_worker_modules(
+        (first_unit,), common_modules=catalog,
+    )
+    operation_pin = worker_runtime._worker_universe.pin_active()
+    first_view = worker_runtime._worker_universe._operation_debug_view(operation_pin)
+    first_module = first_view.modules[0]
+    generated_line = resolve_source_line(
+        first_module, first_module.source_unit, 1,
+    ).generated_line
+    assert generated_line is not None
+
+    _, controller, session = captured_stack_api()
+    worker_runtime._controller = controller
+    worker_runtime._operation_generation_pin = operation_pin
+    worker_runtime.load_worker_modules((second_unit,), common_modules=catalog)
+    session.live_frames = (
+        session.live_frames[0],
+        StackFrame(
+            session.live_frames[0].target_id,
+            1,
+            first_module.registration.module_location(generated_line),
+        ),
+        session.live_frames[2],
+    )
+
+    frame = worker_runtime.current_capture().stack[0]
+    detailed = frame.with_method()
+
+    assert frame.source == "МодульА"
+    assert frame.source_status == "runtime_verified"
+    assert detailed.method.name == "Версия"
+    assert detailed.source_sha256 == first_unit.mapped_source.artifact.source_sha256
+    assert first_generation is operation_pin.handle
+    assert worker_runtime.worker_generation_handle is not first_generation
