@@ -1229,6 +1229,7 @@ class PrototypeRuntimeApi:
             return self._worker_breakpoints.list_statuses()
 
     def _require_worker_breakpoint_mutation_boundary_locked(self) -> None:
+        self._require_capture_data_plane_admission()
         self._require_available()
         if self._controller.state not in {
             OperationState.IDLE,
@@ -1270,6 +1271,7 @@ class PrototypeRuntimeApi:
     ) -> _RuntimeContinuationAdmission:
         """Snapshot API metadata around the controller's physical admission."""
         with self._single_writer():
+            self._require_capture_data_plane_admission()
             self._require_available()
             if self._controller.state is not OperationState.CAPTURED:
                 raise ProtocolError(
