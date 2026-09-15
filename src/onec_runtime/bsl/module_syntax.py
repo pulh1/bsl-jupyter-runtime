@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from bisect import bisect_right
+from collections import OrderedDict
 from dataclasses import dataclass
 import re
 from threading import Lock
@@ -119,20 +120,28 @@ class ModuleSyntaxRegistry:
 
     Publishing permits capture to reuse a candidate parse. It does not activate
     that source; RuntimeApi binds versions to confirmed Worker generations.
-    Existing versions live for the registry's lifetime and are never retargeted.
+    Entries are never retargeted and are retained in a finite least-recently-used
+    window. Saved source versions can be parsed again after eviction.
     """
 
-    def __init__(self) -> None:
-        self._entries: dict[
+    def __init__(self, *, capacity: int = 256) -> None:
+        if type(capacity) is not int or capacity < 1:
+            raise ValueError("syntax registry capacity must be a positive integer")
+        self._capacity = capacity
+        self._entries: OrderedDict[
             tuple[ModuleIdentity, str, tuple[str, str]], ModuleSyntaxIndex
-        ] = {}
+        ] = OrderedDict()
         self._lock = Lock()
 
     def get(
         self, module: ModuleIdentity, source_sha256: str, parser_identity: tuple[str, str],
     ) -> ModuleSyntaxIndex | None:
+        key = (module, source_sha256, parser_identity)
         with self._lock:
-            return self._entries.get((module, source_sha256, parser_identity))
+            index = self._entries.get(key)
+            if index is not None:
+                self._entries.move_to_end(key)
+            return index
 
     def publish(self, module: ModuleIdentity, index: ModuleSyntaxIndex) -> None:
         if type(module) is not ModuleIdentity or type(index) is not ModuleSyntaxIndex:
@@ -142,7 +151,12 @@ class ModuleSyntaxRegistry:
             current = self._entries.get(key)
             if current is not None and current != index:
                 raise ValueError("conflicting syntax facts for an existing source version")
-            self._entries.setdefault(key, index)
+            if current is not None:
+                self._entries.move_to_end(key)
+                return
+            self._entries[key] = index
+            if len(self._entries) > self._capacity:
+                self._entries.popitem(last=False)
 
 
 __all__ = ["MethodSyntaxInfo", "ModuleIdentity", "ModuleSyntaxIndex", "ModuleSyntaxRegistry"]
