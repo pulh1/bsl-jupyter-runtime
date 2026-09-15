@@ -944,3 +944,72 @@ def test_close_drains_queued_evidence_in_order_after_publication_barrier(environ
     assert events[-1].fields["state"] == "failed"
     with coordinator._condition:
         assert not coordinator._events
+
+
+def test_pending_interrupt_detaches_before_condition_exit_allows_late_result(environment, monkeypatch):
+    create, threads = environment
+    coordinator, driver, journal = create()
+    ticket = coordinator.submit_evaluation(driver.request(
+        kind=Kind.PUBLIC_VALUE_GUARD, continuation=driver.continuation,
+    ))
+    assert driver.polling.wait(1)
+    coordinator.wait(FENCE, None, 0)
+    condition_released = Event()
+    resume_handler = Event()
+    interrupted = Queue()
+    original_wait = coordinator._condition.wait
+    condition_type = type(coordinator._condition)
+    original_exit = condition_type.__exit__
+    armed = True
+
+    def interrupt_wait(timeout=None):
+        nonlocal armed
+        if current_thread() is initiator and armed:
+            armed = False
+            raise KeyboardInterrupt
+        return original_wait(timeout)
+
+    def pause_after_release(condition, exc_type, exc_value, traceback):
+        result = original_exit(condition, exc_type, exc_value, traceback)
+        if (condition is coordinator._condition and current_thread() is initiator
+                and exc_type is KeyboardInterrupt and not condition_released.is_set()):
+            # Schedule the owner after the interrupted wait has released the
+            # mutex but before any outer interruption handler can reacquire it.
+            condition_released.set()
+            assert resume_handler.wait(2)
+        return result
+
+    def wait():
+        try:
+            ticket.wait_initiator(1)
+        except KeyboardInterrupt:
+            interrupted.put(True)
+
+    initiator = Thread(target=wait)
+    threads.append(initiator)
+    monkeypatch.setattr(coordinator._condition, "wait", interrupt_wait)
+    monkeypatch.setattr(condition_type, "__exit__", pause_after_release)
+    initiator.start()
+    assert condition_released.wait(1)
+    try:
+        driver.result(0)
+        outcome = coordinator.wait(FENCE, None, 1)
+        assert outcome.state is State.COMPLETED
+        assert driver.continuation_count == 0
+        assert driver.dispatch_count == driver.consumed == 1
+        assert driver.restore_count == driver.cleanup_count == 1
+        assert driver.dispositions == ["release"]
+        assert outcome.timing.initiating_waiter_detached_ms is not None
+    finally:
+        resume_handler.set()
+    assert interrupted.get(timeout=1)
+    assert coordinator.wait(FENCE, None, 0) is outcome
+    eventually(lambda: any(event.event.endswith("outcome_published") for event in journal.events))
+    detach_events = [event for event in journal.events if event.event.endswith("initiating_waiter_detached")]
+    assert len(detach_events) == 1  # Inner/outer handling must be idempotent.
+    assert detach_events[0].fields["reason"] == "interrupt"
+    assert detach_events[0].fields["state"] == "pending"
+    terminal = journal.events[-1]
+    assert terminal.event == "capture_evaluation_outcome_published"
+    assert terminal.fields["initiating_waiter_detached_ms"] == outcome.timing.initiating_waiter_detached_ms
+    assert outcome.timing.initiating_waiter_detached_ms <= outcome.timing.outcome_published_ms

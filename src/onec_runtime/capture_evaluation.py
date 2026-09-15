@@ -756,25 +756,33 @@ class CaptureEvaluationCoordinator:
                 raise ProtocolError("CAPTURE worker cannot wait on its own outcome")
             deadline = _deadline(timeout_s)
             with self._condition:
-                while record.outcome is None:
+                try:
+                    while record.outcome is None:
+                        self._require_fence_locked(record.request.fence)
+                        remaining = _remaining(deadline)
+                        if remaining is not None and remaining <= 0:
+                            self._detach_locked(record, "timeout")
+                            if record.acknowledged:
+                                raise CaptureEvaluationPendingError(
+                                    record.evaluation_id, record.request.evaluation_kind,
+                                )
+                            raise TimeoutError("Waiting for CAPTURE dispatch timed out; use capture.wait()")
+                        self._condition.wait(remaining)
                     self._require_fence_locked(record.request.fence)
-                    remaining = _remaining(deadline)
-                    if remaining is not None and remaining <= 0:
-                        self._detach_locked(record, "timeout")
-                        if record.acknowledged:
-                            raise CaptureEvaluationPendingError(
-                                record.evaluation_id, record.request.evaluation_kind,
-                            )
-                        raise TimeoutError("Waiting for CAPTURE dispatch timed out; use capture.wait()")
-                    self._condition.wait(remaining)
-                self._require_fence_locked(record.request.fence)
-                if record.initiating_error is not None:
-                    raise record.initiating_error
-                return record.private_result
+                    if record.initiating_error is not None:
+                        raise record.initiating_error
+                    return record.private_result
+                except KeyboardInterrupt:
+                    # Condition.wait() reacquires this mutex before raising.
+                    # Abandon pending continuation before releasing it, so
+                    # the owner cannot admit optional work in an unwind gap.
+                    self._detach_locked(record, "interrupt")
+                    raise
         except KeyboardInterrupt:
             # Setup and condition acquisition can both be interrupted. The
             # condition may never have been acquired, or publication may have
-            # won the race before this handler reacquires it.
+            # won the race before this handler reacquires it. Rehandling an
+            # interrupt already detached inside the condition is idempotent.
             with self._condition:
                 self._detach_locked(record, "interrupt")
             raise
