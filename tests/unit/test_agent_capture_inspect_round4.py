@@ -186,7 +186,7 @@ class CacheBackend:
     def __init__(self) -> None:
         self.table_calls = 0
 
-    def require_public_value_handle(self, handle: str) -> None:
+    def validate_value_reference(self, handle: str) -> None:
         del handle
 
     def frame_variables(self, capture, *, filters, cursor, limit):

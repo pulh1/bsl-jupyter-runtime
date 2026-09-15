@@ -134,6 +134,7 @@ from onec_runtime.worker_universe import (
     WorkerModuleArtifactBuilder,
     WorkerUniverseCandidate,
     WorkerUniverseRegistry,
+    WorkerUniverseState,
     worker_module_artifact_from_notebook,
 )
 from onec_runtime.worker_breakpoints import (
@@ -1120,7 +1121,7 @@ class PrototypeRuntimeApi:
             # The schema helper admits only table/structure types and excludes
             # private Worker container shapes. Do not run the general MAIN
             # privacy instruction here: completion must preserve operation state.
-            self._public_value_guard_handle_locked(handle)
+            self._validate_value_reference_locked(handle)
             with self._remaining_command_timeout():
                 result = self._controller.inspect_completion_fields(handle, table_row=table_row)
             if result.error_occurred or len(result.collection_rows) > 128:
@@ -4766,6 +4767,7 @@ class PrototypeRuntimeApi:
                 context_cleaner=self._drop_context_value,
                 runtime_generation=lambda: self._controller.runtime_generation,
                 context_generation=self._context_generation,
+                worker_type_registrations=self._worker_type_registrations,
                 profiler=profiler,
             )
             return transfer.materialize(safe_handle, options)
@@ -4799,6 +4801,7 @@ class PrototypeRuntimeApi:
                 context_cleaner=self._drop_context_value,
                 runtime_generation=lambda: self._controller.runtime_generation,
                 context_generation=self._context_generation,
+                worker_type_registrations=self._worker_type_registrations,
                 profiler=profiler,
             )
             return transfer.payload(
@@ -4829,7 +4832,7 @@ class PrototypeRuntimeApi:
                 runtime_generation=lambda: self._controller.runtime_generation,
                 context_generation=self._context_generation,
                 context_cleaner=self._drop_context_value,
-                schema_reader=self._inspect_compact_columns,
+                worker_type_registrations=self._worker_type_registrations,
                 max_text_size=((max_bytes + 2) // 3) * 4,
                 max_payload_bytes=max_bytes,
                 max_rows=max_rows,
@@ -4944,7 +4947,7 @@ class PrototypeRuntimeApi:
                     runtime_generation=lambda: self._controller.runtime_generation,
                     context_generation=self._context_generation,
                     context_cleaner=self._drop_context_value,
-                    schema_reader=self._inspect_compact_columns,
+                    worker_type_registrations=self._worker_type_registrations,
                     max_text_size=((max_bytes + 2) // 3) * 4,
                     max_payload_bytes=max_bytes,
                     max_rows=limit,
@@ -4962,6 +4965,7 @@ class PrototypeRuntimeApi:
                 context_cleaner=self._drop_context_value,
                 runtime_generation=lambda: self._controller.runtime_generation,
                 context_generation=self._context_generation,
+                worker_type_registrations=self._worker_type_registrations,
             )
             return (
                 "value",
@@ -5154,34 +5158,20 @@ class PrototypeRuntimeApi:
         return route
 
     def _resolve_value_handle_locked(self, handle: str) -> str:
-        self._require_public_value_handle_locked(handle)
-        if isinstance(handle, str) and handle.startswith("capture_table_"):
+        safe_handle = self._validate_value_reference_locked(handle)
+        if handle.startswith("capture_table_"):
             self._require_capture_inspection_available()
             return validate_value_handle(self._controller.capture_value_handle(handle))
-        return validate_value_handle(handle)
+        return safe_handle
 
-    def require_public_value_handle(self, handle: str) -> None:
-        """Reject target Worker roots/modules before any public proxy can escape."""
+    def validate_value_reference(self, handle: str) -> str:
+        """Validate a proxy reference locally without target-side value policy."""
         with self._capture_data_plane_writer():
-            self._require_available()
-            self._require_public_value_handle_locked(handle)
+            return self._validate_value_reference_locked(handle)
 
-    def require_public_value_handles(self, handles: tuple[str, ...]) -> None:
-        """Prove every handle public with at most one target privacy instruction."""
-        with self._capture_data_plane_writer():
-            self._require_available()
-            if not isinstance(handles, tuple) or any(
-                not isinstance(handle, str) for handle in handles
-            ):
-                raise ProtocolError("value handles must be a tuple of strings")
-            self._require_public_value_handles_locked(handles)
-
-    def _require_public_value_handle_locked(self, handle: object) -> None:
-        self._require_public_value_handles_locked((handle,))
-
-    def _public_value_guard_handle_locked(self, handle: object) -> str | None:
+    def _validate_value_reference_locked(self, handle: object) -> str:
         if not isinstance(handle, str):
-            return None
+            raise ProtocolError("value reference must be a string")
         normalized = handle.casefold()
         if normalized.startswith(
             "Контекст.RuntimeWorkerActiveGeneration".casefold()
@@ -5197,10 +5187,10 @@ class PrototypeRuntimeApi:
                 raise ProtocolError(
                     "Worker generation objects are not public values"
                 )
-            # An admitted inventory handle identifies metadata, not a target
-            # value.  Its controller-owned identity is the complete privacy
-            # proof; materialization still rejects it via capture_value_handle.
-            return None
+            # This is an admitted inventory handle, not a target value. It can
+            # be published as a bounded-table descriptor; _resolve_value_handle_locked
+            # later rejects materialization through capture_value_handle.
+            return handle
         if handle.startswith(("capture_table_", "capture_manager_")):
             self._require_capture_inspection_available()
             safe_handle = validate_value_handle(
@@ -5210,92 +5200,10 @@ class PrototypeRuntimeApi:
             safe_handle = validate_value_handle(handle)
         return safe_handle
 
-    def _require_public_value_handles_locked(self, handles: tuple[object, ...]) -> None:
-        # Resolve and admit the entire batch before any target privacy work.
-        safe_handles = tuple(
-            safe_handle
-            for handle in handles
-            if (safe_handle := self._public_value_guard_handle_locked(handle))
-            is not None
-        )
-        if not safe_handles or self._worker_generation_handle is None:
-            return
-        try:
-            privacy_registrations = (
-                self._worker_universe_target.privacy_registration_snapshot()
-            )
-        except BaseException:
-            raise ProtocolError(
-                "Worker generation objects are not public values"
-            ) from None
-        type_probes = tuple(
-            line
-            for index, registration in enumerate(privacy_registrations)
-            for line in (
-                f"ВременныйОбъектWorker{index} = "
-                "ВнешниеОбработки.Создать("
-                f"{bsl_string_literal(registration)}, Ложь);",
-                "ТипыОбъектовWorker.Добавить(ТипЗнч("
-                f"ВременныйОбъектWorker{index}));",
-            )
-        )
-        instruction = (
-            "// onec-worker-public-value-guard\n"
-            "ТипыОбъектовWorker = Новый Массив;\n"
-            + "\n".join(type_probes)
-            + "\n"
-            "ПроверяемыеЗначенияWorker = Новый Массив;\n"
-            + "\n".join(
-                f"ПроверяемыеЗначенияWorker.Добавить({safe_handle});"
-                for safe_handle in safe_handles
-            )
-            + "\n"
-            "ЕстьОбъектыWorker = Ложь;\n"
-            "Для Каждого ПроверяемоеЗначениеWorker "
-            "Из ПроверяемыеЗначенияWorker Цикл\n"
-            "ТипПроверяемогоWorker = ТипЗнч(ПроверяемоеЗначениеWorker);\n"
-            "ЭтоОбъектWorker = "
-            "ТипыОбъектовWorker.Найти(ТипПроверяемогоWorker) "
-            "<> Неопределено;\n"
-            "Если Не ЭтоОбъектWorker "
-            'И ТипПроверяемогоWorker = Тип("ФиксированнаяСтруктура") '
-            "Тогда\n"
-            "    ЭтоКореньWorker = "
-            'ПроверяемоеЗначениеWorker.Свойство("ManifestSha256") '
-            'И ПроверяемоеЗначениеWorker.Свойство("Modules") '
-            'И ПроверяемоеЗначениеWorker.Свойство("Exports");\n'
-            "    ВидКонтейнераWorker = Неопределено;\n"
-            "    ЭтоЭкспортыWorker = "
-            'ПроверяемоеЗначениеWorker.Свойство("Kind", ВидКонтейнераWorker) '
-            'И ВидКонтейнераWorker = "OnecWorkerExportsV1" '
-            'И ПроверяемоеЗначениеWorker.Свойство("Items");\n'
-            "    ЭтоОбъектWorker = ЭтоКореньWorker Или ЭтоЭкспортыWorker;\n"
-            "КонецЕсли;\n"
-            "Если Не ЭтоОбъектWorker "
-            'И ТипПроверяемогоWorker = Тип("ФиксированноеСоответствие") '
-            "Тогда\n"
-            "    Для Каждого ЭлементМодулейWorker "
-            "Из ПроверяемоеЗначениеWorker Цикл\n"
-            "        Если ТипыОбъектовWorker.Найти("
-            "ТипЗнч(ЭлементМодулейWorker.Значение)) "
-            "<> Неопределено Тогда\n"
-            "            ЭтоОбъектWorker = Истина;\n"
-            "            Прервать;\n"
-            "        КонецЕсли;\n"
-            "    КонецЦикла;\n"
-            "КонецЕсли;\n"
-            "ЕстьОбъектыWorker = ЕстьОбъектыWorker Или ЭтоОбъектWorker;\n"
-            "КонецЦикла;\n"
-            "Результат = ЕстьОбъектыWorker;"
-        )
-        try:
-            forbidden = self._worker_instruction_executor(instruction)
-        except BaseException:
-            raise ProtocolError(
-                "Worker generation objects are not public values"
-            ) from None
-        if forbidden is not False:
-            raise ProtocolError("Worker generation objects are not public values")
+    def _worker_type_registrations(self) -> tuple[str, ...]:
+        if self._worker_universe.state is WorkerUniverseState.EMPTY:
+            return ()
+        return self._worker_universe_target.privacy_registration_snapshot()
 
     def _materialize_table_locked(
         self,
@@ -5314,7 +5222,7 @@ class PrototypeRuntimeApi:
             runtime_generation=lambda: self._controller.runtime_generation,
             context_generation=self._context_generation,
             context_cleaner=self._drop_context_value,
-            schema_reader=self._inspect_compact_columns,
+            worker_type_registrations=self._worker_type_registrations,
             max_text_size=((max_bytes + 2) // 3) * 4,
             max_payload_bytes=max_bytes,
             max_rows=max_rows,

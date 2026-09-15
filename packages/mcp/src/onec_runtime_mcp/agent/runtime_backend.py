@@ -242,7 +242,7 @@ class RuntimeBackend(Protocol):
     def namespace_snapshot(self) -> RuntimeNamespaceSnapshot:
         raise RuntimeError("Protocol declaration")
 
-    def require_public_value_handle(self, handle: str) -> None:
+    def validate_value_reference(self, handle: str) -> str:
         raise RuntimeError("Protocol declaration")
 
     def materialize_value(self, handle: str, **options: object) -> object:
@@ -877,10 +877,10 @@ class OnecRuntimeBackend:
             raise ProtocolError("runtime backend is closed")
         return self._session.namespace_snapshot()
 
-    def require_public_value_handle(self, handle: str) -> None:
+    def validate_value_reference(self, handle: str) -> str:
         if self._closed:
             raise ProtocolError("runtime backend is closed")
-        self._session.require_public_value_handle(handle)
+        return self._session.validate_value_reference(handle)
 
     def materialize_value(self, handle: str, **options: object) -> object:
         if self._closed:

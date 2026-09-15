@@ -47,7 +47,7 @@ def test_capture_transfer_registers_key_before_dispatch_and_owns_cleanup():
         request = plan.capture_request(FENCE, step_factory=step, read=read)
         assert request.cleanup_leases[0].private_key == KEY
         ticket = coordinator.submit_evaluation(request)
-        for driver, value in zip(drivers, [f"3|5|{len(payload)}|{sha256(payload).hexdigest()}|{len(encoded)}", encoded, ""]):
+        for driver, value in zip(drivers, [f"R|3|5|{len(payload)}|{sha256(payload).hexdigest()}|{len(encoded)}", encoded, ""]):
             from onec_runtime.rdbg.models import EvaluationResult
             driver.events.put(EvaluationResult(driver.pending.result_id, "Строка", value, False))
         return ticket.wait_initiator(1)
@@ -171,7 +171,7 @@ def test_reads_one_atomic_context_value_and_decodes_snapshot() -> None:
     reads: list[tuple[str, int]] = []
     transfer = RuntimeValueTransfer(
         lambda source: calls.append(source)
-        or f"3|5|{len(payload)}|{sha256(payload).hexdigest()}|{len(encoded)}",
+        or f"R|3|5|{len(payload)}|{sha256(payload).hexdigest()}|{len(encoded)}",
         lambda key, maximum: reads.append((key, maximum)) or encoded,
         runtime_generation=lambda: 3,
         context_generation=5,
@@ -200,7 +200,7 @@ def test_small_byte_limit_still_decodes_bounded_error_envelope() -> None:
     reads: list[int] = []
     transfer = RuntimeValueTransfer(
         lambda _source: (
-            f"1|1|{len(payload)}|{sha256(payload).hexdigest()}|{len(encoded)}"
+            f"R|1|1|{len(payload)}|{sha256(payload).hexdigest()}|{len(encoded)}"
         ),
         lambda _key, maximum: reads.append(maximum) or encoded,
         runtime_generation=lambda: 1,
@@ -239,17 +239,17 @@ def test_rejects_invalid_transfer_metadata_after_atomic_take(metadata: str) -> N
         context_cleaner=lambda _key: None,
     )
 
-    with pytest.raises(ProtocolError, match="metadata"):
+    with pytest.raises(CaptureValueCheckError, match="CAPTURE value admission"):
         transfer.materialize("Контекст.Значение", MaterializationOptions())
 
-    assert reads == [KEY]
+    assert reads == []
 
 
 def test_rejects_payload_hash_mismatch() -> None:
     payload = _payload()
     encoded = b64encode(payload).decode("ascii")
     transfer = RuntimeValueTransfer(
-        lambda _source: f"1|1|{len(payload)}|{'0' * 64}|{len(encoded)}",
+        lambda _source: f"R|1|1|{len(payload)}|{'0' * 64}|{len(encoded)}",
         lambda _key, _maximum: encoded,
         runtime_generation=lambda: 1,
         context_generation=1,

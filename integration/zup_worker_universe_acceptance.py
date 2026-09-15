@@ -2600,8 +2600,8 @@ class _PrivateProxyRuntimeView:
             names = (*names, self._name)
         return replace(snapshot, names=names)
 
-    def require_public_value_handle(self, handle: str) -> None:
-        self._runtime.require_public_value_handle(handle)
+    def validate_value_reference(self, handle: str) -> str:
+        return self._runtime.validate_value_reference(handle)
 
 
 def _require_private_proxy_rejection(

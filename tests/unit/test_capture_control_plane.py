@@ -103,8 +103,6 @@ _CAPTURE_DATA_PLANE_ROUTES = frozenset(
         "project_value_payload",
         "release_worker_generation",
         "remove_worker_breakpoint",
-        "require_public_value_handle",
-        "require_public_value_handles",
         "resolve_capture_manager_origin",
         "resume_capture",
         "resume_debug_stop",
@@ -126,6 +124,7 @@ _LOCAL_READ_ONLY_ROUTES = frozenset(
         "prepared_capture_hypothesis_provenance",
         "prepared_main_execution_provenance",
         "prepared_main_worker_generation",
+        "validate_value_reference",
         "worker_breakpoint_status",
     }
 )
@@ -1448,7 +1447,7 @@ def test_capture_control_plane_bypasses_api_writer_availability_and_worker_guard
         with monkeypatch.context() as patch:
             patch.setattr(api, "_single_writer", forbidden_writer)
             patch.setattr(api, "_require_available", forbidden_available)
-            patch.setattr(api, "require_public_value_handle", forbidden_guard)
+            patch.setattr(api, "validate_value_reference", forbidden_guard)
             runtime_status = api.status()
             current = api.current_capture()
             capture_status = capture.status()
@@ -2580,10 +2579,6 @@ def _invoke_capture_data_plane_route(
         api.release_worker_generation(object())  # type: ignore[arg-type]
     elif route == "remove_worker_breakpoint":
         api.remove_worker_breakpoint(uuid4())
-    elif route == "require_public_value_handle":
-        api.require_public_value_handle("Контекст.Результат")
-    elif route == "require_public_value_handles":
-        api.require_public_value_handles(("Контекст.Результат",))
     elif route == "resolve_capture_manager_origin":
         api.resolve_capture_manager_origin(ManagerOrigin("frame", "Запрос", ()))
     elif route == "resume_capture":

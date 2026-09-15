@@ -197,7 +197,7 @@ def test_compact_serializer_classifies_columns_once_before_full_row_loop() -> No
         "КонецФункции", 1
     )[0]
 
-    assert "ОпределитьКомпактнуюСхемуКолонок(Таблица)" in serializer
+    assert "ОпределитьКомпактнуюСхемуКолонок(Таблица, ТипыОбъектовWorker)" in serializer
     assert "КомпактныйВидЗначения(СтрокаТаблицы" not in serializer
     assert "КомпактноеЗначение(" in serializer
     assert "СсылочныеКолонки[ИндексКолонки]" in serializer

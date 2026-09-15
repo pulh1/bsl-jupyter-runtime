@@ -266,7 +266,7 @@ class CaptureRuntimeBackend(Protocol):
 class CaptureFrameBackend(Protocol):
     """Safe debugger-frame primitives; values and object graphs stay opaque."""
 
-    def require_public_value_handle(self, handle: str) -> None: ...
+    def validate_value_reference(self, handle: str) -> str: ...
 
     def capture_stack(
         self, capture: CaptureFence, *, cursor: int, limit: int,
@@ -788,7 +788,7 @@ class CaptureService:
             handle = item.get("handle")
             if not isinstance(handle, str) or not handle:
                 raise ValueError("frame variable handle must be a non-empty opaque string")
-            backend.require_public_value_handle(handle)
+            backend.validate_value_reference(handle)
             existing = self._frame_proxies.get(proxy_key)
             proxy = (
                 registry.resolve(existing)
@@ -846,7 +846,7 @@ class CaptureService:
         type_name = raw.get("type_name")
         if not isinstance(manager_key, str) or not manager_key or not isinstance(handle, str) or not handle or type_name != "МенеджерВременныхТаблиц":
             raise ValueError("manager resolution is incomplete")
-        backend.require_public_value_handle(handle)
+        backend.validate_value_reference(handle)
         known = self._manager_by_key.get((fence, manager_key))
         if known is not None:
             mutations.set(self._manager_by_origin, key, known)
@@ -898,7 +898,7 @@ class CaptureService:
                 handle = self._table_handles.get(identity)
                 if handle is None:
                     raise StaleProxy("released temporary-table selection cannot be recreated")
-                backend.require_public_value_handle(handle)
+                backend.validate_value_reference(handle)
                 selection_key = (
                     "full"
                     if selection is None
@@ -962,7 +962,7 @@ class CaptureService:
             handle = raw.get("handle")
             if not isinstance(handle, str) or not handle or not isinstance(schema, Sequence) or isinstance(schema, str):
                 raise ValueError("temporary table metadata is invalid")
-            backend.require_public_value_handle(handle)
+            backend.validate_value_reference(handle)
             if known_size is not None and not isinstance(known_size, ValueSize):
                 raise TypeError("temporary table known_size must be a ValueSize")
             # A bounded table-row projection has a different native resolver

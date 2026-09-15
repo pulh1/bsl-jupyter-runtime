@@ -1964,7 +1964,7 @@ class RuntimeSession:
         profiler: PhaseRecorder | None = None,
     ) -> pd.DataFrame:
         with self._operation_lock:
-            self._require_public_value_handle(handle)
+            self.validate_value_reference(handle)
             return self.runtime_api.materialize_table(
                 handle,
                 refs=refs,
@@ -1982,7 +1982,7 @@ class RuntimeSession:
     ) -> pd.DataFrame:
         """Materialize a bounded table projection for a frontend value proxy."""
         with self._operation_lock:
-            self._require_public_value_handle(handle)
+            self.validate_value_reference(handle)
             return self.runtime_api.project_to_df(handle, selection, **options)
 
     def materialize(
@@ -2000,7 +2000,7 @@ class RuntimeSession:
         profiler: PhaseRecorder | None = None,
     ) -> object:
         with self._operation_lock:
-            self._require_public_value_handle(handle)
+            self.validate_value_reference(handle)
             options: dict[str, object] = {
                 "refs": refs,
                 "ref_columns": ref_columns,
@@ -2030,31 +2030,31 @@ class RuntimeSession:
     ) -> object:
         """Materialize a bounded recursive projection for a frontend proxy."""
         with self._operation_lock:
-            self._require_public_value_handle(handle)
+            self.validate_value_reference(handle)
             return self.runtime_api.project_value(handle, selection, **options)
 
     def materialization_kind(
         self, handle: str, *, timeout_s: float | None = None
     ) -> str:
         with self._operation_lock:
-            self._require_public_value_handle(handle)
+            self.validate_value_reference(handle)
             if timeout_s is None:
                 return self.runtime_api.materialization_kind(handle)
             return self.runtime_api.materialization_kind(handle, timeout_s=timeout_s)
 
     def materialize_value_payload(self, handle: str, **options: object) -> bytes:
         with self._operation_lock:
-            self._require_public_value_handle(handle)
+            self.validate_value_reference(handle)
             return self.runtime_api.materialize_value_payload(handle, **options)
 
     def materialize_table_payload(self, handle: str, **options: object) -> bytes:
         with self._operation_lock:
-            self._require_public_value_handle(handle)
+            self.validate_value_reference(handle)
             return self.runtime_api.materialize_table_payload(handle, **options)
 
     def project_value_payload(self, handle: str, selection, **options: object):  # type: ignore[no-untyped-def]
         with self._operation_lock:
-            self._require_public_value_handle(handle)
+            self.validate_value_reference(handle)
             return self.runtime_api.project_value_payload(
                 handle,
                 kind=selection.kind.value,
@@ -2065,23 +2065,9 @@ class RuntimeSession:
                 **options,
             )
 
-    def require_public_value_handle(self, handle: str) -> None:
+    def validate_value_reference(self, handle: str) -> str:
         with self._operation_lock:
-            self._require_public_value_handle(handle)
-
-    def require_public_value_handles(self, handles: tuple[str, ...]) -> None:
-        with self._operation_lock:
-            self.runtime_api.require_public_value_handles(handles)
-
-    def _require_public_value_handle(self, handle: object) -> None:
-        if not isinstance(handle, str):
-            return
-        normalized = handle.casefold()
-        if normalized.startswith(
-            "Контекст.RuntimeWorkerActiveGeneration".casefold()
-        ) or normalized.startswith("__OnecPinnedWorkerGeneration".casefold()):
-            raise ProtocolError("Worker generation objects are not public values")
-        self.runtime_api.require_public_value_handle(handle)
+            return self.runtime_api.validate_value_reference(handle)
 
     def status(self) -> RuntimeStatus:
         return self.runtime_api.status()

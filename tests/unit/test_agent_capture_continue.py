@@ -107,7 +107,7 @@ class _ContinuationRuntime:
         self.continue_calls = 0
         self.armed: list[object] = []
 
-    def require_public_value_handle(self, handle: str) -> None:
+    def validate_value_reference(self, handle: str) -> None:
         del handle
 
     def resolve_capture_points(

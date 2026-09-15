@@ -7,8 +7,8 @@ from hashlib import sha256
 import re
 from uuid import uuid4
 
-from onec_runtime.capture_evaluation import CaptureTransferPlan
-from onec_runtime.errors import ProtocolError
+from onec_runtime.capture_evaluation import AdmissionEnvelopeV1, CaptureTransferPlan
+from onec_runtime.errors import CaptureValueCheckError, ProtocolError
 from onec_runtime.experiment import bsl_string_literal
 from onec_runtime.performance_profile import PhaseRecorder
 from onec_runtime.value_materialization import (
@@ -34,27 +34,47 @@ def build_value_transfer_instruction(
     *,
     runtime_generation: int,
     context_generation: int,
+    worker_type_registrations: tuple[str, ...] = (),
 ) -> str:
     validate_value_handle(handle)
     if not _CONTEXT_KEY.fullmatch(context_key):
         raise ProtocolError("value materialization context key is invalid")
     if runtime_generation <= 0 or context_generation <= 0:
         raise ProtocolError("value transfer generations must be positive")
+    if any(not isinstance(registration, str) or not registration for registration in worker_type_registrations):
+        raise ProtocolError("value Worker type registrations are invalid")
+    type_lines = ["Попытка", "ТипыОбъектовWorker = Новый Массив;"]
+    for index, registration in enumerate(worker_type_registrations):
+        type_lines.extend(
+            (
+                f"ВременныйОбъектWorker{index} = ВнешниеОбработки.Создать("
+                f"{bsl_string_literal(registration)}, Ложь);",
+                f"ТипыОбъектовWorker.Добавить(ТипЗнч(ВременныйОбъектWorker{index}));",
+            )
+        )
     return "\n".join(
         (
+            *type_lines,
             "МатериализацияЗначения = "
             "RuntimeValueTransferServer.СериализоватьЗначение("
             f"{handle}, {bsl_string_literal(options.refs)}, "
-            f"{options.max_depth}, {options.max_items}, {options.max_bytes});",
-            f"Контекст.Вставить({bsl_string_literal(context_key)}, "
+            f"{options.max_depth}, {options.max_items}, {options.max_bytes}, ТипыОбъектовWorker);",
+            "Если Не МатериализацияЗначения.Доступ Тогда",
+            '    Результат = "D|worker_generation_value";',
+            "Иначе",
+            f"    Контекст.Вставить({bsl_string_literal(context_key)}, "
             "МатериализацияЗначения.Base64);",
-            "Результат = "
+            "    Результат = \"R|\" + "
             f'Формат({runtime_generation}, "ЧГ=0; ЧДЦ=0") + "|" + '
             f'Формат({context_generation}, "ЧГ=0; ЧДЦ=0") + "|" + '
             'Формат(МатериализацияЗначения.Размер, "ЧГ=0; ЧДЦ=0") + "|" + '
             'МатериализацияЗначения.Хеш + "|" + '
             "Формат(СтрДлина(МатериализацияЗначения.Base64), "
             '"ЧГ=0; ЧДЦ=0");',
+            "КонецЕсли;",
+            "Исключение",
+            '    Результат = "E|value_admission_failed";',
+            "КонецПопытки;",
         )
     )
 
@@ -79,6 +99,7 @@ class RuntimeValueTransfer:
         key_factory: Callable[[], str] | None = None,
         profiler: PhaseRecorder | None = None,
         capture_executor: Callable[[CaptureTransferPlan], bytes] | None = None,
+        worker_type_registrations: Callable[[], tuple[str, ...]] | None = None,
     ) -> None:
         self._capture_execute = capture_executor
         self._execute = instruction_executor
@@ -89,6 +110,7 @@ class RuntimeValueTransfer:
         self._expected_runtime_generation = runtime_generation()
         self._key_factory = key_factory or (lambda: VALUE_CONTEXT_KEY_PREFIX + uuid4().hex)
         self._profiler = profiler
+        self._worker_type_registrations = worker_type_registrations
 
     def materialize(self, handle: str, options: MaterializationOptions) -> object:
         payload = self.payload(handle, options)
@@ -109,22 +131,27 @@ class RuntimeValueTransfer:
             key,
             runtime_generation=generation,
             context_generation=self._context_generation,
+            worker_type_registrations=(
+                ()
+                if self._worker_type_registrations is None
+                else self._worker_type_registrations()
+            ),
         )
         maximum_transfer_bytes = max(options.max_bytes, _ERROR_ENVELOPE_MAX_BYTES)
         maximum_text_size = _base64_length(maximum_transfer_bytes)
 
         def decode(metadata: object, content: str) -> bytes:
-            observed = _parse_metadata(metadata)
+            observed = AdmissionEnvelopeV1.parse(
+                metadata,
+                max_payload_bytes=maximum_transfer_bytes,
+                max_base64_chars=maximum_text_size,
+            )
             if (
-                observed[0] != generation
-                or observed[1] != self._context_generation
-                or observed[2] <= 0
-                or observed[2] > maximum_transfer_bytes
-                or observed[4] <= 0
-                or observed[4] > maximum_text_size
-                or len(content) != observed[4]
+                observed.runtime_generation != generation
+                or observed.context_generation != self._context_generation
+                or len(content) != observed.base64_chars
             ):
-                raise ProtocolError("value materialization metadata is invalid")
+                raise CaptureValueCheckError("CAPTURE value admission result is invalid")
             try:
                 payload = self._profile(
                     "value.decode_base64",
@@ -134,8 +161,11 @@ class RuntimeValueTransfer:
                 )
             except (ValueError, binascii.Error) as error:
                 raise ProtocolError("value materialization Base64 payload is invalid") from error
-            if len(payload) != observed[2] or sha256(payload).hexdigest() != observed[3]:
-                raise ProtocolError("value materialization payload integrity check failed")
+            if (
+                len(payload) != observed.payload_bytes
+                or sha256(payload).hexdigest() != observed.payload_sha256
+            ):
+                raise CaptureValueCheckError("CAPTURE value payload integrity check failed")
             return payload
 
         return CaptureTransferPlan(
@@ -152,6 +182,16 @@ class RuntimeValueTransfer:
         try:
             metadata = self._profile("value.prepare", lambda: self._execute(plan.instruction),
                                      input_bytes=len(plan.instruction.encode("utf-8")))
+            envelope = AdmissionEnvelopeV1.parse(
+                metadata,
+                max_payload_bytes=max(options.max_bytes, _ERROR_ENVELOPE_MAX_BYTES),
+                max_base64_chars=plan.max_text_size,
+            )
+            if (
+                envelope.runtime_generation != self._expected_runtime_generation
+                or envelope.context_generation != self._context_generation
+            ):
+                raise CaptureValueCheckError("CAPTURE value admission result is invalid")
             content = self._profile("value.transfer_base64",
                                     lambda: self._read(plan.private_key, plan.max_text_size),
                                     output_bytes=lambda value: len(value.encode("ascii")))
@@ -178,31 +218,6 @@ class RuntimeValueTransfer:
         if self._profiler is None:
             return operation()
         return self._profiler.measure(phase, operation, **metadata)
-
-
-def _parse_metadata(value: object) -> tuple[int, int, int, str, int]:
-    if not isinstance(value, str):
-        raise ProtocolError("value materialization metadata is not a string")
-    fields = value.split("|")
-    if len(fields) != 5:
-        raise ProtocolError("value materialization metadata field count is invalid")
-    try:
-        runtime_generation = int(fields[0])
-        context_generation = int(fields[1])
-        byte_count = int(fields[2])
-        base64_count = int(fields[4])
-    except ValueError as error:
-        raise ProtocolError("value materialization metadata number is invalid") from error
-    payload_hash = fields[3]
-    if not _HASH.fullmatch(payload_hash):
-        raise ProtocolError("value materialization metadata hash is invalid")
-    return (
-        runtime_generation,
-        context_generation,
-        byte_count,
-        payload_hash,
-        base64_count,
-    )
 
 
 def _base64_length(byte_count: int) -> int:

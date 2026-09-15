@@ -103,7 +103,7 @@ class FakeRuntime:
 
         return RuntimeNamespaceSnapshot(1, 1, ("ГДФЛ",))
 
-    def require_public_value_handle(self, handle: str) -> None:
+    def validate_value_reference(self, handle: str) -> None:
         del handle
 
 

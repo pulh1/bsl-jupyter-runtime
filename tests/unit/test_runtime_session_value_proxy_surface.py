@@ -29,9 +29,14 @@ class FakeRuntimeApi:
         self.handle = WorkerGenerationHandle(1, 1, 1, "a" * 64)
         self.active_units: dict[str, WorkerModuleUnit] = {}
 
-    def require_public_value_handle(self, handle: str) -> None:
+    def validate_value_reference(self, handle: str) -> None:
         self.guard_calls.append(handle)
-        if handle in self.forbidden_handles:
+        if handle in self.forbidden_handles or handle.casefold().startswith(
+            (
+                "контекст.runtimeworkeractivegeneration",
+                "__onecpinnedworkergeneration",
+            )
+        ):
             raise ProtocolError("Worker generation objects are not public values")
 
     def materialize_value(self, handle: str, **options: object) -> object:

@@ -65,7 +65,7 @@ def test_pending_status_has_safe_capabilities_and_actionable_wait_guidance() -> 
         stop_sequence=2,
         phase=CapturePhase.EVALUATING,
         pending_evaluation_id="eval-<guard>",
-        evaluation_kind=CaptureEvaluationKind.PUBLIC_VALUE_GUARD,
+        evaluation_kind=CaptureEvaluationKind.MATERIALIZATION_HELPER,
         evaluation_timing=CaptureEvaluationTiming(
             evaluation_id="eval-<guard>",
             created_at_utc=datetime(2026, 9, 15, tzinfo=timezone.utc),
@@ -78,7 +78,7 @@ def test_pending_status_has_safe_capabilities_and_actionable_wait_guidance() -> 
     html = render_capture_html(status)
 
     assert "CAPTURE: evaluating" in text
-    assert "public_value_guard" in text
+    assert "materialization_helper" in text
     assert "eval-<guard>" in text
     assert "can_inspect: no" in text
     assert "can_wait: yes" in text

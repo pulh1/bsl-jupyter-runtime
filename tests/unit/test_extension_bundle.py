@@ -72,8 +72,8 @@ def test_dump_fingerprint_separates_permanent_identity_from_exact_artifact(
     dump = write_dump_fixture(
         tmp_path,
         extension_name="OnecInteractiveRuntime",
-        artifact_version="0.1.0",
-        protocol_version="1",
+        artifact_version="0.1.3",
+        protocol_version="2",
     )
 
     fingerprints = fingerprint_extension_dump(dump)
@@ -82,7 +82,7 @@ def test_dump_fingerprint_separates_permanent_identity_from_exact_artifact(
     assert fingerprints.identity.extension_name == "OnecInteractiveRuntime"
     assert fingerprints.identity.purpose == "AddOn"
     assert fingerprints.artifact.language_bound_by_name is False
-    assert fingerprints.artifact.protocol_version == "1"
+    assert fingerprints.artifact.protocol_version == "2"
     assert fingerprints.artifact.metadata
     assert fingerprints.artifact.source_sha256 == tuple(
         sorted(fingerprints.artifact.source_sha256)
@@ -333,7 +333,7 @@ def test_dump_fingerprint_rejects_handshake_disagreement(tmp_path: Path) -> None
     source = server.read_text(encoding="utf-8-sig")
     server.write_text(
         source.replace(
-            'ВерсияПротоколаRuntime = "1";', 'ВерсияПротоколаRuntime = "2";'
+            'ВерсияПротоколаRuntime = "2";', 'ВерсияПротоколаRuntime = "1";'
         ),
         encoding="utf-8-sig",
     )

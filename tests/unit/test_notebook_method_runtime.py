@@ -179,13 +179,9 @@ def test_compile_invalid_worker_registration_is_not_recreated_by_value_guard(tmp
     registrations = api._worker_universe_target.privacy_registration_snapshot()
     assert set(registrations) == before
     assert len(api._worker_universe_target._registrations) > len(registrations)
-    target.public_value_guard_results.append(False)
-    api.require_public_value_handles(('Контекст.Число',))
-    guard_source = next(
-        source for source in reversed(target.sources)
-        if 'onec-worker-public-value-guard' in source
-    )
-    assert all(name in guard_source for name in registrations)
+    before_validation = list(target.sources)
+    assert api.validate_value_reference("Контекст.Число") == "Контекст.Число"
+    assert target.sources == before_validation
 
 
 @pytest.mark.parametrize('prepared', [False, True])

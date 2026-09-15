@@ -376,9 +376,9 @@ class OnecValueProxy:
             raise ProtocolError("1C value proxy is stale after runtime generation change")
         if self.name.casefold() not in {name.casefold() for name in snapshot.names}:
             raise ProtocolError(f"BSL name {self.name!r} is no longer persistent")
-        guard = getattr(runtime, "require_public_value_handle", None)
+        guard = getattr(runtime, "validate_value_reference", None)
         if not callable(guard):
-            raise ProtocolError("1C runtime does not expose a public-value guard")
+            raise ProtocolError("1C runtime does not expose local reference validation")
         guard(self._context_handle())
         return runtime
 
@@ -408,16 +408,12 @@ class _BslNamespaceBridge:
         snapshot = method()
         if not isinstance(snapshot, RuntimeNamespaceSnapshot):
             raise ProtocolError("1C runtime namespace snapshot is invalid")
-        guard = getattr(runtime, "require_public_value_handle", None)
+        guard = getattr(runtime, "validate_value_reference", None)
         if not callable(guard):
-            raise ProtocolError("1C runtime does not expose a public-value guard")
+            raise ProtocolError("1C runtime does not expose local reference validation")
         handles = tuple(f"Контекст.{name}" for name in snapshot.names)
-        batch_guard = getattr(runtime, "require_public_value_handles", None)
-        if callable(batch_guard):
-            batch_guard(handles)
-        else:
-            for handle in handles:
-                guard(handle)
+        for handle in handles:
+            guard(handle)
 
         proposed = dict(self._proxies)
         for name in snapshot.names:

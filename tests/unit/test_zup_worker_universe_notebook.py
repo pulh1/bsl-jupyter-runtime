@@ -1644,7 +1644,7 @@ def test_worker_proxy_privacy_uses_bare_names_and_exact_context_handles() -> Non
         def namespace_snapshot(self) -> RuntimeNamespaceSnapshot:
             return RuntimeNamespaceSnapshot(7, 3, ())
 
-        def require_public_value_handle(self, handle: str) -> None:
+        def validate_value_reference(self, handle: str) -> None:
             self.handles.append(handle)
             raise ProtocolError("Worker generation objects are not public values")
 

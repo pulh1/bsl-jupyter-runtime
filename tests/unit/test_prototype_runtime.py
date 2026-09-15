@@ -1700,7 +1700,7 @@ def test_unselected_preview_uses_one_native_selection_and_one_transfer_through_f
     ).encode("utf-8")
     encoded = b64encode(payload).decode("ascii")
     metadata = (
-        f"1|1|{len(payload)}|{sha256(payload).hexdigest()}|{len(encoded)}"
+        f"R|1|1|{len(payload)}|{sha256(payload).hexdigest()}|{len(encoded)}"
     )
 
     class StrictCaptureSession(ScriptedSession):

@@ -202,7 +202,7 @@ def _older_dump(root: Path) -> Path:
 
 
 def _version_dump(
-    root: Path, artifact_version: str, *, protocol_version: str = "1"
+    root: Path, artifact_version: str, *, protocol_version: str = "2"
 ) -> Path:
     return write_dump_fixture(
         root,
@@ -413,7 +413,7 @@ def test_same_0_1_0_exact_mismatch_fails_closed_without_mutation(
     mismatch: str,
 ) -> None:
     installed = (
-        _version_dump(tmp_path / mismatch, "0.1.0", protocol_version="999")
+        _version_dump(tmp_path / mismatch, "0.1.3", protocol_version="999")
         if mismatch == "protocol"
         else _same_version_source_mismatch(tmp_path / mismatch)
     )
@@ -686,7 +686,7 @@ def test_two_sided_handshake_commits_exact_manifest_bound_marker(
             replace(client, artifact_version="0.0.9"),
             server,
         ),
-        lambda client, server: (replace(client, protocol_version="2"), server),
+        lambda client, server: (replace(client, protocol_version="1"), server),
         lambda client, server: (
             replace(client, location=server.location),
             server,

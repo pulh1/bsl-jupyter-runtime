@@ -41,7 +41,7 @@ class FakeRuntime:
         self.guard_calls: list[str] = []
         self.forbidden_handles: set[str] = set()
 
-    def require_public_value_handle(self, handle: str) -> None:
+    def validate_value_reference(self, handle: str) -> None:
         self.guard_calls.append(handle)
         if handle in self.forbidden_handles:
             raise ProtocolError("Worker generation objects are not public values")
@@ -77,35 +77,22 @@ class FakeRuntime:
         return [5, 6]
 
 
-class BatchGuardRuntime(FakeRuntime):
-    def __post_init__(self) -> None:
-        super().__post_init__()
-        self.batch_guard_calls: list[tuple[str, ...]] = []
-
-    def require_public_value_handles(self, handles: tuple[str, ...]) -> None:
-        self.batch_guard_calls.append(handles)
-        if any(handle in self.forbidden_handles for handle in handles):
-            raise ProtocolError("Worker generation objects are not public values")
-
-
-def test_namespace_sync_checks_all_names_in_one_batch_without_caching_admission() -> None:
+def test_namespace_sync_validates_every_name_locally_without_caching() -> None:
     shell = FakeShell()
-    runtime = BatchGuardRuntime(names=("Первое", "Второе", "Третье", "Четвертое", "Пятое"))
+    runtime = FakeRuntime(names=("Первое", "Второе", "Третье", "Четвертое", "Пятое"))
     install_runtime(shell, runtime)
-    expected = tuple(f"Контекст.{name}" for name in runtime.names)
-    assert runtime.batch_guard_calls == [expected]
-    assert runtime.guard_calls == []
+    expected = [f"Контекст.{name}" for name in runtime.names]
+    assert runtime.guard_calls == expected
     proxies = {name: shell.user_ns[name] for name in runtime.names}
 
     synchronize_bsl_namespace(shell)
-    assert runtime.batch_guard_calls == [expected, expected]
+    assert runtime.guard_calls == [*expected, *expected]
     assert all(shell.user_ns[name] is proxy for name, proxy in proxies.items())
-    assert runtime.guard_calls == []
 
 
-def test_failed_batch_admission_keeps_entire_previous_namespace() -> None:
+def test_failed_local_validation_keeps_entire_previous_namespace() -> None:
     shell = FakeShell()
-    runtime = BatchGuardRuntime(names=("СтароеИмя",))
+    runtime = FakeRuntime(names=("СтароеИмя",))
     install_runtime(shell, runtime)
     old_proxy = shell.user_ns["СтароеИмя"]
     old_namespace = shell.user_ns[BSL_NAMESPACE_NAME]
@@ -115,8 +102,11 @@ def test_failed_batch_admission_keeps_entire_previous_namespace() -> None:
     with pytest.raises(ProtocolError, match="Worker generation objects are not public values"):
         synchronize_bsl_namespace(shell)
 
-    assert runtime.batch_guard_calls[-1] == tuple(f"Контекст.{name}" for name in runtime.names)
-    assert runtime.guard_calls == []
+    assert runtime.guard_calls[-3:] == [
+        "Контекст.СтароеИмя",
+        "Контекст.НовоеИмя",
+        "Контекст.АлиасМодуля",
+    ]
     assert shell.user_ns["СтароеИмя"] is old_proxy
     assert shell.user_ns[BSL_NAMESPACE_NAME] is old_namespace
     assert "НовоеИмя" not in shell.user_ns

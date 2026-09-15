@@ -168,7 +168,6 @@ class CapturePhase(StrEnum):
 
 class CaptureEvaluationKind(StrEnum):
     USER_BSL = "user_bsl"
-    PUBLIC_VALUE_GUARD = "public_value_guard"
     INSPECTION = "inspection"
     MATERIALIZATION_HELPER = "materialization_helper"
 
@@ -182,7 +181,6 @@ class CaptureEvaluationState(StrEnum):
 
 _INTERNAL_EVALUATION_KINDS = frozenset(
     {
-        CaptureEvaluationKind.PUBLIC_VALUE_GUARD,
         CaptureEvaluationKind.INSPECTION,
         CaptureEvaluationKind.MATERIALIZATION_HELPER,
     }

@@ -276,12 +276,9 @@ class _UniverseInstructionExecutor:
         self.sources: list[str] = []
         self.disconnects: list[str] = []
         self.query_results: deque[object] = deque()
-        self.public_value_guard_results: deque[object] = deque()
 
     def __call__(self, source: str) -> object:
         self.sources.append(source)
-        if "onec-worker-public-value-guard" in source:
-            return self.public_value_guard_results.popleft()
         import re
 
         if f'"{WORKER_STAGE_SCHEMA}"' in source:
@@ -3808,7 +3805,7 @@ def test_api_materializes_table_without_active_worker() -> None:
     encoded = b64encode(content).decode()
     controller.context_value = encoded
     controller.worker_results.append(
-        f"1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}"
+        f"R|1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}"
     )
 
     profiler = PhaseRecorder()
@@ -3816,15 +3813,13 @@ def test_api_materializes_table_without_active_worker() -> None:
 
     assert frame.to_dict(orient="records") == [{"Имя": "А"}]
     assert len(controller.main_sources) == 1
-    assert controller.table_declared_schema_calls == ["Контекст.Таблица"]
+    assert controller.table_declared_schema_calls == []
     assert controller.table_sample_calls == []
-    assert "RuntimeTableTransferServer.СериализоватьКомпактнуюТаблицу" not in controller.main_sources[0]
-    assert "Строка(СтрокаМатериализации.Имя)" in controller.main_sources[0]
-    assert "RuntimeWorker" not in controller.main_sources[0]
+    assert "RuntimeTableTransferServer.СериализоватьКомпактнуюТаблицу" in controller.main_sources[0]
+    assert "ТипыОбъектовWorker = Новый Массив;" in controller.main_sources[0]
     assert len(controller.context_reads) == 1
     assert controller.context_reads[0][1] >= len(encoded)
     assert [event.phase for event in profiler.events] == [
-        "table.schema_read",
         "table.prepare_jsonl",
         "table.transfer_base64",
         "table.decode_base64",
@@ -3856,7 +3851,7 @@ def test_api_enforces_table_payload_row_budget_before_transport() -> None:
     controller.worker_results.extend(
         (
             "table",
-            f"1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}",
+            f"R|1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}",
         )
     )
 
@@ -3865,8 +3860,7 @@ def test_api_enforces_table_payload_row_budget_before_transport() -> None:
     )
 
     assert payload == content
-    assert "МаксимумСтрокМатериализации = 3;" in controller.main_sources[1]
-    assert "МаксимумБайтМатериализации = 4096;" in controller.main_sources[1]
+    assert "ТипыОбъектовWorker, 3, 4096);" in controller.main_sources[1]
 
 
 def test_api_project_to_df_transfers_only_bounded_table_projection() -> None:
@@ -3891,7 +3885,7 @@ def test_api_project_to_df_transfers_only_bounded_table_projection() -> None:
     encoded = b64encode(content).decode()
     controller.context_value = encoded
     controller.worker_results.extend(
-        (True, f"1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}")
+        (True, f"R|1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}")
     )
 
     frame = api.project_to_df(
@@ -3904,7 +3898,7 @@ def test_api_project_to_df_transfers_only_bounded_table_projection() -> None:
     assert frame.to_dict("records") == [{"Имя": "А"}]
     assert "Для ИндексПроекции = 20" in controller.main_sources[0]
     assert "Контекст.Таблица.Скопировать" in controller.main_sources[0]
-    assert "МаксимумСтрокМатериализации = 10;" in controller.main_sources[1]
+    assert "ТипыОбъектовWorker, 10, 4096);" in controller.main_sources[1]
     assert controller.context_drops[-1].startswith("__onec_projection_")
 
 
@@ -3925,7 +3919,7 @@ def test_api_project_value_decodes_only_bounded_array_projection() -> None:
         (
             "value",
             True,
-            f"1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}",
+            f"R|1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}",
         )
     )
 
@@ -3966,7 +3960,7 @@ def test_api_project_value_preserves_table_materialize_dataframe_semantics() -> 
         (
             "table",
             True,
-            f"1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}",
+            f"R|1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}",
         )
     )
 
@@ -4001,7 +3995,7 @@ def test_api_project_value_keeps_route_and_projection_under_one_writer(
         (
             "value",
             True,
-            f"1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}",
+            f"R|1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}",
         )
     )
     route_returned = Event()
@@ -4065,7 +4059,7 @@ def test_api_routes_recursive_value_materialization_without_active_worker() -> N
     controller.worker_results.extend(
         (
             "value",
-            f"1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}",
+            f"R|1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}",
         )
     )
 
@@ -4080,7 +4074,7 @@ def test_api_routes_recursive_value_materialization_without_active_worker() -> N
         == "Результат = RuntimeValueTransferServer."
         "ПолучитьВидМатериализации(Контекст.Данные);"
     )
-    assert "СериализоватьЗначение(Контекст.Данные, \"both\", 7, 99, 4096)" in (
+    assert "СериализоватьЗначение(Контекст.Данные, \"both\", 7, 99, 4096, ТипыОбъектовWorker)" in (
         controller.main_sources[1]
     )
     assert len(controller.context_reads) == 1
@@ -4110,14 +4104,14 @@ def test_api_routes_table_materialize_to_existing_dataframe_transport() -> None:
     controller.worker_results.extend(
         (
             "table",
-            f"1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}",
+            f"R|1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}",
         )
     )
 
     result = api.materialize_value("Контекст.Таблица")
 
     assert result.to_dict(orient="records") == [{"Имя": "А"}]
-    assert controller.table_declared_schema_calls == ["Контекст.Таблица"]
+    assert controller.table_declared_schema_calls == []
     assert len(controller.main_sources) == 2
 
 
@@ -4131,8 +4125,8 @@ class _RuntimeApiPreviewBackend:
     def materialize_value(self, handle: str, **options: object) -> object:
         return self.api.materialize_value(handle, **options)
 
-    def require_public_value_handle(self, handle: str) -> None:
-        self.api.require_public_value_handle(handle)
+    def validate_value_reference(self, handle: str) -> None:
+        self.api.validate_value_reference(handle)
 
 
 class _DeadlineAwarePreviewController(FakeController):
@@ -4168,7 +4162,7 @@ def _frame_table_preview(
     controller.worker_results.extend(
         (
             "table",
-            f"1|1|{len(payload)}|{sha256(payload).hexdigest()}|{len(encoded)}",
+            f"R|1|1|{len(payload)}|{sha256(payload).hexdigest()}|{len(encoded)}",
         )
     )
     api = PrototypeRuntimeApi(controller)
@@ -4225,18 +4219,10 @@ def test_frame_table_preview_uses_server_owned_row_byte_and_deadline_bounds() ->
     assert preview.truncated is True
     assert len(controller.capture_sources) == 2
     transfer_source = controller.capture_sources[1]
-    assert "МаксимумСтрокМатериализации = 1;" in transfer_source
-    assert "МаксимумБайтМатериализации = 512;" in transfer_source
-    assert (
-        "ПодготовитьТабличноеЗначение("
-        "Контекст.КонтекстОтладки.Таблица, МаксимумСтрокМатериализации)"
-        in transfer_source
-    )
-    assert controller.table_declared_schema_calls == [
-        "Контекст.КонтекстОтладки.Таблица"
-    ]
+    assert "ТипыОбъектовWorker, 1, 512);" in transfer_source
+    assert controller.table_declared_schema_calls == []
     assert len(controller.context_reads) == 1
-    assert len(controller.preview_command_timeouts) == 4
+    assert len(controller.preview_command_timeouts) == 3
     assert all(0 < value <= 0.75 for value in controller.preview_command_timeouts)
     assert controller.command_timeout_s == 30.0
 
@@ -4247,7 +4233,7 @@ def test_frame_table_preview_rejects_oversize_payload_before_transfer() -> None:
     controller.state = OperationState.CAPTURED
     payload = b"x" * 65
 
-    with pytest.raises(ProtocolError, match="metadata"):
+    with pytest.raises(ProtocolError, match="admission result"):
         _frame_table_preview(
             controller,
             payload=payload,
@@ -4256,8 +4242,7 @@ def test_frame_table_preview_rejects_oversize_payload_before_transfer() -> None:
         )
 
     assert len(controller.capture_sources) == 2
-    assert "МаксимумСтрокМатериализации = 1;" in controller.capture_sources[1]
-    assert "МаксимумБайтМатериализации = 64;" in controller.capture_sources[1]
+    assert "ТипыОбъектовWorker, 1, 64);" in controller.capture_sources[1]
     assert controller.context_reads == []
 
 
@@ -4287,7 +4272,7 @@ def test_api_materializes_recursive_value_while_capture_is_paused() -> None:
     controller.worker_results.extend(
         (
             "value",
-            f"1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}",
+            f"R|1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}",
         )
     )
 
@@ -5572,14 +5557,12 @@ def test_capture_transition_installs_exact_pin_and_clears_it_before_resume(
     assert api.operation_worker_generation is None
 
 
-def test_retired_g17_graph_remains_private_after_g18_g19(
+def test_local_reference_validation_does_not_run_worker_identity_policy(
     tmp_path: Path,
 ) -> None:
-    """Classification derives from target values, never mutable Context roots."""
-    catalog = _common_module_catalog("МодульА", "МодульБ", "МодульВ")
+    """Dynamic Worker identity is checked only by a materialization serializer."""
+    catalog = _common_module_catalog("МодульА")
     module_a = _worker_module_unit("МодульА", 17, catalog)
-    module_b = _worker_module_unit("МодульБ", 18, catalog)
-    module_c = _worker_module_unit("МодульВ", 19, catalog)
     packer = _notebook_worker_builder(tmp_path)
     target = _UniverseInstructionExecutor()
     controller = _PinnedOperationController()
@@ -5594,74 +5577,17 @@ def test_retired_g17_graph_remains_private_after_g18_g19(
         ),
         worker_instruction_executor=target,
     )
-    g17 = api.load_worker_modules((module_a,), common_modules=catalog)
-    assert api.execute_bsl("Результат = Capture();").kind is RuntimeReplyKind.CAPTURED
-    api.load_worker_modules((module_b,), common_modules=catalog)
-    api.load_worker_modules((module_c,), common_modules=catalog)
-    target.public_value_guard_results.extend((True, True, True, True))
+    api.load_worker_modules((module_a,), common_modules=catalog)
+    registrations = api._worker_universe_target.privacy_registration_snapshot()
+    target.sources.clear()
 
-    for alias in (
-        "Контекст.АлиасКорняG17",
-        "Контекст.АлиасModulesG17",
-        "Контекст.АлиасExportsG17",
-        "Контекст.АлиасМодуляG17",
-    ):
-        with pytest.raises(
-            ProtocolError,
-            match="^Worker generation objects are not public values$",
-        ):
-            api.require_public_value_handle(alias)
+    assert api.validate_value_reference("Контекст.АлиасМодуля") == "Контекст.АлиасМодуля"
 
-    guard_sources = [
-        source for source in target.sources
-        if "onec-worker-public-value-guard" in source
-    ]
-    connected_registrations = tuple(
-        sorted(
-            {
-                match.group(0)
-                for source in target.sources
-                    if f'"{WORKER_STAGE_SCHEMA}"' in source
-                for match in (
-                    re.search(r"OnecRuntime_[0-9a-f]{8}_[0-9a-f]{16}", source),
-                )
-                if match is not None
-            },
-            key=str.casefold,
-        )
-    )
-    assert len(connected_registrations) == 3
-    assert len(guard_sources) == 4
-    for source in guard_sources:
-        created_registrations = tuple(
-            re.findall(
-                r'ВнешниеОбработки\.Создать\("(OnecRuntime_[0-9a-f]{8}_[0-9a-f]{16})", Ложь\)',
-                source,
-            )
-        )
-        assert len(created_registrations) == len(connected_registrations)
-        assert created_registrations == connected_registrations
-        assert len({name.casefold() for name in created_registrations}) == len(
-            created_registrations
-        )
-        assert 'Тип("ВнешняяОбработкаОбъект")' not in source
-        assert "ТипЗнч(ВременныйОбъектWorker" in source
-        assert "ТипыОбъектовWorker.Найти(ТипПроверяемогоWorker)" in source
-        assert 'Свойство("ManifestSha256")' in source
-        assert 'Свойство("Modules")' in source
-        assert 'Свойство("Exports")' in source
-        assert '"OnecWorkerExportsV1"' in source
-        assert "ЭлементМодулейWorker.Значение" in source
-        assert "RuntimeWorkerActiveGeneration" not in source
-        assert "RuntimeWorkerPinnedOperationGeneration" not in source
-        PythonParserTarget.from_generated().parse(source, "Модуль")
-    assert not any(
-        "onec-worker-operation-root-clear" in source for source in target.sources
-    )
-    assert target.disconnects == []
+    assert target.sources == []
+    assert api._worker_universe_target.privacy_registration_snapshot() == registrations
 
 
-def test_target_guard_keeps_ordinary_fixed_maps_and_arrays_public(
+def test_local_reference_validation_accepts_ordinary_values_without_target_io(
     tmp_path: Path,
 ) -> None:
     catalog = _common_module_catalog("МодульА")
@@ -5680,190 +5606,54 @@ def test_target_guard_keeps_ordinary_fixed_maps_and_arrays_public(
         worker_instruction_executor=target,
     )
     api.load_worker_modules((module_a,), common_modules=catalog)
-    target.public_value_guard_results.extend((False, False))
-
-    api.require_public_value_handle("Контекст.ОбычноеФиксированноеСоответствие")
-    api.require_public_value_handle("Контекст.ОбычныйФиксированныйМассив")
-
-    for source in target.sources[-2:]:
-        assert 'Тип("ФиксированныйМассив")' not in source
-        assert '"OnecWorkerExportsV1"' in source
-
-
-@pytest.fixture(params=("api", "session"))
-def batch_value_guard(request: pytest.FixtureRequest, tmp_path: Path):
-    catalog = _common_module_catalog("МодульА")
-    packer = _notebook_worker_builder(tmp_path)
-    target = _UniverseInstructionExecutor()
-    controller = _PinnedOperationController()
-    api = PrototypeRuntimeApi(
-        controller,
-        notebook_worker_builder=packer,
-        worker_module_builder=WorkerModuleArtifactBuilder(
-            packer,
-            cache=WorkerModuleArtifactCache(),
-            packer_version="worker-epf-v1",
-            target_profile=catalog.profile,
-        ),
-        worker_instruction_executor=target,
-    )
-    api.load_worker_modules(
-        (_worker_module_unit("МодульА", 17, catalog),), common_modules=catalog
-    )
     target.sources.clear()
-    surface = api
-    if request.param == "session":
-        surface = RuntimeSession.__new__(RuntimeSession)
-        surface.runtime_api = api
-        surface._operation_lock = Lock()
-    return surface, api, controller, target
+
+    assert (
+        api.validate_value_reference("Контекст.ОбычноеФиксированноеСоответствие")
+        == "Контекст.ОбычноеФиксированноеСоответствие"
+    )
+    assert api.validate_value_reference("Контекст.ОбычныйФиксированныйМассив") == (
+        "Контекст.ОбычныйФиксированныйМассив"
+    )
+
+    assert target.sources == []
 
 
-def test_batch_value_guard_checks_five_values_in_one_instruction(batch_value_guard):
-    surface, api, _controller, target = batch_value_guard
-    handles = tuple(f"Контекст.Значение{index}" for index in range(5))
-    target.public_value_guard_results.append(False)
+@pytest.mark.parametrize(
+    "handle",
+    (
+        "Контекст.RuntimeWorkerActiveGeneration.Modules",
+        "контекст.runtimeworkerpinnedoperationgeneration",
+        "__onecPINNEDworkerGeneration.Modules",
+        "Контекст.Значение; Результат = Ложь",
+        "Контекст.Функция()",
+    ),
+)
+def test_local_reference_validation_rejects_reserved_or_malformed_handle_before_target(
+    handle: str,
+) -> None:
+    target = _UniverseInstructionExecutor()
+    api = PrototypeRuntimeApi(
+        _PinnedOperationController(), worker_instruction_executor=target
+    )
 
-    assert surface.require_public_value_handles(handles) is None
-
-    assert len(target.sources) == 1
-    source = target.sources[0]
-    for handle in handles:
-        assert source.count(handle) == 1
-    registrations = api._worker_universe_target.privacy_registration_snapshot()
-    assert source.count("ВнешниеОбработки.Создать(") == len(registrations)
-    for registration in registrations:
-        assert f'ВнешниеОбработки.Создать("{registration}", Ложь)' in source
-    # The remote request must check every candidate and accumulate any rejection.
-    assert "Для Каждого ПроверяемоеЗначениеWorker Из ПроверяемыеЗначенияWorker Цикл" in source
-    assert "ЕстьОбъектыWorker = ЕстьОбъектыWorker Или ЭтоОбъектWorker;" in source
-    assert "Результат = ЕстьОбъектыWorker;" in source
-    assert 'Свойство("ManifestSha256")' in source
-    assert 'Свойство("Modules")' in source
-    assert 'Свойство("Exports")' in source
-    assert '"OnecWorkerExportsV1"' in source
-    assert "ТипЗнч(ЭлементМодулейWorker.Значение)" in source
-    PythonParserTarget.from_generated().parse(source, "Модуль")
-
-
-def test_batch_value_guard_recreates_worker_in_promotion_mode(batch_value_guard):
-    surface, api, _controller, target = batch_value_guard
-    registrations = api._worker_universe_target.privacy_registration_snapshot()
-
-    def platform(source: str) -> object:
-        if "onec-worker-public-value-guard" in source:
-            for registration in registrations:
-                if (
-                    f'ВнешниеОбработки.Создать("{registration}", Ложь)'
-                    not in source
-                ):
-                    raise BslExecutionError("Worker object requires promotion mode")
-            return False
-        return target(source)
-
-    api._worker_instruction_executor = platform
-
-    surface.require_public_value_handles(("Контекст.с",))
-
-
-@pytest.mark.parametrize("bad_handle", (
-    "Контекст.RuntimeWorkerActiveGeneration.Modules",
-    "контекст.runtimeworkerpinnedoperationgeneration",
-    "__onecPINNEDworkerGeneration.Modules",
-    "Контекст.Значение; Результат = Ложь",
-    "Контекст.Функция()",
-))
-def test_batch_value_guard_rejects_later_invalid_handle_before_remote(
-    batch_value_guard, bad_handle: str,
-):
-    surface, _api, _controller, target = batch_value_guard
     with pytest.raises(ProtocolError):
-        surface.require_public_value_handles(("Контекст.Обычное", bad_handle))
+        api.validate_value_reference(handle)
+
     assert target.sources == []
 
 
-@pytest.mark.parametrize("handles", (["Контекст.Обычное"], "Контекст.Обычное", ("Контекст.Обычное", None)))
-def test_batch_value_guard_requires_tuple_of_strings(batch_value_guard, handles):
-    surface, _api, _controller, target = batch_value_guard
-    with pytest.raises(ProtocolError):
-        surface.require_public_value_handles(handles)
-    assert target.sources == []
+def test_session_delegates_single_local_reference_validation() -> None:
+    target = _UniverseInstructionExecutor()
+    api = PrototypeRuntimeApi(
+        _PinnedOperationController(), worker_instruction_executor=target
+    )
+    session = RuntimeSession.__new__(RuntimeSession)
+    session.runtime_api = api
+    session._operation_lock = Lock()
 
+    assert session.validate_value_reference("Контекст.Обычное") == "Контекст.Обычное"
 
-@pytest.mark.parametrize("result", (True, None, 0, "False", (False, False)))
-def test_batch_value_guard_rejects_entire_batch_unless_result_is_false(
-    batch_value_guard, result: object,
-):
-    surface, _api, _controller, target = batch_value_guard
-    target.public_value_guard_results.append(result)
-    with pytest.raises(ProtocolError, match="^Worker generation objects are not public values$"):
-        surface.require_public_value_handles(("Контекст.Обычное", "Контекст.АлиасWorker"))
-    assert len(target.sources) == 1
-
-
-@pytest.mark.parametrize("failure", ("missing_registry", "empty_registry", "remote"))
-def test_batch_value_guard_sanitizes_privacy_failures(batch_value_guard, failure):
-    surface, api, _controller, target = batch_value_guard
-    if failure == "missing_registry":
-        api._worker_universe_target = None
-    elif failure == "empty_registry":
-        api._worker_universe_target._registrations.clear()
-    # With no queued result the remote fixture raises IndexError.
-    with pytest.raises(ProtocolError, match="^Worker generation objects are not public values$") as raised:
-        surface.require_public_value_handles(("Контекст.Обычное", "Контекст.Другое"))
-    assert raised.value.__cause__ is None
-    assert raised.value.__suppress_context__
-    assert len(target.sources) == (1 if failure == "remote" else 0)
-
-
-def test_batch_value_guard_empty_and_admitted_metadata_need_no_remote(batch_value_guard):
-    surface, _api, controller, target = batch_value_guard
-    controller.is_capture_metadata_handle = lambda handle: handle == "capture_table_metadata_valid"
-    surface.require_public_value_handles(())
-    surface.require_public_value_handles(("capture_table_metadata_valid",))
-    assert target.sources == []
-
-
-@pytest.mark.parametrize("admitted", (False, None, 1))
-def test_batch_value_guard_metadata_requires_explicit_admission(batch_value_guard, admitted):
-    surface, _api, controller, target = batch_value_guard
-    controller.is_capture_metadata_handle = lambda handle: admitted
-    with pytest.raises(ProtocolError, match="^Worker generation objects are not public values$"):
-        surface.require_public_value_handles(("Контекст.Обычное", "capture_table_metadata_unknown"))
-    assert target.sources == []
-
-
-def test_batch_value_guard_resolves_capture_values_and_skips_admitted_metadata(batch_value_guard):
-    surface, _api, controller, target = batch_value_guard
-    controller.is_capture_metadata_handle = lambda handle: True
-    controller.capture_value_handle = {
-        "capture_table_valid": "Контекст.Таблица",
-        "capture_manager_valid": "Контекст.Менеджер",
-    }.__getitem__
-    target.public_value_guard_results.append(False)
-    surface.require_public_value_handles((
-        "capture_table_valid", "capture_table_metadata_valid", "capture_manager_valid",
-    ))
-    assert len(target.sources) == 1
-    assert "Контекст.Таблица" in target.sources[0]
-    assert "Контекст.Менеджер" in target.sources[0]
-    assert "capture_" not in target.sources[0]
-
-
-def test_batch_value_guard_capture_quarantine_fails_before_remote(batch_value_guard):
-    surface, api, _controller, target = batch_value_guard
-    api._capture_inspection_quarantined = True
-    with pytest.raises(ProtocolError, match="quarantined"):
-        surface.require_public_value_handles(("Контекст.Обычное", "capture_manager_valid"))
-    assert target.sources == []
-
-
-def test_batch_value_guard_without_generation_still_validates_all_handles(batch_value_guard):
-    surface, api, _controller, target = batch_value_guard
-    api._worker_generation_handle = None
-    surface.require_public_value_handles(("Контекст.Обычное", "Контекст.Другое"))
-    with pytest.raises(ProtocolError):
-        surface.require_public_value_handles(("Контекст.Обычное", "malformed;"))
     assert target.sources == []
 
 
@@ -7461,88 +7251,6 @@ def test_runtime_rejects_worker_generation_materialization_before_controller(
 
     assert controller.main_sources == []
     assert controller.capture_sources == []
-
-
-def test_runtime_rejects_aliased_worker_module_by_target_identity(tmp_path: Path) -> None:
-    catalog = _common_module_catalog("МодульА")
-    module_a = _worker_module_unit("МодульА", 17, catalog)
-    packer = _notebook_worker_builder(tmp_path)
-    target = _UniverseInstructionExecutor()
-    target.public_value_guard_results.append(True)
-    controller = _PinnedOperationController()
-    api = PrototypeRuntimeApi(
-        controller,
-        notebook_worker_builder=packer,
-        worker_module_builder=WorkerModuleArtifactBuilder(
-            packer,
-            cache=WorkerModuleArtifactCache(),
-            packer_version="worker-epf-v1",
-            target_profile=catalog.profile,
-        ),
-        worker_instruction_executor=target,
-    )
-    api.load_worker_modules((module_a,), common_modules=catalog)
-
-    with pytest.raises(
-        ProtocolError,
-        match="^Worker generation objects are not public values$",
-    ):
-        api.materialize_value("Контекст.АлиасМодуля")
-
-    guard_source = next(
-        item for item in target.sources if "onec-worker-public-value-guard" in item
-    )
-    assert (
-        "Для Каждого ЭлементМодулейWorker Из ПроверяемоеЗначениеWorker Цикл"
-        in guard_source
-    )
-    assert (
-        "ТипЗнч(ЭлементМодулейWorker.Значение)"
-        in guard_source
-    )
-    assert guard_source.count("ВнешниеОбработки.Создать(") == 1
-    assert 'Тип("ВнешняяОбработкаОбъект")' not in guard_source
-    assert (
-        "ТипыОбъектовWorker.Найти("
-        "ТипЗнч(ЭлементМодулейWorker.Значение))"
-        in guard_source
-    )
-    assert 'Тип("ФиксированнаяСтруктура")' in guard_source
-    assert '"OnecWorkerExportsV1"' in guard_source
-    assert "RuntimeWorkerActiveGeneration" not in guard_source
-    assert controller.main_sources == []
-
-
-def test_runtime_rejects_aliased_worker_module_before_direct_table_transport(
-    tmp_path: Path,
-) -> None:
-    catalog = _common_module_catalog("МодульА")
-    module_a = _worker_module_unit("МодульА", 17, catalog)
-    packer = _notebook_worker_builder(tmp_path)
-    target = _UniverseInstructionExecutor()
-    target.public_value_guard_results.append(True)
-    controller = _PinnedOperationController()
-    api = PrototypeRuntimeApi(
-        controller,
-        notebook_worker_builder=packer,
-        worker_module_builder=WorkerModuleArtifactBuilder(
-            packer,
-            cache=WorkerModuleArtifactCache(),
-            packer_version="worker-epf-v1",
-            target_profile=catalog.profile,
-        ),
-        worker_instruction_executor=target,
-    )
-    api.load_worker_modules((module_a,), common_modules=catalog)
-
-    with pytest.raises(
-        ProtocolError,
-        match="^Worker generation objects are not public values$",
-    ):
-        api.materialize_table("Контекст.АлиасМодуля")
-
-    assert any("onec-worker-public-value-guard" in item for item in target.sources)
-    assert controller.context_reads == []
 
 
 def test_runtime_rejects_operation_pin_returned_as_user_value(tmp_path: Path) -> None:

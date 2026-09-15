@@ -147,6 +147,31 @@ def write_manifest_fixture(
         "name_prefix": "OnecInteractiveRuntime_",
         "vendor": "onec-interactive-runtime",
     }
+    source_hashes = {
+        "Ext/ManagedApplicationModule.bsl": sha256(
+            (
+                "Процедура Запуск()\n"
+                + _handshake(artifact_version, protocol_version)
+                + "\tС = 1; // @runtime-extension-service-breakpoint\nКонецПроцедуры\n"
+            ).encode("utf-8")
+        ).hexdigest(),
+        "CommonModules/RuntimeKernelServer/Ext/Module.bsl": sha256(
+            (
+                "Процедура Запустить()\n"
+                + _handshake(artifact_version, protocol_version)
+                + "\tКонтекст = Новый Структура; // @runtime-server-extension-entry-breakpoint\n"
+                + "\tС = 1; // @runtime-server-extension-service-breakpoint\nКонецПроцедуры\n"
+            ).encode("utf-8")
+        ).hexdigest(),
+        "CommonModules/RuntimeTableTransferServer/Ext/Module.bsl": sha256(
+            "Функция СериализоватьКомпактнуюТаблицу() Экспорт\n"
+            "\tВозврат Истина;\nКонецФункции\n".encode("utf-8")
+        ).hexdigest(),
+        "CommonModules/RuntimeValueTransferServer/Ext/Module.bsl": sha256(
+            "Функция СериализоватьЗначение() Экспорт\n"
+            "\tВозврат Истина;\nКонецФункции\n".encode("utf-8")
+        ).hexdigest(),
+    }
     artifact = {
         "artifact_version": artifact_version,
         "protocol_version": protocol_version,
@@ -190,12 +215,7 @@ def write_manifest_fixture(
                 "object_id": MANAGED_OBJECT_ID,
             },
         ],
-        "source_sha256": {
-            "CommonModules/RuntimeKernelServer/Ext/Module.bsl": "05e02a1ff3063eb9208d97a94ccd2a4ce3ac0f8c6de1588587d2103d46ad11e9",
-            "CommonModules/RuntimeTableTransferServer/Ext/Module.bsl": "15e02a1ff3063eb9208d97a94ccd2a4ce3ac0f8c6de1588587d2103d46ad11e8",
-            "CommonModules/RuntimeValueTransferServer/Ext/Module.bsl": "25e02a1ff3063eb9208d97a94ccd2a4ce3ac0f8c6de1588587d2103d46ad11e7",
-            "Ext/ManagedApplicationModule.bsl": "90738a90599154558cfb12e7646fcb8fd6b765c9381a03716368a05de374828a",
-        },
+        "source_sha256": source_hashes,
     }
     location = {
         "module_type": "ExtensionModule",

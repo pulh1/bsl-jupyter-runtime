@@ -51,7 +51,7 @@ class RuntimeResource:
     def namespace_snapshot(self):
         return RuntimeNamespaceSnapshot(1, 1, ())
 
-    def require_public_value_handle(self, handle):
+    def validate_value_reference(self, handle):
         pass
 
     def close(self):
@@ -1379,7 +1379,7 @@ from IPython.core.interactiveshell import InteractiveShell
 class Resource:
     def namespace_snapshot(self):
         return RuntimeNamespaceSnapshot(1, 1, ())
-    def require_public_value_handle(self, handle):
+    def validate_value_reference(self, handle):
         pass
     def close(self):
         import time
