@@ -10,10 +10,12 @@ from onec_runtime.bsl.diagnostics import (
     DiagnosticTextSpan,
     DiagnosticCoordinateSpace,
     DiagnosticStage,
+    ErrorTraceFrameOrigin,
     MappingConfidence,
     PlatformCoordinateCodec,
     VisibleSourceContext,
     WorkerDiagnosticArtifact,
+    normalize_platform_diagnostic_trace,
     parse_platform_diagnostic,
     normalize_source_error,
     remap_platform_diagnostic,
@@ -442,6 +444,104 @@ def test_private_platform_text_fails_closed_under_generic_serialization() -> Non
 
     assert parsed.platform_diagnostic == raw
     assert normalized.platform_diagnostic == raw
+
+
+def test_main_trace_maps_every_generated_frame_and_visible_line() -> None:
+    source = "Первый();\nВторой();"
+    diagnostic = remap_platform_diagnostic(
+        parse_platform_diagnostic(
+            "{<Неизвестный модуль>(1,1)}: first\n"
+            "{<Неизвестный модуль>(2,1)}: second"
+        ),
+        _wrapped(source),
+        stage=DiagnosticStage.EXECUTION,
+        visible_source_context=_visible_context(source),
+    )
+
+    assert [frame.origin for frame in diagnostic.frames] == [
+        ErrorTraceFrameOrigin.EXECUTED_ARTIFACT,
+        ErrorTraceFrameOrigin.EXECUTED_ARTIFACT,
+    ]
+    assert [frame.mapping_confidence for frame in diagnostic.frames] == [
+        MappingConfidence.EXACT,
+        MappingConfidence.EXACT,
+    ]
+    assert [frame.visible_location.line for frame in diagnostic.frames] == [1, 2]
+    context = _visible_context(source)
+    unit = diagnostic.frames[0].source_unit
+    assert unit is not None
+    assert [frame.visible_line_span for frame in diagnostic.frames] == [
+        context.line_range(unit, 1),
+        context.line_range(unit, 2),
+    ]
+
+
+def test_native_trace_keeps_direct_platform_coordinates_without_map() -> None:
+    diagnostic = normalize_platform_diagnostic_trace(
+        parse_platform_diagnostic(
+            "{ОбщийМодуль.Сервис.Модуль(12)}: native frame"
+        ),
+        stage=DiagnosticStage.EXECUTION,
+    )
+
+    frame = diagnostic.frames[0]
+    assert frame.origin is ErrorTraceFrameOrigin.NATIVE_MODULE
+    assert (frame.platform_location.line, frame.platform_location.column) == (12, None)
+    assert frame.mapping_confidence is MappingConfidence.UNKNOWN
+    assert frame.visible_location is None
+
+
+def test_trace_order_does_not_redefine_legacy_primary_location() -> None:
+    source = "Результат = 1;"
+    diagnostic = remap_platform_diagnostic(
+        parse_platform_diagnostic(
+            "{ОбщийМодуль.Сервис.Модуль(7,3)}: host\n"
+            "{<Неизвестный модуль>(1,1)}: generated"
+        ),
+        _wrapped(source),
+        stage=DiagnosticStage.EXECUTION,
+        visible_source_context=_visible_context(source),
+    )
+
+    assert diagnostic.mapping_confidence is MappingConfidence.UNKNOWN
+    assert diagnostic.visible_location is None
+    assert diagnostic.frames[0].origin is ErrorTraceFrameOrigin.NATIVE_MODULE
+    assert diagnostic.frames[1].mapping_confidence is MappingConfidence.EXACT
+
+
+def test_line_only_main_frames_map_only_one_exact_code_span() -> None:
+    exact_source = "    Результат = 1;"
+    exact = remap_platform_diagnostic(
+        parse_platform_diagnostic("{<Неизвестный модуль>(1)}: exact"),
+        _wrapped(exact_source),
+        stage=DiagnosticStage.EXECUTION,
+        visible_source_context=_visible_context(exact_source),
+    )
+
+    unit = SourceUnitRef(
+        SourceUnitKind.NOTEBOOK_CELL,
+        "ambiguous-cell",
+        1,
+        source_sha256("Первый();Пропуск();Второй();"),
+    )
+    visible = mapped_visible_source("Первый();Пропуск();Второй();", unit)
+    builder = SourceTransformBuilder(visible)
+    builder.copy(SourceSpan(0, 9))
+    builder.copy(SourceSpan(19, len(visible.text)))
+    ambiguous_source = builder.build(SourceArtifactKind.EXECUTED_BSL)
+    ambiguous = remap_platform_diagnostic(
+        parse_platform_diagnostic("{<Неизвестный модуль>(1)}: ambiguous"),
+        ambiguous_source,
+        stage=DiagnosticStage.EXECUTION,
+        visible_source_context=VisibleSourceContext(
+            {unit: "Первый();Пропуск();Второй();"}
+        ),
+    )
+
+    assert exact.frames[0].mapping_confidence is MappingConfidence.EXACT
+    assert exact.frames[0].lowered_location.column == 5
+    assert ambiguous.frames[0].mapping_confidence is MappingConfidence.UNKNOWN
+    assert ambiguous.frames[0].lowered_location is None
 
 
 def test_coordinate_codec_uses_exact_unicode_and_crlf_artifact() -> None:

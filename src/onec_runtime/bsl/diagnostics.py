@@ -299,6 +299,44 @@ class LoweredSourceLocation:
     span: SourceSpan
 
 
+class ErrorTraceFrameOrigin(StrEnum):
+    EXECUTED_ARTIFACT = "executed_artifact"
+    WORKER_ARTIFACT = "worker_artifact"
+    NATIVE_MODULE = "native_module"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True, slots=True)
+class ErrorTraceCause:
+    ordinal: int
+    summary_span: DiagnosticTextSpan
+    block_span: DiagnosticTextSpan
+    frame_ordinals: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ErrorTraceFrame:
+    ordinal: int
+    cause_ordinal: int | None
+    origin: ErrorTraceFrameOrigin
+    platform_location: PlatformDiagnosticLocation
+    block_span: DiagnosticTextSpan
+    detail_span: DiagnosticTextSpan | None
+    mapping_confidence: MappingConfidence
+    registration_name: str | None = None
+    logical_name: str | None = None
+    revision: int | None = None
+    artifact_sha256: str | None = None
+    source_unit: SourceUnitRef | None = None
+    visible_location: VisibleSourceLocation | None = None
+    visible_line_span: SourceSpan | None = None
+    related_visible_span: SourceSpan | None = None
+    lowered_location: LoweredSourceLocation | None = None
+    synthetic_region: str | None = None
+    dependency_anchor: SourceSpan | None = None
+    method_anchor: SourceSpan | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class NormalizedDiagnostic:
     diagnostic_id: str
@@ -323,6 +361,10 @@ class NormalizedDiagnostic:
     dependency_anchor: SourceSpan | None = None
     method_anchor: SourceSpan | None = None
     worker_frames: tuple[WorkerRuntimeFrameDiagnostic, ...] = ()
+    causes: tuple[ErrorTraceCause, ...] = ()
+    frames: tuple[ErrorTraceFrame, ...] = ()
+    frames_truncated: bool = False
+    causes_truncated: bool = False
 
     @property
     def platform_diagnostic(self) -> str | None:
@@ -793,7 +835,7 @@ def remap_worker_runtime_diagnostic(
     )
 
 
-def remap_platform_diagnostic(
+def _remap_platform_primary(
     parsed: ParsedPlatformDiagnostic,
     executed: MappedSource,
     *,
@@ -857,6 +899,212 @@ def remap_platform_diagnostic(
         platform_diagnostic_redacted=parsed.platform_diagnostic_redacted,
         execution_artifact_sha256=executed.artifact.source_sha256,
         source_map_sha256=executed.source_map_sha256,
+    )
+
+
+def remap_platform_diagnostic(
+    parsed: ParsedPlatformDiagnostic,
+    executed: MappedSource,
+    *,
+    stage: DiagnosticStage,
+    visible_source_context: VisibleSourceContext | None = None,
+) -> NormalizedDiagnostic:
+    return normalize_platform_diagnostic_trace(
+        parsed,
+        stage=stage,
+        executed=executed,
+        visible_source_context=visible_source_context,
+    )
+
+
+def _visible_line_span(
+    mapping: _MappedDiagnosticOffset,
+    context: VisibleSourceContext | None,
+) -> SourceSpan | None:
+    if mapping.visible is None or context is None:
+        return None
+    return context.line_range(mapping.visible.source_unit, mapping.visible.line)
+
+
+def _main_trace_frame(
+    frame: ParsedDiagnosticFrame,
+    executed: MappedSource,
+    context: VisibleSourceContext | None,
+) -> ErrorTraceFrame:
+    location = frame.location
+    if location.column is None:
+        position = _line_only_mapped_position(executed, location.line)
+        column = None if position is None else position[0]
+        offset = None if position is None else position[1]
+    else:
+        column = location.column
+        offset = PlatformCoordinateCodec(executed.text).to_offset(
+            location.line,
+            location.column,
+        )
+    mapping = _map_executed_offset(executed, offset, context)
+    lowered = None
+    if offset is not None and column is not None:
+        width = 0 if offset == len(executed.text) else 1
+        lowered = LoweredSourceLocation(
+            location.line,
+            column,
+            offset,
+            SourceSpan(offset, offset + width),
+        )
+    return ErrorTraceFrame(
+        ordinal=frame.ordinal,
+        cause_ordinal=frame.cause_ordinal,
+        origin=ErrorTraceFrameOrigin.EXECUTED_ARTIFACT,
+        platform_location=location,
+        block_span=frame.block_span,
+        detail_span=frame.detail_span,
+        mapping_confidence=mapping.confidence,
+        source_unit=mapping.source_unit,
+        visible_location=mapping.visible,
+        visible_line_span=_visible_line_span(mapping, context),
+        related_visible_span=mapping.related,
+        lowered_location=lowered,
+        synthetic_region=mapping.synthetic_region,
+    )
+
+
+def _native_trace_frame(frame: ParsedDiagnosticFrame) -> ErrorTraceFrame:
+    return ErrorTraceFrame(
+        ordinal=frame.ordinal,
+        cause_ordinal=frame.cause_ordinal,
+        origin=ErrorTraceFrameOrigin.NATIVE_MODULE,
+        platform_location=frame.location,
+        block_span=frame.block_span,
+        detail_span=frame.detail_span,
+        mapping_confidence=MappingConfidence.UNKNOWN,
+    )
+
+
+def _unknown_trace_frame(
+    frame: ParsedDiagnosticFrame,
+    *,
+    registration_name: str | None = None,
+) -> ErrorTraceFrame:
+    return ErrorTraceFrame(
+        ordinal=frame.ordinal,
+        cause_ordinal=frame.cause_ordinal,
+        origin=ErrorTraceFrameOrigin.UNKNOWN,
+        platform_location=frame.location,
+        block_span=frame.block_span,
+        detail_span=frame.detail_span,
+        mapping_confidence=MappingConfidence.UNKNOWN,
+        registration_name=registration_name,
+    )
+
+
+def _generic_trace_base(
+    parsed: ParsedPlatformDiagnostic,
+    stage: DiagnosticStage,
+) -> NormalizedDiagnostic:
+    effective_stage = (
+        DiagnosticStage.COMPILATION if parsed.has_compilation_marker else stage
+    )
+    diagnostic_id = sha256(
+        "|".join(
+            (
+                effective_stage.value,
+                "platform_trace",
+                parsed.platform_diagnostic_sha256,
+            )
+        ).encode("utf-8")
+    ).hexdigest()
+    return NormalizedDiagnostic(
+        diagnostic_id=diagnostic_id,
+        runtime_summary=_summary(effective_stage),
+        stage=effective_stage,
+        mapping_confidence=MappingConfidence.UNKNOWN,
+        _platform_evidence=parsed._platform_evidence,
+        platform_diagnostic_sha256=parsed.platform_diagnostic_sha256,
+        platform_diagnostic_truncated=parsed.platform_diagnostic_truncated,
+        platform_diagnostic_redacted=parsed.platform_diagnostic_redacted,
+    )
+
+
+def normalize_platform_diagnostic_trace(
+    parsed: ParsedPlatformDiagnostic,
+    *,
+    stage: DiagnosticStage,
+    executed: MappedSource | None = None,
+    visible_source_context: VisibleSourceContext | None = None,
+    pinned_manifest_sha256: str | None = None,
+    pinned_artifacts: tuple[WorkerDiagnosticArtifact, ...] = (),
+) -> NormalizedDiagnostic:
+    if not isinstance(parsed, ParsedPlatformDiagnostic):
+        raise ValueError("parsed must be a ParsedPlatformDiagnostic")
+    if type(stage) is not DiagnosticStage:
+        raise ValueError("stage must be a DiagnosticStage")
+    if executed is not None and not isinstance(executed, MappedSource):
+        raise ValueError("executed must be a MappedSource or None")
+    if visible_source_context is not None and not isinstance(
+        visible_source_context,
+        VisibleSourceContext,
+    ):
+        raise ValueError("visible_source_context must be a VisibleSourceContext")
+    if executed is None and visible_source_context is not None:
+        raise ValueError("visible source context requires an executed artifact")
+    if pinned_manifest_sha256 is None:
+        if pinned_artifacts:
+            raise ValueError("pinned artifacts require a manifest identity")
+    else:
+        _validate_worker_diagnostic_request(
+            parsed,
+            pinned_manifest_sha256,
+            pinned_artifacts,
+        )
+    base = (
+        _remap_platform_primary(
+            parsed,
+            executed,
+            stage=stage,
+            visible_source_context=visible_source_context,
+        )
+        if executed is not None
+        else _generic_trace_base(parsed, stage)
+    )
+    causes = tuple(
+        ErrorTraceCause(
+            item.ordinal,
+            item.summary_span,
+            item.block_span,
+            item.frame_ordinals,
+        )
+        for item in parsed.causes
+    )
+    frames: list[ErrorTraceFrame] = []
+    for item in parsed.frames:
+        try:
+            if item.location.module_name in _UNKNOWN_MODULES and executed is not None:
+                normalized = _main_trace_frame(
+                    item,
+                    executed,
+                    visible_source_context,
+                )
+            elif item.location.worker_artifact_location is not None:
+                normalized = _unknown_trace_frame(
+                    item,
+                    registration_name=(
+                        item.location.worker_artifact_location.registration_name
+                    ),
+                )
+            elif item.location.module_name in _UNKNOWN_MODULES:
+                normalized = _unknown_trace_frame(item)
+            else:
+                normalized = _native_trace_frame(item)
+        except BaseException:
+            normalized = _unknown_trace_frame(item)
+        frames.append(normalized)
+    return replace(
+        base,
+        causes=causes,
+        frames=tuple(frames),
+        frames_truncated=parsed.frames_truncated,
+        causes_truncated=parsed.causes_truncated,
     )
 
 
@@ -1051,11 +1299,11 @@ def _with_dependency_binding(
     )
 
 
-def _line_only_worker_position(
+def _line_only_mapped_position(
     source: MappedSource,
     line: int,
 ) -> tuple[int, int] | None:
-    """Resolve a line-only Worker frame only through one exact code span."""
+    """Resolve a line-only frame only through one exact code span."""
     if type(line) is not int or line <= 0:
         return None
     index = LineIndex(source.text)
@@ -1105,7 +1353,7 @@ def _worker_runtime_frame(
     observed_registration: str,
 ) -> WorkerRuntimeFrameDiagnostic:
     if location.column is None:
-        normalized = _line_only_worker_position(
+        normalized = _line_only_mapped_position(
             artifact.mapped_source,
             location.line,
         )
