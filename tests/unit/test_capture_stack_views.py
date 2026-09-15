@@ -10,7 +10,11 @@ from onec_runtime.bsl.full_ast_worker_projection import (
 from onec_runtime.bsl.module_syntax import ModuleIdentity, ModuleSyntaxRegistry
 from onec_runtime.capture_source import SourceVersionRef
 from onec_runtime.errors import (
-    CaptureSourceUnavailableError, ProtocolError, StaleCaptureError,
+    CaptureBusyError,
+    CaptureSourceUnavailableError,
+    CommandTimeout,
+    ProtocolError,
+    StaleCaptureError,
 )
 from onec_runtime.rdbg.models import ModuleLocation, StackFrame, StopEvent, TargetId
 from onec_runtime.runtime_api import PrototypeRuntimeApi
@@ -580,6 +584,125 @@ def test_public_stack_sanitizes_actual_rdbg_http_failure() -> None:
         assert private not in rendered
 
 
+def test_public_stack_maps_command_deadline_to_sanitized_inspection_timeout() -> None:
+    import traceback
+
+    import onec_runtime.errors as runtime_errors
+    from onec_runtime.privacy import public_artifact_value
+
+    timeout_type = getattr(runtime_errors, "CaptureInspectionTimeout", None)
+    assert isinstance(timeout_type, type), "CaptureInspectionTimeout is not public"
+
+    runtime, _, session = captured_stack_api()
+    private_evidence = "private stack deadline for СекретныйРасчет"
+
+    def timeout(*, timeout_s: float) -> StopEvent:
+        assert timeout_s > 0
+        raise CommandTimeout(private_evidence)
+
+    session.read_current_stack = timeout  # type: ignore[method-assign]
+
+    with pytest.raises(timeout_type) as caught:
+        runtime.current_capture().stack[:20]
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    rendered = "\n".join((
+        str(caught.value),
+        repr(caught.value),
+        "".join(traceback.format_exception(caught.value)),
+        repr(public_artifact_value(caught.value)),
+    ))
+    assert "capture stack inventory timed out" in rendered
+    assert private_evidence not in rendered
+
+
+def test_public_stack_maps_actual_rdbg_http_deadline_to_inspection_timeout() -> None:
+    import traceback
+
+    import httpx
+
+    import onec_runtime.errors as runtime_errors
+    from onec_runtime.privacy import public_artifact_value
+    from onec_runtime.rdbg.models import DebugTarget
+    from onec_runtime.rdbg.session import RdbgSession, SessionState
+    from onec_runtime.rdbg.transport import RdbgTransport
+
+    timeout_type = getattr(runtime_errors, "CaptureInspectionTimeout", None)
+    assert isinstance(timeout_type, type), "CaptureInspectionTimeout is not public"
+
+    private_url = "file:///private/customer/CommonModules/Payroll/Ext/Module.bsl"
+    private_source = "СекретныйРасчет = ЗарплатаСотрудника;"
+
+    def timeout(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout(
+            f"deadline at {private_url}: {private_source}",
+            request=request,
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(timeout))
+    transport = RdbgTransport("private-rdbg.customer.internal", 19542, client=client)
+    _, controller, _ = captured_stack_api()
+    rdbg = RdbgSession(transport, CAPTURE_A, alias="PrivateCustomerBase")
+    rdbg.target = DebugTarget(
+        controller._capture_target_id,
+        "ServerEmulation",
+        "stopped",
+    )
+    rdbg.state = SessionState.READY
+    controller.session = rdbg
+    runtime = PrototypeRuntimeApi(controller)
+
+    try:
+        with pytest.raises(timeout_type) as caught:
+            runtime.current_capture().stack[:20]
+    finally:
+        client.close()
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    rendered = "\n".join((
+        str(caught.value),
+        repr(caught.value),
+        "".join(traceback.format_exception(caught.value)),
+        repr(public_artifact_value(caught.value)),
+    ))
+    for private in (
+        private_url,
+        private_source,
+        "private-rdbg.customer.internal",
+        "PrivateCustomerBase",
+    ):
+        assert private not in rendered
+
+
+def test_pending_capture_evaluation_precedes_stack_inspection_timeout() -> None:
+    from test_capture_control_plane import (
+        _capture_runtime, _finish_pending, _start_pending_capture, close_owner,
+    )
+
+    runtime, controller, transport = _capture_runtime()
+    thread = None
+    try:
+        thread, finished, failures = _start_pending_capture(
+            lambda: runtime.execute_bsl("РезультатИнструкции = 901;"),
+            transport.accepted,
+        )
+        assert not finished.is_set()
+        capture = runtime.current_capture()
+        pending_id = capture.status().pending_evaluation_id
+
+        with pytest.raises(CaptureBusyError) as caught:
+            capture.stack[:1]
+
+        assert caught.value.evaluation_id == pending_id
+        assert failures == []
+    finally:
+        if thread is not None:
+            _finish_pending(thread, transport)
+        close_owner(controller, transport)
+
+
 def test_runtime_native_stack_bypasses_config_source_resolution_and_ast() -> None:
     runtime, _, session = captured_stack_api()
     source_calls = []
@@ -950,6 +1073,77 @@ def test_shared_source_unit_keeps_distinct_common_and_notebook_physical_owners(
     public = repr(current_page) + repr(historical_frame)
     assert "PrivateLaterCell" not in public
     assert "SourceUnitRef" not in public and "identity=" not in public
+
+
+def test_worker_source_snapshots_follow_live_generations_without_stale_revisions(
+    tmp_path,
+) -> None:
+    from test_runtime_api import (
+        _common_module_catalog, _semantic_snapshot_runtime, _worker_module_unit,
+    )
+    from onec_runtime.worker_breakpoints import resolve_source_line
+
+    catalog = _common_module_catalog("МодульА")
+    worker_runtime = _semantic_snapshot_runtime(tmp_path, catalog)
+    first_unit = _worker_module_unit("МодульА", 1, catalog)
+    first_handle = worker_runtime.load_worker_modules(
+        (first_unit,), common_modules=catalog,
+    )
+    historical_pin = worker_runtime._worker_universe.pin_active()
+
+    current_handle = first_handle
+    for revision in range(2, 26):
+        current_handle = worker_runtime.load_worker_modules(
+            (_worker_module_unit("МодульА", revision, catalog),),
+            common_modules=catalog,
+        )
+
+    assert set(worker_runtime._worker_source_generations) == {
+        first_handle,
+        current_handle,
+    }
+    assert {
+        handle: len(sources)
+        for handle, sources in worker_runtime._worker_source_generations.items()
+    } == {
+        first_handle: 1,
+        current_handle: 1,
+    }
+
+    historical_view = worker_runtime._worker_universe._operation_debug_view(
+        historical_pin
+    )
+    historical_module = historical_view.modules[0]
+    historical_line = resolve_source_line(
+        historical_module,
+        historical_module.source_unit,
+        2,
+    ).generated_line
+    assert historical_line is not None
+    _, controller, session = captured_stack_api()
+    worker_runtime._controller = controller
+    worker_runtime._operation_generation_pin = historical_pin
+    session.live_frames = (
+        session.live_frames[0],
+        StackFrame(
+            session.live_frames[0].target_id,
+            1,
+            historical_module.registration.module_location(historical_line),
+        ),
+        session.live_frames[2],
+    )
+
+    saved = worker_runtime.current_capture().stack[0]
+
+    assert saved.source_status == "runtime_verified"
+    assert saved.with_method().method.name == "Версия"
+    assert saved._resolved.version.generation == first_handle.generation
+
+    worker_runtime._operation_generation_pin = None
+    worker_runtime._release_generation_pin_locked(historical_pin)
+
+    assert set(worker_runtime._worker_source_generations) == {current_handle}
+    assert saved.with_method().method.name == "Версия"
 
 
 @pytest.mark.parametrize(
