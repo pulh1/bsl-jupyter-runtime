@@ -17,6 +17,11 @@ from onec_runtime.runtime_api import RuntimeNamespaceSnapshot
 from onec_runtime.errors import ProtocolError, StaleCaptureError
 from onec_runtime.recovery_journal import RecoveryJournal
 from onec_runtime.runtime_api import PrototypeRuntimeApi
+from onec_runtime.worker_universe import (
+    WorkerModuleArtifactBuilder,
+    WorkerModuleArtifactCache,
+    WorkerUniverseState,
+)
 from onec_runtime_jupyter import InteractiveRuntimeSession, install_runtime
 from onec_runtime_jupyter import session as session_module
 
@@ -27,6 +32,12 @@ from test_capture_control_plane import (
     start_shutdown_evaluation,
 )
 from test_prototype_runtime import captured_controller
+from test_runtime_api import (
+    _UniverseInstructionExecutor,
+    _common_module_catalog,
+    _notebook_worker_builder,
+    _worker_module_unit,
+)
 
 
 class RuntimeResource:
@@ -126,6 +137,38 @@ def _shutdown_runtime_session(
     runtime._heartbeat_stop = Event()
     runtime._heartbeat_thread = _ShutdownHeartbeat()
     return runtime
+
+
+def _real_worker_shutdown_api(
+    tmp_path: Path,
+    controller: object,
+    journal: RecoveryJournal,
+) -> tuple[PrototypeRuntimeApi, _UniverseInstructionExecutor, object]:
+    """Publish two real Worker registrations owned by the RuntimeApi."""
+
+    target = _UniverseInstructionExecutor()
+    builder = _notebook_worker_builder(tmp_path)
+    catalog = _common_module_catalog("МодульА", "МодульБ")
+    api = PrototypeRuntimeApi(
+        controller,  # type: ignore[arg-type]
+        journal=journal,
+        notebook_worker_builder=builder,
+        worker_module_builder=WorkerModuleArtifactBuilder(
+            builder,
+            cache=WorkerModuleArtifactCache(),
+            packer_version="worker-epf-v1",
+            target_profile=catalog.profile,
+        ),
+        worker_instruction_executor=target,
+    )
+    handle = api.load_worker_modules(
+        (
+            _worker_module_unit("МодульА", 17, catalog),
+            _worker_module_unit("МодульБ", 17, catalog),
+        ),
+        common_modules=catalog,
+    )
+    return api, target, handle
 
 
 def _start_shutdown_thread(invoke, timeline: list[str]):  # type: ignore[no-untyped-def]
@@ -762,6 +805,122 @@ def test_late_worker_exit_keeps_abandoned_shutdown_retryable(
                 runtime.close_for_kernel_shutdown()
             except ProtocolError:
                 pass
+        if not wrapper._closed:
+            wrapper.close()
+
+
+@pytest.mark.parametrize("first_entry", ("normal", "kernel"))
+@pytest.mark.parametrize("retry_entry", ("normal", "kernel"))
+def test_unproven_close_finalizes_real_worker_ownership(
+    tmp_path: Path,
+    first_entry: str,
+    retry_entry: str,
+) -> None:
+    """Break caught: admission closure cannot stand in for Worker teardown."""
+
+    rdbg = _ServerShutdownCaptureSession(wake_on_invalidate=False)
+    journal = RecoveryJournal()
+    controller = captured_controller(
+        rdbg,
+        command_timeout_s=0.05,
+        journal=journal,
+    )
+    api, target, handle = _real_worker_shutdown_api(tmp_path, controller, journal)
+    host = api._worker_universe
+    target_registry = api._worker_universe_target
+    registration_keys = tuple(sorted(target_registry._registrations, key=str.casefold))
+    assert len(registration_keys) == 2
+    assert host.state is WorkerUniverseState.READY
+    assert {name: host.registration_refcount(name) for name in registration_keys} == {
+        name: 1 for name in registration_keys
+    }
+    pin = api._pin_capture_evaluation_locked()
+    assert pin is not None and pin.handle is handle
+    pin_lease = api._detach_capture_evaluation_pin_locked()
+    assert api._evaluation_generation_pin is None
+    assert set(host._leases) == {pin.lease_id}
+    assert {name: host.registration_refcount(name) for name in registration_keys} == {
+        name: 2 for name in registration_keys
+    }
+    target_calls_before_close = tuple(target.sources)
+    capture_owner, ticket, cleanup_probe = start_shutdown_evaluation(
+        controller,
+        rdbg,
+        pin_lease=pin_lease,
+    )
+    evaluation_id = ticket.evaluation_id
+    del ticket, pin_lease
+    runtime = _shutdown_runtime_session(rdbg, api, server=True)
+    stopped: list[str] = []
+    wrapper = InteractiveRuntimeSession(
+        runtime,
+        SimpleNamespace(stop=lambda: stopped.append("stopped")),
+    )
+    shell = InteractiveShell()
+    wrapper._register_shutdown(shell)
+    invoke = wrapper.close if first_entry == "normal" else wrapper._close_at_shutdown
+    retry = wrapper.close if retry_entry == "normal" else wrapper._close_at_shutdown
+
+    try:
+        invoke()
+
+        assert runtime.is_closed is True
+        assert api._capture_shutdown_finished is True
+        assert api._capture_shutdown_termination_proven is False
+        assert capture_owner.join(0) is False, "the unresponsive poll unexpectedly exited"
+        assert host.state is WorkerUniverseState.CLOSED
+        assert host._leases == {}
+        assert host._registration_refcounts == {}
+        assert target_registry._registrations == {}
+        assert target_registry._broken is True
+        assert api._worker_generation_handle is None
+        assert api._api_owned_worker_generation_handle is None
+        assert api._operation_generation_pin is None
+        assert api._preparing_generation_pin is None
+        assert api._evaluation_generation_pin is None
+        assert api._worker_module_artifacts == {}
+        assert api._worker_active_modules == {}
+        assert tuple(target.sources) == target_calls_before_close
+        assert target.disconnects == []
+        assert cleanup_probe.dispositions == []
+        assert rdbg.shutdown_cleanup_dispatches == 0
+        abandoned = [
+            event
+            for event in journal.events
+            if event.event == "capture_evaluation_shutdown_abandoned"
+        ]
+        assert len(abandoned) == 1
+        assert abandoned[0].fields["evaluation_id"] == evaluation_id
+        assert abandoned[0].fields["evaluation_kind"] == "user_bsl"
+        assert abandoned[0].fields["termination_proven"] is False
+        assert abandoned[0].fields["pin_disposition"] == "retained"
+        assert abandoned[0].fields["cleanup_disposition"] == "retained"
+        assert abandoned[0].fields["cleanup_lease_count"] == 1
+        assert type(abandoned[0].fields["elapsed_ms"]) is int
+        for private in rdbg.shutdown_private_values:
+            assert private not in repr(abandoned[0])
+        assert wrapper._closed is True
+        assert stopped == ["stopped"]
+        assert wrapper._shutdown_shell is None
+
+        retry()
+        api.close()
+        assert host.state is WorkerUniverseState.CLOSED
+        assert host._leases == {}
+        assert target_registry._registrations == {}
+        assert tuple(target.sources) == target_calls_before_close
+        assert len(
+            [
+                event
+                for event in journal.events
+                if event.event == "capture_evaluation_shutdown_abandoned"
+            ]
+        ) == 1
+        assert stopped == ["stopped"]
+    finally:
+        rdbg.shutdown_poll_release.set()
+        capture_owner.begin_close()
+        assert capture_owner.join(2)
         if not wrapper._closed:
             wrapper.close()
 
