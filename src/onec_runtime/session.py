@@ -1649,26 +1649,95 @@ class RuntimeSession:
         *,
         dirty_roots: tuple[str, ...] = (),
         continuation_attempt_id: str | None = None,
+        timeout_s: float | None = None,
     ) -> RuntimeReply:
         with self._operation_lock:
             active = self._active_capture_ticket
+            completion_seen = False
+
+            def complete_resume(
+                reply: RuntimeReply | None,
+                error: BaseException | None,
+            ) -> None:
+                nonlocal completion_seen
+                del error
+                with self._operation_lock:
+                    completion_seen = True
+                    current = self._active_capture_ticket
+                    if current is not active or active is None:
+                        return
+                    if (
+                        reply is not None
+                        and getattr(reply, "capture_ticket", None)
+                        == active.ticket_id
+                        and getattr(reply, "state", None)
+                        is OperationState.CAPTURED
+                    ):
+                        return
+                    self._active_capture_ticket = None
+                    self._notify_capture_ended(active)
+
+            def complete_detached_resume(
+                reply: RuntimeReply | None,
+                error: BaseException | None,
+            ) -> None:
+                # The coordinator must publish its ticket without acquiring
+                # this Session admission lock. Once an initiating waiter has
+                # detached, hand the local listener/ticket transition to a
+                # short Session-owned notifier instead.
+                Thread(
+                    target=complete_resume,
+                    args=(reply, error),
+                    name="onec-runtime-capture-resume-completion",
+                    daemon=True,
+                ).start()
+
             try:
-                reply = self.runtime_api.resume_capture(
-                    dirty_roots=dirty_roots,
-                    continuation_attempt_id=continuation_attempt_id,
+                bind = getattr(
+                    self.runtime_api,
+                    "capture_session_caller_handoff",
+                    None,
                 )
+                arguments = {
+                    "dirty_roots": dirty_roots,
+                    "continuation_attempt_id": continuation_attempt_id,
+                    "on_completion": complete_resume,
+                    "on_detached_completion": complete_detached_resume,
+                }
+                if timeout_s is not None:
+                    arguments["timeout_s"] = timeout_s
+                if not callable(bind):
+                    arguments.pop("on_completion")
+                    arguments.pop("on_detached_completion")
+                    reply = self.runtime_api.resume_capture(**arguments)
+                else:
+                    with bind(self._release_operation_lock_for_capture_wait):
+                        reply = self.runtime_api.resume_capture(**arguments)
             except CaptureBusyError:
                 # The coordinator still owns this exact capture. A rejected
                 # resume does not end the Session fence or notify listeners.
                 raise
             except BaseException:
-                # A non-CAPTURED runtime is not inspectable even when transport
-                # outcome is unknown; expire the service fence before it can
-                # issue another metadata request.
-                if active is not None and self.runtime_api.status().state is not OperationState.CAPTURED:
-                    self._active_capture_ticket = None
-                    self._notify_capture_ended(active)
+                # An interrupted/timeout initiating waiter only detached from
+                # a controller-owned resume. Keep its service fence while the
+                # controller still reports the live continuation; terminal or
+                # recovery states still expire a ticket if no completion
+                # callback had a chance to publish it.
+                if active is not None and not completion_seen:
+                    try:
+                        state = self.runtime_api.status().state
+                    except BaseException:
+                        state = OperationState.CAPTURED
+                    if state not in {
+                        OperationState.CAPTURED,
+                        OperationState.FLUSHING,
+                        OperationState.RESUMING,
+                    }:
+                        self._active_capture_ticket = None
+                        self._notify_capture_ended(active)
                 raise
+            if completion_seen:
+                return reply
             if (
                 active is not None
                 and getattr(reply, "capture_ticket", None)

@@ -91,14 +91,14 @@ class CaptureInspectionTimeout(ProtocolError):
 
 
 class CaptureBusyError(ProtocolError):
-    """The current capture is owned by another acknowledged evaluation."""
+    """The current capture is owned by another controller operation."""
 
     __slots__ = ("evaluation_id", "evaluation_kind", "phase")
 
     def __init__(
         self,
-        evaluation_id: str,
-        evaluation_kind: CaptureEvaluationKind,
+        evaluation_id: str | None,
+        evaluation_kind: CaptureEvaluationKind | None,
         phase: CapturePhase,
     ) -> None:
         from onec_runtime.capture_evaluation import (
@@ -106,11 +106,22 @@ class CaptureBusyError(ProtocolError):
             CapturePhase as Phase,
         )
 
+        try:
+            current_phase = phase if isinstance(phase, Phase) else Phase(phase)
+        except (TypeError, ValueError) as error:
+            raise ValueError("capture lifecycle identity is invalid") from error
+        if current_phase is Phase.RESUMING:
+            if evaluation_id is not None or evaluation_kind is not None:
+                raise ValueError("resuming capture cannot name an evaluation")
+            self.evaluation_id = None
+            self.evaluation_kind = None
+            self.phase = current_phase
+            super().__init__("CAPTURE is busy (phase=resuming)")
+            return
         if not isinstance(evaluation_id, str) or not evaluation_id:
             raise ValueError("evaluation_id is invalid")
         try:
             kind = evaluation_kind if isinstance(evaluation_kind, Kind) else Kind(evaluation_kind)
-            current_phase = phase if isinstance(phase, Phase) else Phase(phase)
         except (TypeError, ValueError) as error:
             raise ValueError("capture lifecycle identity is invalid") from error
         self.evaluation_id = _safe_error_text(evaluation_id, default="<unknown>")

@@ -26,6 +26,7 @@ from onec_runtime.capture_evaluation import (
     CaptureFence,
     CaptureEvaluationTicket,
     CapturePhase,
+    CaptureResumeTicket,
     _CapturePinDispositionLease,
     _CaptureSubmission,
 )
@@ -1057,11 +1058,19 @@ class PrototypeRuntimeApi:
         capture_controls_state = (
             capture_status is not None
             and (
-                capture_status.phase is not CapturePhase.PAUSED
-                or self._controller.state in {
-                    OperationState.CAPTURED,
-                    OperationState.EVALUATING_CAPTURE,
+                capture_status.phase in {
+                    CapturePhase.EVALUATING,
+                    CapturePhase.RESUMING,
+                    CapturePhase.OUTCOME_UNKNOWN,
+                    CapturePhase.RECOVERY_REQUIRED,
                 }
+                or (
+                    capture_status.phase is CapturePhase.PAUSED
+                    and self._controller.state in {
+                        OperationState.CAPTURED,
+                        OperationState.EVALUATING_CAPTURE,
+                    }
+                )
             )
         )
         if not capture_controls_state:
@@ -1147,6 +1156,7 @@ class PrototypeRuntimeApi:
         def is_current() -> bool:
             return (
                 self._capture_control_owner() is owner
+                and owner.capture_view_is_current(fence)
                 and self._controller.operation_id == fence.operation_id
                 and self._controller.runtime_generation == fence.capture_generation
                 and getattr(self._controller, "stop_sequence", None)
@@ -1315,6 +1325,8 @@ class PrototypeRuntimeApi:
                 status.evaluation_kind,
                 status.phase,
             )
+        if status.phase is CapturePhase.RESUMING:
+            raise CaptureBusyError(None, None, status.phase)
         if status.phase is CapturePhase.OUTCOME_UNKNOWN:
             raise CaptureOutcomeUnknownError(
                 status.last_evaluation_id,
@@ -1323,7 +1335,14 @@ class PrototypeRuntimeApi:
         if status.phase is CapturePhase.RECOVERY_REQUIRED:
             raise CaptureRecoveryRequiredError(status.failure)
         if status.phase is CapturePhase.STALE:
-            raise StaleCaptureError()
+            if self._controller.state in {
+                OperationState.CAPTURED,
+                OperationState.EVALUATING_CAPTURE,
+                OperationState.FLUSHING,
+                OperationState.RESUMING,
+            }:
+                raise StaleCaptureError()
+            return
         raise ProtocolError(f"CAPTURE data plane is unavailable ({status.phase.value})")
 
     def namespace_snapshot(self) -> RuntimeNamespaceSnapshot:
@@ -3082,6 +3101,51 @@ class PrototypeRuntimeApi:
         self._operation_generation_pin = None
         self._release_generation_pin_locked(pin)
 
+    def _finalize_controller_owned_resume_pin(
+        self,
+        *,
+        reply: RuntimeReply | None,
+        outcome_unknown: bool = False,
+    ) -> None:
+        """Detach a resume-owned pin before the coordinator disposes it.
+
+        Resume completion runs on the coordinator after the initiating caller
+        has released the API writer.  Slot ownership is synchronized briefly;
+        Worker lifecycle and CAPTURE helper work happen only after that lock
+        is released.
+        """
+        pin: OperationGenerationPin | None
+        action: str | None = None
+        install_capture_pin = False
+        with self._generation_lock:
+            pin = self._operation_generation_pin
+            if pin is None or self._poisoned_error is not None:
+                return
+            if self._reply_keeps_operation_pin(reply):
+                install_capture_pin = (
+                    reply is not None and reply.kind is RuntimeReplyKind.CAPTURED
+                )
+            elif reply is None and outcome_unknown:
+                self._operation_generation_pin = None
+                action = "quarantine"
+            else:
+                self._operation_generation_pin = None
+                action = "release"
+        if install_capture_pin:
+            self._install_capture_worker_generation_pin_locked(pin)
+            return
+        if action == "quarantine":
+            try:
+                self._worker_universe.retain_outcome_unknown(pin)
+            finally:
+                self._poisoned_error = WorkerPromotionOutcomeUnknown(
+                    pin.handle.generation,
+                    pin.handle.manifest_sha256,
+                )
+            return
+        if action == "release":
+            self._release_generation_pin_locked(pin)
+
     def _reply_keeps_operation_pin(
         self,
         reply: RuntimeReply | None,
@@ -3729,8 +3793,24 @@ class PrototypeRuntimeApi:
         *,
         dirty_roots: tuple[str, ...] = (),
         continuation_attempt_id: str | None = None,
+        timeout_s: float | None = None,
+        on_completion: Callable[[RuntimeReply | None, BaseException | None], None]
+        | None = None,
+        on_detached_completion: Callable[
+            [RuntimeReply | None, BaseException | None], None
+        ]
+        | None = None,
     ) -> RuntimeReply:
         with self._capture_data_plane_writer():
+            if timeout_s is not None and (
+                isinstance(timeout_s, bool)
+                or not isinstance(timeout_s, (int, float))
+                or not isfinite(float(timeout_s))
+                or timeout_s < 0
+            ):
+                raise ProtocolError(
+                    "capture resume timeout must be finite and non-negative"
+                )
             self._require_available()
             if self._controller.state is OperationState.CAPTURED:
                 combined = dict(self._pending_dirty_roots)
@@ -3754,6 +3834,83 @@ class PrototypeRuntimeApi:
                     self._operation_generation_pin,
                     mode=LoweringMode.CAPTURE,
                 )
+                submit_resume = getattr(self._controller, "submit_resume", None)
+                if callable(submit_resume):
+                    def complete_resume(
+                        result: object | None,
+                        error: BaseException | None,
+                    ) -> object:
+                        completed: RuntimeReply | None = None
+                        try:
+                            if error is None:
+                                completed = self._reply(result)  # type: ignore[arg-type]
+                                self._pending_dirty_roots.clear()
+                                self._finalize_pending_namespace(completed)
+                                return completed
+                            return None
+                        finally:
+                            if error is None or resume_dispatched:
+                                self._finalize_controller_owned_resume_pin(
+                                    reply=completed,
+                                    outcome_unknown=(
+                                        resume_dispatched and completed is None
+                                    ),
+                                )
+
+                    resume_arguments["on_transport_dispatch"] = (
+                        mark_resume_dispatched
+                    )
+                    resume_arguments["completion"] = complete_resume
+                    if self._operation_generation_pin is not None:
+                        clear_worker_pin = getattr(
+                            self._controller,
+                            "clear_capture_worker_generation_pin_for_resume",
+                            None,
+                        )
+                        if not callable(clear_worker_pin):
+                            raise ProtocolError(
+                                "Runtime controller cannot clear the CAPTURE "
+                                "Worker pin from its resume owner"
+                            )
+                        resume_arguments["before_resume"] = clear_worker_pin
+                    # A waiter that times out or is interrupted has no caller
+                    # stack left to retire Session-facing state. Its fallback
+                    # runs only after the coordinator published the terminal
+                    # ticket. An attached waiter invokes the same callback on
+                    # its own thread below, after it regains outer locks.
+                    resume_arguments["detached_completion"] = (
+                        on_completion
+                        if on_detached_completion is None
+                        else on_detached_completion
+                    )
+                    ticket: CaptureResumeTicket | None = None
+                    try:
+                        ticket = submit_resume(**resume_arguments)
+                        if not isinstance(ticket, CaptureResumeTicket):
+                            raise ProtocolError(
+                                "CAPTURE controller did not return a resume ticket"
+                            )
+                        # Submission is the outer-lock linearization point.
+                        # The worker now owns all target I/O and the next
+                        # event; the initiating Python/Jupyter thread only
+                        # waits on the coordinator condition.
+                        with self._capture_owner_handoff():
+                            with self._capture_session_waiter_handoff():
+                                completed = ticket.wait_initiator(timeout_s)
+                    except BaseException as error:
+                        if isinstance(error, KeyboardInterrupt) and ticket is not None:
+                            ticket.detach_initiator()
+                        if (
+                            ticket is not None
+                            and not ticket.initiator_detached
+                            and on_completion is not None
+                        ):
+                            on_completion(None, error)
+                        raise
+                    assert ticket is not None
+                    if on_completion is not None:
+                        on_completion(completed, None)
+                    return completed
                 if self._operation_generation_pin is not None:
                     self._clear_capture_worker_generation_pin_locked()
                 try:

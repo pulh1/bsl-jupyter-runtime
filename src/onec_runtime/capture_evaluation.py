@@ -758,14 +758,23 @@ class _ShutdownStepSettled(Exception):
 @dataclass(frozen=True, slots=True, repr=False)
 class CaptureStepContext:
     _coordinator: CaptureEvaluationCoordinator
-    _record: _CaptureEvaluationRecord
+    _record: _CaptureEvaluationRecord | _CaptureResumeRecord
 
     def execute_inline(self, step: CaptureRemoteStep) -> EvaluationResult:
         owner = self._coordinator
         if current_thread() is not owner._worker:
             raise ProtocolError("CAPTURE inline steps require the coordinator worker")
         with owner._condition:
-            if owner._active is not self._record or self._record.outcome is not None:
+            active = (
+                owner._active is self._record
+                or owner._active_resume is self._record
+            )
+            completed = (
+                self._record.outcome is not None
+                if isinstance(self._record, _CaptureEvaluationRecord)
+                else self._record.completed
+            )
+            if not active or completed:
                 raise ProtocolError("CAPTURE inline steps require the active record")
             if self._record.step_in_progress or self._record.capability is not None:
                 raise ProtocolError("CAPTURE record already owns a remote step")
@@ -900,6 +909,84 @@ class CaptureEvaluationTicket:
         return self._coordinator._wait_initiator(self._record, timeout_s)
 
 
+@dataclass(frozen=True, slots=True)
+class CaptureResumeRequest:
+    """One controller-owned continuation of the paused CAPTURE frame.
+
+    A resume is deliberately not an evaluation: it owns a compound mutation
+    and the next debugger stop, so it has no evaluation kind or public result
+    record.  The coordinator invokes every callback on its single worker.
+    """
+
+    fence: CaptureFence = field(repr=False)
+    admit: Callable[[], None] = field(repr=False)
+    execute: Callable[[CaptureStepContext], object] = field(repr=False)
+    completion: Callable[[object | None, BaseException | None], object] | None = (
+        field(default=None, repr=False)
+    )
+    detached_completion: Callable[[object | None, BaseException | None], None] | None = (
+        field(default=None, repr=False)
+    )
+    settlement: Callable[
+        [BaseException | None],
+        tuple[CapturePhase, CaptureFailureDiagnostic | None],
+    ] | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.fence, CaptureFence):
+            raise ValueError("capture fence is required")
+        if not callable(self.admit) or not callable(self.execute):
+            raise ValueError("resume callbacks must be callable")
+        if self.completion is not None and not callable(self.completion):
+            raise ValueError("resume completion callback must be callable")
+        if self.detached_completion is not None and not callable(
+            self.detached_completion
+        ):
+            raise ValueError("detached resume completion callback must be callable")
+        if self.settlement is not None and not callable(self.settlement):
+            raise ValueError("resume settlement callback must be callable")
+
+
+@dataclass(slots=True, repr=False)
+class _CaptureResumeRecord:
+    request: CaptureResumeRequest
+    resume_id: str = field(default_factory=lambda: uuid4().hex)
+    created: float = field(default_factory=monotonic)
+    offsets: dict[str, int] = field(default_factory=dict)
+    remote_step_count: int = 0
+    poll_count: int = 0
+    poll_events: int = 0
+    capability: PendingEvaluation | None = None
+    step_in_progress: bool = False
+    dispatch_entered: bool = False
+    acknowledged: bool = False
+    initiator_attached: bool = True
+    completed: bool = False
+    private_result: object = None
+    initiating_error: BaseException | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureResumeTicket:
+    """Private receipt for a submitted controller-owned CAPTURE resume."""
+
+    resume_id: str
+    _coordinator: CaptureEvaluationCoordinator = field(repr=False)
+    _record: _CaptureResumeRecord = field(repr=False)
+
+    def wait_initiator(self, timeout_s: float | None = None) -> object:
+        return self._coordinator._wait_resume_initiator(self._record, timeout_s)
+
+    def detach_initiator(self) -> None:
+        """Give terminal delivery to the controller after caller interruption."""
+        self._coordinator._detach_resume_initiator(self._record)
+
+    @property
+    def initiator_detached(self) -> bool:
+        """Whether the caller left before this ticket's terminal delivery."""
+        return self._coordinator._resume_initiator_detached(self._record)
+
+
 @dataclass(slots=True, repr=False)
 class _CaptureSubmission:
     """Private receipt for one synchronous adapter-to-coordinator handoff.
@@ -962,6 +1049,8 @@ class CaptureEvaluationCoordinator:
         self._phase = CapturePhase.PAUSED
         self._failure: CaptureFailureDiagnostic | None = None
         self._active: _CaptureEvaluationRecord | None = None
+        self._active_resume: _CaptureResumeRecord | None = None
+        self._capture_view_stale = False
         self._last_user: CaptureEvaluationOutcome | None = None
         self._last_internal: CaptureEvaluationOutcome | None = None
         self._last: CaptureEvaluationOutcome | None = None
@@ -991,6 +1080,8 @@ class CaptureEvaluationCoordinator:
                 )
             if self._phase is CapturePhase.RECOVERY_REQUIRED:
                 raise CaptureRecoveryRequiredError(self._failure)
+            if self._active_resume is not None:
+                raise CaptureBusyError(None, None, CapturePhase.RESUMING)
             if self._active is not None:
                 raise CaptureBusyError(
                     self._active.evaluation_id,
@@ -1024,6 +1115,40 @@ class CaptureEvaluationCoordinator:
                     self._condition.notify_all()
                 raise
 
+    def submit_resume(self, request: CaptureResumeRequest) -> CaptureResumeTicket:
+        """Atomically reserve the paused frame for its controller-owned resume."""
+        if current_thread() is self._worker:
+            raise ProtocolError("Recursive CAPTURE submission is prohibited")
+        with self._condition:
+            self._require_fence_locked(request.fence)
+            if self._phase is CapturePhase.OUTCOME_UNKNOWN:
+                raise CaptureOutcomeUnknownError(
+                    self._last.evaluation_id if self._last is not None else None,
+                    self._failure,
+                )
+            if self._phase is CapturePhase.RECOVERY_REQUIRED:
+                raise CaptureRecoveryRequiredError(self._failure)
+            if self._active_resume is not None or self._phase is CapturePhase.RESUMING:
+                raise CaptureBusyError(None, None, CapturePhase.RESUMING)
+            if self._active is not None:
+                raise CaptureBusyError(
+                    self._active.evaluation_id,
+                    self._active.request.evaluation_kind,
+                    self._phase,
+                )
+            if self._phase is not CapturePhase.PAUSED:
+                raise StaleCaptureError()
+            record = _CaptureResumeRecord(request)
+            ticket = CaptureResumeTicket(record.resume_id, self, record)
+            # The callback changes controller state while the phase reservation
+            # remains private. Once observers can see ``resuming``, no root
+            # export or inspection can fit before it.
+            request.admit()
+            self._active_resume = record
+            self._phase = CapturePhase.RESUMING
+            self._condition.notify_all()
+            return ticket
+
     def status(self, fence: CaptureFence) -> CaptureStatus:
         with self._condition:
             if fence != self._fence or self._closing or self._phase is CapturePhase.STALE:
@@ -1045,6 +1170,25 @@ class CaptureEvaluationCoordinator:
                 evaluation_timing=timing,
                 failure=self._failure,
             )
+
+    def capture_view_is_current(self, fence: CaptureFence) -> bool:
+        """Keep the view fence distinct from the controller's active MAIN."""
+        with self._condition:
+            return (
+                fence == self._fence
+                and not self._closing
+                and not self._capture_view_stale
+                and self._phase is not CapturePhase.STALE
+            )
+
+    def mark_continue_acknowledged(self, fence: CaptureFence) -> None:
+        """Stale frame-backed views at the Continue acknowledgement boundary."""
+        with self._condition:
+            self._require_fence_locked(fence)
+            if self._active_resume is None or self._phase is not CapturePhase.RESUMING:
+                raise ProtocolError("CAPTURE resume acknowledgement has no active owner")
+            self._capture_view_stale = True
+            self._condition.notify_all()
 
     def wait(
         self,
@@ -1080,6 +1224,8 @@ class CaptureEvaluationCoordinator:
             self._closing = True
             if self._active is not None:
                 self._active.initiator_attached = False
+            if self._active_resume is not None:
+                self._active_resume.initiator_attached = False
             self._condition.notify_all()
 
     def join(self, timeout_s: float) -> bool:
@@ -1090,6 +1236,9 @@ class CaptureEvaluationCoordinator:
             raise ProtocolError("CAPTURE worker cannot join itself")
         self._worker.join(timeout_s)
         return not self._worker.is_alive()
+
+    def is_worker_thread(self) -> bool:
+        return current_thread() is self._worker
 
     def finish_close(self, termination_proven: bool) -> None:
         """Dispose shutdown ownership once, after termination has been classified."""
@@ -1117,6 +1266,23 @@ class CaptureEvaluationCoordinator:
                 )
             record = self._shutdown_record or self._active
             if record is None:
+                resume = self._active_resume
+                if resume is not None:
+                    # Resume has no evaluation pin/cleanup leases for this
+                    # evaluator's shutdown path.  An unproven join must leave
+                    # its record live so the worker can still settle its own
+                    # terminal result after target termination is classified.
+                    self._phase = CapturePhase.STALE
+                    self._capture_view_stale = True
+                    if termination_proven:
+                        resume.initiating_error = TargetLost(
+                            "CAPTURE resume target terminated"
+                        )
+                        resume.completed = True
+                        self._active_resume = None
+                        self._shutdown_finalized = True
+                    self._condition.notify_all()
+                    return
                 self._shutdown_finalized = True
                 return
             elapsed_ms = self._offset(record)
@@ -1260,6 +1426,46 @@ class CaptureEvaluationCoordinator:
                 self._detach_locked(record, "interrupt")
             raise
 
+    def _wait_resume_initiator(
+        self,
+        record: _CaptureResumeRecord,
+        timeout_s: float | None,
+    ) -> object:
+        """Detach a caller without cancelling the controller-owned resume."""
+        if current_thread() is self._worker:
+            raise ProtocolError("CAPTURE worker cannot wait on its own resume")
+        deadline = _deadline(timeout_s)
+        try:
+            with self._condition:
+                while not record.completed:
+                    remaining = _remaining(deadline)
+                    if remaining is not None and remaining <= 0:
+                        self._detach_resume_locked(record)
+                        raise TimeoutError(
+                            "CAPTURE resume remains pending; use runtime.status()"
+                        )
+                    self._condition.wait(remaining)
+                if record.initiating_error is not None:
+                    raise record.initiating_error
+                return record.private_result
+        except KeyboardInterrupt:
+            with self._condition:
+                self._detach_resume_locked(record)
+            raise
+
+    def _detach_resume_locked(self, record: _CaptureResumeRecord) -> None:
+        if not record.completed and record.initiator_attached:
+            record.initiator_attached = False
+            self._condition.notify_all()
+
+    def _detach_resume_initiator(self, record: _CaptureResumeRecord) -> None:
+        with self._condition:
+            self._detach_resume_locked(record)
+
+    def _resume_initiator_detached(self, record: _CaptureResumeRecord) -> bool:
+        with self._condition:
+            return not record.initiator_attached
+
     def _detach_locked(self, record: _CaptureEvaluationRecord, reason: str) -> None:
         if record.outcome is None and record.initiator_attached:
             record.initiator_attached = False
@@ -1269,11 +1475,23 @@ class CaptureEvaluationCoordinator:
     def _run(self) -> None:
         while True:
             with self._condition:
-                while self._active is None and not self._closing:
+                while (
+                    self._active is None
+                    and self._active_resume is None
+                    and not self._closing
+                ):
                     self._condition.wait()
-                if self._closing and self._active is None:
+                if (
+                    self._closing
+                    and self._active is None
+                    and self._active_resume is None
+                ):
                     return
                 record = self._active
+                resume = self._active_resume if record is None else None
+            if resume is not None:
+                self._execute_resume(resume)
+                continue
             assert record is not None
             self._flush_evidence()
             self._execute(record)
@@ -1281,6 +1499,82 @@ class CaptureEvaluationCoordinator:
             # Public retention contains only immutable outcomes. Do not keep
             # the last request/temporary result alive in an idle worker frame.
             del record
+
+    def _execute_resume(self, record: _CaptureResumeRecord) -> None:
+        """Run the full continuation even after its initiating waiter detaches."""
+        result: object | None = None
+        error: BaseException | None = None
+        try:
+            result = record.request.execute(CaptureStepContext(self, record))
+        except BaseException as caught:
+            error = caught
+        self._finish_resume(record, result, error)
+
+    def _finish_resume(
+        self,
+        record: _CaptureResumeRecord,
+        result: object | None,
+        error: BaseException | None,
+    ) -> None:
+        completion = record.request.completion
+        if completion is not None:
+            try:
+                result = completion(result, error)
+            except BaseException as completion_error:
+                if error is None:
+                    error = completion_error
+                    result = None
+        phase = CapturePhase.STALE
+        failure: CaptureFailureDiagnostic | None = None
+        settlement = record.request.settlement
+        if settlement is not None:
+            try:
+                phase, failure = settlement(error)
+            except BaseException as settlement_error:
+                if error is None:
+                    error = settlement_error
+                    result = None
+                phase = CapturePhase.RECOVERY_REQUIRED
+                failure = _diagnostic("resume_settlement_failed")
+            if phase not in {
+                CapturePhase.PAUSED,
+                CapturePhase.RECOVERY_REQUIRED,
+                CapturePhase.STALE,
+            }:
+                if error is None:
+                    error = ProtocolError("CAPTURE resume settlement is invalid")
+                    result = None
+                phase = CapturePhase.RECOVERY_REQUIRED
+                failure = _diagnostic("resume_settlement_failed")
+            if phase is CapturePhase.PAUSED:
+                failure = None
+            elif phase is CapturePhase.RECOVERY_REQUIRED and failure is None:
+                failure = _diagnostic("resume_recovery_required")
+        with self._condition:
+            # A successor CAPTURE may have retired this coordinator while this
+            # worker routed its next stop. The ticket still receives exactly
+            # the controller result; the successor owns future admission.
+            record.private_result = result
+            record.initiating_error = error
+            record.completed = True
+            if self._active_resume is record:
+                self._active_resume = None
+                if not self._closing:
+                    self._phase = phase
+                    self._failure = failure
+            detached = not record.initiator_attached
+            self._condition.notify_all()
+        # A detached caller cannot publish its Session/capture-service state.
+        # Publish the ticket first: an attached caller owns synchronous
+        # delivery, while this fallback only runs after that caller released
+        # any outer admission lock.
+        if detached and record.request.detached_completion is not None:
+            try:
+                record.request.detached_completion(result, error)
+            except BaseException:
+                # Session observers are after terminal ticket publication and
+                # cannot revise the classified controller outcome.
+                pass
 
     def _execute(self, record: _CaptureEvaluationRecord) -> None:
         request = record.request
@@ -1418,7 +1712,9 @@ class CaptureEvaluationCoordinator:
                      private_result=private_result, diagnostic=diagnostic, messages=messages)
 
     def _execute_remote_step(
-        self, record: _CaptureEvaluationRecord, step: CaptureRemoteStep,
+        self,
+        record: _CaptureEvaluationRecord | _CaptureResumeRecord,
+        step: CaptureRemoteStep,
     ) -> EvaluationResult:
         entered = False
         with self._condition:
@@ -1721,13 +2017,34 @@ class CaptureEvaluationCoordinator:
         )
 
     @staticmethod
-    def _offset(record: _CaptureEvaluationRecord) -> int:
+    def _offset(record: _CaptureEvaluationRecord | _CaptureResumeRecord) -> int:
         return min(MAX_CAPTURE_TIMING_MS, max(0, int((monotonic() - record.created) * 1000)))
 
-    def _evidence_locked(self, record: _CaptureEvaluationRecord, event: str, **extra: object) -> None:
+    def _evidence_locked(
+        self,
+        record: _CaptureEvaluationRecord | _CaptureResumeRecord,
+        event: str,
+        **extra: object,
+    ) -> None:
         offset = self._offset(record)
         if event != "record_created" and event != "poll_progress":
             record.offsets.setdefault(f"{event}_ms", offset)
+        if isinstance(record, _CaptureResumeRecord):
+            self._events.append((
+                f"capture_resume_{event}",
+                {
+                    "operation_id": record.request.fence.operation_id,
+                    "capture_generation": record.request.fence.capture_generation,
+                    "stop_sequence": record.request.fence.stop_sequence,
+                    "elapsed_ms": offset,
+                    "poll_count": record.poll_count,
+                    "remote_step_count": record.remote_step_count,
+                    "state": "completed" if record.completed else "pending",
+                    **record.offsets,
+                    **extra,
+                },
+            ))
+            return
         fields: dict[str, object] = {
             "evaluation_id": record.evaluation_id,
             "evaluation_kind": record.request.evaluation_kind.value,
@@ -1743,7 +2060,10 @@ class CaptureEvaluationCoordinator:
         }
         self._events.append((f"capture_evaluation_{event}", fields))
 
-    def _poll_evidence(self, record: _CaptureEvaluationRecord) -> None:
+    def _poll_evidence(
+        self,
+        record: _CaptureEvaluationRecord | _CaptureResumeRecord,
+    ) -> None:
         with self._condition:
             record.poll_count = min(MAX_CAPTURE_TIMING_COUNT, record.poll_count + 1)
             record.offsets["last_poll_ms"] = self._offset(record)
@@ -1796,6 +2116,8 @@ def _diagnostic(code: str) -> CaptureFailureDiagnostic:
         "target_lost": "The CAPTURE debugger target is no longer available.",
         "coordinator_closed": "The CAPTURE coordinator is closing.",
         "pin_disposition_failed": "CAPTURE generation pin disposition failed.",
+        "resume_recovery_required": "CAPTURE resume requires recovery before it can continue.",
+        "resume_settlement_failed": "CAPTURE resume could not publish its terminal state.",
     }
     normal_failure = code in {
         "pre_dispatch_failed", "bsl_error", "result_policy_failed",

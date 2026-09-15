@@ -42,12 +42,15 @@ from onec_runtime.capture import (
 )
 from onec_runtime.capture_evaluation import (
     CaptureEvaluationCoordinator,
+    CaptureFailureDiagnostic,
     CaptureEvaluationKind,
     CaptureEvaluationRequest,
     CaptureEvaluationTicket,
     CaptureFence,
     CapturePhase,
     CaptureRemoteStep,
+    CaptureResumeRequest,
+    CaptureResumeTicket,
     CaptureStepContext,
 )
 from onec_runtime.breakpoint_workspace import (
@@ -444,7 +447,10 @@ class PrototypeRuntimeController:
         previous = self._capture_evaluation_coordinator
         if previous is not None:
             previous.begin_close()
-            if not previous.join(min(1.0, self.command_timeout_s)):
+            if (
+                not previous.is_worker_thread()
+                and not previous.join(min(1.0, self.command_timeout_s))
+            ):
                 raise ProtocolError("Previous CAPTURE coordinator did not stop")
         if self.active_operation is None or self._capture_target_id is None:
             raise ProtocolError("CAPTURE coordinator identity is incomplete")
@@ -480,6 +486,8 @@ class PrototypeRuntimeController:
                     status.evaluation_kind,
                     status.phase,
                 )
+            if status.phase is CapturePhase.RESUMING:
+                raise CaptureBusyError(None, None, status.phase)
             if status.phase is CapturePhase.OUTCOME_UNKNOWN:
                 raise CaptureOutcomeUnknownError(
                     status.last_evaluation_id,
@@ -2244,6 +2252,20 @@ class PrototypeRuntimeController:
             result_policy=accept_cleanup,
         )
 
+    def clear_capture_worker_generation_pin_for_resume(
+        self,
+        step_context: CaptureStepContext,
+    ) -> None:
+        """Clear the ephemeral Worker slot inside the accepted resume owner."""
+        if not isinstance(step_context, CaptureStepContext):
+            raise TypeError("CAPTURE resume requires its coordinator step context")
+        result = step_context.execute_inline(self._capture_remote_step(
+            "RuntimeKernelServer.ОчиститьПинПоколенияWorker(Контекст)",
+            stack_level=self._required_capture_kernel_stack_level(),
+        ))
+        if result.error_occurred or evaluation_to_python(result) is not True:
+            raise ProtocolError("CAPTURE Worker pin cleanup failed")
+
     def _execute_capture(
         self,
         visible_source: str,
@@ -2512,18 +2534,115 @@ class PrototypeRuntimeController:
         continuation_attempt_id: str | None = None,
         on_transport_dispatch: Callable[[], None] | None = None,
     ) -> MainCompletion | CapturedStop | DebugStop:
+        """Synchronously resume for legacy controller callers.
+
+        RuntimeApi uses ``submit_resume`` so its caller only waits on a ticket;
+        direct controller tests retain this small compatibility surface.
+        """
         self._require_state(OperationState.CAPTURED)
+        return self._resume_owned(
+            dirty_roots=dirty_roots,
+            continuation_attempt_id=continuation_attempt_id,
+            on_transport_dispatch=on_transport_dispatch,
+            on_continue_acknowledged=None,
+        )
+
+    def submit_resume(
+        self,
+        *,
+        dirty_roots: tuple[str, ...] = (),
+        continuation_attempt_id: str | None = None,
+        on_transport_dispatch: Callable[[], None] | None = None,
+        completion: Callable[[object | None, BaseException | None], object] | None = None,
+        detached_completion: Callable[[object | None, BaseException | None], None]
+        | None = None,
+        before_resume: Callable[[CaptureStepContext], None] | None = None,
+    ) -> CaptureResumeTicket:
+        """Hand the paused frame and its next stop to the coordinator worker."""
+        self._require_state(OperationState.CAPTURED)
+        owner = self._capture_evaluation_owner()
+
+        def admit() -> None:
+            self._require_state(OperationState.CAPTURED)
+            self.state = OperationState.RESUMING
+
+        def execute(step_context: CaptureStepContext) -> object:
+            if before_resume is not None:
+                before_resume(step_context)
+            return self._resume_owned(
+                dirty_roots=dirty_roots,
+                continuation_attempt_id=continuation_attempt_id,
+                on_transport_dispatch=on_transport_dispatch,
+                on_continue_acknowledged=lambda: owner.mark_continue_acknowledged(
+                    owner._fence
+                ),
+                step_context=step_context,
+            )
+
+        def settlement(
+            error: BaseException | None,
+        ) -> tuple[CapturePhase, CaptureFailureDiagnostic | None]:
+            """Classify the old capture fence after its owned continuation."""
+            if error is None:
+                return CapturePhase.STALE, None
+            if self.state is OperationState.CAPTURED:
+                # A controller can prove that its paused frame remained live;
+                # retain this fence rather than turning an ordinary rejection
+                # into a synthetic target loss.
+                return CapturePhase.PAUSED, None
+            if self.state in {
+                OperationState.FLUSHING,
+                OperationState.PARTIAL_WRITEBACK_FAILURE,
+                OperationState.BREAKPOINT_RESTORE_FAILURE,
+                OperationState.RECOVERING,
+                OperationState.RESUMING,
+            }:
+                return (
+                    CapturePhase.RECOVERY_REQUIRED,
+                    CaptureFailureDiagnostic(
+                        "resume_recovery_required",
+                        "CAPTURE resume requires recovery before it can continue.",
+                        "close and restart the runtime",
+                    ),
+                )
+            return CapturePhase.STALE, None
+
+        return owner.submit_resume(CaptureResumeRequest(
+            owner._fence,
+            admit,
+            execute,
+            completion,
+            detached_completion,
+            settlement,
+        ))
+
+    def _resume_owned(
+        self,
+        *,
+        dirty_roots: tuple[str, ...],
+        continuation_attempt_id: str | None,
+        on_transport_dispatch: Callable[[], None] | None,
+        on_continue_acknowledged: Callable[[], None] | None,
+        step_context: CaptureStepContext | None = None,
+    ) -> MainCompletion | CapturedStop | DebugStop:
         dirty_roots = tuple(dirty_roots)
         attempt = self._continuation_attempt(
             dirty_roots, continuation_attempt_id
         )
         self.state = OperationState.FLUSHING
+
+        def capture_step(expression: str) -> EvaluationResult:
+            stack_level = self._required_capture_kernel_stack_level()
+            if step_context is None:
+                return self.session.evaluate(expression, stack_level=stack_level)
+            return step_context.execute_inline(self._capture_remote_step(
+                expression,
+                stack_level=stack_level,
+            ))
+
         for root in dirty_roots:
             try:
-                transfer = self.session.evaluate(
-                    build_live_capture_root_transfer_call(root),
-                    stack_level=self._required_capture_kernel_stack_level(),
-                )
+                transfer = capture_step(build_live_capture_root_transfer_call(root))
             except BaseException as error:
                 self._mark_continuation_root(
                     attempt, root, "failed", error=type(error).__name__
@@ -2626,10 +2745,7 @@ class PrototypeRuntimeController:
         )
         self._flush_journal()
         try:
-            close = self.session.evaluate(
-                build_live_capture_end_call(),
-                stack_level=self._required_capture_kernel_stack_level(),
-            )
+            close = capture_step(build_live_capture_end_call())
         except RdbgTransportError as error:
             self._record(
                 "write-journal.jsonl",
@@ -2702,6 +2818,8 @@ class PrototypeRuntimeController:
             raise
         # The debugger has accepted Continue; no frame-backed resolver may
         # survive into the next stop, even if the subsequent wait is unknown.
+        if on_continue_acknowledged is not None:
+            on_continue_acknowledged()
         self._clear_capture_inspection()
         attempt.continue_state = "acknowledged"
         self._record(
