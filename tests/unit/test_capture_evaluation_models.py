@@ -138,22 +138,99 @@ def test_status_capabilities_follow_phase_and_retained_outcome(
     assert status.can_resume_capture is can_resume
     assert status.can_wait is can_wait
 
-    retained = CaptureStatus(
-        operation_id=7,
-        capture_generation=3,
-        stop_sequence=11,
-        phase=phase,
-        last_evaluation_id=("eval-last" if phase is not CapturePhase.STALE else None),
+    if phase is not CapturePhase.EVALUATING:
+        retained = CaptureStatus(
+            operation_id=7,
+            capture_generation=3,
+            stop_sequence=11,
+            phase=phase,
+            last_evaluation_id=("eval-last" if phase is not CapturePhase.STALE else None),
+        )
+        assert retained.can_wait is (
+            phase in {
+                CapturePhase.PAUSED,
+                CapturePhase.RESUMING,
+                CapturePhase.OUTCOME_UNKNOWN,
+                CapturePhase.RECOVERY_REQUIRED,
+            }
+        )
+
+
+def test_status_rejects_pending_records_outside_evaluating() -> None:
+    for phase in CapturePhase:
+        if phase is CapturePhase.EVALUATING:
+            continue
+        with pytest.raises(ValueError, match="pending_evaluation_id"):
+            CaptureStatus(
+                operation_id=7,
+                capture_generation=3,
+                stop_sequence=11,
+                phase=phase,
+                pending_evaluation_id="eval-pending",
+                evaluation_kind=CaptureEvaluationKind.INSPECTION,
+            )
+
+
+def test_status_requires_pending_identity_while_evaluating() -> None:
+    with pytest.raises(ValueError, match="evaluating"):
+        CaptureStatus(
+            operation_id=7,
+            capture_generation=3,
+            stop_sequence=11,
+            phase=CapturePhase.EVALUATING,
+        )
+
+
+def test_status_requires_timing_to_describe_selected_evaluation() -> None:
+    timing = CaptureEvaluationTiming(
+        evaluation_id="other-eval",
+        created_at_utc=datetime.now(timezone.utc),
     )
-    assert retained.can_wait is (
-        phase is CapturePhase.EVALUATING
-        or phase in {
-            CapturePhase.PAUSED,
-            CapturePhase.RESUMING,
-            CapturePhase.OUTCOME_UNKNOWN,
-            CapturePhase.RECOVERY_REQUIRED,
-        }
-    )
+    with pytest.raises(ValueError, match="evaluation_timing"):
+        CaptureStatus(
+            operation_id=7,
+            capture_generation=3,
+            stop_sequence=11,
+            phase=CapturePhase.EVALUATING,
+            pending_evaluation_id="eval-pending",
+            evaluation_kind=CaptureEvaluationKind.INSPECTION,
+            evaluation_timing=timing,
+        )
+    with pytest.raises(ValueError, match="evaluation_timing"):
+        CaptureStatus(
+            operation_id=7,
+            capture_generation=3,
+            stop_sequence=11,
+            phase=CapturePhase.PAUSED,
+            last_evaluation_id="eval-last",
+            evaluation_timing=timing,
+        )
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [
+        CapturePhase.PAUSED,
+        CapturePhase.EVALUATING,
+        CapturePhase.RESUMING,
+        CapturePhase.STALE,
+    ],
+)
+def test_status_rejects_failure_outside_terminal_failure_phases(phase: CapturePhase) -> None:
+    with pytest.raises(ValueError, match="failure"):
+        CaptureStatus(
+            operation_id=7,
+            capture_generation=3,
+            stop_sequence=11,
+            phase=phase,
+            pending_evaluation_id=("eval-pending" if phase is CapturePhase.EVALUATING else None),
+            evaluation_kind=(
+                CaptureEvaluationKind.INSPECTION
+                if phase is CapturePhase.EVALUATING
+                else None
+            ),
+            failure=CaptureFailureDiagnostic("failed", "message", "recover"),
+        )
 
 
 def test_outcome_normalizes_messages_and_is_immutable() -> None:
@@ -171,6 +248,98 @@ def test_outcome_normalizes_messages_and_is_immutable() -> None:
     with pytest.raises(FrozenInstanceError):
         outcome.state = CaptureEvaluationState.COMPLETED  # type: ignore[misc]
     assert "raw" not in repr(outcome)
+
+
+@pytest.mark.parametrize(
+    ("state", "kwargs"),
+    [
+        (CaptureEvaluationState.PENDING, {"result": 1}),
+        (CaptureEvaluationState.PENDING, {"messages": ("still waiting",)}),
+        (CaptureEvaluationState.PENDING, {"error": "failed"}),
+        (CaptureEvaluationState.PENDING, {"diagnostic": CaptureFailureDiagnostic("x", "y", "z")}),
+        (CaptureEvaluationState.COMPLETED, {"error": "failed"}),
+        (CaptureEvaluationState.COMPLETED, {"diagnostic": CaptureFailureDiagnostic("x", "y", "z")}),
+        (CaptureEvaluationState.FAILED, {"result": "private"}),
+        (CaptureEvaluationState.UNKNOWN, {"result": "private"}),
+        (CaptureEvaluationState.UNKNOWN, {"error": "private"}),
+    ],
+)
+def test_outcome_rejects_state_incompatible_payloads(
+    state: CaptureEvaluationState, kwargs: dict[str, object]
+) -> None:
+    with pytest.raises(ValueError, match="state"):
+        CaptureEvaluationOutcome(
+            evaluation_id="eval-1",
+            evaluation_kind=CaptureEvaluationKind.USER_BSL,
+            state=state,
+            **kwargs,
+        )
+
+
+@pytest.mark.parametrize(
+    ("state", "kwargs"),
+    [
+        (CaptureEvaluationState.PENDING, {}),
+        (CaptureEvaluationState.COMPLETED, {}),
+        (CaptureEvaluationState.FAILED, {"error": "failed safely"}),
+        (
+            CaptureEvaluationState.UNKNOWN,
+            {"diagnostic": CaptureFailureDiagnostic("unknown", "uncertain", "recover")},
+        ),
+    ],
+)
+def test_outcome_accepts_state_appropriate_payloads(
+    state: CaptureEvaluationState, kwargs: dict[str, object]
+) -> None:
+    outcome = CaptureEvaluationOutcome(
+        evaluation_id="eval-1",
+        evaluation_kind=CaptureEvaluationKind.USER_BSL,
+        state=state,
+        **kwargs,
+    )
+    assert outcome.state is state
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        Exception("SELECT * FROM secret"),
+        {"request": "opaque"},
+        ["mutable"],
+        ("safe", ["mutable nested"]),
+    ],
+)
+def test_outcome_rejects_opaque_and_mutable_results(value: object) -> None:
+    with pytest.raises(ValueError, match="public result"):
+        CaptureEvaluationOutcome(
+            evaluation_id="eval-1",
+            evaluation_kind=CaptureEvaluationKind.USER_BSL,
+            state=CaptureEvaluationState.COMPLETED,
+            result=value,
+        )
+
+
+def test_outcome_accepts_only_immutable_public_scalars_and_hides_internal_results() -> None:
+    outcome = CaptureEvaluationOutcome(
+        evaluation_id="eval-1",
+        evaluation_kind=CaptureEvaluationKind.USER_BSL,
+        state=CaptureEvaluationState.COMPLETED,
+        result=(None, True, 4, 1.5, "value"),
+    )
+    assert outcome.result == (None, True, 4, 1.5, "value")
+
+    for kind in (
+        CaptureEvaluationKind.PUBLIC_VALUE_GUARD,
+        CaptureEvaluationKind.INSPECTION,
+        CaptureEvaluationKind.MATERIALIZATION_HELPER,
+    ):
+        with pytest.raises(ValueError, match="internal"):
+            CaptureEvaluationOutcome(
+                evaluation_id="eval-1",
+                evaluation_kind=kind,
+                state=CaptureEvaluationState.COMPLETED,
+                result=True,
+            )
 
 
 def test_pending_and_busy_errors_expose_only_safe_evaluation_facts() -> None:

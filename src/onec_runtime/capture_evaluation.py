@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
-from typing import Any
+from math import isfinite
 
 
 # These limits are part of the public safety boundary.  Timing is intentionally
@@ -45,6 +45,15 @@ class CaptureEvaluationState(StrEnum):
     COMPLETED = "completed"
     FAILED = "failed"
     UNKNOWN = "unknown"
+
+
+_INTERNAL_EVALUATION_KINDS = frozenset(
+    {
+        CaptureEvaluationKind.PUBLIC_VALUE_GUARD,
+        CaptureEvaluationKind.INSPECTION,
+        CaptureEvaluationKind.MATERIALIZATION_HELPER,
+    }
+)
 
 
 def _safe_text(value: object, *, name: str, limit: int, allow_empty: bool = True) -> str:
@@ -217,6 +226,8 @@ class CaptureStatus:
             if self.evaluation_kind is not None:
                 raise ValueError("evaluation_kind requires pending_evaluation_id")
         else:
+            if self.phase is not CapturePhase.EVALUATING:
+                raise ValueError("pending_evaluation_id requires evaluating phase")
             object.__setattr__(
                 self,
                 "evaluation_kind",
@@ -226,6 +237,8 @@ class CaptureStatus:
                     name="evaluation_kind",
                 ),
             )
+        if self.phase is CapturePhase.EVALUATING and self.pending_evaluation_id is None:
+            raise ValueError("evaluating phase requires pending_evaluation_id")
         if self.evaluation_timing is not None and not isinstance(
             self.evaluation_timing, CaptureEvaluationTiming
         ):
@@ -234,6 +247,15 @@ class CaptureStatus:
             self.failure, CaptureFailureDiagnostic
         ):
             raise ValueError("failure is invalid")
+        if self.failure is not None and self.phase not in {
+            CapturePhase.OUTCOME_UNKNOWN,
+            CapturePhase.RECOVERY_REQUIRED,
+        }:
+            raise ValueError("failure requires a terminal failure phase")
+        if self.evaluation_timing is not None:
+            selected_id = self.pending_evaluation_id or self.last_evaluation_id
+            if selected_id is None or self.evaluation_timing.evaluation_id != selected_id:
+                raise ValueError("evaluation_timing does not match selected evaluation")
 
     @property
     def can_inspect(self) -> bool:
@@ -263,7 +285,7 @@ class CaptureEvaluationOutcome:
     evaluation_id: str
     evaluation_kind: CaptureEvaluationKind
     state: CaptureEvaluationState
-    result: Any = None
+    result: object = None
     messages: tuple[str, ...] = ()
     error: str | None = None
     diagnostic: CaptureFailureDiagnostic | None = None
@@ -285,6 +307,10 @@ class CaptureEvaluationOutcome:
             "state",
             _enum(self.state, CaptureEvaluationState, name="state"),
         )
+        if self.result is not None:
+            if self.evaluation_kind in _INTERNAL_EVALUATION_KINDS:
+                raise ValueError("internal evaluation outcomes cannot expose a result")
+            object.__setattr__(self, "result", _public_result(self.result))
         if isinstance(self.messages, str) or not isinstance(self.messages, (tuple, list)):
             raise ValueError("messages must be a sequence of strings")
         messages = tuple(
@@ -312,6 +338,25 @@ class CaptureEvaluationOutcome:
             raise ValueError("diagnostic is invalid")
         if self.timing is not None and not isinstance(self.timing, CaptureEvaluationTiming):
             raise ValueError("timing is invalid")
+        if self.timing is not None and self.timing.evaluation_id != self.evaluation_id:
+            raise ValueError("timing does not match evaluation_id")
+        if self.state is CaptureEvaluationState.PENDING:
+            if (
+                self.result is not None
+                or self.messages
+                or self.error is not None
+                or self.diagnostic is not None
+            ):
+                raise ValueError("pending outcome has incompatible state payload")
+        elif self.state is CaptureEvaluationState.COMPLETED:
+            if self.error is not None or self.diagnostic is not None:
+                raise ValueError("completed outcome has incompatible state payload")
+        elif self.state is CaptureEvaluationState.FAILED:
+            if self.result is not None:
+                raise ValueError("failed outcome has incompatible state payload")
+        elif self.state is CaptureEvaluationState.UNKNOWN:
+            if self.result is not None or self.error is not None:
+                raise ValueError("unknown outcome has incompatible state payload")
 
     def __repr__(self) -> str:
         return (
@@ -325,6 +370,26 @@ class CaptureEvaluationOutcome:
             f"diagnostic={'<present>' if self.diagnostic else None!r}, "
             f"timing={self.timing!r})"
         )
+
+
+def _public_result(value: object) -> object:
+    """Copy the narrow immutable result shape produced by evaluation_to_python."""
+
+    if value is None or type(value) in {bool, int}:
+        return value
+    if type(value) is float:
+        if not isfinite(value):
+            raise ValueError("public result must be finite")
+        return value
+    if type(value) is str:
+        return _safe_text(
+            value,
+            name="public result",
+            limit=MAX_CAPTURE_MESSAGE_CODEPOINTS,
+        )
+    if type(value) is tuple:
+        return tuple(_public_result(item) for item in value)
+    raise ValueError("public result must be an immutable scalar or tuple")
 
 
 __all__ = [
