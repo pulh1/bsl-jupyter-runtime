@@ -322,7 +322,7 @@ def test_prepared_capture_becomes_stale_after_notebook_publication(tmp_path):
 @pytest.mark.parametrize("uncertain", [False, True])
 def test_prepared_capture_coordinator_owns_pin_after_waiter_timeout(tmp_path, monkeypatch, uncertain):
     from dataclasses import replace
-    from threading import Event, Thread
+    from threading import Event, Thread, current_thread
     from onec_runtime.capture_evaluation import CaptureEvaluationCoordinator, CapturePhase
     from onec_runtime.errors import CaptureEvaluationPendingError
     from onec_runtime.prototype_runtime import CaptureCellResult
@@ -349,7 +349,8 @@ def test_prepared_capture_coordinator_owns_pin_after_waiter_timeout(tmp_path, mo
             return original(pin)
         monkeypatch.setattr(api._worker_universe, method_name, checked)
     def submit(*, pin_lease, completion):
-        assert not api._lock.locked(), "submission must not hold runtime writer"
+        assert api._writer_owner == current_thread().ident
+        assert api._lock.locked(), "submission must retain runtime writer"
         assert api._evaluation_generation_pin is None, "pin slot must detach before dispatch"
         def settle(value, error):
             return completion(CaptureCellResult(controller.operation_id, "visible", "lowered", value), error)

@@ -797,34 +797,34 @@ class _PreparedCaptureExecution:
         submission = _CaptureSubmission()
         lease = self.detach_pin()
         self.transferred = True
-        with self.release_writer():
-            try:
-                ownership: dict[str, object] = {
-                    "pin_lease": lease,
-                    "completion": self.completion,
-                }
-                if _accepts_capture_execution_callbacks(submit):
-                    ownership.update(
-                        primary_execution=self.primary_execution,
-                        normalize_error=self.normalize_error,
-                    )
-                ticket = submission.submit(submit, **ownership)
-                self.submitted = True
+        try:
+            ownership: dict[str, object] = {
+                "pin_lease": lease,
+                "completion": self.completion,
+            }
+            if _accepts_capture_execution_callbacks(submit):
+                ownership.update(
+                    primary_execution=self.primary_execution,
+                    normalize_error=self.normalize_error,
+                )
+            ticket = submission.submit(submit, **ownership)
+            self.submitted = True
+            with self.release_writer():
                 with self.release_waiter():
                     return ticket.wait_initiator()
-            except BaseException as error:
-                if submission.ticket is not None:
-                    self.submitted = True
-                    submission.detach_initiator()
-                    raise
-                try:
-                    if self.rejection is not None:
-                        self.rejection(error)
-                    else:
-                        self.completion(None, error)
-                finally:
-                    lease("release")
+        except BaseException as error:
+            if submission.ticket is not None:
+                self.submitted = True
+                submission.detach_initiator()
                 raise
+            try:
+                if self.rejection is not None:
+                    self.rejection(error)
+                else:
+                    self.completion(None, error)
+            finally:
+                lease("release")
+            raise
 
 
 class PrototypeRuntimeApi:
@@ -984,7 +984,10 @@ class PrototypeRuntimeApi:
             capture_status is not None
             and (
                 capture_status.phase is not CapturePhase.PAUSED
-                or self._controller.state is OperationState.CAPTURED
+                or self._controller.state in {
+                    OperationState.CAPTURED,
+                    OperationState.EVALUATING_CAPTURE,
+                }
             )
         )
         if not capture_controls_state or self._closed:
@@ -2363,6 +2366,7 @@ class PrototypeRuntimeApi:
     def execute_prepared_capture_hypothesis(self, prepared: object) -> RuntimeReply:
         """Consume one exact prepared CAPTURE lowering without lowering again."""
         with self._single_writer():
+            self._require_capture_data_plane_admission()
             self._require_available()
             self._require_capture_inspection_available()
             if not isinstance(prepared, _PreparedCaptureHypothesis):
@@ -3464,6 +3468,7 @@ class PrototypeRuntimeApi:
         continuation_attempt_id: str | None = None,
     ) -> RuntimeReply:
         with self._single_writer():
+            self._require_capture_data_plane_admission()
             self._require_available()
             if self._controller.state is OperationState.CAPTURED:
                 combined = dict(self._pending_dirty_roots)
