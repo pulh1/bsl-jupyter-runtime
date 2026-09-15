@@ -299,17 +299,49 @@ def test_rejects_non_module_braced_labels() -> None:
     assert parsed.line is None
 
 
-def test_platform_diagnostic_is_code_point_bounded_and_hashes_original() -> None:
-    raw = "{<Неизвестный модуль>(1,1)}: " + "😀" * 5000
+def test_platform_diagnostic_is_utf8_byte_bounded_and_hashes_original() -> None:
+    raw = "{<Неизвестный модуль>(1,1)}: " + "😀" * 20_000
 
     parsed = parse_platform_diagnostic(raw)
+    retained_size = len(parsed.platform_diagnostic.encode("utf-8"))
 
-    assert len(parsed.platform_diagnostic) == 4096
+    assert retained_size <= 64 * 1024
+    assert retained_size + len("😀".encode("utf-8")) > 64 * 1024
+    assert parsed.platform_diagnostic.encode("utf-8").decode("utf-8") == (
+        parsed.platform_diagnostic
+    )
     assert parsed.platform_diagnostic_truncated is True
     assert parsed.platform_diagnostic_sha256 == hashlib.sha256(
         raw.encode("utf-8")
     ).hexdigest()
     assert parsed.platform_diagnostic_redacted is False
+
+
+def test_parses_canonical_line_only_native_and_unknown_locations() -> None:
+    parsed = parse_platform_diagnostic(
+        "{ОбщийМодуль.Сервис.Модуль(12)}: native\n"
+        "{<Неизвестный модуль>(3)}: generated"
+    )
+
+    assert [
+        (item.module_name, item.line, item.column)
+        for item in parsed.locations
+    ] == [
+        ("ОбщийМодуль.Сервис.Модуль", 12, None),
+        ("<Неизвестный модуль>", 3, None),
+    ]
+
+
+def test_line_only_parser_rejects_zero_and_does_not_classify_decorated_worker() -> None:
+    registration = "OnecRuntime_aaaaaaaa_aaaaaaaaaaaaaaaa"
+    parsed = parse_platform_diagnostic(
+        "{ОбщийМодуль.Сервис.Модуль(0)}: zero\n"
+        f"{{Decorator.ВнешняяОбработка.{registration}.МодульОбъекта(2)}}: decorated"
+    )
+
+    assert len(parsed.locations) == 1
+    assert parsed.locations[0].module_name.startswith("Decorator.")
+    assert parsed.locations[0].worker_artifact_location is None
 
 
 def test_private_platform_text_fails_closed_under_generic_serialization() -> None:
@@ -1079,7 +1111,7 @@ def test_worker_stage_does_not_parse_canonical_locator_beyond_prose_bound() -> N
         manifest,
     )
     raw = (
-        "x" * 4096
+        "x" * (64 * 1024)
         + "\n{ВнешняяОбработка."
         + artifact.registration_name
         + ".МодульОбъекта(1,1)}: hidden"
@@ -1096,7 +1128,7 @@ def test_worker_stage_does_not_parse_canonical_locator_beyond_prose_bound() -> N
     assert diagnostic.mapping_confidence is MappingConfidence.UNKNOWN
     assert diagnostic.code == "worker_artifact_location_unmapped"
     assert diagnostic.platform_diagnostic_truncated
-    assert diagnostic.platform_diagnostic == raw[:4096]
+    assert diagnostic.platform_diagnostic == "x" * (64 * 1024)
 
 
 def test_worker_stage_does_not_fallback_to_wrapper_or_wrong_worker_location() -> None:
@@ -1234,7 +1266,7 @@ def test_runtime_canonical_line_only_worker_frames_map_exactly_in_order() -> Non
     ]
 
 
-def test_line_only_worker_parser_rejects_host_and_decorated_shapes() -> None:
+def test_line_only_parser_keeps_native_paths_without_worker_classification() -> None:
     registration = "OnecRuntime_aaaaaaaa_aaaaaaaaaaaaaaaa"
     raw = (
         "{ОбщийМодуль.RuntimeKernelServer.Модуль(12)}: host\n"
@@ -1244,7 +1276,10 @@ def test_line_only_worker_parser_rejects_host_and_decorated_shapes() -> None:
 
     parsed = parse_platform_diagnostic(raw)
 
-    assert parsed.locations == ()
+    assert [item.line for item in parsed.locations] == [12, 2]
+    assert all(
+        item.worker_artifact_location is None for item in parsed.locations
+    )
 
 
 def test_line_only_worker_unknown_registration_never_maps_to_known_artifact() -> None:

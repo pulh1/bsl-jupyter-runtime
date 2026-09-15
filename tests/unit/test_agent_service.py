@@ -1546,7 +1546,7 @@ def test_explain_failure_missing_or_untrusted_private_record_fails_closed(
     """Break caught: expert lookup falls back to raw or mismatched evidence."""
     service, _, _ = seeded_service(tmp_path)
     platform_text = (
-        "{<Неизвестный модуль>(1,1)}: " + "x" * 5000
+        "{Module(1,1)}: " + "x" * (64 * 1024)
         if private_mutation == "truncated_replaced"
         else "{<Неизвестный модуль>(1,1)}: rdbg_pid=9182 "
         "token=private-connection"

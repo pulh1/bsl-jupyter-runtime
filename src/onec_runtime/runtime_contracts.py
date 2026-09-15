@@ -18,7 +18,8 @@ from onec_runtime.bsl import (
 
 MAX_DIAGNOSTIC_COORDINATE = 10_000_000
 MAX_DIAGNOSTIC_LABEL_LENGTH = 128
-MAX_PRIVATE_DIAGNOSTIC_LENGTH = 4_096
+MAX_PRIVATE_DIAGNOSTIC_BYTES = 64 * 1024
+MAX_PRIVATE_DIAGNOSTIC_LENGTH = MAX_PRIVATE_DIAGNOSTIC_BYTES
 
 _DIAGNOSTIC_ID_RE = re.compile(r"[0-9a-f]{64}\Z")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -110,7 +111,7 @@ def sanitize_normalized_diagnostic(
         platform_diagnostic = value.platform_diagnostic
         if platform_diagnostic is not None and (
             type(platform_diagnostic) is not str
-            or len(platform_diagnostic) > MAX_PRIVATE_DIAGNOSTIC_LENGTH
+            or len(platform_diagnostic.encode("utf-8")) > MAX_PRIVATE_DIAGNOSTIC_BYTES
             or value.platform_diagnostic_sha256 is None
         ):
             return None

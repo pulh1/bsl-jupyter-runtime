@@ -19,20 +19,23 @@ from onec_runtime.bsl.source_maps import (
 )
 
 
-_PLATFORM_DIAGNOSTIC_LIMIT = 4096
+_PLATFORM_DIAGNOSTIC_LIMIT_BYTES = 64 * 1024
+_PLATFORM_FRAME_LIMIT = 128
+_PLATFORM_CAUSE_LIMIT = 32
+_PLATFORM_COORDINATE_LIMIT = 10_000_000
 _MODULE_LOCATOR_LIMIT = 512
 _MODULE_COMPONENT_LIMIT = 32
 _MODULE_IDENTIFIER = r"[A-Za-zА-Яа-яЁё_][0-9A-Za-zА-Яа-яЁё_]*"
 _LOCATION_RE = re.compile(
-    rf"^\{{(?P<module><Неизвестный модуль>|Неизвестный модуль|{_MODULE_IDENTIFIER}(?:\.{_MODULE_IDENTIFIER})*)"
-    r"\((?P<line>[0-9]{1,10})\s*,\s*(?P<column>[0-9]{1,10})\)\}",
+    rf"^\{{(?P<module><Неизвестный модуль>|Неизвестный модуль|"
+    rf"{_MODULE_IDENTIFIER}(?:\.{_MODULE_IDENTIFIER})*)"
+    r"\((?P<line>[0-9]{1,10})"
+    r"(?:\s*,\s*(?P<column>[0-9]{1,10}))?\)\}",
     re.MULTILINE,
 )
-_WORKER_LINE_ONLY_LOCATION_RE = re.compile(
-    r"^\{(?P<module>ВнешняяОбработка\."
-    r"(?P<registration>OnecRuntime_[0-9a-f]{8}_[0-9a-f]{16})\."
-    r"МодульОбъекта)\((?P<line>[1-9][0-9]{0,9})\)\}",
-    re.IGNORECASE | re.MULTILINE,
+_WORKER_REGISTRATION_RE = re.compile(
+    r"OnecRuntime_[0-9a-f]{8}_[0-9a-f]{16}\Z",
+    re.IGNORECASE,
 )
 _COMPILATION_MARKER_RE = re.compile(
     r"(?:[ \t]+|\r?\n[ \t]*)"
@@ -188,6 +191,13 @@ class PlatformDiagnosticLocation:
     coordinate_space: DiagnosticCoordinateSpace
 
 
+@dataclass(frozen=True, slots=True)
+class _AcceptedPlatformLocation:
+    start: int
+    end: int
+    location: PlatformDiagnosticLocation
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class WorkerDiagnosticArtifact:
     """Private, manifest-fenced source-map input for Worker diagnostics."""
@@ -303,30 +313,42 @@ class PlatformCoordinateCodec:
             return None
 
 
-def parse_platform_diagnostic(message: str) -> ParsedPlatformDiagnostic:
-    """Structurally parse allowlisted 1C locations from bounded diagnostic text."""
-    if type(message) is not str:
-        raise ValueError("platform diagnostic must be a string")
-    bounded = message[:_PLATFORM_DIAGNOSTIC_LIMIT]
-    digest = sha256(message.encode("utf-8")).hexdigest()
-    accepted: list[tuple[re.Match[str], PlatformDiagnosticLocation]] = []
-    for match in _LOCATION_RE.finditer(bounded):
+def _bound_platform_diagnostic(message: str) -> tuple[str, bool]:
+    encoded = message.encode("utf-8")
+    if len(encoded) <= _PLATFORM_DIAGNOSTIC_LIMIT_BYTES:
+        return message, False
+    return (
+        encoded[:_PLATFORM_DIAGNOSTIC_LIMIT_BYTES].decode("utf-8", errors="ignore"),
+        True,
+    )
+
+
+def _accepted_platform_locations(text: str) -> tuple[_AcceptedPlatformLocation, ...]:
+    accepted: list[_AcceptedPlatformLocation] = []
+    for match in _LOCATION_RE.finditer(text):
         module = match.group("module")
-        components = (module,) if module in _UNKNOWN_MODULES else tuple(module.split("."))
+        components = (
+            (module,) if module in _UNKNOWN_MODULES else tuple(module.split("."))
+        )
+        line = int(match.group("line"))
+        column_text = match.group("column")
+        column = None if column_text is None else int(column_text)
         if (
             len(module) > _MODULE_LOCATOR_LIMIT
             or len(components) > _MODULE_COMPONENT_LIMIT
+            or (column is None and line <= 0)
         ):
             continue
         accepted.append(
-            (
-                match,
+            _AcceptedPlatformLocation(
+                match.start(),
+                match.end(),
                 PlatformDiagnosticLocation(
                     module,
                     components,
                     _parse_worker_artifact_location(components),
-                    int(match.group("line")),
-                    int(match.group("column")),
+                    line,
+                    column,
                     (
                         DiagnosticCoordinateSpace.EXECUTED_BSL
                         if module in _UNKNOWN_MODULES
@@ -335,46 +357,40 @@ def parse_platform_diagnostic(message: str) -> ParsedPlatformDiagnostic:
                 ),
             )
         )
-    line_only_locations = tuple(
-        (
-            match.start(),
-            PlatformDiagnosticLocation(
-                match.group("module"),
-                tuple(match.group("module").split(".")),
-                WorkerArtifactPlatformLocation(match.group("registration")),
-                int(match.group("line")),
-                None,
-                DiagnosticCoordinateSpace.HOST_MODULE,
-            ),
-        )
-        for match in _WORKER_LINE_ONLY_LOCATION_RE.finditer(bounded)
-    )
-    locations = tuple(
-        location
-        for _offset, location in sorted(
-            (
-                *((match.start(), location) for match, location in accepted),
-                *line_only_locations,
-            ),
-            key=lambda item: item[0],
-        )
+    return tuple(accepted)
+
+
+def parse_platform_diagnostic(message: str) -> ParsedPlatformDiagnostic:
+    """Structurally parse allowlisted 1C locations from bounded diagnostic text."""
+    if type(message) is not str:
+        raise ValueError("platform diagnostic must be a string")
+    bounded, text_truncated = _bound_platform_diagnostic(message)
+    digest = sha256(message.encode("utf-8")).hexdigest()
+    accepted = _accepted_platform_locations(bounded)
+    column_locations = tuple(
+        item for item in accepted if item.location.column is not None
     )
     terminal_compilation = _COMPILATION_MARKER_RE.search(bounded) is not None
-    primary = accepted[0][0] if accepted and accepted[0][0].start() == 0 else None
+    primary = (
+        column_locations[0]
+        if column_locations and column_locations[0].start == 0
+        else None
+    )
     if (
         primary is None
         and terminal_compilation
-        and len(accepted) == 1
+        and len(column_locations) == 1
         and (
-            accepted[0][1].coordinate_space is DiagnosticCoordinateSpace.EXECUTED_BSL
-            or accepted[0][1].worker_artifact_location is not None
+            column_locations[0].location.coordinate_space
+            is DiagnosticCoordinateSpace.EXECUTED_BSL
+            or column_locations[0].location.worker_artifact_location is not None
         )
         and _NESTED_COMPILE_CAUSE_PREFIX_RE.search(
-            bounded[: accepted[0][0].start()]
+            bounded[: column_locations[0].start]
         )
         is not None
     ):
-        primary = accepted[0][0]
+        primary = column_locations[0]
     if primary is None:
         module_name = None
         line = None
@@ -382,22 +398,18 @@ def parse_platform_diagnostic(message: str) -> ParsedPlatformDiagnostic:
         space = DiagnosticCoordinateSpace.UNKNOWN
         additional: tuple[tuple[int, int], ...] = ()
     else:
-        module_name = primary.group("module")
-        line = int(primary.group("line"))
-        column = int(primary.group("column"))
-        space = (
-            DiagnosticCoordinateSpace.EXECUTED_BSL
-            if module_name in _UNKNOWN_MODULES
-            else DiagnosticCoordinateSpace.HOST_MODULE
-        )
+        module_name = primary.location.module_name
+        line = primary.location.line
+        column = primary.location.column
+        space = primary.location.coordinate_space
         additional = tuple(
-            (int(match.group("line")), int(match.group("column")))
-            for match, _location in accepted[1:]
+            (item.location.line, item.location.column)
+            for item in column_locations[1:]
         )
     return ParsedPlatformDiagnostic(
         _PrivatePlatformEvidence(bounded),
         digest,
-        len(message) > _PLATFORM_DIAGNOSTIC_LIMIT,
+        text_truncated,
         False,
         line,
         column,
@@ -405,7 +417,7 @@ def parse_platform_diagnostic(message: str) -> ParsedPlatformDiagnostic:
         module_name,
         additional,
         primary is not None and terminal_compilation,
-        locations,
+        tuple(item.location for item in accepted[:_PLATFORM_FRAME_LIMIT]),
     )
 
 
@@ -990,7 +1002,7 @@ def _parse_worker_artifact_location(
     if (
         len(components) == 3
         and components[0].casefold() == "внешняяобработка"
-        and components[1].casefold().startswith("onecruntime_")
+        and _WORKER_REGISTRATION_RE.fullmatch(components[1]) is not None
         and components[2].casefold() == "модульобъекта"
     ):
         return WorkerArtifactPlatformLocation(components[1])
