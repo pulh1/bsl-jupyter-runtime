@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import pytest
 
+import onec_runtime.rdbg.session as rdbg_session_module
 from onec_runtime.capture_evaluation import (
     CaptureEvaluationCoordinator,
     CaptureEvaluationKind,
@@ -400,6 +401,64 @@ def test_coordinator_classifies_exact_evalexpr_entry_boundary(
         assert transport.calls == transport_calls
         assert transport.request_entered is bool(transport_calls)
         assert transport.dispatch_marker_set is bool(transport_calls)
+    finally:
+        owner.begin_close()
+        assert owner.join(2)
+
+
+def test_coordinator_keeps_local_eval_request_build_before_dispatch_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = FailingEvalTransport()
+    session = ready_rdbg(transport)
+    capture_fence = CaptureFence(7, 1, 1)
+    owner = CaptureEvaluationCoordinator(capture_fence, poll_interval_s=0.01)
+    dispositions: list[str] = []
+    build_attempts: list[str] = []
+
+    def fail_local_request_build(*args: object, **kwargs: object) -> bytes:
+        del args, kwargs
+        build_attempts.append("build_eval_request")
+        raise ValueError("synthetic local eval request build failure")
+
+    monkeypatch.setattr(
+        rdbg_session_module,
+        "build_eval_request",
+        fail_local_request_build,
+    )
+
+    def dispatch(entered):  # type: ignore[no-untyped-def]
+        def exact_transport_entry() -> None:
+            entered()
+            transport.mark_evalexpr_dispatch()
+
+        return session.start_evaluation(
+            "Результат = 1",
+            on_transport_dispatch=exact_transport_entry,
+        )
+
+    try:
+        ticket = owner.submit_evaluation(CaptureEvaluationRequest(
+            capture_fence,
+            CaptureEvaluationKind.USER_BSL,
+            dispatch,
+            lambda pending, timeout_s: session.wait_evaluation_event(
+                pending, timeout_s=timeout_s,
+            ),
+            lambda result: result.presentation,
+            pin_lease=dispositions.append,
+        ))
+        outcome = owner.wait(capture_fence, ticket.evaluation_id, timeout_s=1)
+
+        assert build_attempts == ["build_eval_request"]
+        assert transport.dispatch_marker_set is False
+        assert transport.request_entered is False
+        assert transport.calls == []
+        assert outcome.state is CaptureEvaluationState.FAILED
+        assert outcome.diagnostic is not None
+        assert outcome.diagnostic.code == "pre_dispatch_failed"
+        assert owner.status(capture_fence).phase is CapturePhase.PAUSED
+        assert dispositions == ["release"]
     finally:
         owner.begin_close()
         assert owner.join(2)
