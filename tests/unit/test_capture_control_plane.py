@@ -982,3 +982,270 @@ def test_late_completion_does_not_need_runtime_api_lock() -> None:
             assert not observer.is_alive(), "late-result observer leaked"
         _finish_pending(initiator, transport)
         close_owner(controller, transport)
+
+
+def test_capture_submission_keeps_runtime_writer_until_ticket_is_adopted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api, controller, transport = _capture_runtime()
+    owner = _capture_owner(controller)
+    original_submit = owner.submit_evaluation
+    observations: list[tuple[bool, bool]] = []
+    initiator: Thread | None = None
+
+    def observed_submit(
+        request: CaptureEvaluationRequest,
+    ) -> CaptureEvaluationTicket:
+        acquired = api._lock.acquire(blocking=False)
+        observations.append(
+            (api._writer_owner == current_thread().ident, acquired)
+        )
+        if acquired:
+            api._lock.release()
+        return original_submit(request)
+
+    try:
+        monkeypatch.setattr(owner, "submit_evaluation", observed_submit)
+        initiator, _finished, failures = _start_pending_capture(
+            lambda: api.execute_bsl("РезультатИнструкции = 901;"),
+            transport.accepted,
+        )
+        assert failures == []
+    finally:
+        _finish_pending(initiator, transport)
+        close_owner(controller, transport)
+
+    assert observations == [(True, False)]
+
+
+def test_runtime_status_uses_paused_coordinator_during_real_presubmit_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api, controller, transport = _capture_runtime()
+    owner = _capture_owner(controller)
+    original_submit = owner.submit_evaluation
+    submit_entered = Event()
+    allow_submit = Event()
+    initiator: Thread | None = None
+
+    def delayed_submit(
+        request: CaptureEvaluationRequest,
+    ) -> CaptureEvaluationTicket:
+        submit_entered.set()
+        assert allow_submit.wait(_JOIN_TIMEOUT_S)
+        return original_submit(request)
+
+    @contextmanager
+    def forbidden_writer():
+        raise AssertionError("capture status entered RuntimeApi single-writer")
+        yield
+
+    try:
+        monkeypatch.setattr(owner, "submit_evaluation", delayed_submit)
+        failures: list[BaseException] = []
+
+        def initiate() -> None:
+            try:
+                api.execute_bsl("РезультатИнструкции = 901;")
+            except BaseException as error:
+                failures.append(error)
+
+        initiator = Thread(target=initiate, name="capture-presubmit-initiator")
+        initiator.start()
+        assert submit_entered.wait(1), "coordinator submission was not reached"
+        assert controller.state is OperationState.EVALUATING_CAPTURE
+        assert owner.status(owner._fence).phase is CapturePhase.PAUSED
+
+        with monkeypatch.context() as patch:
+            patch.setattr(api, "_single_writer", forbidden_writer)
+            patch.setattr(
+                api,
+                "_require_available",
+                lambda: (_ for _ in ()).throw(
+                    AssertionError("capture status called _require_available")
+                ),
+            )
+            status = api.status()
+
+        assert status.state is OperationState.CAPTURED
+        assert status.runtime_generation == owner._fence.capture_generation
+        assert status.operation_id == owner._fence.operation_id
+        assert failures == []
+    finally:
+        allow_submit.set()
+        if transport.accepted.wait(1) and transport.capture_pending is not None:
+            transport.complete()
+        if initiator is not None:
+            initiator.join(_JOIN_TIMEOUT_S)
+            assert not initiator.is_alive(), "pre-submit initiator leaked"
+        close_owner(controller, transport)
+
+
+def test_prepared_reentry_reports_the_active_capture_evaluation(
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    api, controller, transport = controlled_notebook_runtime(tmp_path)
+    initiator: Thread | None = None
+    try:
+        assert api.execute_bsl(UPDATE).succeeded
+        assert api.execute_bsl("Результат = Б();").kind.value == "captured"
+        prepared = api.prepare_capture_hypothesis(
+            "РезультатИнструкции = Б();"
+        )
+        initiator, _finished, failures = _start_pending_capture(
+            lambda: api.execute_bsl("РезультатИнструкции = Б();"),
+            transport.accepted,
+        )
+        pending_id = api.current_capture().status().pending_evaluation_id
+        starts_before = transport.capture_start_count
+
+        with pytest.raises(CaptureBusyError) as caught:
+            api.execute_prepared_capture_hypothesis(prepared)
+
+        assert pending_id is not None
+        assert caught.value.evaluation_id == pending_id
+        assert transport.capture_start_count == starts_before
+        assert failures == []
+    finally:
+        _finish_pending(initiator, transport)
+        close_owner(controller, transport)
+
+
+def test_resume_is_rejected_during_capture_completion_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api, controller, transport = _capture_runtime()
+    owner = _capture_owner(controller)
+    original_finalize = api._finalize_namespace_reply
+    original_resume = controller.resume
+    completion_entered = Event()
+    release_completion = Event()
+    resume_calls: list[dict[str, object]] = []
+    initiator: Thread | None = None
+
+    def blocked_finalize(*args, **kwargs):  # type: ignore[no-untyped-def]
+        completion_entered.set()
+        assert release_completion.wait(_JOIN_TIMEOUT_S)
+        return original_finalize(*args, **kwargs)
+
+    def observed_resume(**kwargs):  # type: ignore[no-untyped-def]
+        resume_calls.append(kwargs)
+        raise AssertionError("resume entered during CAPTURE completion")
+
+    try:
+        monkeypatch.setattr(api, "_finalize_namespace_reply", blocked_finalize)
+        monkeypatch.setattr(controller, "resume", observed_resume)
+        initiator, _finished, failures = _start_pending_capture(
+            lambda: api.execute_bsl("РезультатИнструкции = 901;"),
+            transport.accepted,
+        )
+        pending_id = api.current_capture().status().pending_evaluation_id
+        transport.complete()
+        assert completion_entered.wait(1), "completion barrier was not reached"
+        assert controller.state is OperationState.CAPTURED
+        assert owner.status(owner._fence).phase is CapturePhase.EVALUATING
+
+        with pytest.raises(CaptureBusyError) as caught:
+            api.resume_capture()
+
+        assert pending_id is not None
+        assert caught.value.evaluation_id == pending_id
+        assert resume_calls == []
+        assert failures == []
+    finally:
+        release_completion.set()
+        if initiator is not None:
+            initiator.join(_JOIN_TIMEOUT_S)
+            assert not initiator.is_alive(), "completion initiator leaked"
+        monkeypatch.setattr(api, "_finalize_namespace_reply", original_finalize)
+        monkeypatch.setattr(controller, "resume", original_resume)
+        close_owner(controller, transport)
+
+
+def test_session_prepared_capture_releases_admission_lock_while_waiting(
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    api, controller, transport = controlled_notebook_runtime(tmp_path)
+    initiator: Thread | None = None
+    contender: Thread | None = None
+    try:
+        assert api.execute_bsl(UPDATE).succeeded
+        assert api.execute_bsl("Результат = Б();").kind.value == "captured"
+        controller.command_timeout_s = 2.0
+        prepared = api.prepare_capture_hypothesis(
+            "РезультатИнструкции = Б();"
+        )
+        fence = SimpleNamespace(
+            capture_intent_id="intent",
+            operation_id=controller.operation_id,
+            capture_generation=controller.runtime_generation,
+            source_revision=1,
+            source_sha256="synthetic",
+            stop_sequence=controller.stop_sequence,
+        )
+        runtime = object.__new__(RuntimeSession)
+        runtime.runtime_api = api
+        runtime._operation_lock = RLock()
+        runtime._closed = False
+        runtime._active_capture_ticket = fence
+        runtime.config = SimpleNamespace(chunk_size=128)
+
+        first_errors: list[BaseException] = []
+        second_errors: list[BaseException] = []
+        second_done = Event()
+
+        def first() -> None:
+            try:
+                runtime.execute_prepared_capture_hypothesis(prepared, fence)
+            except BaseException as error:
+                first_errors.append(error)
+
+        def second() -> None:
+            try:
+                runtime.execute_bsl("РезультатИнструкции = Б();")
+            except BaseException as error:
+                second_errors.append(error)
+            finally:
+                second_done.set()
+
+        transport.accepted.clear()
+        initiator = Thread(target=first, name="prepared-capture-initiator")
+        initiator.start()
+        assert transport.accepted.wait(1), "prepared evaluation was not accepted"
+        pending_id = api.current_capture().status().pending_evaluation_id
+        starts_before = transport.capture_start_count
+        transport.accepted.clear()
+
+        contender = Thread(target=second, name="prepared-capture-contender")
+        contender.start()
+        contender_finished_while_pending = second_done.wait(0.2)
+
+        if not contender_finished_while_pending:
+            transport.complete()
+            initiator.join(_JOIN_TIMEOUT_S)
+            if transport.accepted.wait(1) and transport.capture_pending is not None:
+                transport.complete()
+        elif transport.capture_pending is not None:
+            transport.complete()
+        initiator.join(_JOIN_TIMEOUT_S)
+        contender.join(_JOIN_TIMEOUT_S)
+
+        assert contender_finished_while_pending, (
+            "prepared CAPTURE held the Session admission lock through wait"
+        )
+        assert pending_id is not None
+        assert first_errors == []
+        assert len(second_errors) == 1
+        assert isinstance(second_errors[0], CaptureBusyError)
+        assert second_errors[0].evaluation_id == pending_id
+        assert transport.capture_start_count == starts_before
+        assert not initiator.is_alive()
+        assert not contender.is_alive()
+    finally:
+        if transport.capture_pending is not None:
+            transport.complete()
+        if initiator is not None:
+            initiator.join(_JOIN_TIMEOUT_S)
+        if contender is not None:
+            contender.join(_JOIN_TIMEOUT_S)
+        close_owner(controller, transport)
