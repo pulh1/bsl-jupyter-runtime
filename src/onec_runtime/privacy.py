@@ -168,6 +168,9 @@ def _span_wire(value: object) -> dict[str, object]:
 def public_artifact_value(value: Any) -> Any:
     """Recursively redact reversible BSL sources from automatic evidence paths."""
     kind = type(value).__name__
+    if kind == "CaptureView":
+        # A live control-plane capability is not a saved status snapshot.
+        return {"type": "CaptureView"}
     if kind == "ValueNode":
         return {
             "name": value.name,
