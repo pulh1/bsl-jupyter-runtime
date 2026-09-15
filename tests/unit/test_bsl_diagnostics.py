@@ -7,6 +7,7 @@ import json
 import pytest
 
 from onec_runtime.bsl.diagnostics import (
+    DiagnosticTextSpan,
     DiagnosticCoordinateSpace,
     DiagnosticStage,
     MappingConfidence,
@@ -129,6 +130,78 @@ def _worker_diagnostic_artifact_from_mapped(
         mapped_source=mapped,
         visible_source_context=VisibleSourceContext({unit: visible_source}),
     )
+
+
+def _diagnostic_text(raw: str, span: DiagnosticTextSpan | None) -> str | None:
+    return None if span is None else raw[span.start : span.end]
+
+
+def test_parses_ordered_causes_frames_and_platform_fragments() -> None:
+    raw = (
+        "Ошибка оболочки\n"
+        "{ОбщийМодуль.Верхний.Модуль(10,2)}: верхний кадр\n"
+        "по причине:\n"
+        "Деление на ноль\n"
+        "{<Неизвестный модуль>(2,5)}: выражение 1 / 0\n"
+        "  дополнительный контекст\n"
+        "{ОбщийМодуль.Нижний.Модуль(20)}: вызывающий кадр"
+    )
+
+    parsed = parse_platform_diagnostic(raw)
+
+    assert [_diagnostic_text(raw, item.summary_span) for item in parsed.causes] == [
+        "Ошибка оболочки",
+        "Деление на ноль",
+    ]
+    assert [item.frame_ordinals for item in parsed.causes] == [(0,), (1, 2)]
+    assert [item.cause_ordinal for item in parsed.frames] == [0, 1, 1]
+    assert [_diagnostic_text(raw, item.detail_span) for item in parsed.frames] == [
+        "верхний кадр",
+        "выражение 1 / 0\n  дополнительный контекст",
+        "вызывающий кадр",
+    ]
+    assert [item.location.column for item in parsed.frames] == [2, 5, None]
+
+
+def test_nonstructural_cause_text_does_not_split_chain() -> None:
+    raw = "Оболочка: по причине: значение\n{ОбщийМодуль.Сервис.Модуль(2,1)}: сбой"
+
+    parsed = parse_platform_diagnostic(raw)
+
+    assert len(parsed.causes) == 1
+    assert parsed.causes[0].frame_ordinals == (0,)
+
+
+def test_cause_and_frame_limits_are_independent() -> None:
+    raw = "\nпо причине:\n".join(
+        f"Причина {index}\n{{Модуль{index}(1,1)}}: кадр"
+        for index in range(33)
+    )
+    raw += "\n" + "\n".join(
+        f"{{ДополнительныйМодуль{index}(1,1)}}: кадр"
+        for index in range(96)
+    )
+
+    parsed = parse_platform_diagnostic(raw)
+
+    assert len(parsed.causes) == 32
+    assert parsed.causes_truncated is True
+    assert len(parsed.frames) == 128
+    assert parsed.frames_truncated is True
+    assert parsed.platform_diagnostic_truncated is False
+
+
+def test_unrecognized_blocks_are_retained_as_opaque_text() -> None:
+    raw = (
+        "{ОбщийМодуль.Первый.Модуль(1,1)}: first\n"
+        "{not a module label(7,4)}: opaque\n"
+        "{ОбщийМодуль.Второй.Модуль(2,1)}: second"
+    )
+
+    parsed = parse_platform_diagnostic(raw)
+
+    opaque = "".join(raw[span.start : span.end] for span in parsed.opaque_spans)
+    assert "{not a module label(7,4)}: opaque" in opaque
 
 
 def test_parses_unknown_module_location_without_rewriting_message() -> None:

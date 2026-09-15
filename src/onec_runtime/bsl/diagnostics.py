@@ -46,6 +46,11 @@ _NESTED_COMPILE_CAUSE_PREFIX_RE = re.compile(
     r"(?:^|\r?\n)[ \t]*по причине:[ \t]*\r?\n\Z",
     re.IGNORECASE,
 )
+_CAUSE_BOUNDARY_RE = re.compile(
+    r"^[ \t]*по причине:[ \t]*(?:\r?\n|\Z)",
+    re.IGNORECASE | re.MULTILINE,
+)
+_DIAGNOSTIC_BLOCK_START_RE = re.compile(r"^\{", re.MULTILINE)
 _UNKNOWN_MODULES = frozenset({"<Неизвестный модуль>", "Неизвестный модуль"})
 
 
@@ -99,6 +104,29 @@ _REDACTED_PLATFORM_EVIDENCE = _RedactedPlatformEvidence()
 
 
 @dataclass(frozen=True, slots=True)
+class DiagnosticTextSpan:
+    start: int
+    end: int
+
+
+@dataclass(frozen=True, slots=True)
+class ParsedDiagnosticCause:
+    ordinal: int
+    summary_span: DiagnosticTextSpan
+    block_span: DiagnosticTextSpan
+    frame_ordinals: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ParsedDiagnosticFrame:
+    ordinal: int
+    cause_ordinal: int | None
+    location: PlatformDiagnosticLocation
+    block_span: DiagnosticTextSpan
+    detail_span: DiagnosticTextSpan | None
+
+
+@dataclass(frozen=True, slots=True)
 class ParsedPlatformDiagnostic:
     _platform_evidence: _PrivatePlatformEvidence = dataclass_field(repr=False)
     platform_diagnostic_sha256: str
@@ -111,6 +139,11 @@ class ParsedPlatformDiagnostic:
     additional_locations: tuple[tuple[int, int], ...]
     has_compilation_marker: bool
     locations: tuple[PlatformDiagnosticLocation, ...]
+    causes: tuple[ParsedDiagnosticCause, ...] = ()
+    frames: tuple[ParsedDiagnosticFrame, ...] = ()
+    opaque_spans: tuple[DiagnosticTextSpan, ...] = ()
+    frames_truncated: bool = False
+    causes_truncated: bool = False
 
     @property
     def platform_diagnostic(self) -> str:
@@ -360,6 +393,150 @@ def _accepted_platform_locations(text: str) -> tuple[_AcceptedPlatformLocation, 
     return tuple(accepted)
 
 
+def _trim_diagnostic_span(text: str, start: int, end: int) -> DiagnosticTextSpan:
+    while start < end and text[start].isspace():
+        start += 1
+    while end > start and text[end - 1].isspace():
+        end -= 1
+    return DiagnosticTextSpan(start, end)
+
+
+def _frame_detail_span(
+    text: str,
+    locator_end: int,
+    block_end: int,
+) -> DiagnosticTextSpan | None:
+    start = locator_end
+    if start < block_end and text[start] == ":":
+        start += 1
+    span = _trim_diagnostic_span(text, start, block_end)
+    return None if span.start == span.end else span
+
+
+def _complement_spans(
+    text_length: int,
+    consumed: tuple[DiagnosticTextSpan, ...],
+) -> tuple[DiagnosticTextSpan, ...]:
+    merged: list[DiagnosticTextSpan] = []
+    for span in sorted(consumed, key=lambda item: (item.start, item.end)):
+        if span.start == span.end:
+            continue
+        if merged and span.start <= merged[-1].end:
+            merged[-1] = DiagnosticTextSpan(
+                merged[-1].start,
+                max(merged[-1].end, span.end),
+            )
+        else:
+            merged.append(span)
+    opaque: list[DiagnosticTextSpan] = []
+    cursor = 0
+    for span in merged:
+        if cursor < span.start:
+            opaque.append(DiagnosticTextSpan(cursor, span.start))
+        cursor = max(cursor, span.end)
+    if cursor < text_length:
+        opaque.append(DiagnosticTextSpan(cursor, text_length))
+    return tuple(opaque)
+
+
+def _trace_location_is_bounded(location: PlatformDiagnosticLocation) -> bool:
+    return (
+        0 <= location.line <= _PLATFORM_COORDINATE_LIMIT
+        and (
+            location.column is None
+            or 0 <= location.column <= _PLATFORM_COORDINATE_LIMIT
+        )
+    )
+
+
+def _parse_diagnostic_structure(
+    text: str,
+    accepted: tuple[_AcceptedPlatformLocation, ...],
+) -> tuple[
+    tuple[ParsedDiagnosticCause, ...],
+    tuple[ParsedDiagnosticFrame, ...],
+    tuple[DiagnosticTextSpan, ...],
+    bool,
+    bool,
+]:
+    markers = tuple(_CAUSE_BOUNDARY_RE.finditer(text))
+    if not text:
+        cause_blocks: tuple[DiagnosticTextSpan, ...] = ()
+    else:
+        starts = (0, *(match.end() for match in markers))
+        ends = (*(match.start() for match in markers), len(text))
+        cause_blocks = tuple(
+            DiagnosticTextSpan(start, end)
+            for start, end in zip(starts, ends, strict=True)
+        )
+    retained_cause_blocks = cause_blocks[:_PLATFORM_CAUSE_LIMIT]
+    candidates = tuple(
+        item for item in accepted if _trace_location_is_bounded(item.location)
+    )
+    retained_candidates = candidates[:_PLATFORM_FRAME_LIMIT]
+    diagnostic_block_starts = tuple(
+        match.start() for match in _DIAGNOSTIC_BLOCK_START_RE.finditer(text)
+    )
+    frames: list[ParsedDiagnosticFrame] = []
+    for ordinal, item in enumerate(retained_candidates):
+        cause_index = next(
+            (
+                index
+                for index, block in enumerate(cause_blocks)
+                if block.start <= item.start < block.end
+            ),
+            None,
+        )
+        cause_end = len(text) if cause_index is None else cause_blocks[cause_index].end
+        next_block_start = next(
+            (start for start in diagnostic_block_starts if start > item.start),
+            cause_end,
+        )
+        block_end = min(next_block_start, cause_end)
+        frames.append(
+            ParsedDiagnosticFrame(
+                ordinal,
+                (
+                    cause_index
+                    if cause_index is not None
+                    and cause_index < len(retained_cause_blocks)
+                    else None
+                ),
+                item.location,
+                DiagnosticTextSpan(item.start, block_end),
+                _frame_detail_span(text, item.end, block_end),
+            )
+        )
+    causes: list[ParsedDiagnosticCause] = []
+    for ordinal, block in enumerate(retained_cause_blocks):
+        first_locator = next(
+            (item.start for item in accepted if block.start <= item.start < block.end),
+            block.end,
+        )
+        causes.append(
+            ParsedDiagnosticCause(
+                ordinal,
+                _trim_diagnostic_span(text, block.start, first_locator),
+                block,
+                tuple(
+                    frame.ordinal for frame in frames if frame.cause_ordinal == ordinal
+                ),
+            )
+        )
+    consumed = (
+        *(DiagnosticTextSpan(match.start(), match.end()) for match in markers),
+        *(cause.summary_span for cause in causes),
+        *(frame.block_span for frame in frames),
+    )
+    return (
+        tuple(causes),
+        tuple(frames),
+        _complement_spans(len(text), tuple(consumed)),
+        len(candidates) > _PLATFORM_FRAME_LIMIT,
+        len(cause_blocks) > _PLATFORM_CAUSE_LIMIT,
+    )
+
+
 def parse_platform_diagnostic(message: str) -> ParsedPlatformDiagnostic:
     """Structurally parse allowlisted 1C locations from bounded diagnostic text."""
     if type(message) is not str:
@@ -367,6 +544,13 @@ def parse_platform_diagnostic(message: str) -> ParsedPlatformDiagnostic:
     bounded, text_truncated = _bound_platform_diagnostic(message)
     digest = sha256(message.encode("utf-8")).hexdigest()
     accepted = _accepted_platform_locations(bounded)
+    (
+        causes,
+        frames,
+        opaque_spans,
+        frames_truncated,
+        causes_truncated,
+    ) = _parse_diagnostic_structure(bounded, accepted)
     column_locations = tuple(
         item for item in accepted if item.location.column is not None
     )
@@ -418,6 +602,11 @@ def parse_platform_diagnostic(message: str) -> ParsedPlatformDiagnostic:
         additional,
         primary is not None and terminal_compilation,
         tuple(item.location for item in accepted[:_PLATFORM_FRAME_LIMIT]),
+        causes=causes,
+        frames=frames,
+        opaque_spans=opaque_spans,
+        frames_truncated=frames_truncated,
+        causes_truncated=causes_truncated,
     )
 
 
