@@ -607,9 +607,11 @@ class CaptureEvaluationRequest:
 
     dispatch must call its argument immediately before entering transport. An
     exception before that marker proves there was no dispatch; after it, only
-    a returned PendingEvaluation proves acceptance. All callbacks run outside
-    the condition, exclusively on the worker. pin_lease receives 'release' or
-    'quarantine'; cleanup callbacks remain owned on abnormal termination.
+    a returned PendingEvaluation proves acceptance. Normal callbacks run
+    outside the condition, exclusively on the worker. pin_lease receives
+    'release' or 'quarantine'; cleanup callbacks remain owned on abnormal
+    termination. After a proven shutdown join, the close caller owns pin
+    disposition and any cleanup lease ``dispose_shutdown`` hook.
 
     result_policy admits/normalizes the private RDBG result. For user_bsl its
     returned value must also fit the public immutable scalar/tuple boundary.
@@ -685,6 +687,9 @@ class _CaptureEvaluationRecord:
     cleanup_status: str = "not_started"
     settlement_order: int = 0
     outcome: CaptureEvaluationOutcome | None = None
+    shutdown_pin_disposed: bool = False
+    shutdown_cleanup_disposed: set[int] = field(default_factory=set)
+    shutdown_evidence_published: bool = False
     # These never enter a public snapshot, repr, journal, or observer outcome.
     private_result: object = None
     initiating_error: BaseException | None = None
@@ -745,6 +750,7 @@ class CaptureEvaluationCoordinator:
 
     The condition protects local records only. Dispatch, polling, restoration,
     policy, cleanup, pin disposition and journal callbacks run without it.
+    Shutdown disposition runs on the close caller only after a proven join.
     begin_close wakes callers and rejects admission; the controller must then
     stop/invalidate its transport before bounded join and resource teardown.
     """
@@ -924,8 +930,14 @@ class CaptureEvaluationCoordinator:
             elapsed_ms = self._offset(record)
             cleanup_count = len(record.request.cleanup_leases)
             if not termination_proven:
-                self._shutdown_finalized = True
                 self._shutdown_abandoned = True
+                self._shutdown_record = record
+                self._quarantined = record
+                if self._active is record:
+                    self._active = None
+                self._phase = CapturePhase.STALE
+                self._failure = None
+                self._condition.notify_all()
                 event = "capture_evaluation_shutdown_abandoned"
                 disposition = "retained"
             else:
@@ -934,29 +946,57 @@ class CaptureEvaluationCoordinator:
                     raise ProtocolError(
                         "CAPTURE shutdown record has no terminal disposition"
                     )
-                self._shutdown_finalized = True
-                self._shutdown_record = None
-                if disposition == "quarantine":
-                    self._quarantined = record
                 event = "capture_evaluation_shutdown_disposed"
 
         if termination_proven:
-            record.request.pin_lease(disposition)
-            for cleanup in record.request.cleanup_leases:
+            failed_resources = 0
+            if not record.shutdown_pin_disposed:
+                try:
+                    record.request.pin_lease(disposition)
+                except BaseException:
+                    failed_resources += 1
+                else:
+                    record.shutdown_pin_disposed = True
+            for index, cleanup in enumerate(record.request.cleanup_leases):
+                if index in record.shutdown_cleanup_disposed:
+                    continue
                 dispose = getattr(cleanup, "dispose_shutdown", None)
-                if callable(dispose):
-                    dispose(disposition)
-        self._journal.record(
-            "capture-evaluation.jsonl",
-            event,
-            evaluation_id=record.evaluation_id,
-            evaluation_kind=record.request.evaluation_kind.value,
-            termination_proven=termination_proven,
-            elapsed_ms=elapsed_ms,
-            pin_disposition=disposition,
-            cleanup_disposition=disposition,
-            cleanup_lease_count=cleanup_count,
-        )
+                try:
+                    if callable(dispose):
+                        dispose(disposition)
+                except BaseException:
+                    failed_resources += 1
+                else:
+                    record.shutdown_cleanup_disposed.add(index)
+            if failed_resources:
+                raise ProtocolError(
+                    "CAPTURE shutdown disposition failed "
+                    f"(failed_resources={failed_resources})"
+                ) from None
+        if not record.shutdown_evidence_published:
+            try:
+                self._journal.record(
+                    "capture-evaluation.jsonl",
+                    event,
+                    evaluation_id=record.evaluation_id,
+                    evaluation_kind=record.request.evaluation_kind.value,
+                    termination_proven=termination_proven,
+                    elapsed_ms=elapsed_ms,
+                    pin_disposition=disposition,
+                    cleanup_disposition=disposition,
+                    cleanup_lease_count=cleanup_count,
+                )
+            except BaseException:
+                raise ProtocolError(
+                    "CAPTURE shutdown evidence could not be recorded"
+                ) from None
+            record.shutdown_evidence_published = True
+        with self._condition:
+            self._shutdown_finalized = True
+            if termination_proven:
+                self._shutdown_record = None
+                if disposition == "quarantine":
+                    self._quarantined = record
 
     def _require_fence_locked(self, fence: CaptureFence) -> None:
         if fence != self._fence or self._closing or self._phase is CapturePhase.STALE:
@@ -1331,6 +1371,18 @@ class CaptureEvaluationCoordinator:
                     candidate = None
                 # Local delivery cannot resolve an unknown remote outcome or
                 # replace the primary recovery/stale lifecycle diagnostic.
+        with self._condition:
+            shutdown_claimed = (
+                self._closing
+                or self._shutdown_abandoned
+                or self._active is not record
+            )
+        if shutdown_claimed:
+            self._defer_shutdown(
+                record,
+                "quarantine" if quarantine else "release",
+            )
+            return
         try:
             record.request.pin_lease("quarantine" if quarantine else "release")
         except BaseException:

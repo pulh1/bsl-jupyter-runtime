@@ -714,6 +714,7 @@ def test_shutdown_pin_failure_attempts_cleanup_and_retries_only_unfinished(envir
         event.event == "capture_evaluation_shutdown_disposed"
         for event in journal.events
     )
+    del caught
 
     coordinator.finish_close(True)
     coordinator.finish_close(True)
@@ -731,6 +732,9 @@ def test_shutdown_pin_failure_attempts_cleanup_and_retries_only_unfinished(envir
 
 
 def test_shutdown_cleanup_failure_attempts_siblings_and_retries_only_unfinished(environment):
+    import gc
+    import weakref
+
     create, _ = environment
     coordinator, driver, journal = create()
     pin_attempts = []
@@ -746,12 +750,15 @@ def test_shutdown_cleanup_failure_attempts_siblings_and_retries_only_unfinished(
         failures=0,
         private_error="private sibling cleanup failure",
     )
+    failing_ref = weakref.ref(failing)
+    successful_ref = weakref.ref(successful)
     _prepare_release_shutdown_record(
         coordinator,
         driver,
         pin=lambda disposition: pin_attempts.append(disposition),
         cleanup_leases=(failing, successful),
     )
+    del failing, successful
 
     with pytest.raises(ProtocolError, match="CAPTURE shutdown disposition failed") as caught:
         coordinator.finish_close(True)
@@ -761,10 +768,12 @@ def test_shutdown_cleanup_failure_attempts_siblings_and_retries_only_unfinished(
     assert pin_attempts == ["release"]
     assert failing_attempts == ["release"]
     assert successful_attempts == ["release"]
+    assert failing_ref() is not None and successful_ref() is not None
     assert not any(
         event.event == "capture_evaluation_shutdown_disposed"
         for event in journal.events
     )
+    del caught
 
     coordinator.finish_close(True)
     coordinator.finish_close(True)
@@ -776,6 +785,8 @@ def test_shutdown_cleanup_failure_attempts_siblings_and_retries_only_unfinished(
         for event in journal.events
         if event.event == "capture_evaluation_shutdown_disposed"
     ]) == 1
+    gc.collect()
+    assert failing_ref() is None and successful_ref() is None
 
 
 @pytest.mark.parametrize("boundary", ["before_dispatch", "dispatch", "policy", "continuation", "restore", "cleanup"])
