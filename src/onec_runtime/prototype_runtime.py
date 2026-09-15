@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from enum import Enum
 from hashlib import sha256
 from math import isfinite
@@ -10,6 +11,7 @@ from collections.abc import Mapping, Sequence
 from time import monotonic
 from typing import Callable
 from functools import lru_cache
+from threading import local
 from uuid import UUID, uuid4
 
 from onec_runtime.bsl import (
@@ -205,6 +207,16 @@ class _CaptureInitiatingWaiter:
 
 
 @dataclass(frozen=True, slots=True)
+class _CaptureOwnedSubmission:
+    pin_lease: Callable[[str], None] = field(repr=False)
+    completion: Callable[[object, BaseException | None], object] = field(repr=False)
+    primary_execution: Callable[[], None] = field(repr=False)
+    normalize_error: Callable[[BslExecutionError], BslExecutionError] = field(
+        repr=False,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class BreakpointWorkspaceEvent:
     phase: str
     locations: tuple[ModuleLocation, ...]
@@ -390,10 +402,8 @@ class PrototypeRuntimeController:
         self.last_debug_stop: DebugStop | None = None
         self.pending_capture_evaluation: _PendingCaptureEvaluation | None = None
         self._capture_evaluation_coordinator: CaptureEvaluationCoordinator | None = None
-        self._capture_owned_submission: tuple[
-            Callable[[str], None],
-            Callable[[object, BaseException | None], object],
-        ] | None = None
+        self._capture_owned_submission: _CaptureOwnedSubmission | None = None
+        self._capture_helper_handoffs = local()
         self.breakpoint_workspaces: list[BreakpointWorkspaceEvent] = []
         self._breakpoint_workspace = self.registry.full_locations
         self.breakpoint_workspace_owner = BreakpointWorkspaceController(
@@ -562,19 +572,50 @@ class PrototypeRuntimeController:
         *,
         return_ticket: bool = False,
         timeout_s: float | None = None,
+        helper_handoff: bool = False,
     ) -> object:
         self.state = OperationState.EVALUATING_CAPTURE
-        try:
-            ticket = self._capture_evaluation_owner().submit_evaluation(request)
-        except BaseException:
-            if self.state is OperationState.EVALUATING_CAPTURE:
-                self.state = OperationState.CAPTURED
-            raise
-        if return_ticket:
-            return ticket
-        return ticket.wait_initiator(
-            self.command_timeout_s if timeout_s is None else timeout_s
+        handoff = (
+            getattr(self._capture_helper_handoffs, "factory")()
+            if helper_handoff
+            and callable(getattr(self._capture_helper_handoffs, "factory", None))
+            else nullcontext()
         )
+        with handoff:
+            try:
+                ticket = self._capture_evaluation_owner().submit_evaluation(request)
+            except BaseException:
+                if self.state is OperationState.EVALUATING_CAPTURE:
+                    owner = self._capture_evaluation_owner()
+                    status = owner.status(request.fence)
+                    adopted = (
+                        status.phase is CapturePhase.EVALUATING
+                        and status.pending_evaluation_id is not None
+                    )
+                    if not adopted:
+                        self.state = OperationState.CAPTURED
+                raise
+            if return_ticket:
+                return ticket
+            return ticket.wait_initiator(
+                self.command_timeout_s if timeout_s is None else timeout_s
+            )
+
+    @contextmanager
+    def capture_helper_caller_handoff(
+        self,
+        factory: Callable[[], AbstractContextManager[None]],
+    ):  # type: ignore[no-untyped-def]
+        """Bind one caller thread's writer release to helper submit/wait only."""
+        if not callable(factory):
+            raise TypeError("CAPTURE helper handoff factory must be callable")
+        if getattr(self._capture_helper_handoffs, "factory", None) is not None:
+            raise ProtocolError("CAPTURE helper handoff is already bound")
+        self._capture_helper_handoffs.factory = factory
+        try:
+            yield
+        finally:
+            del self._capture_helper_handoffs.factory
 
     def submit_capture_execution(
         self,
@@ -582,13 +623,26 @@ class PrototypeRuntimeController:
         *,
         pin_lease: Callable[[str], None],
         completion: Callable[[object, BaseException | None], object],
+        primary_execution: Callable[[], None],
+        normalize_error: Callable[[BslExecutionError], BslExecutionError],
     ) -> _CaptureInitiatingWaiter:
         """Bind one RuntimeApi ownership handoff to its controller submission."""
         if self._capture_owned_submission is not None:
             raise ProtocolError("CAPTURE ownership submission is already active")
-        if not all(callable(callback) for callback in (execute, pin_lease, completion)):
+        if not all(callable(callback) for callback in (
+            execute,
+            pin_lease,
+            completion,
+            primary_execution,
+            normalize_error,
+        )):
             raise TypeError("CAPTURE ownership callbacks must be callable")
-        self._capture_owned_submission = (pin_lease, completion)
+        self._capture_owned_submission = _CaptureOwnedSubmission(
+            pin_lease,
+            completion,
+            primary_execution,
+            normalize_error,
+        )
         try:
             ticket = execute()
         finally:
@@ -609,6 +663,9 @@ class PrototypeRuntimeController:
     ) -> object:
         self._require_capture_evaluation_admission()
         owner = self._capture_evaluation_owner()
+        selected_timeout = (
+            self.command_timeout_s if timeout_s is None else timeout_s
+        )
         policy_failure: BaseException | None = None
 
         def apply_policy(result: EvaluationResult) -> object:
@@ -623,7 +680,7 @@ class PrototypeRuntimeController:
             expression,
             stack_level=stack_level,
             max_text_size=max_text_size,
-            timeout_s=timeout_s,
+            timeout_s=selected_timeout,
         )
         try:
             return self._submit_capture_request(CaptureEvaluationRequest(
@@ -634,7 +691,7 @@ class PrototypeRuntimeController:
                 apply_policy,
                 restore=step.restore,
                 completion=self._complete_capture_lifecycle,
-            ), timeout_s=timeout_s)
+            ), timeout_s=selected_timeout, helper_handoff=True)
         except (BslExecutionError, CaptureEvaluationDeliveryError):
             if policy_failure is not None:
                 raise policy_failure
@@ -2153,6 +2210,7 @@ class PrototypeRuntimeController:
         self._require_capture_evaluation_admission()
         if self.active_operation is None:
             raise ProtocolError("Capture cell has no active MAIN operation")
+        selected_timeout = self.command_timeout_s
         mapped_lowered = (
             lowered_source
             if isinstance(lowered_source, MappedSource)
@@ -2214,6 +2272,7 @@ class PrototypeRuntimeController:
         primary = self._capture_remote_step(
             build_live_current_capture_call(lowered_text),
             stack_level=stack_level,
+            timeout_s=selected_timeout,
             before_dispatch=shield_workspace,
             pre_dispatch_cleanup=restore_workspace,
             on_transport_dispatch=on_transport_dispatch,
@@ -2225,12 +2284,15 @@ class PrototypeRuntimeController:
             event: EvaluationResult,
         ) -> object:
             nonlocal sealed_messages, platform_error
+            if owned is not None:
+                owned.primary_execution()
             if messages_intercepted:
                 message_step = self._capture_remote_step(
                     "RuntimeKernelServer.ЗабратьСообщенияЯчейкиИзКонтекста(Контекст, "
                     + bsl_string_literal(message_collector_key)
                     + ")",
                     stack_level=stack_level,
+                    timeout_s=selected_timeout,
                     restore=restore_workspace,
                 )
                 sealed_messages = self._decode_cell_messages(
@@ -2246,6 +2308,8 @@ class PrototypeRuntimeController:
                         visible_source_context=visible_source_context,
                     ),
                 )
+                if owned is not None:
+                    platform_error = owned.normalize_error(platform_error)
                 return None
             return evaluation_to_python(event)
 
@@ -2254,7 +2318,7 @@ class PrototypeRuntimeController:
                 return platform_error
             return error
 
-        external_completion = None if owned is None else owned[1]
+        external_completion = None if owned is None else owned.completion
 
         def complete_cell(
             value: object,
@@ -2292,7 +2356,11 @@ class PrototypeRuntimeController:
             evaluation_to_python,
             restore=primary.restore,
             seal_messages=lambda: sealed_messages,
-            pin_lease=(lambda disposition: None) if owned is None else owned[0],
+            pin_lease=(
+                (lambda disposition: None)
+                if owned is None
+                else owned.pin_lease
+            ),
             step_policy=apply_result,
             completion=complete_cell,
             initiator_error_policy=preserve_platform_error,
@@ -2300,6 +2368,11 @@ class PrototypeRuntimeController:
         return self._submit_capture_request(
             request,
             return_ticket=owned is not None,
+            timeout_s=selected_timeout,
+            helper_handoff=(
+                owned is None
+                and evaluation_kind is not CaptureEvaluationKind.USER_BSL
+            ),
         )  # type: ignore[return-value]
 
     def _handle_capture_evaluation_event(

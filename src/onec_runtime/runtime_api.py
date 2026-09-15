@@ -5,6 +5,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from hashlib import sha256
+from inspect import Parameter, signature
 from math import isfinite
 from pathlib import Path
 from threading import Lock, get_ident
@@ -142,6 +143,26 @@ from onec_runtime.value_transfer_backend import (
 MAX_PROJECTION_POSITION = 10_000_000
 _BSL_EXECUTION_FAILURE_SUMMARY = "BSL execution failed"
 _RESERVED_WORKER_ROOT_CONTEXT_SLOT = "RuntimeWorkerPinnedOperationGeneration"
+
+
+def _no_capture_primary_execution() -> None:
+    return None
+
+
+def _identity_capture_error(error: BslExecutionError) -> BslExecutionError:
+    return error
+
+
+def _accepts_capture_execution_callbacks(callback: Callable[..., object]) -> bool:
+    try:
+        parameters = signature(callback).parameters.values()
+    except (TypeError, ValueError):
+        return True
+    names = {parameter.name for parameter in parameters}
+    return (
+        any(parameter.kind is Parameter.VAR_KEYWORD for parameter in parameters)
+        or {"primary_execution", "normalize_error"} <= names
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -739,6 +760,10 @@ class _PreparedCaptureExecution:
     detach_pin: Callable[[], Callable[[str], None]]
     completion: Callable[[object, BaseException | None], object]
     release_writer: Callable[[], AbstractContextManager[None]]
+    primary_execution: Callable[[], None] = _no_capture_primary_execution
+    normalize_error: Callable[[BslExecutionError], BslExecutionError] = (
+        _identity_capture_error
+    )
     transferred: bool = False
     rejection: Callable[[BaseException], object] | None = None
     submitted: bool = False
@@ -756,7 +781,16 @@ class _PreparedCaptureExecution:
         submission = _CaptureSubmission()
         with self.release_writer():
             try:
-                ticket = submission.submit(submit, pin_lease=lease, completion=self.completion)
+                ownership: dict[str, object] = {
+                    "pin_lease": lease,
+                    "completion": self.completion,
+                }
+                if _accepts_capture_execution_callbacks(submit):
+                    ownership.update(
+                        primary_execution=self.primary_execution,
+                        normalize_error=self.normalize_error,
+                    )
+                ticket = submission.submit(submit, **ownership)
                 self.submitted = True
                 return ticket.wait_initiator()
             except BaseException as error:
@@ -2256,6 +2290,12 @@ class PrototypeRuntimeApi:
                     mode=LoweringMode.CAPTURE,
                     capture_evaluation=True,
                 )
+                primary_execution, normalize_capture_error = (
+                    self._capture_execution_callbacks_locked(
+                        lowering.dirty_roots,
+                    )
+                )
+
                 def completion(result: object, error: BaseException | None) -> object:
                     # Mandatory local completion is owned by the record,
                     # including after its initiating waiter detaches.
@@ -2296,6 +2336,8 @@ class PrototypeRuntimeApi:
                             detach_pin=self._detach_capture_evaluation_pin_locked,
                             completion=completion,
                             release_writer=self._capture_owner_handoff,
+                            primary_execution=primary_execution,
+                            normalize_error=normalize_capture_error,
                             rejection=rejection,
                         )
                         result = self._execute_prepared_capture_handoff(handoff)
@@ -2307,9 +2349,13 @@ class PrototypeRuntimeApi:
                             "Runtime controller requires mapped CAPTURE execution"
                         )
                 except BslExecutionError as error:
-                    diagnostic = self._worker_runtime_diagnostic(
-                        str(error),
-                        error.diagnostic,
+                    diagnostic = (
+                        error.diagnostic
+                        if handoff is not None and handoff.transferred
+                        else self._worker_runtime_diagnostic(
+                            str(error),
+                            error.diagnostic,
+                        )
                     )
                     reply = RuntimeReply(
                         RuntimeReplyKind.CAPTURE_CELL,
@@ -2458,6 +2504,57 @@ class PrototypeRuntimeApi:
                 self._release_generation_pin_locked(pin)
 
         return dispose
+
+    def _capture_execution_callbacks_locked(
+        self,
+        dirty_roots: tuple[str, ...],
+    ) -> tuple[
+        Callable[[], None],
+        Callable[[BslExecutionError], BslExecutionError],
+    ]:
+        """Bind post-dispatch evidence to this exact CAPTURE generation.
+
+        The callbacks outlive the caller-side writer handoff.  Capture the
+        immutable diagnostic artifacts now, while the evaluation pin still
+        identifies the generation that will execute the request.
+        """
+        with self._confirmed_single_writer():
+            pin = self._evaluation_generation_pin
+            manifest_sha256 = (
+                None if pin is None else pin.handle.manifest_sha256
+            )
+            artifacts = (
+                ()
+                if manifest_sha256 is None
+                else self._worker_generation_diagnostics.get(
+                    manifest_sha256,
+                    (),
+                )
+            )
+
+        def primary_execution() -> None:
+            with self._lock:
+                for root in dirty_roots:
+                    self._pending_dirty_roots.setdefault(root.casefold(), root)
+
+        def normalize_error(error: BslExecutionError) -> BslExecutionError:
+            if manifest_sha256 is None or not artifacts:
+                return error
+            diagnostic = self._worker_runtime_diagnostic_from_artifacts(
+                str(error),
+                error.diagnostic,
+                manifest_sha256=manifest_sha256,
+                artifacts=artifacts,
+            )
+            if diagnostic is error.diagnostic:
+                return error
+            return BslExecutionError(
+                str(error),
+                messages=error.messages,
+                diagnostic=diagnostic,
+            )
+
+        return primary_execution, normalize_error
 
     def _finish_capture_evaluation_pin_locked(
         self, *, reply: RuntimeReply | None = None, outcome_unknown: bool = False
@@ -2612,7 +2709,8 @@ class PrototypeRuntimeApi:
         active = self._worker_generation_handle
         if active is None:
             raise ProtocolError("CAPTURE evaluation generation is unavailable")
-        install(active.manifest_sha256)
+        with self._capture_helper_writer_handoff():
+            install(active.manifest_sha256)
 
     def _clear_capture_worker_generation_pin_locked(self) -> None:
         clear = getattr(
@@ -2624,7 +2722,8 @@ class PrototypeRuntimeApi:
             raise ProtocolError(
                 "Runtime controller cannot clear the CAPTURE Worker pin"
             )
-        clear()
+        with self._capture_helper_writer_handoff():
+            clear()
 
     @staticmethod
     def _with_generation_pin_prelude(
@@ -2975,6 +3074,11 @@ class PrototypeRuntimeApi:
                         dirty_roots = (
                             () if lowering is None else lowering.dirty_roots
                         )
+                        primary_execution, normalize_capture_error = (
+                            self._capture_execution_callbacks_locked(
+                                dirty_roots,
+                            )
+                        )
 
                         def completion(
                             result: object,
@@ -3027,6 +3131,8 @@ class PrototypeRuntimeApi:
                             detach_pin=self._detach_capture_evaluation_pin_locked,
                             completion=completion,
                             release_writer=self._capture_owner_handoff,
+                            primary_execution=primary_execution,
+                            normalize_error=normalize_capture_error,
                             rejection=rejection,
                         )
                         result = self._execute_prepared_capture_handoff(handoff)
@@ -3038,9 +3144,13 @@ class PrototypeRuntimeApi:
                             "Runtime controller requires mapped CAPTURE execution"
                         )
                 except BslExecutionError as error:
-                    diagnostic = self._worker_runtime_diagnostic(
-                        str(error),
-                        error.diagnostic,
+                    diagnostic = (
+                        error.diagnostic
+                        if handoff is not None and handoff.transferred
+                        else self._worker_runtime_diagnostic(
+                            str(error),
+                            error.diagnostic,
+                        )
                     )
                     reply = RuntimeReply(
                         RuntimeReplyKind.CAPTURE_CELL,
@@ -4377,7 +4487,7 @@ class PrototypeRuntimeApi:
             transfer = RuntimeValueTransfer(
                 self._execute_worker_instruction,
                 self._take_context_string,
-                context_cleaner=self._controller.drop_context_value,
+                context_cleaner=self._drop_context_value,
                 runtime_generation=lambda: self._controller.runtime_generation,
                 context_generation=self._context_generation,
                 profiler=profiler,
@@ -4410,7 +4520,7 @@ class PrototypeRuntimeApi:
             transfer = RuntimeValueTransfer(
                 self._execute_worker_instruction,
                 self._take_context_string,
-                context_cleaner=self._controller.drop_context_value,
+                context_cleaner=self._drop_context_value,
                 runtime_generation=lambda: self._controller.runtime_generation,
                 context_generation=self._context_generation,
                 profiler=profiler,
@@ -4442,7 +4552,7 @@ class PrototypeRuntimeApi:
                 self._take_context_string,
                 runtime_generation=lambda: self._controller.runtime_generation,
                 context_generation=self._context_generation,
-                context_cleaner=self._controller.drop_context_value,
+                context_cleaner=self._drop_context_value,
                 schema_reader=self._inspect_compact_columns,
                 max_text_size=((max_bytes + 2) // 3) * 4,
                 max_payload_bytes=max_bytes,
@@ -4557,7 +4667,7 @@ class PrototypeRuntimeApi:
                     self._take_context_string,
                     runtime_generation=lambda: self._controller.runtime_generation,
                     context_generation=self._context_generation,
-                    context_cleaner=self._controller.drop_context_value,
+                    context_cleaner=self._drop_context_value,
                     schema_reader=self._inspect_compact_columns,
                     max_text_size=((max_bytes + 2) // 3) * 4,
                     max_payload_bytes=max_bytes,
@@ -4573,7 +4683,7 @@ class PrototypeRuntimeApi:
             transfer = RuntimeValueTransfer(
                 self._execute_worker_instruction,
                 self._take_context_string,
-                context_cleaner=self._controller.drop_context_value,
+                context_cleaner=self._drop_context_value,
                 runtime_generation=lambda: self._controller.runtime_generation,
                 context_generation=self._context_generation,
             )
@@ -4590,7 +4700,7 @@ class PrototypeRuntimeApi:
                 ),
             )
         finally:
-            self._controller.drop_context_value(context_key)
+            self._drop_context_value(context_key)
 
     def project_to_df(
         self,
@@ -4927,7 +5037,7 @@ class PrototypeRuntimeApi:
             self._take_context_string,
             runtime_generation=lambda: self._controller.runtime_generation,
             context_generation=self._context_generation,
-            context_cleaner=self._controller.drop_context_value,
+            context_cleaner=self._drop_context_value,
             schema_reader=self._inspect_compact_columns,
             max_text_size=((max_bytes + 2) // 3) * 4,
             max_payload_bytes=max_bytes,
@@ -4955,17 +5065,23 @@ class PrototypeRuntimeApi:
 
     def _take_context_string(self, key: str, max_text_size: int) -> str:
         with self._remaining_command_timeout():
-            return self._controller.take_context_string(
-                key,
-                max_text_size=max_text_size,
-            )
+            with self._capture_helper_writer_handoff():
+                return self._controller.take_context_string(
+                    key,
+                    max_text_size=max_text_size,
+                )
+
+    def _drop_context_value(self, key: str) -> None:
+        with self._capture_helper_writer_handoff():
+            self._controller.drop_context_value(key)
 
     def _execute_worker_instruction(self, source: str) -> object:
         with self._remaining_command_timeout():
             if self._controller.state is OperationState.CAPTURED:
-                cell = self._controller.execute_system_capture(
-                    source + "\nРезультатИнструкции = Результат;"
-                )
+                with self._capture_helper_writer_handoff():
+                    cell = self._controller.execute_system_capture(
+                        source + "\nРезультатИнструкции = Результат;"
+                    )
                 return cell.result
             completion = self._controller.execute_system_main(source)
             if not completion.succeeded:
@@ -5225,6 +5341,20 @@ class PrototypeRuntimeApi:
                 self._writer_owner = get_ident()
 
     @contextmanager
+    def _capture_helper_writer_handoff(self) -> Iterator[None]:
+        """Keep helper admission local, but release the writer for remote work."""
+        bind = getattr(
+            self._controller,
+            "capture_helper_caller_handoff",
+            None,
+        )
+        if not callable(bind):
+            yield
+            return
+        with bind(self._capture_owner_handoff):
+            yield
+
+    @contextmanager
     def _single_writer(self) -> Iterator[None]:
         if not self._lock.acquire(blocking=False):
             raise ProtocolError("Runtime is already executing another request")
@@ -5258,6 +5388,21 @@ class PrototypeRuntimeApi:
         )
         if artifacts is None:
             return current
+        return self._worker_runtime_diagnostic_from_artifacts(
+            message,
+            current,
+            manifest_sha256=pin.handle.manifest_sha256,
+            artifacts=artifacts,
+        )
+
+    @staticmethod
+    def _worker_runtime_diagnostic_from_artifacts(
+        message: str,
+        current: NormalizedDiagnostic | None,
+        *,
+        manifest_sha256: str,
+        artifacts: tuple[WorkerDiagnosticArtifact, ...],
+    ) -> NormalizedDiagnostic | None:
         try:
             parsed = parse_platform_diagnostic(message)
             if not any(
@@ -5267,7 +5412,7 @@ class PrototypeRuntimeApi:
                 return current
             return remap_worker_runtime_diagnostic(
                 parsed,
-                pinned_manifest_sha256=pin.handle.manifest_sha256,
+                pinned_manifest_sha256=manifest_sha256,
                 pinned_artifacts=artifacts,
             )
         except (TypeError, ValueError):
@@ -5441,9 +5586,10 @@ class PrototypeRuntimeApi:
                 raise ProtocolError("capture manager origin must be frame-scoped")
             with self._bounded_command_timeout(timeout_s):
                 with self._remaining_command_timeout() as remaining:
-                    return self._controller.resolve_capture_manager_origin(
-                        origin.root, origin.fields, timeout_s=remaining
-                    )
+                    with self._capture_helper_writer_handoff():
+                        return self._controller.resolve_capture_manager_origin(
+                            origin.root, origin.fields, timeout_s=remaining
+                        )
 
     def capture_temporary_tables(self, manager_handle: str, *, names: tuple[str, ...] | None, cursor: int, limit: int, selection: ValueSelection | None, timeout_s: float | None = None) -> Mapping[str, object]:
         with self._single_writer():
@@ -5461,7 +5607,8 @@ class PrototypeRuntimeApi:
             )
             with self._bounded_command_timeout(timeout_s):
                 with self._remaining_command_timeout() as remaining:
-                    return self._controller.capture_temporary_tables(
-                        manager_handle, names=names, cursor=cursor, limit=limit,
-                        selection=wire_selection, timeout_s=remaining,
-                    )
+                    with self._capture_helper_writer_handoff():
+                        return self._controller.capture_temporary_tables(
+                            manager_handle, names=names, cursor=cursor, limit=limit,
+                            selection=wire_selection, timeout_s=remaining,
+                        )

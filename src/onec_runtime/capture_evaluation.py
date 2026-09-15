@@ -1195,7 +1195,7 @@ class CaptureEvaluationCoordinator:
             try:
                 private_result = record.request.completion(
                     private_result,
-                    self._initiator_failure(record, phase, provisional),
+                    _initiating_failure(record.evaluation_id, phase, provisional),
                 )
             except BaseException:
                 private_result = None
@@ -1219,13 +1219,10 @@ class CaptureEvaluationCoordinator:
                 diagnostic=diagnostic,
                 error=diagnostic.message if diagnostic and state is CaptureEvaluationState.FAILED else None,
             )
+        initiating_error = self._initiator_failure(record, phase, candidate)
         with self._condition:
             record.private_result = private_result
-            record.initiating_error = self._initiator_failure(
-                record,
-                phase,
-                candidate,
-            )
+            record.initiating_error = initiating_error
             if quarantine:
                 self._quarantined = record
             self._evidence_locked(record, "outcome_published", state=state.value,
