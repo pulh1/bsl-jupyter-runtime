@@ -156,6 +156,30 @@ def test_compact_serializer_admits_root_and_cells_before_type_or_payload() -> No
     )
 
 
+def test_compact_serializer_success_has_the_same_explicit_access_contract_as_denial() -> None:
+    source = SERVICE_MODULE.read_text(encoding="utf-8-sig")
+    finalizer = source.split("Функция ЗавершитьКомпактнуюМатериализацию", 1)[1].split(
+        "КонецФункции", 1
+    )[0]
+
+    assert 'Результат.Вставить("Доступ", Истина);' in finalizer
+    assert finalizer.index('Результат.Вставить("Доступ", Истина);') < finalizer.index(
+        'Результат.Вставить("Base64",'
+    )
+
+
+def test_generic_compact_serializer_uses_declared_schema_before_observed_values() -> None:
+    source = SERVICE_MODULE.read_text(encoding="utf-8-sig")
+    classifier = source.split("Функция ОпределитьКомпактнуюСхемуКолонок", 1)[1].split(
+        "КонецФункции", 1
+    )[0]
+
+    assert "ОпределитьОбъявленныйКомпактныйВид(Колонка.ТипЗначения)" in classifier
+    assert classifier.index("ОпределитьОбъявленныйКомпактныйВид(") < classifier.index(
+        "Для Каждого СтрокаТаблицы Из Таблица"
+    )
+
+
 def test_compact_serializer_checks_budgets_before_base64_construction() -> None:
     source = SERVICE_MODULE.read_text(encoding="utf-8-sig")
     serializer = source.split(

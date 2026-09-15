@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from base64 import b64encode
 from hashlib import sha256
+from inspect import signature
 import json
 
 import pytest
@@ -283,6 +284,11 @@ def test_precomputed_schema_cannot_bypass_server_admission_policy() -> None:
             context_generation=5,
             columns=(CompactColumn("Amount", "number", is_reference=False),),
         )
+
+
+def test_generic_table_transport_has_no_specialized_schema_compatibility_surface() -> None:
+    assert "columns" not in signature(build_compact_transfer_instruction).parameters
+    assert "schema_reader" not in signature(CompactRuntimeTableTransfer).parameters
 
 
 def test_generic_instruction_passes_budgets_to_server_serializer() -> None:

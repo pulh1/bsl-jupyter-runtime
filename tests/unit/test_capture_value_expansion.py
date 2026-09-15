@@ -304,6 +304,24 @@ def test_denied_page_entry_is_redacted_and_exact_access_is_denied_before_describ
     assert node.private and node.type_name is None
     assert node.preview == "<private runtime value>" and not node.expandable
     assert denied.describe_calls == 0
+
+
+def test_denied_child_uses_the_exact_three_field_wire_model_without_a_guard_callback():
+    roots = fixture()
+    adapter, backend = setup_values(roots=roots)
+    backend.private.add(roots["Структура"].handle.identity)
+
+    node = next(
+        item for item in adapter.context.variables[:20].items if item.name == "Структура"
+    )
+
+    assert type(node).__name__ == "DeniedValueNode"
+    assert public_artifact_value(node) == {
+        "name": "Структура",
+        "access": "denied",
+        "expandable": False,
+    }
+    assert "private_guard" not in api().CaptureValuePolicy.__dataclass_fields__
     with pytest.raises(CaptureValueAccessDeniedError):
         adapter.context.variables["структура"]
     with pytest.raises(CaptureValueAccessDeniedError):

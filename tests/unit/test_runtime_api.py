@@ -1529,7 +1529,12 @@ def test_projection_instruction_is_bounded_and_stages_only_projected_rows() -> N
 
     assert "Для ИндексПроекции = 20 По Мин(Контекст.Таблица.Количество() - 1, 29)" in source
     assert 'Скопировать(СтрокиПроекции, "Сотрудник,Сумма")' in source
-    assert "Контекст.Вставить" in source
+    assert source.index("RuntimeValueTransferServer.ДопуститьЗначение(") < source.index(
+        "Для ИндексПроекции"
+    )
+    assert source.index("RuntimeTableTransferServer.СериализоватьКомпактнуюТаблицу(") < source.index(
+        "Контекст.Вставить"
+    )
 
 
 class FakeController:

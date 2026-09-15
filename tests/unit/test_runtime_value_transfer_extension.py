@@ -104,6 +104,23 @@ def test_value_serializer_admits_root_and_each_descendant_before_encoding() -> N
     assert 'Свойство("Exports")' in source
 
 
+def test_value_serializer_success_has_the_same_explicit_access_contract_as_denial() -> None:
+    """A generated protocol-2 branch may read only an explicitly present field."""
+    source = MODULE.read_text(encoding="utf-8-sig")
+    serializer = source.split("Функция СериализоватьЗначение", 1)[1].split(
+        "КонецФункции", 1
+    )[0]
+
+    success = serializer.split("Результат = Новый Структура;", 1)[1].split(
+        "Возврат Результат;", 1
+    )[0]
+
+    assert 'Результат.Вставить("Доступ", Истина);' in success
+    assert success.index('Результат.Вставить("Доступ", Истина);') < success.index(
+        'Результат.Вставить("Base64",'
+    )
+
+
 def test_object_adapter_reads_metadata_attributes_but_not_section_rows() -> None:
     source = MODULE.read_text(encoding="utf-8-sig")
 
