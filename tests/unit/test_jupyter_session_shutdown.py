@@ -56,9 +56,11 @@ class _ShutdownHeartbeat:
 class _ShutdownProcesses:
     def __init__(self, timeline: list[str]) -> None:
         self.timeline = timeline
+        self.closed = Event()
 
     def close(self, **_options: object) -> None:
         self.timeline.append("processes_closed")
+        self.closed.set()
 
 
 class _ShutdownTransport:
@@ -411,6 +413,67 @@ def test_runtime_session_close_joins_pending_capture_consumer_before_return() ->
     )
     assert rdbg.shutdown_cleanup_dispatches == 0
     assert timeline_before_rescue.count("pin_quarantine") == 1
+    assert not holder.is_alive()
+    assert not closer.is_alive()
+
+
+@pytest.mark.parametrize(
+    ("entry", "server"),
+    (("normal", False), ("kernel", True)),
+)
+def test_runtime_session_close_is_bounded_while_operation_lock_stays_owned(
+    entry: str,
+    server: bool,
+) -> None:
+    rdbg = ShutdownBlockingCaptureSession(wake_on_invalidate=True)
+    journal = RecoveryJournal()
+    controller = captured_controller(
+        rdbg,
+        command_timeout_s=0.05,
+        journal=journal,
+    )
+    api = PrototypeRuntimeApi(controller, journal=journal)
+    owner, _ticket, cleanup_probe = start_shutdown_evaluation(controller, rdbg)
+    runtime = _shutdown_runtime_session(rdbg, api, server=server)
+    invocation = (
+        runtime.close
+        if entry == "normal"
+        else InteractiveRuntimeSession(runtime)._close_at_shutdown
+    )
+    holder, release_operation, holder_errors = _start_lock_holder(
+        runtime._operation_lock
+    )
+    closer, finished, errors = _start_shutdown_thread(
+        invocation,
+        rdbg.shutdown_timeline,
+    )
+    try:
+        assert finished.wait(0.3), (
+            "RuntimeSession shutdown waited indefinitely for its operation lock"
+        )
+        assert not errors
+        assert not holder_errors
+        assert holder.is_alive(), "test released the operation lock before deadline"
+        assert owner.join(0.01), "CAPTURE owner was not joined before bounded return"
+        assert cleanup_probe.dispositions == [
+            (cleanup_probe.lease_identity, "quarantine")
+        ]
+        assert runtime._processes.closed.is_set() is False
+
+        # Cleanup is supervised after the bounded caller returns. Releasing
+        # the operation lock is teardown, not a rescue for the close result.
+        release_operation.set()
+        assert runtime._processes.closed.wait(1), (
+            "deferred Session owner did not finish cleanup"
+        )
+    finally:
+        release_operation.set()
+        rdbg.shutdown_poll_release.set()
+        holder.join(2)
+        owner.begin_close()
+        assert owner.join(2)
+        closer.join(2)
+
     assert not holder.is_alive()
     assert not closer.is_alive()
 

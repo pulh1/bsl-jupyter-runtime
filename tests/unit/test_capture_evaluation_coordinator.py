@@ -1033,6 +1033,47 @@ class ShutdownPublicationBarrierJournal(RecoveryJournal):
         return super().record(stream, event, **fields)
 
 
+class ResultReceivedBarrierJournal(RecoveryJournal):
+    def __init__(self):
+        super().__init__()
+        self.entered = Event()
+        self.release = Event()
+
+    def record(self, stream, event, **fields):  # type: ignore[no-untyped-def]
+        if event == "capture_evaluation_result_received":
+            self.entered.set()
+            assert self.release.wait(2)
+        return super().record(stream, event, **fields)
+
+
+def test_close_during_result_evidence_prevents_late_restore_entry(environment):
+    create, _ = environment
+    journal = ResultReceivedBarrierJournal()
+    coordinator, driver, _ = create(journal=journal)
+    restore_calls = []
+    coordinator.submit_evaluation(driver.request(
+        cleanup_leases=(),
+        restore=lambda: restore_calls.append("restore_entered"),
+    ))
+    driver.result()
+    assert journal.entered.wait(1), "result evidence did not reach its barrier"
+    coordinator.begin_close()
+    assert not coordinator.join(0.01)
+    coordinator.finish_close(False)
+    try:
+        journal.release.set()
+        assert coordinator.join(1)
+    finally:
+        journal.release.set()
+
+    assert restore_calls == []
+    assert len([
+        event
+        for event in journal.events
+        if event.event == "capture_evaluation_shutdown_abandoned"
+    ]) == 1
+
+
 @pytest.mark.parametrize("contender_proven", [False, True])
 def test_shutdown_classification_publication_is_reserved_once_without_waiting(
     environment,

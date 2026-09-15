@@ -1,9 +1,11 @@
 from collections import defaultdict, deque
+from threading import Event, Thread
 from uuid import UUID
 from xml.etree import ElementTree
 
 import pytest
 
+import onec_runtime.rdbg.session as session_module
 from onec_runtime.errors import CommandTimeout, ProtocolError, TargetLost, UnexpectedStop
 from onec_runtime.performance_profile import PhaseRecorder
 from onec_runtime.rdbg.models import (
@@ -103,6 +105,81 @@ def test_set_breakpoints_accepts_explicit_success_acknowledgement() -> None:
     session.set_breakpoints((LOCATION, CAPTURE_A))
 
     assert session._breakpoint_locations == (LOCATION, CAPTURE_A)
+
+
+def test_invalidate_fences_breakpoint_request_after_validation_and_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = FakeTransport()
+    session = ready_session(transport)
+    build_entered = Event()
+    release_build = Event()
+    errors = []
+    original_build = session_module.build_breakpoints_request
+
+    def blocked_build(*args, **kwargs):  # type: ignore[no-untyped-def]
+        build_entered.set()
+        assert release_build.wait(2)
+        return original_build(*args, **kwargs)
+
+    monkeypatch.setattr(session_module, "build_breakpoints_request", blocked_build)
+
+    def set_breakpoints() -> None:
+        try:
+            session.set_breakpoints((LOCATION, CAPTURE_A))
+        except BaseException as error:
+            errors.append(error)
+
+    worker = Thread(target=set_breakpoints)
+    worker.start()
+    assert build_entered.wait(1), "breakpoint request did not pass validation"
+    session.invalidate()
+    assert session.state is SessionState.FAILED
+    assert transport.calls == []
+    release_build.set()
+    worker.join(1)
+
+    assert not worker.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], ProtocolError)
+    assert transport.calls == []
+    assert session._breakpoint_installed is False
+
+
+def test_invalidate_fences_eval_request_after_dispatch_marker() -> None:
+    transport = FakeTransport()
+    session = ready_session(transport)
+    dispatch_entered = Event()
+    release_dispatch = Event()
+    errors = []
+
+    def dispatch_marker() -> None:
+        dispatch_entered.set()
+        assert release_dispatch.wait(2)
+
+    def evaluate() -> None:
+        try:
+            session.start_evaluation(
+                "Результат = 1;",
+                timeout_s=0.05,
+                on_transport_dispatch=dispatch_marker,
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    worker = Thread(target=evaluate)
+    worker.start()
+    assert dispatch_entered.wait(1), "evalExpr did not reach its dispatch marker"
+    session.invalidate()
+    assert transport.calls == []
+    release_dispatch.set()
+    worker.join(1)
+
+    assert not worker.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], ProtocolError)
+    assert transport.calls == []
+    assert session._pending_evaluation_states == {}
 
 
 @pytest.mark.parametrize(

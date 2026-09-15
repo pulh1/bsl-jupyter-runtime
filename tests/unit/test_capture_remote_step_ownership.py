@@ -180,6 +180,58 @@ def test_classified_inline_uncertainty_survives_callback_boundary(environment, b
     assert first.dispositions == ["quarantine"]
 
 
+@pytest.mark.parametrize("secondary_owner", ["step_policy", "step_continuation"])
+def test_shutdown_quarantines_acknowledged_unsettled_secondary_step(
+    environment,
+    secondary_owner,
+):
+    create, _ = environment
+    coordinator, primary, journal = create()
+    secondary = Driver()
+    dispatch_entered = Event()
+    release_dispatch = Event()
+
+    def secondary_dispatch(entered):  # type: ignore[no-untyped-def]
+        entered()
+        secondary.dispatch_count += 1
+        dispatch_entered.set()
+        assert release_dispatch.wait(2)
+        return secondary.pending
+
+    secondary_step = capture.CaptureRemoteStep(
+        secondary_dispatch,
+        secondary.poll,
+        secondary.restore,
+    )
+    changes = {
+        secondary_owner: (
+            lambda context, _value: context.execute_inline(secondary_step)
+        )
+    }
+    ticket = coordinator.submit_evaluation(replace(
+        primary.request(cleanup_leases=()),
+        **changes,
+    ))
+    primary.result()
+    assert dispatch_entered.wait(1), "secondary dispatch did not enter transport"
+    coordinator.begin_close()
+    release_dispatch.set()
+    assert coordinator.join(1)
+    coordinator.finish_close(True)
+
+    assert secondary.dispatch_count == 1
+    assert secondary.consumed == 0
+    assert ticket._record.capability is secondary.pending
+    assert primary.dispositions == ["quarantine"]
+    disposed = [
+        event
+        for event in journal.events
+        if event.event == "capture_evaluation_shutdown_disposed"
+    ]
+    assert len(disposed) == 1
+    assert disposed[0].fields["pin_disposition"] == "quarantine"
+
+
 @pytest.mark.parametrize("failure, phase, state, code", [
     ("dispatch", "outcome_unknown", "unknown", "dispatch_uncertain"),
     ("poll", "recovery_required", "failed", "evaluation_stream_failed"),
