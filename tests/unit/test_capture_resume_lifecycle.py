@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from threading import Event, RLock, Thread, current_thread, get_ident
 from types import SimpleNamespace
 from time import monotonic, sleep
@@ -212,6 +213,39 @@ def test_keyboard_interrupt_detaches_resume_waiter_and_controller_finishes_once(
     finally:
         session.release_root_export.set()
         session.release_next_stop.set()
+        controller.shutdown_capture_evaluation()
+
+
+def test_interrupt_after_resume_submission_detaches_the_initiator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Interrupting the caller before ticket.wait cannot strand its delivery."""
+    rdbg = ResumeBarrierSession((CAPTURE_A, SERVICE))
+    controller = captured_controller(rdbg, command_timeout_s=1)
+    api = PrototypeRuntimeApi(controller)
+
+    @contextmanager
+    def interrupting_handoff():  # type: ignore[no-untyped-def]
+        raise KeyboardInterrupt
+        yield
+
+    monkeypatch.setattr(api, "_capture_owner_handoff", interrupting_handoff)
+    rdbg.release_root_export.set()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            api.resume_capture(dirty_roots=("Скаляр",))
+        assert rdbg.next_stop_wait_entered.wait(1)
+        owner = controller._capture_evaluation_coordinator
+        assert owner is not None
+        assert owner._active_resume is not None
+        assert owner._active_resume.initiator_attached is False
+
+        rdbg.release_next_stop.set()
+        eventually(lambda: controller.state is OperationState.COMPLETED)
+        assert rdbg.continue_count == 2
+    finally:
+        rdbg.release_root_export.set()
+        rdbg.release_next_stop.set()
         controller.shutdown_capture_evaluation()
 
 
