@@ -4553,11 +4553,23 @@ class PrototypeRuntimeApi:
             with self._single_writer():
                 self._close_data_plane_locked()
 
-    def _close_data_plane_locked(self) -> None:
+    def _close_after_target_termination(self) -> None:
+        """Finish local API teardown after RuntimeSession killed the target."""
+        with self._close_lock:
+            if self._closed:
+                return
+            if not self._capture_shutdown_finished:
+                raise ProtocolError(
+                    "CAPTURE shutdown publication is incomplete"
+                )
+            with self._single_writer():
+                self._close_data_plane_locked(target_terminated=True)
+
+    def _close_data_plane_locked(self, *, target_terminated: bool = False) -> None:
         if self._closed:
             return
         try:
-            if self._controller.state is OperationState.RECOVERING:
+            if target_terminated or self._controller.state is OperationState.RECOVERING:
                 self._worker_universe_target.abandon_target()
             else:
                 self._worker_universe_target.teardown()
