@@ -105,6 +105,7 @@ _CAPTURE_CONTROL_PLANE_ROUTES = frozenset({"current_capture", "status"})
 _LOCAL_READ_ONLY_ROUTES = frozenset(
     {
         "activated_main_worker_generation",
+        "confirmed_worker_module_units",
         "continuation_admission_is_uncertain",
         "continuation_attempt_evidence",
         "last_worker_breakpoint_reload_report",

@@ -479,4 +479,15 @@ class _MethodEnricher:
         return index, "timeout" if expired else "resolved", None
 
 
-__all__ = ['CaptureView', 'StackInventoryBackend', 'ResolvedFrameSource', 'ConfigurationFrameResolver', 'PhysicalFrameIdentity', 'DebugFrame', 'RuntimeFrameMarker', 'StackPage', 'StackDescriptor', 'LocalStackAdapter']
+__all__ = [
+    "CaptureView",
+    "StackInventoryBackend",
+    "ResolvedFrameSource",
+    "ConfigurationFrameResolver",
+    "PhysicalFrameIdentity",
+    "DebugFrame",
+    "RuntimeFrameMarker",
+    "StackPage",
+    "StackDescriptor",
+    "LocalStackAdapter",
+]
