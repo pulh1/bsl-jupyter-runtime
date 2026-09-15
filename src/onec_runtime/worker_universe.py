@@ -2659,7 +2659,9 @@ class ServerWorkerUniverseRegistry:
         abort: Callable[[BaseException], object],
     ) -> PreparedWorkerMutation:
         with self._lock:
-            if self._broken or self._host.state is WorkerUniverseState.CLOSED or self._mutations:
+            if self._broken or self._host.state in (
+                WorkerUniverseState.BROKEN, WorkerUniverseState.CLOSED,
+            ) or self._mutations:
                 raise ProtocolError("Worker target mutation is unavailable")
             reservation = WorkerMutationReservation(uuid4(), commit, abort)
             prepared = PreparedWorkerMutation(instruction, reservation, self)
@@ -2692,7 +2694,9 @@ class ServerWorkerUniverseRegistry:
 
     def execute_mutation(self, prepared: PreparedWorkerMutation) -> object:
         with self._lock:
-            if self._broken or self._host.state is WorkerUniverseState.CLOSED:
+            if self._broken or self._host.state in (
+                WorkerUniverseState.BROKEN, WorkerUniverseState.CLOSED,
+            ):
                 raise ProtocolError("Worker target mutation is unavailable")
             reservation = self._require_exact_mutation(prepared)
             if reservation.token in self._claimed_mutations:

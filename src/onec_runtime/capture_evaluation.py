@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -687,6 +688,38 @@ class CaptureEvaluationTicket:
         return self._coordinator._wait_initiator(self._record, timeout_s)
 
 
+@dataclass(slots=True, repr=False)
+class _CaptureSubmission:
+    """Private receipt for one synchronous adapter-to-coordinator handoff.
+
+    The receipt survives an interrupted ticket return. Its dynamic scope is
+    only the local submission call, so adapters may wrap pin/completion
+    callbacks without hiding acceptance. It never crosses the remote boundary.
+    """
+
+    ticket: CaptureEvaluationTicket | None = None
+
+    def submit(self, adapter: Callable[..., CaptureEvaluationTicket], **kwargs: object) -> CaptureEvaluationTicket:
+        if _capture_submission.get() is not None or self.ticket is not None:
+            raise ProtocolError("CAPTURE submission handoff was already claimed")
+        token = _capture_submission.set(self)
+        try:
+            return adapter(**kwargs)
+        finally:
+            _capture_submission.reset(token)
+
+    def detach_initiator(self) -> None:
+        ticket = self.ticket
+        if ticket is not None:
+            with ticket._coordinator._condition:
+                ticket._coordinator._detach_locked(ticket._record, "submission_interrupted")
+
+
+_capture_submission: ContextVar[_CaptureSubmission | None] = ContextVar(
+    "capture_submission", default=None,
+)
+
+
 class CaptureEvaluationCoordinator:
     """One daemon event consumer and one active logical evaluation.
 
@@ -746,14 +779,31 @@ class CaptureEvaluationCoordinator:
                     self._phase,
                 )
             record = _CaptureEvaluationRecord(request)
-            self._active = record
-            self._phase = CapturePhase.EVALUATING
-            self._evidence_locked(record, "record_created")
             ticket = CaptureEvaluationTicket(
                 record.evaluation_id, request.evaluation_kind, self, record,
             )
-            self._condition.notify_all()
-            return ticket
+            submission = _capture_submission.get()
+            if submission is not None and submission.ticket is not None:
+                raise ProtocolError("CAPTURE submission handoff was already claimed")
+            try:
+                self._active = record
+                if submission is not None:
+                    submission.ticket = ticket
+                self._phase = CapturePhase.EVALUATING
+                self._evidence_locked(record, "record_created")
+                self._condition.notify_all()
+                return ticket
+            except BaseException:
+                if self._active is record:
+                    # Adoption, not a successful return, transfers ownership.
+                    # Repair the receipt if interruption fell between these
+                    # short assignments, before releasing the worker mutex.
+                    if submission is not None:
+                        submission.ticket = ticket
+                    self._phase = CapturePhase.EVALUATING
+                    record.initiator_attached = False
+                    self._condition.notify_all()
+                raise
 
     def status(self, fence: CaptureFence) -> CaptureStatus:
         with self._condition:

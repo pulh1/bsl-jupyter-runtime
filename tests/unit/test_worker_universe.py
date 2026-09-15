@@ -203,6 +203,68 @@ def test_concurrent_worker_mutation_claim_has_one_remote_owner(coordinated):
     assert not registry._mutations
 
 
+@pytest.mark.parametrize("unavailable", ["broken", "closed", "registry_broken"])
+def test_worker_mutation_reservation_rejects_unavailable_host(unavailable):
+    host = worker_universe.WorkerUniverseRegistry(runtime_generation=7, context_generation=3)
+    registry = worker_universe.ServerWorkerUniverseRegistry(host, lambda source: None)
+    if unavailable == 'broken':
+        host.mark_broken()
+    elif unavailable == 'closed':
+        host.teardown()
+    else:
+        registry._broken = True
+    with pytest.raises(ProtocolError, match='unavailable'):
+        registry.reserve_mutation('synthetic', commit=lambda result: result, abort=lambda error: None)
+    assert not registry._mutations and not registry._claimed_mutations
+
+
+@pytest.mark.parametrize("coordinated", [False, True])
+@pytest.mark.parametrize("unavailable", ["broken", "quarantined", "closed", "registry_broken"])
+def test_reserved_worker_swap_cannot_dispatch_to_unavailable_host(tmp_path, coordinated, unavailable):
+    host = worker_universe.WorkerUniverseRegistry(runtime_generation=7, context_generation=3)
+    artifacts = _generation_artifacts(tmp_path)
+    target = _UniverseTargetExecutor()
+    calls, submissions = [], []
+    def execute(source):
+        assert not registry._lock._is_owned() and not host._lock._is_owned()
+        calls.append(source)
+        return target(source)
+    registry = worker_universe.ServerWorkerUniverseRegistry(host, execute)
+    active = host.prepare(artifacts[:2])
+    target.acknowledge(active)
+    registry.promote(active)
+    pin = host.pin_active()
+    candidate = host.prepare((artifacts[0], artifacts[2]))
+    target.acknowledge(candidate)
+    prepared = registry.prepare_root(candidate, transaction_id=UUID(int=701))
+    mutation = registry.reserve_swap_root(prepared)
+    if unavailable == 'broken':
+        host.mark_broken(candidate)
+    elif unavailable == 'quarantined':
+        host.retain_outcome_unknown(pin)
+    elif unavailable == 'closed':
+        host.teardown()
+    else:
+        registry._broken = True
+    def submit(plan):
+        submissions.append(plan)
+        return plan.commit(execute(plan.instruction))
+    if coordinated:
+        registry._mutation_executor = submit
+    before = len(calls)
+    for _ in range(2):
+        with pytest.raises(ProtocolError, match='unavailable'):
+            registry.execute_mutation(mutation)
+    assert len(calls) == before and not submissions
+    # The unexecuted reservation stays owned locally, never claimed/committed.
+    assert registry._mutations == {mutation.reservation.token: mutation}
+    assert not registry._claimed_mutations
+    assert prepared.transaction_id in registry._prepared_roots
+    registry.abandon_target()
+    assert not registry._mutations and not registry._claimed_mutations
+    assert not registry._prepared_roots
+
+
 class _CountingArtifactBuilder:
     def __init__(self, wrapped: NotebookWorkerArtifactBuilder) -> None:
         self.wrapped = wrapped

@@ -16,7 +16,7 @@ from weakref import WeakKeyDictionary
 
 import pandas as pd
 
-from onec_runtime.capture_evaluation import CaptureEvaluationTicket
+from onec_runtime.capture_evaluation import CaptureEvaluationTicket, _CaptureSubmission
 
 from onec_runtime.bsl import (
     DiagnosticStage,
@@ -753,10 +753,17 @@ class _PreparedCaptureExecution:
             raise ProtocolError("Prepared CAPTURE execution was already transferred")
         lease = self.detach_pin()
         self.transferred = True
+        submission = _CaptureSubmission()
         with self.release_writer():
             try:
-                ticket = submit(pin_lease=lease, completion=self.completion)
+                ticket = submission.submit(submit, pin_lease=lease, completion=self.completion)
+                self.submitted = True
+                return ticket.wait_initiator()
             except BaseException as error:
+                if submission.ticket is not None:
+                    self.submitted = True
+                    submission.detach_initiator()
+                    raise
                 try:
                     if self.rejection is not None:
                         self.rejection(error)
@@ -765,8 +772,6 @@ class _PreparedCaptureExecution:
                 finally:
                     lease("release")
                 raise
-            self.submitted = True
-            return ticket.wait_initiator()
 
 
 class PrototypeRuntimeApi:

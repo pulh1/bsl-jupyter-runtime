@@ -470,6 +470,93 @@ def test_owned_late_bsl_failure_records_dirty_roots_before_paused(tmp_path, monk
         assert coordinator.join(2)
 
 
+@pytest.mark.parametrize("window", ["notify", "adapter"])
+@pytest.mark.parametrize("error_type", [KeyboardInterrupt, RuntimeError])
+@pytest.mark.parametrize("late", ["success", "bsl_failure", "uncertain"])
+def test_owned_submit_interruption_keeps_accepted_record_owner(tmp_path, monkeypatch, window, error_type, late):
+    from dataclasses import replace
+    from threading import current_thread
+    from onec_runtime.capture_evaluation import CaptureEvaluationCoordinator, CapturePhase
+    from onec_runtime.prototype_runtime import CaptureCellResult
+    from test_capture_evaluation_coordinator import Driver, FENCE
+
+    api, controller, _ = runtime(tmp_path, captured=True)
+    api.execute_bsl(UPDATE)
+    api.execute_bsl('Результат = Б();')
+    context_before = controller.lowerer.persistent_names
+    prepared = api.prepare_capture_hypothesis('НовоеЗначение = 12; КонтекстОтладки.Скаляр = 778;')
+    coordinator = CaptureEvaluationCoordinator(FENCE, poll_interval_s=.01)
+    driver = Driver()
+    initiating = current_thread()
+    notify = coordinator._condition.notify_all
+    completions, disposals, continuations, cleanups = [], [], [], []
+
+    def interrupted_notify():
+        notify()
+        if current_thread() is initiating:
+            raise error_type('interrupted after acceptance')
+
+    def submit(*, pin_lease, completion):
+        def settle(value, error):
+            completions.append((current_thread(), error))
+            return completion(CaptureCellResult(controller.operation_id, 'visible', 'lowered', value), error)
+        # An adapter may wrap either callback. Acceptance must survive this.
+        def dispose(disposition):
+            assert not api._lock.locked()
+            assert not api._evaluation_pin_lock.locked()
+            disposals.append(disposition)
+            pin_lease(disposition)
+        ticket = coordinator.submit_evaluation(replace(
+            driver.request(cleanup_leases=(lambda: cleanups.append(current_thread()),)),
+            pin_lease=dispose, completion=settle,
+            continuation=lambda value: continuations.append(value),
+        ))
+        if window == 'adapter':
+            raise error_type('interrupted after acceptance')
+        return ticket
+
+    monkeypatch.setattr(api, '_execute_prepared_capture_handoff', lambda handoff: handoff.execute_owned(submit))
+    try:
+        if window == 'notify':
+            monkeypatch.setattr(coordinator._condition, 'notify_all', interrupted_notify)
+        with pytest.raises(error_type, match='after acceptance'):
+            api.execute_prepared_capture_hypothesis(prepared)
+        monkeypatch.setattr(coordinator._condition, 'notify_all', notify)
+        assert driver.polling.wait(1)
+        record = coordinator._active
+        assert record is not None and record.acknowledged
+        assert not record.initiator_attached
+        assert len(api._worker_universe._leases) == 2
+        assert not disposals and not completions and not cleanups
+        assert controller.lowerer.persistent_names != context_before
+        if late == 'uncertain':
+            driver.events.put(OSError('synthetic stream loss'))
+        else:
+            driver.result(failed=late == 'bsl_failure')
+        outcome = coordinator.wait(FENCE, record.evaluation_id, timeout_s=1)
+        assert driver.dispatch_count == 1
+        assert not continuations
+        assert len(completions) == 1 and completions[0][0] is coordinator._worker
+        if late == 'uncertain':
+            assert coordinator.status(FENCE).phase is CapturePhase.RECOVERY_REQUIRED
+            assert disposals == ['quarantine']
+            assert sum(lease.outcome_unknown for lease in api._worker_universe._leases.values()) == 1
+            assert not cleanups
+        else:
+            assert outcome.state.value == ('failed' if late == 'bsl_failure' else 'completed')
+            assert tuple(api._pending_dirty_roots.values()) == ('Скаляр',)
+            assert coordinator.status(FENCE).phase is CapturePhase.PAUSED
+            assert disposals == ['release'] and len(api._worker_universe._leases) == 1
+            assert cleanups == [coordinator._worker]
+        if late != 'success':
+            assert controller.lowerer.persistent_names == context_before
+    finally:
+        monkeypatch.setattr(coordinator._condition, 'notify_all', notify)
+        coordinator.begin_close()
+        driver.closed.set()
+        assert coordinator.join(2)
+
+
 def test_mixed_capture_added_name_uses_new_catalog_and_releases_cell_lease(tmp_path):
     api, _, session = runtime(tmp_path, captured=True)
     api.execute_bsl(UPDATE)
