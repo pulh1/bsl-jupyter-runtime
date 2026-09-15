@@ -645,8 +645,10 @@ def test_interactive_owner_retains_guardian_and_hooks_until_core_close_finishes(
     assert wrapper._shutdown_shell is None
 
 
+@pytest.mark.parametrize("first_entry", ("normal", "kernel"))
 @pytest.mark.parametrize("retry_entry", ("normal", "kernel"))
 def test_late_worker_exit_keeps_abandoned_shutdown_retryable(
+    first_entry: str,
     retry_entry: str,
 ) -> None:
     rdbg = _ServerShutdownCaptureSession(wake_on_invalidate=False)
@@ -673,15 +675,25 @@ def test_late_worker_exit_keeps_abandoned_shutdown_retryable(
     wrapper._register_shutdown(shell)
 
     try:
-        with pytest.raises(
-            ProtocolError,
-            match="ZUP demo cleanup failed: ProtocolError",
-        ) as caught:
-            runtime.close()
-        assert "private transient shutdown journal failure" not in (
-            str(caught.value) + repr(caught.value)
-        )
+        if first_entry == "normal":
+            with pytest.raises(
+                ProtocolError,
+                match="ZUP demo cleanup failed: ProtocolError",
+            ) as caught:
+                wrapper.close()
+            assert "private transient shutdown journal failure" not in (
+                str(caught.value) + repr(caught.value)
+            )
+        else:
+            wrapper._close_at_shutdown()
+
         assert runtime.is_closed is False
+        assert runtime._processes_closed is True
+        assert runtime._debug_ui_detached is True
+        assert runtime._transport_closed is True
+        assert runtime._runtime_api_closed is False
+        assert api._capture_shutdown_finished is False
+        assert api._closed is False
         assert wrapper._closed is False
         assert stopped == []
         assert wrapper._shutdown_shell is shell
@@ -700,6 +712,9 @@ def test_late_worker_exit_keeps_abandoned_shutdown_retryable(
             wrapper._close_at_shutdown()
 
         assert runtime.is_closed is True
+        assert runtime._runtime_api_closed is True
+        assert api._capture_shutdown_finished is True
+        assert api._closed is True
         assert wrapper._closed is True
         assert stopped == ["stopped"]
         assert wrapper._shutdown_shell is None
