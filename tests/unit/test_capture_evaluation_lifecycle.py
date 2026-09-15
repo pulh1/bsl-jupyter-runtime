@@ -282,6 +282,11 @@ class FailingEvalTransport:
         self.request_entered = False
         self.dispatch_marker_set = False
 
+    def reset_observations(self) -> None:
+        self.calls.clear()
+        self.request_entered = False
+        self.dispatch_marker_set = False
+
     def mark_evalexpr_dispatch(self) -> None:
         assert not self.request_entered, (
             "dispatch marker must precede transport.request entry"
@@ -415,6 +420,7 @@ def test_coordinator_keeps_local_eval_request_build_before_dispatch_boundary(
     owner = CaptureEvaluationCoordinator(capture_fence, poll_interval_s=0.01)
     dispositions: list[str] = []
     build_attempts: list[str] = []
+    real_build_eval_request = rdbg_session_module.build_eval_request
 
     def fail_local_request_build(*args: object, **kwargs: object) -> bytes:
         del args, kwargs
@@ -459,7 +465,23 @@ def test_coordinator_keeps_local_eval_request_build_before_dispatch_boundary(
         assert outcome.diagnostic.code == "pre_dispatch_failed"
         assert owner.status(capture_fence).phase is CapturePhase.PAUSED
         assert dispositions == ["release"]
+
+        monkeypatch.setattr(
+            rdbg_session_module,
+            "build_eval_request",
+            real_build_eval_request,
+        )
+        transport.reset_observations()
+        with pytest.raises(OSError, match="transport failure"):
+            session.start_evaluation(
+                "Результат = 2",
+                on_transport_dispatch=transport.mark_evalexpr_dispatch,
+            )
+        assert transport.dispatch_marker_set is True
+        assert transport.request_entered is True
+        assert transport.calls == ["evalExpr"]
     finally:
+        session.invalidate()
         owner.begin_close()
         assert owner.join(2)
 
