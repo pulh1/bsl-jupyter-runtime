@@ -689,6 +689,8 @@ class OnecRuntimeMagics(Magics):
 
 def load_ipython_extension(ipython: InteractiveShell) -> None:
     ipython.register_magics(OnecRuntimeMagics(ipython))
+    from .capture_display import install_capture_formatters
+    install_capture_formatters(ipython)
     from .completion import install_completion_matcher
     install_completion_matcher(ipython)
     from .lsp_kernel import install_project_bridge
@@ -697,6 +699,8 @@ def load_ipython_extension(ipython: InteractiveShell) -> None:
 
 
 def unload_ipython_extension(ipython: InteractiveShell) -> None:
+    from .capture_display import remove_capture_formatters
+    remove_capture_formatters(ipython)
     from .completion import remove_completion_matcher
     remove_completion_matcher(ipython)
     source_session = _source_session_for_shell(ipython, create=False)

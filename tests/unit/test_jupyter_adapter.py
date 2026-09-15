@@ -19,6 +19,17 @@ from onec_runtime_jupyter.extension import (
     _display_reply,
     install_runtime,
     load_ipython_extension,
+    unload_ipython_extension,
+)
+from onec_runtime.capture_evaluation import CapturePhase, CaptureStatus
+from onec_runtime.capture_inspection import DebugFrame, StackPage
+from onec_runtime.capture_values import (
+    SafeValuePath,
+    ValueNode,
+    ValuePage,
+    ValueRoot,
+    ValueRootKind,
+    ValueShape,
 )
 from onec_runtime.prototype_runtime import OperationState
 from onec_runtime.runtime_api import (
@@ -1007,3 +1018,58 @@ def test_extension_registers_magics() -> None:
     load_ipython_extension(shell)  # type: ignore[arg-type]
 
     assert isinstance(shell.registered, OnecRuntimeMagics)
+
+
+class _FakeTypeFormatter:
+    def __init__(self) -> None:
+        self.type_printers: dict[type[object], object] = {}
+
+    def for_type(self, value_type: type[object], formatter: object) -> object | None:
+        previous = self.type_printers.get(value_type)
+        self.type_printers[value_type] = formatter
+        return previous
+
+    def pop(self, value_type: type[object]) -> object:
+        return self.type_printers.pop(value_type)
+
+
+class _FakeDisplayFormatter:
+    def __init__(self) -> None:
+        self.formatters = {
+            "text/plain": _FakeTypeFormatter(),
+            "text/html": _FakeTypeFormatter(),
+        }
+
+
+def test_extension_registers_capture_snapshot_formatters_without_global_alias() -> None:
+    shell = FakeShell()
+    shell.display_formatter = _FakeDisplayFormatter()  # type: ignore[attr-defined]
+
+    load_ipython_extension(shell)  # type: ignore[arg-type]
+
+    expected = {CaptureStatus, StackPage, DebugFrame, ValuePage, ValueNode}
+    plain = shell.display_formatter.formatters["text/plain"]  # type: ignore[attr-defined]
+    html = shell.display_formatter.formatters["text/html"]  # type: ignore[attr-defined]
+    assert expected <= plain.type_printers.keys()
+    assert expected <= html.type_printers.keys()
+    assert "capture" not in shell.user_ns
+
+    status = CaptureStatus(7, 2, 1, CapturePhase.PAUSED)
+
+    class Printer:
+        def __init__(self) -> None:
+            self.value = ""
+
+        def text(self, value: str) -> None:
+            self.value += value
+
+    printer = Printer()
+    plain.type_printers[CaptureStatus](status, printer, False)
+    rich = html.type_printers[CaptureStatus](status)
+    assert printer.value.startswith("CAPTURE: paused")
+    assert rich.startswith('<section class="onec-capture onec-capture-status">')
+
+    unload_ipython_extension(shell)  # type: ignore[arg-type]
+
+    assert not (expected & plain.type_printers.keys())
+    assert not (expected & html.type_printers.keys())
