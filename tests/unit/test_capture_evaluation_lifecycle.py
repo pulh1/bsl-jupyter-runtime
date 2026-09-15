@@ -118,9 +118,10 @@ class ControlledCaptureSession(ScriptedSession):
         *,
         max_text_size: int = 307_200,
         stack_level: int = 0,
+        timeout_s: float = 30.0,
         on_transport_dispatch=None,  # type: ignore[no-untyped-def]
     ) -> PendingEvaluation:
-        del max_text_size
+        del max_text_size, timeout_s
         ident = current_thread().ident
         assert ident is not None
         self.start_threads.append(ident)
@@ -294,8 +295,15 @@ class FailingEvalTransport:
         assert not self.dispatch_marker_set
         self.dispatch_marker_set = True
 
-    def request(self, method: str, payload: bytes) -> bytes:
+    def request(
+        self,
+        method: str,
+        payload: bytes,
+        *,
+        timeout_s: float = 60.0,
+    ) -> bytes:
         del payload
+        assert timeout_s > 0
         self.request_entered = True
         self.calls.append(method)
         assert self.dispatch_marker_set, (

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from base64 import b64encode
 from collections import deque
+from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import asdict
 from hashlib import sha256
@@ -54,6 +55,7 @@ from onec_runtime.bsl import (
 from onec_runtime.session import RuntimeSession, _ActiveCaptureTicket
 from onec_runtime_mcp.agent.runtime_session import AgentRuntimeSession
 from onec_runtime.errors import (
+    CaptureOutcomeUnknownError,
     CaptureRecoveryRequiredError,
     ProtocolError,
     RdbgTransportError,
@@ -379,13 +381,18 @@ class ScriptedSession:
         *,
         max_text_size: int = 307_200,
         stack_level: int = 0,
+        timeout_s: float = 30.0,
+        on_transport_dispatch: Callable[[], None] | None = None,
     ) -> PendingEvaluation:
         if self._pending_evaluations:
             raise ProtocolError("Another expression evaluation is already pending")
+        if on_transport_dispatch is not None:
+            on_transport_dispatch()
         result = self.evaluate(
             expression,
             max_text_size=max_text_size,
             stack_level=stack_level,
+            timeout_s=timeout_s,
         )
         pending = PendingEvaluation(
             TARGET,
@@ -3936,13 +3943,16 @@ def test_restore_failure_blocks_resume_without_continue() -> None:
     )
     controller = captured_controller(session)
 
-    with pytest.raises(runtime.BreakpointRestoreError):
+    with pytest.raises(CaptureRecoveryRequiredError) as caught:
         controller.execute_capture("РезультатИнструкции = 901;")
 
-    assert controller.state is runtime.OperationState.BREAKPOINT_RESTORE_FAILURE
+    assert caught.value.diagnostic is not None
+    assert caught.value.diagnostic.code == "workspace_restore_failed"
+    assert controller.state is runtime.OperationState.RECOVERING
     assert session.continue_count == 1
-    with pytest.raises(ProtocolError, match="breakpoint_restore_failure"):
-        controller.resume()
+    with pytest.raises(CaptureRecoveryRequiredError):
+        controller.resume_debug_stop()
+    assert session.continue_count == 1
 
 
 def test_shield_install_failure_does_not_start_evaluation() -> None:
@@ -3950,8 +3960,11 @@ def test_shield_install_failure_does_not_start_evaluation() -> None:
     session = ScriptedSession((CAPTURE_A,), fail_workspace_on_call=2)
     controller = captured_controller(session)
 
-    with pytest.raises(ProtocolError, match="outcome is unknown"):
+    with pytest.raises(CaptureOutcomeUnknownError) as caught:
         controller.execute_capture("РезультатИнструкции = 901;")
+
+    assert caught.value.diagnostic is not None
+    assert caught.value.diagnostic.code == "workspace_shield_unknown"
 
     capture_evaluations = [
         value

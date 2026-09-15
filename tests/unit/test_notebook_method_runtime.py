@@ -7,7 +7,13 @@ import re
 
 import pytest
 
-from onec_runtime.errors import BslExecutionError, ProtocolError, WorkerPromotionOutcomeUnknown
+from onec_runtime.errors import (
+    BslExecutionError,
+    CaptureOutcomeUnknownError,
+    CaptureRecoveryRequiredError,
+    ProtocolError,
+    WorkerPromotionOutcomeUnknown,
+)
 from onec_runtime.prototype_runtime import PrototypeRuntimeController
 from onec_runtime.runtime_api import PrototypeRuntimeApi
 from onec_runtime.bsl.source_maps import SourceUnitKind, SourceUnitRef, source_sha256
@@ -599,11 +605,13 @@ def test_unknown_capture_reply_retains_both_generation_leases_until_close(tmp_pa
     source = 'РезультатИнструкции = В();'
     candidate = api.prepare_capture_hypothesis(source) if prepared else None
     session.lose_capture_reply = True
-    with pytest.raises(TimeoutError, match='transport loss'):
+    with pytest.raises(CaptureOutcomeUnknownError) as caught:
         if prepared:
             api.execute_prepared_capture_hypothesis(candidate)
         else:
             api.execute_bsl(source)
+    assert caught.value.diagnostic is not None
+    assert caught.value.diagnostic.code == 'dispatch_uncertain'
     assert api._operation_generation_pin is original
     assert len(api._worker_universe._leases) == 2
     assert sum(lease.outcome_unknown for lease in api._worker_universe._leases.values()) == 1
@@ -686,47 +694,32 @@ def test_owned_capture_rejection_disposes_pin_even_when_completion_fails():
 
 
 @pytest.mark.parametrize('prepared', [False, True])
-@pytest.mark.parametrize('outcome', ['success', 'failure', 'unknown'])
-def test_pending_capture_evaluation_keeps_g2_across_debug_stops_and_resumes(tmp_path, prepared, outcome):
+def test_capture_evaluation_stop_requires_recovery_and_quarantines_g2(
+    tmp_path, prepared,
+):
     api, controller, session = runtime(tmp_path, captured=True)
     api.execute_bsl(UPDATE)
     api.execute_bsl('Результат = Б();')
     original = api._operation_generation_pin
     api.execute_bsl(THIRD)
-    if outcome == 'failure':
-        session.capture_evaluations.append(evaluation('Ошибка', '', error='planned pending failure'))
     user_stop = ScriptedSession((USER,)).stops[0]
     session.pending_evaluation_stops.append(user_stop)
     source = 'РезультатИнструкции = В();'
-    reply = (api.execute_prepared_capture_hypothesis(api.prepare_capture_hypothesis(source))
-             if prepared else api.execute_bsl(source))
-    assert reply.state.value == 'capture_debug_stopped'
-    evaluation_pin = api._evaluation_generation_pin
-    assert evaluation_pin is not None
-    assert evaluation_pin.handle is api.worker_generation_handle
-    assert evaluation_pin.handle is not original.handle
+    with pytest.raises(CaptureRecoveryRequiredError) as caught:
+        if prepared:
+            api.execute_prepared_capture_hypothesis(api.prepare_capture_hypothesis(source))
+        else:
+            api.execute_bsl(source)
+    assert caught.value.diagnostic is not None
+    assert caught.value.diagnostic.code == 'unexpected_stop'
+    assert controller.state.value == 'recovering'
+    assert api._evaluation_generation_pin is None
     assert len(api._worker_universe._leases) == 2
-    session.pending_evaluation_stops.append(user_stop)
-    repeated = api.resume_debug_stop()
-    assert repeated.state.value == 'capture_debug_stopped'
-    assert api._evaluation_generation_pin is evaluation_pin
+    assert sum(lease.outcome_unknown for lease in api._worker_universe._leases.values()) == 1
     assert api._operation_generation_pin is original
-
-    if outcome == 'unknown':
-        session.lose_capture_resume = True
-        with pytest.raises(TimeoutError, match='resume loss'):
-            api.resume_debug_stop()
-        assert len(api._worker_universe._leases) == 2
-        assert sum(lease.outcome_unknown for lease in api._worker_universe._leases.values()) == 1
-        with pytest.raises(WorkerPromotionOutcomeUnknown):
-            api.status()
-    else:
-        completed = api.resume_debug_stop()
-        assert completed.state.value == 'captured'
-        assert completed.succeeded == (outcome == 'success')
-        assert api._evaluation_generation_pin is None
-        assert len(api._worker_universe._leases) == 1
-    assert api._operation_generation_pin is original
+    with pytest.raises(CaptureRecoveryRequiredError):
+        controller.resume_debug_stop()
+    assert session.continue_count == 1
 
 
 @pytest.mark.parametrize('statements_only', [False, True])

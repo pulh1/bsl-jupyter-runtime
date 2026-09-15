@@ -20,13 +20,19 @@ from onec_runtime_mcp.agent.onec_values import OnecValueResolver
 from onec_runtime_mcp.agent.proxies import ProxyRealm, ProxyRegistry, ReleasedProxy
 from onec_runtime_mcp.agent.value_service import ValueService
 from onec_runtime.errors import ProtocolError
-from onec_runtime.prototype_runtime import OperationState, PrototypeRuntimeController
+from onec_runtime.prototype_runtime import (
+    OperationHandle,
+    OperationState,
+    PrototypeRuntimeController,
+)
 from onec_runtime.rdbg.models import (
     CollectionCell,
     CollectionRow,
     EvaluationResult,
     FrameVariable,
     ModuleLocation,
+    PendingEvaluation,
+    TargetId,
 )
 
 
@@ -50,6 +56,8 @@ class StrictCaptureRdbg:
     def __init__(self) -> None:
         self.evaluations: list[tuple[str, int]] = []
         self.collections: list[tuple[str, int, int, int]] = []
+        self.target_id = TargetId(uuid4(), uuid4(), 1)
+        self._pending: dict[int, tuple[PendingEvaluation, EvaluationResult]] = {}
 
     def evaluate(self, expression: str, *, stack_level: int, **_kwargs: object) -> EvaluationResult:
         self.evaluations.append((expression, stack_level))
@@ -71,13 +79,49 @@ class StrictCaptureRdbg:
         )
         return EvaluationResult(uuid4(), "ТаблицаЗначений", "", False, collection_rows=(row,))
 
+    def start_evaluation(
+        self,
+        expression: str,
+        *,
+        stack_level: int,
+        timeout_s: float,
+        max_text_size: int = 307_200,
+        on_transport_dispatch=None,  # type: ignore[no-untyped-def]
+    ) -> PendingEvaluation:
+        if on_transport_dispatch is not None:
+            on_transport_dispatch()
+        result = self.evaluate(
+            expression,
+            stack_level=stack_level,
+            timeout_s=timeout_s,
+            max_text_size=max_text_size,
+        )
+        pending = PendingEvaluation(self.target_id, result.result_id, self)
+        self._pending[id(pending)] = (pending, result)
+        return pending
+
+    def wait_evaluation_event(
+        self,
+        pending: PendingEvaluation,
+        *,
+        timeout_s: float,
+    ) -> EvaluationResult:
+        del timeout_s
+        stored, result = self._pending.pop(id(pending))
+        assert stored is pending
+        return result
+
 
 def captured_controller(rdbg: StrictCaptureRdbg) -> tuple[PrototypeRuntimeController, str]:
     controller = PrototypeRuntimeController(
         rdbg,  # type: ignore[arg-type]
         ModuleLocation("ExtensionModule", "", None, None, 1, "Runtime"),
     )
+    controller.active_operation = OperationHandle(1, "", "")
+    controller._capture_target_id = rdbg.target_id
+    controller.stop_sequence = 1
     controller.state = OperationState.CAPTURED
+    controller._replace_capture_evaluation_coordinator()
     controller.capture_frame_stack_level = 0
     controller.capture_kernel_stack_level = 2
     controller._capture_frame_variables = (FrameVariable("Query", "Query", "<query>"),)
