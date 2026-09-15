@@ -53,7 +53,11 @@ from onec_runtime.bsl import (
 )
 from onec_runtime.session import RuntimeSession, _ActiveCaptureTicket
 from onec_runtime_mcp.agent.runtime_session import AgentRuntimeSession
-from onec_runtime.errors import ProtocolError, RdbgTransportError
+from onec_runtime.errors import (
+    CaptureRecoveryRequiredError,
+    ProtocolError,
+    RdbgTransportError,
+)
 from onec_runtime.fault_injection import (
     CloseTransportAt,
     FaultPoint,
@@ -3674,7 +3678,7 @@ def test_capture_cell_masks_only_capture_points_then_restores_full_workspace() -
     assert controller.state is runtime.OperationState.CAPTURED
 
 
-def test_capture_evaluation_worker_stop_resumes_same_pending_evaluation() -> None:
+def test_capture_evaluation_worker_stop_requires_recovery_without_public_nested_frame() -> None:
     runtime = runtime_module()
     session = ScriptedSession(
         (CAPTURE_A,),
@@ -3700,27 +3704,19 @@ def test_capture_evaluation_worker_stop_resumes_same_pending_evaluation() -> Non
         )
     )
 
-    stopped = controller.execute_capture("РезультатИнструкции = 901;")
+    with pytest.raises(CaptureRecoveryRequiredError) as caught:
+        controller.execute_capture("РезультатИнструкции = 901;")
 
-    assert isinstance(stopped, runtime.DebugStop)
-    assert stopped.reason is StopReason.USER_BREAKPOINT
-    assert controller.state is runtime.OperationState.CAPTURE_DEBUG_STOPPED
-    assert controller.pending_capture_evaluation is not None
+    assert caught.value.diagnostic is not None
+    assert caught.value.diagnostic.code == "unexpected_stop"
+    assert controller.state is runtime.OperationState.RECOVERING
     shielded = controller.breakpoint_workspace_owner.confirmed_snapshot
     assert shielded.shielded is True
     assert CAPTURE_A not in shielded.effective_locations
     assert WORKER_BREAKPOINT in shielded.effective_locations
-
-    cell = controller.resume_debug_stop()
-
-    assert isinstance(cell, runtime.CaptureCellResult)
-    assert cell.result == 901
-    assert controller.state is runtime.OperationState.CAPTURED
-    assert controller.pending_capture_evaluation is None
-    restored = controller.breakpoint_workspace_owner.confirmed_snapshot
-    assert restored.shielded is False
-    assert CAPTURE_A in restored.effective_locations
-    assert WORKER_BREAKPOINT in restored.effective_locations
+    with pytest.raises(ProtocolError, match="requires state"):
+        controller.resume_debug_stop()
+    assert session.continue_count == 1
 
 
 def test_bsl_error_restores_workspace_and_next_capture_cell_succeeds() -> None:
