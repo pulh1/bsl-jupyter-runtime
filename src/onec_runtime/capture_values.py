@@ -1,0 +1,737 @@
+"""Bounded, expression-free local models for CAPTURE value inspection.
+
+``LocalCaptureValueAdapter`` is an internal integration seam.  Its backend owns
+the exact stop-fence/lifecycle check and all target-side coordinator operations;
+this module deliberately does not guess RDBG entry points.  Every descriptor
+request is fresh, while returned pages contain immutable presentation data.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
+from enum import StrEnum
+import re
+from typing import TYPE_CHECKING, Protocol, cast, overload
+
+from onec_runtime.bsl.lexer import KEYWORDS
+from onec_runtime.errors import (
+    CaptureBusyError,
+    CaptureEvaluationPendingError,
+    CaptureLookupError,
+    CaptureOutcomeUnknownError,
+    CapturePathError,
+    CaptureRecoveryRequiredError,
+    CaptureShapeUnsupportedError,
+    CaptureSourceUnavailableError,
+    CaptureValueAccessDeniedError,
+    CaptureValueCheckError,
+    NoActiveCaptureError,
+    StaleCaptureError,
+)
+
+if TYPE_CHECKING:
+    from onec_runtime.capture_inspection import DebugFrame
+
+
+MAX_PAGE_ITEMS = 100
+MAX_NAME_CHARS = 256
+MAX_TYPE_CHARS = 256
+MAX_PREVIEW_CHARS = 512
+_BSL_IDENTIFIER = re.compile(r"[A-Za-zА-Яа-яЁё_][0-9A-Za-zА-Яа-яЁё_]*\Z")
+
+
+class ValueRootKind(StrEnum):
+    CONTEXT = "context"
+    FRAME = "frame"
+
+
+class ValuePathSegmentKind(StrEnum):
+    VARIABLE = "variable"
+    FIELD = "field"
+    INDEX = "index"
+    COLUMN = "column"
+    ROW = "row"
+
+
+class ValueShape(StrEnum):
+    SCALAR = "scalar"
+    STRUCTURE = "structure"
+    FIXED_STRUCTURE = "fixed_structure"
+    ARRAY = "array"
+    FIXED_ARRAY = "fixed_array"
+    VALUE_TABLE = "value_table"
+    VALUE_TABLE_ROW = "value_table_row"
+    COLUMN = "column"
+    MAP = "map"
+    VALUE_TREE = "value_tree"
+    APPLICATION_OBJECT = "application_object"
+    UNDOCUMENTED = "undocumented"
+
+
+class ValueViewKind(StrEnum):
+    VARIABLES = "variables"
+    STRUCTURE_FIELDS = "structure_fields"
+    ARRAY_ITEMS = "array_items"
+    TABLE_COLUMNS = "table_columns"
+    TABLE_ROWS = "table_rows"
+    ROW_FIELDS = "row_fields"
+
+
+class VariableRole(StrEnum):
+    VARIABLES = "variables"
+    PARAMETERS = "parameters"
+    LOCALS = "locals"
+
+
+def _identifier(value: object, *, what: str) -> str:
+    if (not isinstance(value, str) or not value or len(value) > MAX_NAME_CHARS
+            or _BSL_IDENTIFIER.fullmatch(value) is None or value.upper() in KEYWORDS):
+        raise CapturePathError(f"{what} must be a bounded identifier")
+    return value
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ValueRoot:
+    kind: ValueRootKind
+    native_level: int | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, ValueRootKind):
+            raise CapturePathError("value root kind is invalid")
+        if self.kind is ValueRootKind.CONTEXT:
+            if self.native_level is not None:
+                raise CapturePathError("context root cannot have a native level")
+        elif type(self.native_level) is not int or self.native_level < 0:
+            raise CapturePathError("frame root needs a nonnegative native level")
+
+    def __repr__(self) -> str:
+        return (
+            "КонтекстОтладки"
+            if self.kind is ValueRootKind.CONTEXT
+            else f"frame[{self.native_level}]"
+        )
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class SafePathSegment:
+    kind: ValuePathSegmentKind
+    key: str | int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, ValuePathSegmentKind):
+            raise CapturePathError("safe-path segment kind is invalid")
+        if self.kind in {
+            ValuePathSegmentKind.VARIABLE,
+            ValuePathSegmentKind.FIELD,
+            ValuePathSegmentKind.COLUMN,
+        }:
+            _identifier(self.key, what="safe-path name")
+        elif type(self.key) is not int or self.key < 0:
+            raise CapturePathError("safe-path index must be nonnegative")
+
+    @property
+    def display_name(self) -> str | int:
+        return self.key
+
+    def __repr__(self) -> str:
+        return f"{self.kind.value}({self.key!r})"
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class SafeValuePath:
+    root: ValueRoot
+    segments: tuple[SafePathSegment, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.root, ValueRoot):
+            raise CapturePathError("safe path root is invalid")
+        if type(self.segments) is not tuple or any(
+            not isinstance(item, SafePathSegment) for item in self.segments
+        ):
+            raise CapturePathError("safe path must contain frozen segments")
+        if len(self.segments) > 64:
+            raise CapturePathError("safe path is too deep")
+
+    def child(self, kind: ValuePathSegmentKind, key: str | int) -> SafeValuePath:
+        return SafeValuePath(self.root, self.segments + (SafePathSegment(kind, key),))
+
+    def __repr__(self) -> str:
+        suffix = "".join(
+            f".{part.key}" if isinstance(part.key, str) else f"[{part.key}]"
+            for part in self.segments
+        )
+        return repr(self.root) + suffix
+
+
+@dataclass(frozen=True, slots=True)
+class ValueMetadata:
+    type_name: str
+    preview: str
+    size: int | None
+    shape: ValueShape
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.type_name, str) or not self.type_name
+                or len(self.type_name) > MAX_TYPE_CHARS):
+            raise CaptureValueCheckError("capture value type is invalid")
+        if not isinstance(self.preview, str):
+            raise CaptureValueCheckError("capture value preview is invalid")
+        if self.size is not None and (type(self.size) is not int or self.size < 0):
+            raise CaptureValueCheckError("capture value size is invalid")
+        if not isinstance(self.shape, ValueShape):
+            raise CaptureValueCheckError("capture value shape is invalid")
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class PrivateProjectedValue:
+    """Private backend result; metadata must not be read before its guard."""
+
+    name: str | int
+    handle: object = field(repr=False, compare=False)
+    describe: Callable[[], ValueMetadata] = field(repr=False, compare=False)
+    cycle: bool = False
+
+    def __post_init__(self) -> None:
+        if type(self.name) is int:
+            if self.name < 0:
+                raise CaptureValueCheckError("projected index is invalid")
+        else:
+            _identifier(self.name, what="projected name")
+        if not callable(self.describe):
+            raise CaptureValueCheckError("projected metadata reader is invalid")
+        if type(self.cycle) is not bool:
+            raise CaptureValueCheckError("projected cycle marker is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class PrivateValueProjection:
+    entries: tuple[PrivateProjectedValue, ...]
+    total: int
+    next_cursor: int | None
+
+    def __post_init__(self) -> None:
+        if type(self.entries) is not tuple or any(
+            not isinstance(item, PrivateProjectedValue) for item in self.entries
+        ):
+            raise CaptureValueCheckError("projected values must be an immutable tuple")
+        if type(self.total) is not int or self.total < len(self.entries):
+            raise CaptureValueCheckError("projected total is invalid")
+        if self.next_cursor is not None and (
+            type(self.next_cursor) is not int or self.next_cursor < 0
+        ):
+            raise CaptureValueCheckError("projected cursor is invalid")
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ValueInspectionRequest:
+    path: SafeValuePath
+    view: ValueViewKind
+    start: int
+    stop: int
+    role: VariableRole = VariableRole.VARIABLES
+    parameter_names: tuple[str, ...] = ()
+    exact: str | int | None = None
+
+
+class CaptureValueBackend(Protocol):
+    """Target-side seam awaiting RuntimeApi/Session/coordinator attachment.
+
+    ``validate_inspection`` must validate the exact fence and lifecycle without
+    privacy or source work.  Each later call must validate the same fence again
+    while it runs.  Projection and guard calls are coordinator-owned inspection
+    operations; temporary-handle cleanup is a materialization-helper step.
+    """
+
+    def validate_inspection(self, fence: object) -> None: ...
+    def resolve_value(self, fence: object, path: SafeValuePath) -> PrivateProjectedValue: ...
+    def project_values(
+        self, fence: object, request: ValueInspectionRequest,
+    ) -> PrivateValueProjection: ...
+    def discover_table_columns(
+        self, fence: object, path: SafeValuePath, limit: int,
+    ) -> tuple[str, ...]: ...
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class CaptureValuePolicy:
+    private_guard: Callable[[object, object], bool] = field(repr=False, compare=False)
+    max_depth: int = 16
+    max_items: int = MAX_PAGE_ITEMS
+    max_bytes: int = 64 * 1024
+
+    def __post_init__(self) -> None:
+        if not callable(self.private_guard):
+            raise TypeError("capture private-value guard must be callable")
+        if type(self.max_depth) is not int or self.max_depth < 0 or self.max_depth > 64:
+            raise ValueError("capture value depth budget is invalid")
+        if (type(self.max_items) is not int or self.max_items < 1
+                or self.max_items > MAX_PAGE_ITEMS):
+            raise ValueError("capture value item budget is invalid")
+        if type(self.max_bytes) is not int or self.max_bytes < 1:
+            raise ValueError("capture value byte budget is invalid")
+
+    def is_private(self, fence: object, handle: object) -> bool:
+        try:
+            result = self.private_guard(fence, handle)
+        except (
+            CaptureBusyError,
+            CaptureEvaluationPendingError,
+            CaptureOutcomeUnknownError,
+            CaptureRecoveryRequiredError,
+            CaptureValueAccessDeniedError,
+            CaptureValueCheckError,
+            NoActiveCaptureError,
+            StaleCaptureError,
+        ):
+            raise
+        except Exception as error:
+            raise CaptureValueCheckError("capture public-value check failed") from error
+        if type(result) is not bool:
+            raise CaptureValueCheckError("public-value guard returned an invalid result")
+        return result
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ValueNode:
+    name: str | int
+    type_name: str | None
+    preview: str
+    size: int | None
+    expandable: bool
+    shape: ValueShape | None
+    path: SafeValuePath
+    private: bool = False
+    cycle: bool = False
+    _owner: LocalCaptureValueAdapter | None = field(
+        repr=False, compare=False, default=None,
+    )
+
+    @property
+    def children(self) -> ChildValueDescriptor:
+        return ChildValueDescriptor(self._require_owner(), self, None)
+
+    @property
+    def fields(self) -> ChildValueDescriptor:
+        return ChildValueDescriptor(self._require_owner(), self, "fields")
+
+    @property
+    def items(self) -> ChildValueDescriptor:
+        return ChildValueDescriptor(self._require_owner(), self, "items")
+
+    @property
+    def columns(self) -> ChildValueDescriptor:
+        return ChildValueDescriptor(self._require_owner(), self, "columns")
+
+    @property
+    def rows(self) -> ChildValueDescriptor:
+        return ChildValueDescriptor(self._require_owner(), self, "rows")
+
+    def _require_owner(self) -> LocalCaptureValueAdapter:
+        if self._owner is None:
+            raise CaptureSourceUnavailableError("value inspection is not attached")
+        return self._owner
+
+    def __str__(self) -> str:
+        if self.private:
+            return f"{self.name}: <private runtime value>"
+        marker = " ▸" if self.expandable else ""
+        return f"{self.name}: {self.type_name} = {self.preview}{marker}"
+
+    __repr__ = __str__
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ValuePage:
+    items: tuple[ValueNode, ...]
+    total: int
+    next_cursor: int | None
+    path: SafeValuePath
+    view: str
+    start: int
+    stop: int
+
+    def __post_init__(self) -> None:
+        if type(self.items) is not tuple or any(
+            not isinstance(item, ValueNode) for item in self.items
+        ):
+            raise TypeError("value page items must be an immutable tuple")
+
+    def __str__(self) -> str:
+        header = f"{self.path}.{self.view} [{self.start}:{self.stop}]"
+        body = "\n".join(f"├─ {item}" for item in self.items)
+        return header + ("\n" + body if body else "")
+
+    __repr__ = __str__
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class VariableDescriptor:
+    _owner: LocalCaptureValueAdapter
+    _root: ValueRoot
+    _role: VariableRole
+
+    @overload
+    def __getitem__(self, key: str) -> ValueNode: ...
+    @overload
+    def __getitem__(self, key: int) -> ValueNode: ...
+    @overload
+    def __getitem__(self, key: slice) -> ValuePage: ...
+
+    def __getitem__(self, key: str | int | slice) -> ValueNode | ValuePage:
+        return self._owner._read_variables(self._root, self._role, key)
+
+    def __iter__(self):
+        raise CapturePathError("variable iteration requires a bounded page")
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class CaptureContextView:
+    _owner: LocalCaptureValueAdapter
+    _root: ValueRoot
+
+    @property
+    def variables(self) -> VariableDescriptor:
+        return VariableDescriptor(self._owner, self._root, VariableRole.VARIABLES)
+
+    @property
+    def parameters(self) -> VariableDescriptor:
+        return VariableDescriptor(self._owner, self._root, VariableRole.PARAMETERS)
+
+    @property
+    def locals(self) -> VariableDescriptor:
+        return VariableDescriptor(self._owner, self._root, VariableRole.LOCALS)
+
+    def __repr__(self) -> str:
+        return repr(self._root)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ChildValueDescriptor:
+    _owner: LocalCaptureValueAdapter
+    _node: ValueNode
+    _alias: str | None
+
+    @overload
+    def __getitem__(self, key: str) -> ValueNode: ...
+    @overload
+    def __getitem__(self, key: int) -> ValueNode: ...
+    @overload
+    def __getitem__(self, key: slice) -> ValuePage: ...
+
+    def __getitem__(self, key: str | int | slice) -> ValueNode | ValuePage:
+        return self._owner._read_children(self._node, self._alias, key)
+
+    def __iter__(self):
+        raise CapturePathError("child iteration requires a bounded page")
+
+
+class LocalCaptureValueAdapter:
+    """Local descriptor engine; lifecycle and remote execution stay injected."""
+
+    def __init__(
+        self,
+        backend: CaptureValueBackend,
+        fence: object,
+        *,
+        policy: CaptureValuePolicy,
+        resolve_parameters: Callable[[ValueRoot], tuple[str, ...]],
+    ) -> None:
+        if not isinstance(policy, CaptureValuePolicy):
+            raise TypeError("capture value policy is invalid")
+        if not callable(resolve_parameters):
+            raise TypeError("parameter resolver must be callable")
+        self._backend = backend
+        self._fence = fence
+        self._policy = policy
+        self._resolve_parameters = resolve_parameters
+
+    @property
+    def context(self) -> CaptureContextView:
+        return CaptureContextView(self, ValueRoot(ValueRootKind.CONTEXT))
+
+    def frame(self, native_level: int) -> CaptureContextView:
+        return CaptureContextView(self, ValueRoot(ValueRootKind.FRAME, native_level))
+
+    def bind_frame(self, frame: DebugFrame) -> DebugFrame:
+        """Return a saved stack frame carrying this adapter's live value scope."""
+        from onec_runtime.capture_inspection import DebugFrame
+
+        if not isinstance(frame, DebugFrame):
+            raise TypeError("capture value scope requires a DebugFrame")
+        return replace(frame, _value_scope=self.frame(frame.native_level))
+
+    def _validate_first(self) -> None:
+        self._backend.validate_inspection(self._fence)
+
+    def _read_variables(
+        self, root: ValueRoot, role: VariableRole, key: str | int | slice,
+    ) -> ValueNode | ValuePage:
+        self._validate_first()
+        exact: str | None = None
+        if isinstance(key, str):
+            exact = _identifier(key, what="variable name")
+            start, stop = 0, 2  # One overflow sentinel detects folded-name ambiguity.
+        elif type(key) is int:
+            if key < 0:
+                raise CapturePathError("variable index must be nonnegative")
+            start, stop = key, key + 1
+        elif isinstance(key, slice):
+            start, stop = self._page_bounds(key)
+        else:
+            raise TypeError("variables require an identifier, index or bounded slice")
+        parameters = self._parameters(root) if role is not VariableRole.VARIABLES else ()
+        request = ValueInspectionRequest(
+            SafeValuePath(root), ValueViewKind.VARIABLES, start, stop,
+            role, parameters, exact,
+        )
+        projection = self._project(request)
+        page = self._normalize_page(
+            projection, request, exact_access=not isinstance(key, slice),
+        )
+        if isinstance(key, slice):
+            return page
+        return self._one(page, exact=exact)
+
+    def _parameters(self, root: ValueRoot) -> tuple[str, ...]:
+        try:
+            names = self._resolve_parameters(root)
+        except CaptureSourceUnavailableError as error:
+            raise CaptureSourceUnavailableError(
+                "method source unavailable; use variables for unclassified values"
+            ) from error
+        if type(names) is not tuple:
+            raise CaptureSourceUnavailableError(
+                "method parameter classification unavailable; use variables"
+            )
+        try:
+            checked = tuple(_identifier(name, what="method parameter") for name in names)
+        except CapturePathError as error:
+            raise CaptureSourceUnavailableError(
+                "method parameter classification unavailable; use variables"
+            ) from error
+        if len({name.casefold() for name in checked}) != len(checked):
+            raise CaptureSourceUnavailableError(
+                "method parameter classification is ambiguous; use variables"
+            )
+        return checked
+
+    def _read_children(
+        self, node: ValueNode, alias: str | None, key: str | int | slice,
+    ) -> ValueNode | ValuePage:
+        self._validate_first()
+        if node.private:
+            raise CaptureValueAccessDeniedError("capture value is private")
+        if node.cycle:
+            raise CapturePathError("capture value cycle cannot be expanded")
+        depth = max(0, len(node.path.segments) - 1)
+        if depth >= self._policy.max_depth:
+            raise CapturePathError("capture value depth budget exceeded")
+        view, segment_kind = self._view_for(node.shape, alias)
+        exact: str | int | None = None
+        if isinstance(key, str):
+            exact = _identifier(key, what="child name")
+            if segment_kind not in {ValuePathSegmentKind.FIELD, ValuePathSegmentKind.COLUMN}:
+                raise CapturePathError("this child view requires a nonnegative index")
+            start, stop = 0, 2  # One overflow sentinel detects folded-name ambiguity.
+        elif type(key) is int:
+            if key < 0:
+                raise CapturePathError("child index must be nonnegative")
+            if segment_kind not in {ValuePathSegmentKind.INDEX, ValuePathSegmentKind.ROW}:
+                raise CapturePathError("this child view requires an identifier")
+            exact, start, stop = key, 0, 1
+        elif isinstance(key, slice):
+            start, stop = self._page_bounds(key)
+        else:
+            raise TypeError("children require a safe name, index or bounded slice")
+
+        root_record = self._backend.resolve_value(self._fence, node.path)
+        if self._policy.is_private(self._fence, root_record.handle):
+            raise CaptureValueAccessDeniedError("capture value is private")
+        root_metadata = self._describe(root_record)
+        if not isinstance(root_metadata, ValueMetadata) or root_metadata.shape is not node.shape:
+            raise CaptureValueCheckError("capture value shape changed during inspection")
+        if view in {ValueViewKind.TABLE_ROWS, ValueViewKind.TABLE_COLUMNS}:
+            columns = self._backend.discover_table_columns(
+                self._fence, node.path, MAX_PAGE_ITEMS + 1,
+            )
+            if type(columns) is not tuple or any(not isinstance(name, str) for name in columns):
+                raise CaptureValueCheckError("value-table schema is invalid")
+            if len(columns) > MAX_PAGE_ITEMS:
+                raise CaptureShapeUnsupportedError("value table exceeds 100 columns")
+            for name in columns:
+                _identifier(name, what="value-table column")
+        request = ValueInspectionRequest(node.path, view, start, stop, exact=exact)
+        projection = self._project(request)
+        page = self._normalize_page(
+            projection, request, exact_access=exact is not None,
+            segment_kind=segment_kind,
+        )
+        if isinstance(key, slice):
+            return page
+        return self._one(page, exact=exact)
+
+    def _view_for(
+        self, shape: ValueShape | None, alias: str | None,
+    ) -> tuple[ValueViewKind, ValuePathSegmentKind]:
+        supported = {
+            ValueShape.STRUCTURE: (ValueViewKind.STRUCTURE_FIELDS, ValuePathSegmentKind.FIELD),
+            ValueShape.FIXED_STRUCTURE: (
+                ValueViewKind.STRUCTURE_FIELDS, ValuePathSegmentKind.FIELD,
+            ),
+            ValueShape.ARRAY: (ValueViewKind.ARRAY_ITEMS, ValuePathSegmentKind.INDEX),
+            ValueShape.FIXED_ARRAY: (ValueViewKind.ARRAY_ITEMS, ValuePathSegmentKind.INDEX),
+            ValueShape.VALUE_TABLE_ROW: (ValueViewKind.ROW_FIELDS, ValuePathSegmentKind.FIELD),
+        }
+        if shape is ValueShape.VALUE_TABLE:
+            if alias == "columns":
+                return ValueViewKind.TABLE_COLUMNS, ValuePathSegmentKind.COLUMN
+            if alias in (None, "rows"):
+                return ValueViewKind.TABLE_ROWS, ValuePathSegmentKind.ROW
+        expected_alias = {
+            ValueShape.STRUCTURE: "fields",
+            ValueShape.FIXED_STRUCTURE: "fields",
+            ValueShape.ARRAY: "items",
+            ValueShape.FIXED_ARRAY: "items",
+            ValueShape.VALUE_TABLE_ROW: "fields",
+        }.get(shape)
+        if shape in supported and alias in (None, expected_alias):
+            return supported[cast(ValueShape, shape)]
+        raise CaptureShapeUnsupportedError("capture value shape or child view is unsupported")
+
+    def _page_bounds(self, key: slice) -> tuple[int, int]:
+        if key.step is not None:
+            raise CapturePathError("capture pages do not accept a slice step")
+        start, stop = 0 if key.start is None else key.start, key.stop
+        if (type(start) is not int or type(stop) is not int or start < 0
+                or stop < start or stop - start > MAX_PAGE_ITEMS):
+            raise CapturePathError("capture pages require finite nonnegative bounds of at most 100")
+        if stop - start > self._policy.max_items:
+            raise CapturePathError("capture page exceeds the item budget")
+        return start, stop
+
+    def _project(self, request: ValueInspectionRequest) -> PrivateValueProjection:
+        result = self._backend.project_values(self._fence, request)
+        if not isinstance(result, PrivateValueProjection):
+            raise CaptureValueCheckError("capture projection result is invalid")
+        if len(result.entries) > request.stop - request.start:
+            raise CaptureValueCheckError("capture projection exceeded the requested page")
+        if result.next_cursor is not None and (
+            not result.entries
+            or result.next_cursor != request.start + len(result.entries)
+            or result.next_cursor >= result.total
+        ):
+            raise CaptureValueCheckError("capture projection cursor is invalid")
+        return result
+
+    def _normalize_page(
+        self,
+        projection: PrivateValueProjection,
+        request: ValueInspectionRequest,
+        *,
+        exact_access: bool,
+        segment_kind: ValuePathSegmentKind = ValuePathSegmentKind.VARIABLE,
+    ) -> ValuePage:
+        nodes: list[ValueNode] = []
+        used_bytes = 0
+        for entry in projection.entries:
+            name = entry.name
+            if segment_kind in {
+                ValuePathSegmentKind.VARIABLE,
+                ValuePathSegmentKind.FIELD,
+                ValuePathSegmentKind.COLUMN,
+            }:
+                checked_name: str | int = _identifier(name, what="projected name")
+            elif type(name) is int and name >= 0:
+                checked_name = name
+            else:
+                raise CaptureValueCheckError("projected child index is invalid")
+            path = request.path.child(segment_kind, checked_name)
+            private = self._policy.is_private(self._fence, entry.handle)
+            if private:
+                if exact_access:
+                    raise CaptureValueAccessDeniedError("capture value is private")
+                node = ValueNode(
+                    checked_name, None, "<private runtime value>", None, False,
+                    None, path, private=True, _owner=self,
+                )
+            else:
+                metadata = self._describe(entry)
+                if not isinstance(metadata, ValueMetadata):
+                    raise CaptureValueCheckError("capture value metadata is invalid")
+                preview = self._preview(metadata)
+                cycle = entry.cycle
+                expandable = (
+                    not cycle
+                    and metadata.shape in {
+                        ValueShape.STRUCTURE, ValueShape.FIXED_STRUCTURE,
+                        ValueShape.ARRAY, ValueShape.FIXED_ARRAY,
+                        ValueShape.VALUE_TABLE, ValueShape.VALUE_TABLE_ROW,
+                    }
+                    and metadata.size != 0
+                )
+                node = ValueNode(
+                    checked_name, metadata.type_name, preview, metadata.size,
+                    expandable, metadata.shape, path, cycle=cycle,
+                    _owner=self,
+                )
+            used_bytes += len(str(checked_name).encode("utf-8"))
+            used_bytes += len((node.type_name or "").encode("utf-8"))
+            used_bytes += len(node.preview.encode("utf-8"))
+            if used_bytes > self._policy.max_bytes:
+                raise CaptureValueCheckError("capture value page byte budget exceeded")
+            nodes.append(node)
+        return ValuePage(
+            tuple(nodes), projection.total, projection.next_cursor,
+            request.path,
+            request.role.value
+            if request.view is ValueViewKind.VARIABLES
+            else request.view.value,
+            request.start, request.stop,
+        )
+
+    @staticmethod
+    def _preview(metadata: ValueMetadata) -> str:
+        preview = metadata.preview
+        if metadata.shape is not ValueShape.SCALAR and metadata.size is not None:
+            preview = f"{metadata.size} elements"
+        if len(preview) > MAX_PREVIEW_CHARS:
+            preview = preview[: MAX_PREVIEW_CHARS - 1] + "…"
+        return preview
+
+    @staticmethod
+    def _describe(entry: PrivateProjectedValue) -> ValueMetadata:
+        try:
+            metadata = entry.describe()
+        except (
+            CaptureBusyError,
+            CaptureEvaluationPendingError,
+            CaptureOutcomeUnknownError,
+            CaptureRecoveryRequiredError,
+            CaptureValueAccessDeniedError,
+            CaptureValueCheckError,
+            NoActiveCaptureError,
+            StaleCaptureError,
+        ):
+            raise
+        except Exception as error:
+            raise CaptureValueCheckError("capture value metadata check failed") from error
+        if not isinstance(metadata, ValueMetadata):
+            raise CaptureValueCheckError("capture value metadata is invalid")
+        return metadata
+
+    @staticmethod
+    def _one(page: ValuePage, *, exact: str | int | None) -> ValueNode:
+        if not page.items:
+            raise CaptureLookupError("capture value not found")
+        if len(page.items) != 1:
+            raise CaptureLookupError("capture value lookup is ambiguous")
+        if exact is not None:
+            matches = [item for item in page.items if (
+                item.name.casefold() == exact.casefold()
+                if isinstance(item.name, str) and isinstance(exact, str)
+                else item.name == exact
+            )]
+            if len(matches) != 1:
+                raise CaptureLookupError("capture value lookup is ambiguous")
+        return page.items[0]

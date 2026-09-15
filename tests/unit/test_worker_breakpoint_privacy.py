@@ -59,3 +59,41 @@ def test_breakpoint_plan_repr_never_contains_private_locator(tmp_path: Path) -> 
     rendered = repr(plan)
     assert module.registration.exact_temp_storage_url not in rendered
     assert "location=<redacted>" in repr(coordinator.bindings_for_view(view)[0])
+
+
+def test_capture_value_snapshots_expose_only_normalized_public_fields() -> None:
+    from onec_runtime.capture_values import (
+        SafePathSegment,
+        SafeValuePath,
+        ValueNode,
+        ValuePage,
+        ValuePathSegmentKind,
+        ValueRoot,
+        ValueRootKind,
+        ValueShape,
+    )
+
+    secret = object()
+    path = SafeValuePath(
+        ValueRoot(ValueRootKind.CONTEXT),
+        (SafePathSegment(ValuePathSegmentKind.VARIABLE, "Данные"),),
+    )
+    node = ValueNode(
+        "Данные", "Структура", "2 elements", 2, True,
+        ValueShape.STRUCTURE, path,
+        _owner=secret,
+    )
+    page = ValuePage((node,), 1, None, SafeValuePath(path.root), "variables", 0, 20)
+
+    node_wire = public_artifact_value(node)
+    page_wire = public_artifact_value(page)
+    serialized = json.dumps((node_wire, page_wire), ensure_ascii=False, default=str)
+    assert set(node_wire) == {
+        "name", "type_name", "preview", "size", "expandable", "shape",
+        "path", "private", "cycle",
+    }
+    assert set(page_wire) == {
+        "items", "total", "next_cursor", "path", "view", "start", "stop",
+    }
+    assert "object at" not in serialized
+    assert "_owner" not in serialized and "_lineage" not in serialized

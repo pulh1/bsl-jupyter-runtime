@@ -15,7 +15,7 @@ from hashlib import sha256
 from math import isfinite
 from threading import Lock
 from time import monotonic
-from typing import Protocol, cast, overload
+from typing import TYPE_CHECKING, Protocol, cast, overload
 from uuid import UUID, uuid4
 
 from onec_runtime.bsl.full_ast_worker_projection import (
@@ -30,8 +30,11 @@ from onec_runtime.capture_source import (
     SourceVersionRef,
 )
 from onec_runtime.configuration_source import SourceRootBinding
-from onec_runtime.errors import ProtocolError
+from onec_runtime.errors import CaptureSourceUnavailableError, ProtocolError
 from onec_runtime.rdbg.models import StackFrame
+
+if TYPE_CHECKING:
+    from onec_runtime.capture_values import CaptureContextView, VariableDescriptor
 
 
 class StackInventoryBackend(Protocol):
@@ -121,6 +124,26 @@ class DebugFrame:
     physical: PhysicalFrameIdentity | None = field(default=None, repr=False)
     _resolved: ResolvedFrameSource | None = field(default=None, repr=False)
     _enricher: _MethodEnricher | None = field(default=None, repr=False, compare=False)
+    _value_scope: object | None = field(default=None, repr=False, compare=False)
+
+    def _values(self) -> CaptureContextView:
+        from onec_runtime.capture_values import CaptureContextView
+
+        if not isinstance(self._value_scope, CaptureContextView):
+            raise CaptureSourceUnavailableError("frame value inspection is not attached")
+        return self._value_scope
+
+    @property
+    def variables(self) -> VariableDescriptor:
+        return self._values().variables
+
+    @property
+    def parameters(self) -> VariableDescriptor:
+        return self._values().parameters
+
+    @property
+    def locals(self) -> VariableDescriptor:
+        return self._values().locals
 
     def with_method(self, work_budget_s: float | None = None) -> DebugFrame:
         if self._enricher is None:

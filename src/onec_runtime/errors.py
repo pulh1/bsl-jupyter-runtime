@@ -191,6 +191,30 @@ class StaleCaptureError(ProtocolError):
         super().__init__(_safe_error_text(message, default="CAPTURE view is stale"))
 
 
+class CaptureValueCheckError(ProtocolError):
+    """A public-value check or bounded value payload was inconclusive."""
+
+
+class CaptureLookupError(ProtocolError):
+    """A case-insensitive exact capture lookup was missing or ambiguous."""
+
+
+class CapturePathError(ProtocolError):
+    """A capture request did not describe a finite safe symbolic path."""
+
+
+class CaptureSourceUnavailableError(ProtocolError):
+    """Source-dependent capture classification cannot be established."""
+
+
+class CaptureShapeUnsupportedError(ProtocolError):
+    """The value shape has no qualified bounded inspection adapter."""
+
+
+class CaptureValueAccessDeniedError(ProtocolError):
+    """A capture value belongs to a private runtime generation."""
+
+
 def _coerce_diagnostic(
     diagnostic: CaptureFailureDiagnostic | str | None,
     *,
