@@ -89,11 +89,21 @@ class ConfigurationSourceLayout:
                 with os.scandir(folder) as entries:
                     for entry in entries:
                         if entry.name.endswith(".xml"):
+                            name = Path(entry.name).stem
+                            if (folder / name / f"{name}.mdo").is_file():
+                                raise ProtocolError("duplicate common module identity")
                             designer = True
                             break
                         if entry.is_dir(follow_symlinks=False):
                             name = entry.name
                             if (folder / name / f"{name}.mdo").is_file():
+                                if (folder / f"{name}.xml").is_file():
+                                    raise ProtocolError(
+                                        "duplicate common module identity"
+                                    )
+                                edt = True
+                                break
+                            if next((folder / name).glob("*.mdo"), None) is not None:
                                 edt = True
                                 break
                 if designer or edt:
@@ -161,6 +171,10 @@ class ConfigurationSourceLayout:
             values: dict[str, str] = {}
             for node in owner:
                 key = local_name(node.tag).casefold()
+                # Native EDT repeats collection children. Only these scalar
+                # fields participate in configuration-layer identity.
+                if key not in {"name", "configurationextensionpurpose"}:
+                    continue
                 if key in values:
                     raise ValueError("duplicate configuration property")
                 values[key] = node.text or ""
@@ -184,23 +198,51 @@ class ConfigurationSourceLayout:
             project, self.configured_root, root, self.layout, discovered, name
         )
 
+    def metadata_candidates(
+        self,
+        directory: str,
+        *,
+        streaming: bool = False,
+    ) -> Iterator[Path]:
+        """Enumerate selected-format names without opening metadata payloads.
+
+        Callers must validate a yielded path before reading it. In particular,
+        Designer indexing does not stat or resolve every XML candidate.
+        """
+        if directory not in METADATA_DIRECTORIES:
+            raise ProtocolError("configuration metadata kind is unsupported")
+        folder = self.normalized_root / directory
+        if self.layout == SourceTreeLayout.DESIGNER and not streaming:
+            yield from folder.glob("*.xml")
+            return
+        with os.scandir(folder) as entries:
+            for entry in entries:
+                if self.layout == SourceTreeLayout.DESIGNER:
+                    if Path(entry.name).match("*.xml"):
+                        yield folder / entry.name
+                    continue
+                if entry.is_symlink():
+                    raise ProtocolError("configuration source root is unsafe")
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+                module = folder / entry.name
+                if module.is_junction():
+                    raise ProtocolError("configuration source root is unsafe")
+                for metadata in module.glob("*.mdo"):
+                    if metadata.stem != module.name:
+                        raise ProtocolError(
+                            "common-module metadata identity is invalid"
+                        )
+                    yield metadata
+
     def metadata_paths(self, directory: str) -> Iterator[Path]:
         if directory not in METADATA_DIRECTORIES:
             raise ProtocolError("configuration metadata kind is unsupported")
         folder = self.safe_path(self.normalized_root / directory, must_exist=False)
         if not folder.is_dir():
             return
-        with os.scandir(folder) as entries:
-            for entry in entries:
-                path = folder / entry.name
-                if self.layout == SourceTreeLayout.DESIGNER:
-                    if path.suffix == ".xml":
-                        yield self.safe_path(path)
-                elif entry.is_dir(follow_symlinks=False) or entry.is_symlink():
-                    self.safe_path(path)
-                    metadata = path / f"{entry.name}.mdo"
-                    if metadata.is_file():
-                        yield self.safe_path(metadata)
+        for path in self.metadata_candidates(directory, streaming=True):
+            yield self.safe_path(path)
 
     def metadata_path(self, directory: str, name: str) -> Path:
         if directory not in METADATA_DIRECTORIES or not name.isidentifier():

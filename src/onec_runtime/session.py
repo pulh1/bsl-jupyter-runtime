@@ -1744,6 +1744,9 @@ class RuntimeSession:
                     breakpoint_policy=breakpoint_policy,
                     profiler=profiler,
                 )
+                active_units = self.runtime_api.confirmed_worker_module_units(
+                    generation
+                )
                 source_catalog = getattr(self, "_capture_source_catalog", None)
                 previous = getattr(self, "_capture_worker_sources", {})
                 published = {
@@ -1752,7 +1755,7 @@ class RuntimeSession:
                         generation=generation.generation,
                         source_text=unit.mapped_source.text,
                     )
-                    for unit in units
+                    for unit in active_units
                 }
                 # Retained SourceVersionRefs own old text; a successful
                 # promotion only publishes the next generation's lookup.

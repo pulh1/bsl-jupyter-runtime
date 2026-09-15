@@ -88,3 +88,40 @@ def test_rejects_reparse_metadata_tree_before_scan(tmp_path, monkeypatch):
     )
     with pytest.raises(ProtocolError, match="unsafe"):
         api.ConfigurationSourceLayout(tmp_path / "project")
+
+
+@pytest.mark.parametrize("layer", ["base", "extension"])
+@pytest.mark.parametrize("suffix", ["", "src"])
+def test_edt_collections_do_not_change_scalar_identity(layer, suffix):
+    api = layout_api()
+    tree = api.ConfigurationSourceLayout(FIXTURES / f"edt_{layer}" / suffix)
+    auto = tree.bind("demo")
+    name = "Дополнение" if layer == "extension" else None
+    explicit = tree.bind("demo", layer=layer, extension_name=name)
+    assert auto == explicit
+    assert auto.layer.value == layer
+    assert auto.extension_name == name
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "<name>Дополнение</name>",
+        "<name>Другое</name>",
+        "<configurationExtensionPurpose>Customization</configurationExtensionPurpose>",
+        "<configurationExtensionPurpose>AddOn</configurationExtensionPurpose>",
+    ],
+)
+def test_edt_duplicate_scalar_identity_is_rejected(tmp_path, extra):
+    api = layout_api()
+    shutil.copytree(FIXTURES / "edt_extension", tmp_path / "project")
+    metadata = tmp_path / "project/src/Configuration/Configuration.mdo"
+    original = metadata.read_text(encoding="utf-8")
+    metadata.write_text(
+        original.replace(
+            "</mdclass:Configuration>", extra + "</mdclass:Configuration>"
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ProtocolError, match="invalid"):
+        api.ConfigurationSourceLayout(tmp_path / "project").bind("demo")

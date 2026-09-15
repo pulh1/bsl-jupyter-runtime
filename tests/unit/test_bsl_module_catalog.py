@@ -276,8 +276,8 @@ def test_edt_invalid_identity_or_flags_fail_closed(tmp_path, replacement):
 def test_duplicate_identity_across_source_formats_is_rejected(tmp_path):
     add_metadata(tmp_path, "Модуль", server=True, client=False, global_module=False)
     add_edt_metadata(tmp_path, "МОДУЛЬ")
-    catalog = SessionCommonModuleCatalog(tmp_path, profile="server")
     with pytest.raises(ProtocolError, match="duplicate common module identity"):
+        catalog = SessionCommonModuleCatalog(tmp_path, profile="server")
         catalog.ensure_initialized()
 
 
@@ -387,3 +387,41 @@ def test_worker_and_capture_cannot_select_alternate_layout_in_bound_tree(tmp_pat
     location = CommonModuleCaptureResolver('demo', root).resolve_module_line('Общий', 2)
     assert location.object_id == UUID('11111111-2222-3333-4444-555555555555')
     assert location.property_id == UUID(COMMON_MODULE_PROPERTY_ID)
+
+
+@pytest.mark.parametrize('layout', ['designer', 'edt'])
+@pytest.mark.parametrize('same_name', [False, True])
+def test_catalog_admission_uses_only_selected_layout(tmp_path, layout, same_name):
+    import shutil
+    from uuid import UUID
+    from tests.unit.test_configuration_source_layout import FIXTURES
+    from tests.unit.test_capture_source_resolver import location
+    from onec_runtime.capture_source import CaptureSourceCatalog, CaptureSourceConfig
+    root = tmp_path / 'project'
+    shutil.copytree(FIXTURES / f'{layout}_base', root)
+    normalized = root / 'src' if layout == 'edt' else root
+    name = 'Общий' if same_name else 'ТолькоДругойФормат'
+    group = normalized / 'CommonModules'
+    folder = group / name
+    folder.mkdir(exist_ok=True)
+    object_id = UUID(int=42)
+    if layout == 'designer':
+        opposite = folder / f'{name}.mdo'
+        opposite.write_text(f'<CommonModule uuid="{object_id}"><name>{name}</name><server>true</server><clientManagedApplication>true</clientManagedApplication></CommonModule>', encoding='utf-8')
+        (folder / 'Module.bsl').write_text('Значение = 2;', encoding='utf-8')
+    else:
+        opposite = add_metadata(normalized, name, server=True, client=True, global_module=False)
+        opposite.write_text(opposite.read_text(encoding='utf-8').replace('<CommonModule>', f'<CommonModule uuid="{object_id}">'), encoding='utf-8')
+        (folder / 'Ext').mkdir(exist_ok=True)
+        (folder / 'Ext/Module.bsl').write_text('Значение = 2;', encoding='utf-8')
+    catalog = SessionCommonModuleCatalog(root, profile='server')
+    if same_name:
+        assert catalog.ensure_modules((name,)).require(name).scope == CommonModuleScope.SERVER
+    else:
+        assert catalog.resolve_candidates((name,)).modules == ()
+        with pytest.raises(ProtocolError, match='missing'):
+            catalog.ensure_modules((name,))
+    capture = CaptureSourceCatalog((CaptureSourceConfig('demo', root),))
+    assert capture.resolve_modules((location(object_id),))[0].reason == 'source_unavailable'
+    with pytest.raises(ProtocolError):
+        catalog._safe_metadata_path(opposite)

@@ -342,11 +342,19 @@ def test_successful_reload_publishes_owning_source_version_failure_keeps_old(
     @dataclass
     class ReloadApi(RecordingCaptureApi):
         generation: int = 0
+        active_units: dict = field(default_factory=dict)
+
+        def confirmed_worker_module_units(self, handle):
+            assert handle.generation == self.generation
+            return tuple(self.active_units.values())
 
         def load_worker_modules(self, units, **kwargs):
             if self.failure:
                 raise self.failure
             self.generation += 1
+            self.active_units.update(
+                (unit.logical_name.casefold(), unit) for unit in units
+            )
             return WorkerGenerationHandle(1, 1, self.generation, "a" * 64)
 
     api = ReloadApi()
@@ -388,3 +396,113 @@ def test_successful_reload_publishes_owning_source_version_failure_keeps_old(
     with pytest.raises(ProtocolError):
         session.load_worker_modules((first,))
     assert session._capture_worker_sources["общий"].generation == 2
+
+
+@pytest.mark.parametrize("loader", ["batch", "file"])
+@pytest.mark.parametrize("failure", ["create", "unknown"])
+def test_confirmed_worker_upserts_publish_complete_source_set(
+    tmp_path, loader, failure
+):
+    import shutil
+    from onec_runtime.bsl.module_catalog import SessionCommonModuleCatalog
+    from onec_runtime.errors import BslExecutionError, WorkerPromotionOutcomeUnknown
+    from tests.unit.test_bsl_module_catalog import add_metadata
+    from tests.unit.test_configuration_source_layout import FIXTURES
+    from tests.unit.test_runtime_api import (
+        _common_module_catalog,
+        _semantic_snapshot_runtime,
+        _SemanticSnapshotFailureTarget,
+        _worker_module_unit,
+    )
+
+    root = tmp_path / "project"
+    shutil.copytree(FIXTURES / "designer_base", root)
+    names = ("ModuleA", "ModuleB", "ModuleC")
+    metadata_catalog = _common_module_catalog(*names)
+    target = _SemanticSnapshotFailureTarget()
+    api = _semantic_snapshot_runtime(tmp_path, metadata_catalog, target=target)
+    session = bare_capture_session(api)
+    session._common_module_catalog = SessionCommonModuleCatalog(
+        root, profile="server-test"
+    )
+    session._active_worker_file_units = {}
+    session._worker_file_revisions = {}
+    session.configure_capture_source("demo", root)
+
+    def save(name, revision):
+        add_metadata(root, name, server=True, client=False, global_module=False)
+        unit = _worker_module_unit(name, revision, metadata_catalog)
+        path = root / "CommonModules" / name / "Ext/Module.bsl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(unit.mapped_source.text.encode("utf-8"))
+        return unit, path
+
+    a1, path_a = save("ModuleA", 1)
+    b1, path_b = save("ModuleB", 1)
+    if loader == "batch":
+        first = session.load_worker_modules((a1, b1))
+    else:
+        session.load_worker_module(path_a)
+        before_add = session._capture_source_catalog.generation
+        first = session.load_worker_module(path_b)
+        assert session._capture_source_catalog.generation == before_add + 1
+    assert set(session._capture_worker_sources) == {"modulea", "moduleb"}
+    old_b = session._capture_worker_sources["moduleb"]
+    before_update = session._capture_source_catalog.generation
+    a2, _ = save("ModuleA", 2)
+    second = (
+        session.load_worker_modules((a2,))
+        if loader == "batch"
+        else session.load_worker_module(path_a)
+    )
+    assert set(session._capture_worker_sources) == {"modulea", "moduleb"}
+    assert {pin.generation for pin in session._capture_worker_sources.values()} == {
+        second.generation
+    }
+    assert (
+        session._capture_worker_sources["moduleb"].read_text() == b1.mapped_source.text
+    )
+    assert (
+        session._capture_worker_sources["modulea"].read_text() == a2.mapped_source.text
+    )
+    assert old_b.generation == first.generation
+    assert old_b.read_text() == b1.mapped_source.text
+    assert session._capture_source_catalog.generation == before_update
+    with pytest.raises(ProtocolError, match="generation"):
+        api.confirmed_worker_module_units(first)
+
+    c1, path_c = save("ModuleC", 1)
+    third = (
+        session.load_worker_modules((c1,))
+        if loader == "batch"
+        else session.load_worker_module(path_c)
+    )
+    assert set(session._capture_worker_sources) == {"modulea", "moduleb", "modulec"}
+    assert {pin.generation for pin in session._capture_worker_sources.values()} == {
+        third.generation
+    }
+    assert session._capture_source_catalog.generation == before_update + 1
+    confirmed = session._capture_worker_sources
+    failed_revision, _ = save("ModuleA", 3)
+    target.failure = failure
+    with pytest.raises((BslExecutionError, WorkerPromotionOutcomeUnknown)):
+        if loader == "batch":
+            session.load_worker_modules((failed_revision,))
+        else:
+            session.load_worker_module(path_a)
+    assert session._capture_worker_sources is confirmed
+    assert (
+        session._capture_worker_sources["modulea"].read_text() == a2.mapped_source.text
+    )
+    assert session._capture_source_catalog.generation == before_update + 1
+
+
+def test_confirmed_worker_source_inventory_rejects_unconfirmed_handle(tmp_path):
+    from tests.unit.test_runtime_api import (
+        _common_module_catalog,
+        _semantic_snapshot_runtime,
+    )
+
+    api = _semantic_snapshot_runtime(tmp_path, _common_module_catalog("ModuleA"))
+    with pytest.raises(ProtocolError, match="generation"):
+        api.confirmed_worker_module_units(None)

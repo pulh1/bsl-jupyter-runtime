@@ -3505,6 +3505,26 @@ class PrototypeRuntimeApi:
             self._prune_worker_caches_locked()
             return handle
 
+    def confirmed_worker_module_units(
+        self, handle: WorkerGenerationHandle,
+    ) -> tuple[WorkerModuleUnit, ...]:
+        """Read the complete source set of the current confirmed generation.
+
+        This is local inventory access, not a target evaluation. An older or
+        unconfirmed handle must never be relabeled as the current source set.
+        """
+        with self._single_writer():
+            self._require_available()
+            if (
+                not isinstance(handle, WorkerGenerationHandle)
+                or handle is not self._worker_generation_handle
+            ):
+                raise ProtocolError("Worker source generation is not current")
+            return tuple(
+                self._worker_active_modules[name].unit
+                for name in sorted(self._worker_active_modules)
+            )
+
     def _worker_units_with_updates(
         self,
         units: tuple[WorkerModuleUnit, ...],

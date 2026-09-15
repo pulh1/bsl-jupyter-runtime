@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from enum import Enum
 from hashlib import sha256
 import json
-import os
 from pathlib import Path
 import re
 from threading import RLock
@@ -256,24 +255,7 @@ class SessionCommonModuleCatalog:
 
     def _enumerate_path_index(self) -> dict[str, Path]:
         index: dict[str, Path] = {}
-        paths = list(self._common_modules.glob("*.xml"))
-        with os.scandir(self._common_modules) as entries:
-            for entry in entries:
-                if entry.name.casefold().endswith(".xml"):
-                    continue
-                if entry.is_symlink():
-                    raise ProtocolError("common-module source root is unsafe")
-                if not entry.is_dir(follow_symlinks=False):
-                    continue
-                folder = Path(entry.path)
-                if folder.is_junction():
-                    raise ProtocolError("common-module source root is unsafe")
-                # One level only: EDT metadata is Name/Name.mdo. Do not scan
-                # module source files or descend into Designer's Ext directory.
-                for path in folder.glob("*.mdo"):
-                    if path.stem != folder.name:
-                        raise ProtocolError("common-module metadata identity is invalid")
-                    paths.append(path)
+        paths = self._layout.metadata_candidates("CommonModules")
         for path in sorted(paths, key=lambda item: item.name.casefold()):
             if not _is_bsl_identifier(path.stem):
                 raise ProtocolError("common-module metadata identity is invalid")
@@ -333,21 +315,10 @@ class SessionCommonModuleCatalog:
 
     def _safe_metadata_path(self, metadata_path: Path) -> Path:
         path = Path(metadata_path)
-        designer_path = path.suffix.casefold() == ".xml" and path.parent == self._common_modules
-        edt_path = (
-            path.suffix.casefold() == ".mdo"
-            and path.parent.parent == self._common_modules
-            and path.stem == path.parent.name
-        )
-        if _is_link(path) or _is_link(path.parent) or not (designer_path or edt_path):
+        expected = self._layout.metadata_path("CommonModules", path.stem)
+        if path != expected or not expected.is_file():
             raise ProtocolError("common-module source root is unsafe")
-        try:
-            resolved = path.resolve(strict=True)
-        except (FileNotFoundError, OSError) as error:
-            raise ProtocolError("common-module source root is unsafe") from error
-        if resolved.parent != path.parent or not resolved.is_file():
-            raise ProtocolError("common-module source root is unsafe")
-        return resolved
+        return expected
 
 
 def _local_name(tag: object) -> str:

@@ -286,6 +286,11 @@ class _SessionModuleRuntimeApi:
         self.calls: list[tuple[tuple[WorkerModuleUnit, ...], object, object]] = []
         self.breakpoint_calls: list[tuple[SourceUnitRef, str, int]] = []
         self.released: list[object] = []
+        self.active_units: dict[str, WorkerModuleUnit] = {}
+
+    def confirmed_worker_module_units(self, handle: WorkerGenerationHandle) -> tuple[WorkerModuleUnit, ...]:
+        assert handle is SESSION_WORKER_GENERATION
+        return tuple(self.active_units.values())
 
     def load_worker_modules(
         self,
@@ -297,6 +302,7 @@ class _SessionModuleRuntimeApi:
     ) -> WorkerGenerationHandle:
         del breakpoint_policy
         self.calls.append((units, common_modules, profiler))
+        self.active_units.update((unit.logical_name.casefold(), unit) for unit in units)
         return SESSION_WORKER_GENERATION
 
     def add_worker_breakpoint(
