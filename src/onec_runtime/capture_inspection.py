@@ -25,16 +25,78 @@ from onec_runtime.bsl.module_syntax import (
     MethodSyntaxInfo, ModuleIdentity, ModuleSyntaxIndex, ModuleSyntaxRegistry,
 )
 from onec_runtime.bsl.worker_projection_model import ParsedModuleModel
+from onec_runtime.capture_evaluation import (
+    CaptureEvaluationOutcome, CapturePhase, CaptureStatus,
+)
 from onec_runtime.capture_source import (
     CaptureModuleSource, CaptureSourceCatalog, CaptureSourceChangedError,
     SourceVersionRef,
 )
 from onec_runtime.configuration_source import SourceRootBinding
-from onec_runtime.errors import CaptureSourceUnavailableError, ProtocolError
+from onec_runtime.errors import (
+    CaptureSourceUnavailableError, ProtocolError, StaleCaptureError,
+)
 from onec_runtime.rdbg.models import StackFrame
 
 if TYPE_CHECKING:
     from onec_runtime.capture_values import CaptureContextView, VariableDescriptor
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class CaptureView:
+    """Immutable access to one captured stop's local control plane."""
+
+    operation_id: int
+    capture_generation: int
+    stop_sequence: int
+    __is_current: Callable[[], bool] = field(repr=False, compare=False)
+    __read_status: Callable[[], CaptureStatus] = field(repr=False, compare=False)
+    __wait_for_outcome: Callable[
+        [float | None, str | None], CaptureEvaluationOutcome
+    ] = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        for name in ("operation_id", "capture_generation", "stop_sequence"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if not all(
+            callable(callback)
+            for callback in (
+                self.__is_current,
+                self.__read_status,
+                self.__wait_for_outcome,
+            )
+        ):
+            raise TypeError("capture view readers must be callable")
+
+    def __repr__(self) -> str:
+        return (
+            "CaptureView("
+            f"operation_id={self.operation_id}, "
+            f"capture_generation={self.capture_generation}, "
+            f"stop_sequence={self.stop_sequence})"
+        )
+
+    def status(self) -> CaptureStatus:
+        if not self.__is_current():
+            return CaptureStatus(
+                self.operation_id,
+                self.capture_generation,
+                self.stop_sequence,
+                CapturePhase.STALE,
+            )
+        return self.__read_status()
+
+    def wait(
+        self,
+        timeout_s: float | None = None,
+        evaluation_id: str | None = None,
+    ) -> CaptureEvaluationOutcome:
+        if not self.__is_current():
+            raise StaleCaptureError()
+        return self.__wait_for_outcome(timeout_s, evaluation_id)
+
 
 
 class StackInventoryBackend(Protocol):
@@ -415,3 +477,6 @@ class _MethodEnricher:
             return None, "unavailable", "syntax_version_unavailable"
         self._registry.publish(source.identity, index)
         return index, "timeout" if expired else "resolved", None
+
+
+__all__ = ['CaptureView', 'StackInventoryBackend', 'ResolvedFrameSource', 'ConfigurationFrameResolver', 'PhysicalFrameIdentity', 'DebugFrame', 'RuntimeFrameMarker', 'StackPage', 'StackDescriptor', 'LocalStackAdapter']

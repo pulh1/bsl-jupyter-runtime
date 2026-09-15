@@ -12,7 +12,6 @@ from onec_runtime.errors import (
     CaptureOutcomeUnknownError,
     CaptureRecoveryRequiredError,
     ProtocolError,
-    WorkerPromotionOutcomeUnknown,
 )
 from onec_runtime.prototype_runtime import PrototypeRuntimeController
 from onec_runtime.runtime_api import PrototypeRuntimeApi
@@ -597,6 +596,12 @@ def test_known_capture_failure_releases_evaluation_lease_and_remains_captured(tm
 
 @pytest.mark.parametrize('prepared', [False, True])
 def test_unknown_capture_reply_retains_both_generation_leases_until_close(tmp_path, prepared):
+    from onec_runtime.capture_evaluation import (
+        CaptureEvaluationState,
+        CapturePhase,
+    )
+    from onec_runtime.prototype_runtime import OperationState
+
     api, _, session = runtime(tmp_path, captured=True)
     api.execute_bsl(UPDATE)
     api.execute_bsl('Результат = Б();')
@@ -615,8 +620,13 @@ def test_unknown_capture_reply_retains_both_generation_leases_until_close(tmp_pa
     assert api._operation_generation_pin is original
     assert len(api._worker_universe._leases) == 2
     assert sum(lease.outcome_unknown for lease in api._worker_universe._leases.values()) == 1
-    with pytest.raises(WorkerPromotionOutcomeUnknown):
-        api.status()
+    assert api.status().state is OperationState.RECOVERING
+    capture = api.current_capture()
+    capture_status = capture.status()
+    outcome = capture.wait(timeout_s=0)
+    assert capture_status.phase is CapturePhase.OUTCOME_UNKNOWN
+    assert outcome.state is CaptureEvaluationState.UNKNOWN
+    assert outcome.evaluation_id == caught.value.evaluation_id
     session.lose_capture_reply = False
     api.close()
     assert not api._worker_universe._leases

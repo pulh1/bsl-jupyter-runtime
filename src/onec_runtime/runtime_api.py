@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -8,7 +8,7 @@ from hashlib import sha256
 from inspect import Parameter, signature
 from math import isfinite
 from pathlib import Path
-from threading import Lock, get_ident
+from threading import Lock, get_ident, local
 from time import monotonic
 from types import MappingProxyType
 from typing import Callable, Iterator, Protocol
@@ -18,7 +18,13 @@ from weakref import WeakKeyDictionary
 
 import pandas as pd
 
-from onec_runtime.capture_evaluation import CaptureEvaluationTicket, _CaptureSubmission
+from onec_runtime.capture_evaluation import (
+    CaptureEvaluationCoordinator,
+    CaptureEvaluationTicket,
+    CapturePhase,
+    _CaptureSubmission,
+)
+from onec_runtime.capture_inspection import CaptureView
 
 from onec_runtime.bsl import (
     DiagnosticStage,
@@ -84,8 +90,13 @@ from onec_runtime.compact_table_backend import (
 )
 from onec_runtime.errors import (
     BslExecutionError,
+    CaptureBusyError,
+    CaptureOutcomeUnknownError,
+    CaptureRecoveryRequiredError,
+    NoActiveCaptureError,
     PoisonedRuntimeError,
     ProtocolError,
+    StaleCaptureError,
     StaleWorkerGeneration,
     WorkerPromotionOutcomeUnknown,
 )
@@ -766,6 +777,7 @@ class _PreparedCaptureExecution:
     detach_pin: Callable[[], Callable[[str], None]]
     completion: Callable[[object, BaseException | None], object]
     release_writer: Callable[[], AbstractContextManager[None]]
+    release_waiter: Callable[[], AbstractContextManager[None]] = nullcontext
     primary_execution: Callable[[], None] = _no_capture_primary_execution
     normalize_error: Callable[[BslExecutionError], BslExecutionError] = (
         _identity_capture_error
@@ -782,9 +794,9 @@ class _PreparedCaptureExecution:
     def execute_owned(self, submit: Callable[..., CaptureEvaluationTicket]) -> object:
         if self.transferred:
             raise ProtocolError("Prepared CAPTURE execution was already transferred")
+        submission = _CaptureSubmission()
         lease = self.detach_pin()
         self.transferred = True
-        submission = _CaptureSubmission()
         with self.release_writer():
             try:
                 ownership: dict[str, object] = {
@@ -798,7 +810,8 @@ class _PreparedCaptureExecution:
                     )
                 ticket = submission.submit(submit, **ownership)
                 self.submitted = True
-                return ticket.wait_initiator()
+                with self.release_waiter():
+                    return ticket.wait_initiator()
             except BaseException as error:
                 if submission.ticket is not None:
                     self.submitted = True
@@ -911,7 +924,9 @@ class PrototypeRuntimeApi:
         self._operation_generation_pin: OperationGenerationPin | None = None
         self._preparing_generation_pin: OperationGenerationPin | None = None
         self._evaluation_generation_pin: OperationGenerationPin | None = None
-        self._evaluation_pin_lock = Lock()
+        self._generation_lock = Lock()
+        self._evaluation_pin_lock = self._generation_lock
+        self._session_waiter_handoffs = local()
         self._worker_instruction_executor = (
             worker_instruction_executor or self._execute_worker_instruction
         )
@@ -963,14 +978,102 @@ class PrototypeRuntimeApi:
         return None if pin is None else pin.handle
 
     def status(self) -> RuntimeStatus:
-        with self._single_writer():
-            self._require_available()
-            return RuntimeStatus(
-                self._controller.state,
-                self._controller.runtime_generation,
-                self._controller.operation_id,
-                self._worker_generation_handle,
+        owner = self._capture_control_owner()
+        capture_status = None if owner is None else owner.status(owner._fence)
+        capture_controls_state = (
+            capture_status is not None
+            and (
+                capture_status.phase is not CapturePhase.PAUSED
+                or self._controller.state is OperationState.CAPTURED
             )
+        )
+        if not capture_controls_state or self._closed:
+            with self._single_writer():
+                self._require_available()
+                return RuntimeStatus(
+                    self._controller.state,
+                    self._controller.runtime_generation,
+                    self._controller.operation_id,
+                    self._worker_generation_handle,
+                )
+        state = self._controller.state
+        assert capture_status is not None
+        state = {
+            CapturePhase.PAUSED: OperationState.CAPTURED,
+            CapturePhase.EVALUATING: OperationState.EVALUATING_CAPTURE,
+            CapturePhase.RESUMING: OperationState.RESUMING,
+            CapturePhase.OUTCOME_UNKNOWN: OperationState.RECOVERING,
+            CapturePhase.RECOVERY_REQUIRED: OperationState.RECOVERING,
+        }.get(capture_status.phase, state)
+        with self._generation_lock:
+            worker_generation = self._worker_generation_handle
+        return RuntimeStatus(
+            state,
+            capture_status.capture_generation,
+            capture_status.operation_id,
+            worker_generation,
+        )
+
+    def current_capture(self) -> CaptureView:
+        owner = self._capture_control_owner()
+        if owner is None:
+            state = getattr(self._controller, "state", None)
+            raise NoActiveCaptureError(
+                state.value if isinstance(state, OperationState) else None
+            )
+        fence = owner._fence
+
+        def is_current() -> bool:
+            return (
+                self._capture_control_owner() is owner
+                and self._controller.operation_id == fence.operation_id
+                and self._controller.runtime_generation == fence.capture_generation
+                and getattr(self._controller, "stop_sequence", None)
+                == fence.stop_sequence
+            )
+
+        return CaptureView(
+            fence.operation_id,
+            fence.capture_generation,
+            fence.stop_sequence,
+            is_current,
+            lambda: owner.status(fence),
+            lambda timeout_s, evaluation_id: owner.wait(
+                fence,
+                evaluation_id,
+                timeout_s,
+            ),
+        )
+
+    def _capture_control_owner(self) -> CaptureEvaluationCoordinator | None:
+        owner = getattr(self._controller, "_capture_evaluation_coordinator", None)
+        return owner if isinstance(owner, CaptureEvaluationCoordinator) else None
+
+    def _require_capture_data_plane_admission(self) -> None:
+        owner = self._capture_control_owner()
+        if owner is None:
+            return
+        status = owner.status(owner._fence)
+        if status.phase is CapturePhase.PAUSED:
+            return
+        if status.phase is CapturePhase.EVALUATING:
+            assert status.pending_evaluation_id is not None
+            assert status.evaluation_kind is not None
+            raise CaptureBusyError(
+                status.pending_evaluation_id,
+                status.evaluation_kind,
+                status.phase,
+            )
+        if status.phase is CapturePhase.OUTCOME_UNKNOWN:
+            raise CaptureOutcomeUnknownError(
+                status.last_evaluation_id,
+                status.failure,
+            )
+        if status.phase is CapturePhase.RECOVERY_REQUIRED:
+            raise CaptureRecoveryRequiredError(status.failure)
+        if status.phase is CapturePhase.STALE:
+            raise StaleCaptureError()
+        raise ProtocolError(f"CAPTURE data plane is unavailable ({status.phase.value})")
 
     def namespace_snapshot(self) -> RuntimeNamespaceSnapshot:
         with self._single_writer():
@@ -2337,26 +2440,27 @@ class PrototypeRuntimeApi:
                 def completion(result: object, error: BaseException | None) -> object:
                     # Mandatory local completion is owned by the record,
                     # including after its initiating waiter detaches.
-                    with self._lock:
-                        # A confirmed execution may write a captured root
-                        # before BSL fails. This ledger belongs to completion,
-                        # even when no initiating caller remains to see it.
-                        if error is None or isinstance(error, BslExecutionError):
-                            for root in lowering.dirty_roots:
-                                self._pending_dirty_roots.setdefault(root.casefold(), root)
-                        if error is not None:
-                            lowerer.restore_persistent_names(context_before)
-                            return None
-                        reply = self._reply(result)
-                        return self._finalize_namespace_reply(
-                            reply, lowering=lowering, context_before=context_before, lowerer=lowerer,
-                        )
+                    # A confirmed execution may write a captured root before
+                    # BSL fails. This ledger belongs to coordinator completion,
+                    # even when no initiating caller remains to see it.
+                    if error is None or isinstance(error, BslExecutionError):
+                        for root in lowering.dirty_roots:
+                            self._pending_dirty_roots.setdefault(root.casefold(), root)
+                    if error is not None:
+                        lowerer.restore_persistent_names(context_before)
+                        return None
+                    reply = self._reply(result)
+                    return self._finalize_namespace_reply(
+                        reply,
+                        lowering=lowering,
+                        context_before=context_before,
+                        lowerer=lowerer,
+                    )
 
                 def rejection(error: BaseException) -> None:
                     # Submission did not create an owned record. Its error
                     # type is not proof that captured BSL actually executed.
-                    with self._lock:
-                        lowerer.restore_persistent_names(context_before)
+                    lowerer.restore_persistent_names(context_before)
 
                 try:
                     if callable(execute_mapped):
@@ -2374,6 +2478,7 @@ class PrototypeRuntimeApi:
                             detach_pin=self._detach_capture_evaluation_pin_locked,
                             completion=completion,
                             release_writer=self._capture_owner_handoff,
+                            release_waiter=self._capture_session_waiter_handoff,
                             primary_execution=primary_execution,
                             normalize_error=normalize_capture_error,
                             rejection=rejection,
@@ -2500,20 +2605,28 @@ class PrototypeRuntimeApi:
         return pin.export_catalog
 
     def _pin_capture_evaluation_locked(self) -> OperationGenerationPin | None:
-        with self._evaluation_pin_lock:
+        with self._generation_lock:
             if self._evaluation_generation_pin is not None:
                 raise ProtocolError("CAPTURE evaluation already owns a generation pin")
-            if self._worker_generation_handle is None:
-                return None
-            pin = self._worker_universe.pin_active()
-            if pin.handle is self._worker_generation_handle:
+            expected = self._worker_generation_handle
+        if expected is None:
+            return None
+        pin = self._worker_universe.pin_active()
+        failure = "Active Worker generation changed while pinning CAPTURE"
+        with self._generation_lock:
+            if self._evaluation_generation_pin is not None:
+                failure = "CAPTURE evaluation already owns a generation pin"
+            elif (
+                self._worker_generation_handle is expected
+                and pin.handle is expected
+            ):
                 self._evaluation_generation_pin = pin
                 return pin
         self._release_generation_pin_locked(pin)
-        raise ProtocolError("Active Worker generation changed while pinning CAPTURE")
+        raise ProtocolError(failure)
 
     def _detach_capture_evaluation_pin_locked(self) -> Callable[[str], None]:
-        with self._evaluation_pin_lock:
+        with self._generation_lock:
             pin = self._evaluation_generation_pin
             self._evaluation_generation_pin = None
         lease_lock = Lock()
@@ -2571,9 +2684,8 @@ class PrototypeRuntimeApi:
             )
 
         def primary_execution() -> None:
-            with self._lock:
-                for root in dirty_roots:
-                    self._pending_dirty_roots.setdefault(root.casefold(), root)
+            for root in dirty_roots:
+                self._pending_dirty_roots.setdefault(root.casefold(), root)
 
         def normalize_error(error: BslExecutionError) -> BslExecutionError:
             if manifest_sha256 is None or not artifacts:
@@ -2819,6 +2931,7 @@ class PrototypeRuntimeApi:
         ) = None,
     ) -> RuntimeReply:
         with self._single_writer():
+            self._require_capture_data_plane_admission()
             self._require_available()
             pin, shared_capture_pin = self._begin_user_operation_pin_locked()
             user_bsl_dispatched = False
@@ -3122,33 +3235,31 @@ class PrototypeRuntimeApi:
                             result: object,
                             error: BaseException | None,
                         ) -> object:
-                            with self._lock:
-                                if error is None or isinstance(error, BslExecutionError):
-                                    for root in dirty_roots:
-                                        self._pending_dirty_roots.setdefault(
-                                            root.casefold(), root,
-                                        )
-                                if error is not None:
-                                    self._restore_namespace_context(
-                                        lowerer, context_before,
+                            if error is None or isinstance(error, BslExecutionError):
+                                for root in dirty_roots:
+                                    self._pending_dirty_roots.setdefault(
+                                        root.casefold(), root,
                                     )
-                                    return None
-                                completed_reply = self._reply(result)
-                                if _reply_evidence is not None:
-                                    _reply_evidence(completed_reply)
-                                return self._finalize_namespace_reply(
-                                    completed_reply,
-                                    lowering=lowering,
-                                    context_before=context_before,
-                                    lowerer=lowerer,
-                                )
-
-                        def rejection(error: BaseException) -> None:
-                            del error
-                            with self._lock:
+                            if error is not None:
                                 self._restore_namespace_context(
                                     lowerer, context_before,
                                 )
+                                return None
+                            completed_reply = self._reply(result)
+                            if _reply_evidence is not None:
+                                _reply_evidence(completed_reply)
+                            return self._finalize_namespace_reply(
+                                completed_reply,
+                                lowering=lowering,
+                                context_before=context_before,
+                                lowerer=lowerer,
+                            )
+
+                        def rejection(error: BaseException) -> None:
+                            del error
+                            self._restore_namespace_context(
+                                lowerer, context_before,
+                            )
 
                         handoff = _PreparedCaptureExecution(
                             execute=lambda: execute_mapped(
@@ -3169,6 +3280,7 @@ class PrototypeRuntimeApi:
                             detach_pin=self._detach_capture_evaluation_pin_locked,
                             completion=completion,
                             release_writer=self._capture_owner_handoff,
+                            release_waiter=self._capture_session_waiter_handoff,
                             primary_execution=primary_execution,
                             normalize_error=normalize_capture_error,
                             rejection=rejection,
@@ -5413,6 +5525,31 @@ class PrototypeRuntimeApi:
             if owns_writer:
                 self._lock.acquire()
                 self._writer_owner = get_ident()
+
+    @contextmanager
+    def capture_session_caller_handoff(
+        self,
+        factory: Callable[[], AbstractContextManager[None]],
+    ) -> Iterator[None]:
+        """Bind one Session admission lock to this caller's CAPTURE wait."""
+        if not callable(factory):
+            raise TypeError("CAPTURE Session handoff factory must be callable")
+        if getattr(self._session_waiter_handoffs, "factory", None) is not None:
+            raise ProtocolError("CAPTURE Session handoff is already bound")
+        self._session_waiter_handoffs.factory = factory
+        try:
+            yield
+        finally:
+            del self._session_waiter_handoffs.factory
+
+    @contextmanager
+    def _capture_session_waiter_handoff(self) -> Iterator[None]:
+        factory = getattr(self._session_waiter_handoffs, "factory", None)
+        if not callable(factory):
+            yield
+            return
+        with factory():
+            yield
 
     @contextmanager
     def _capture_helper_writer_handoff(self) -> Iterator[None]:

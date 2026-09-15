@@ -47,6 +47,7 @@ from onec_runtime.capture_source import (
     ResolvedCapturePoint,
 )
 from onec_runtime.configuration_source import SourceLayer
+from onec_runtime.capture_inspection import CaptureView
 from onec_runtime.config import RuntimeConfig
 from onec_runtime.configurator_agent import ExtensionAgentEditor, edit_extension
 from onec_runtime.errors import (
@@ -1195,7 +1196,23 @@ class RuntimeSession:
                 arguments["on_execution_provenance"] = (
                     on_execution_provenance
                 )
-            return self.runtime_api.execute_bsl(source, **arguments)  # type: ignore[arg-type]
+            bind = getattr(
+                self.runtime_api,
+                "capture_session_caller_handoff",
+                None,
+            )
+            if not callable(bind):
+                return self.runtime_api.execute_bsl(source, **arguments)  # type: ignore[arg-type]
+            with bind(self._release_operation_lock_for_capture_wait):
+                return self.runtime_api.execute_bsl(source, **arguments)  # type: ignore[arg-type]
+
+    @contextmanager
+    def _release_operation_lock_for_capture_wait(self) -> Iterator[None]:
+        self._operation_lock.release()
+        try:
+            yield
+        finally:
+            self._operation_lock.acquire()
 
     def configure_capture_source(
         self, project: str, source_root: Path | str, *,
@@ -2028,8 +2045,10 @@ class RuntimeSession:
         self.runtime_api.require_public_value_handle(handle)
 
     def status(self) -> RuntimeStatus:
-        with self._operation_lock:
-            return self.runtime_api.status()
+        return self.runtime_api.status()
+
+    def current_capture(self) -> CaptureView:
+        return self.runtime_api.current_capture()
 
     def namespace_snapshot(self) -> RuntimeNamespaceSnapshot:
         with self._operation_lock:
