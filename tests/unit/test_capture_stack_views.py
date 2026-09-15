@@ -1075,7 +1075,7 @@ def test_shared_source_unit_keeps_distinct_common_and_notebook_physical_owners(
     assert "SourceUnitRef" not in public and "identity=" not in public
 
 
-def test_worker_source_snapshots_follow_live_generations_without_stale_revisions(
+def test_worker_snapshots_follow_live_generations_without_stale_revisions(
     tmp_path,
 ) -> None:
     from test_runtime_api import (
@@ -1098,10 +1098,14 @@ def test_worker_source_snapshots_follow_live_generations_without_stale_revisions
             common_modules=catalog,
         )
 
-    assert set(worker_runtime._worker_source_generations) == {
-        first_handle,
-        current_handle,
-    }
+    live_inventory = worker_runtime._worker_universe._confirmed_live_inventory()
+    assert live_inventory is not None
+    assert set(worker_runtime._worker_source_generations) == set(
+        live_inventory.generation_handles
+    )
+    assert set(worker_runtime._worker_syntax_generations) == set(
+        live_inventory.generation_handles
+    )
     assert {
         handle: len(sources)
         for handle, sources in worker_runtime._worker_source_generations.items()
@@ -1142,8 +1146,21 @@ def test_worker_source_snapshots_follow_live_generations_without_stale_revisions
     worker_runtime._operation_generation_pin = None
     worker_runtime._release_generation_pin_locked(historical_pin)
 
-    assert set(worker_runtime._worker_source_generations) == {current_handle}
+    live_inventory = worker_runtime._worker_universe._confirmed_live_inventory()
+    assert live_inventory is not None
+    assert set(worker_runtime._worker_source_generations) == set(
+        live_inventory.generation_handles
+    ) == {current_handle}
+    assert set(worker_runtime._worker_syntax_generations) == set(
+        live_inventory.generation_handles
+    )
     assert saved.with_method().method.name == "Версия"
+
+    worker_runtime.close()
+
+    assert worker_runtime._worker_universe._confirmed_live_inventory() is None
+    assert not worker_runtime._worker_source_generations
+    assert not worker_runtime._worker_syntax_generations
 
 
 @pytest.mark.parametrize(

@@ -4590,16 +4590,28 @@ def test_syntax_candidates_activate_only_after_confirmed_worker_publication(
         g2 = api.load_worker_modules((second,), common_modules=catalog, profiler=profiler)
         assert api._worker_module_syntax("МодульА", generation=g2) is staged[0]
         assert api._worker_module_syntax("МодульА") is staged[0]
+        live_inventory = api._worker_universe._confirmed_live_inventory()
+        assert live_inventory is not None
+        assert set(api._worker_syntax_generations) == set(
+            live_inventory.generation_handles
+        ) == {g2}
+        assert set(api._worker_source_generations) == set(
+            live_inventory.generation_handles
+        )
+        assert api._worker_module_syntax("МодульА", generation=g1) is None
     else:
         expected = WorkerPromotionOutcomeUnknown if failure == "unknown" else BslExecutionError
         with pytest.raises(expected):
             api.load_worker_modules((second,), common_modules=catalog, profiler=profiler)
         assert api.worker_generation_handle is g1
         assert api._worker_module_syntax("МодульА") is first_index
+        assert set(api._worker_syntax_generations) == {g1}
+        assert set(api._worker_source_generations) == {g1}
         assert all(staged[0] not in entries.values()
                    for entries in api._worker_syntax_generations.values())
     assert len(staged) == 1
-    assert api._worker_module_syntax("МодульА", generation=g1) is first_index
+    if failure is not None:
+        assert api._worker_module_syntax("МодульА", generation=g1) is first_index
     assert api.module_syntax_registry.get(
         api._worker_module_identity(second), second.mapped_source.artifact.source_sha256,
         full_ast_parser_identity(),
