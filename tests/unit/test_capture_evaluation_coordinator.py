@@ -9,12 +9,14 @@ from uuid import UUID, uuid4
 import pytest
 
 from onec_runtime.capture_evaluation import (
+    CaptureCleanupLease,
     CaptureEvaluationCoordinator,
     CaptureEvaluationKind as Kind,
     CaptureEvaluationRequest,
     CaptureEvaluationState as State,
     CaptureFence,
     CapturePhase as Phase,
+    CaptureRemoteStep,
 )
 from onec_runtime.errors import (
     BslExecutionError,
@@ -612,6 +614,168 @@ def test_close_before_transport_marker_prevents_dispatch(environment):
     assert driver.dispositions == []
     coordinator.finish_close(True)
     assert driver.dispositions == ["release"]
+
+
+class _FailingShutdownCleanupLease(CaptureCleanupLease):
+    __slots__ = ("_attempts", "_failures_remaining", "_private_error", "__weakref__")
+
+    def __init__(self, attempts, *, failures: int, private_error: str):  # type: ignore[no-untyped-def]
+        pending = PendingEvaluation(TargetId(UUID(int=2), "cleanup"), uuid4(), object())
+        step = CaptureRemoteStep(
+            lambda entered: (entered(), pending)[1],
+            lambda capability, timeout_s: EvaluationResult(
+                capability.result_id,
+                "Булево",
+                "Истина",
+                False,
+            ),
+        )
+        super().__init__("private shutdown value handle", step)
+        object.__setattr__(self, "_attempts", attempts)
+        object.__setattr__(self, "_failures_remaining", failures)
+        object.__setattr__(self, "_private_error", private_error)
+
+    def dispose_shutdown(self, disposition: str) -> None:
+        self._attempts.append(disposition)
+        if self._failures_remaining:
+            object.__setattr__(
+                self,
+                "_failures_remaining",
+                self._failures_remaining - 1,
+            )
+            raise RuntimeError(self._private_error)
+
+
+def _prepare_release_shutdown_record(coordinator, driver, *, pin, cleanup_leases):  # type: ignore[no-untyped-def]
+    preparing = Event()
+    release_prepare = Event()
+
+    def dispatch(entered):  # type: ignore[no-untyped-def]
+        preparing.set()
+        assert release_prepare.wait(1)
+        return driver.dispatch(entered)
+
+    ticket = coordinator.submit_evaluation(driver.request(
+        dispatch=dispatch,
+        pin_lease=pin,
+        cleanup_leases=cleanup_leases,
+    ))
+    assert preparing.wait(1)
+    coordinator.begin_close()
+    release_prepare.set()
+    assert coordinator.join(1)
+    del ticket
+
+
+def test_shutdown_pin_failure_attempts_cleanup_and_retries_only_unfinished(environment):
+    import gc
+    import weakref
+
+    create, _ = environment
+    coordinator, driver, journal = create()
+    pin_attempts = []
+    pin_failures = ["private pin callback failure"]
+    first_cleanup_attempts = []
+    second_cleanup_attempts = []
+    first_cleanup = _FailingShutdownCleanupLease(
+        first_cleanup_attempts,
+        failures=0,
+        private_error="private first cleanup failure",
+    )
+    second_cleanup = _FailingShutdownCleanupLease(
+        second_cleanup_attempts,
+        failures=0,
+        private_error="private second cleanup failure",
+    )
+    first_ref = weakref.ref(first_cleanup)
+    second_ref = weakref.ref(second_cleanup)
+
+    def pin(disposition):  # type: ignore[no-untyped-def]
+        pin_attempts.append(disposition)
+        if pin_failures:
+            raise RuntimeError(pin_failures.pop())
+
+    _prepare_release_shutdown_record(
+        coordinator,
+        driver,
+        pin=pin,
+        cleanup_leases=(first_cleanup, second_cleanup),
+    )
+    del first_cleanup, second_cleanup
+
+    with pytest.raises(ProtocolError, match="CAPTURE shutdown disposition failed") as caught:
+        coordinator.finish_close(True)
+    assert "private pin callback failure" not in (str(caught.value) + repr(caught.value))
+    assert pin_attempts == ["release"]
+    assert first_cleanup_attempts == ["release"]
+    assert second_cleanup_attempts == ["release"]
+    assert first_ref() is not None and second_ref() is not None
+    assert not any(
+        event.event == "capture_evaluation_shutdown_disposed"
+        for event in journal.events
+    )
+
+    coordinator.finish_close(True)
+    coordinator.finish_close(True)
+    assert pin_attempts == ["release", "release"]
+    assert first_cleanup_attempts == ["release"]
+    assert second_cleanup_attempts == ["release"]
+    disposed = [
+        event
+        for event in journal.events
+        if event.event == "capture_evaluation_shutdown_disposed"
+    ]
+    assert len(disposed) == 1
+    gc.collect()
+    assert first_ref() is None and second_ref() is None
+
+
+def test_shutdown_cleanup_failure_attempts_siblings_and_retries_only_unfinished(environment):
+    create, _ = environment
+    coordinator, driver, journal = create()
+    pin_attempts = []
+    failing_attempts = []
+    successful_attempts = []
+    failing = _FailingShutdownCleanupLease(
+        failing_attempts,
+        failures=1,
+        private_error="private cleanup callback failure",
+    )
+    successful = _FailingShutdownCleanupLease(
+        successful_attempts,
+        failures=0,
+        private_error="private sibling cleanup failure",
+    )
+    _prepare_release_shutdown_record(
+        coordinator,
+        driver,
+        pin=lambda disposition: pin_attempts.append(disposition),
+        cleanup_leases=(failing, successful),
+    )
+
+    with pytest.raises(ProtocolError, match="CAPTURE shutdown disposition failed") as caught:
+        coordinator.finish_close(True)
+    assert "private cleanup callback failure" not in (
+        str(caught.value) + repr(caught.value)
+    )
+    assert pin_attempts == ["release"]
+    assert failing_attempts == ["release"]
+    assert successful_attempts == ["release"]
+    assert not any(
+        event.event == "capture_evaluation_shutdown_disposed"
+        for event in journal.events
+    )
+
+    coordinator.finish_close(True)
+    coordinator.finish_close(True)
+    assert pin_attempts == ["release"]
+    assert failing_attempts == ["release", "release"]
+    assert successful_attempts == ["release"]
+    assert len([
+        event
+        for event in journal.events
+        if event.event == "capture_evaluation_shutdown_disposed"
+    ]) == 1
 
 
 @pytest.mark.parametrize("boundary", ["before_dispatch", "dispatch", "policy", "continuation", "restore", "cleanup"])

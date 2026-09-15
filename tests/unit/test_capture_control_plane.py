@@ -461,6 +461,8 @@ class _ShutdownCleanupOwnershipProbe:
 def start_shutdown_evaluation(
     controller: object,
     transport: ShutdownBlockingCaptureSession,
+    *,
+    completion=None,  # type: ignore[no-untyped-def]
 ):  # type: ignore[no-untyped-def]
     owner = _capture_owner(controller)
 
@@ -513,6 +515,7 @@ def start_shutdown_evaluation(
             "pin_" + disposition
         ),
         cleanup_leases=(cleanup,),
+        completion=completion,
     ))
     assert transport.shutdown_poll_entered.wait(1), "evaluation poll did not start"
     return owner, ticket, cleanup_probe
@@ -1025,6 +1028,79 @@ def test_runtime_api_close_journals_unproven_poll_without_releasing_its_lease() 
         finished_at=finished_at,
         private_values=transport.shutdown_private_values,
     )
+    assert not closer.is_alive()
+
+
+def test_unproven_close_claim_prevents_late_worker_disposition() -> None:
+    """A worker past its first close check cannot escape supervised retention."""
+
+    completion_entered = Event()
+    release_completion = Event()
+
+    def blocking_completion(value, error):  # type: ignore[no-untyped-def]
+        assert error is None
+        completion_entered.set()
+        assert release_completion.wait(_JOIN_TIMEOUT_S)
+        return value
+
+    transport = ShutdownBlockingCaptureSession(
+        wake_on_invalidate=False,
+        result_on_release=True,
+    )
+    journal = RecoveryJournal()
+    controller = captured_controller(
+        transport,
+        command_timeout_s=0.05,
+        journal=journal,
+    )
+    api = PrototypeRuntimeApi(controller, journal=journal)
+    owner, ticket, cleanup_probe = start_shutdown_evaluation(
+        controller,
+        transport,
+        completion=blocking_completion,
+    )
+    evaluation_id = ticket.evaluation_id
+    del ticket
+    transport.shutdown_poll_release.set()
+    assert completion_entered.wait(1), "completion did not cross the initial close check"
+
+    closer, finished, close_errors = _run_close(
+        api.close,
+        transport.shutdown_timeline,
+    )
+    try:
+        assert finished.wait(0.6), "unproven close exceeded its configured deadline"
+        assert not close_errors
+        abandoned_before_release = tuple(
+            event
+            for event in journal.events
+            if event.event == "capture_evaluation_shutdown_abandoned"
+        )
+        assert len(abandoned_before_release) == 1
+        assert abandoned_before_release[0].fields["evaluation_id"] == evaluation_id
+        assert "pin_release" not in transport.shutdown_timeline
+        assert "pin_quarantine" not in transport.shutdown_timeline
+        assert cleanup_probe.dispositions == []
+        assert cleanup_probe.is_product_owned
+
+        evidence_before_release = tuple(journal.events)
+        cleanup_dispatches_before_release = transport.shutdown_cleanup_dispatches
+        release_completion.set()
+        assert owner.join(_JOIN_TIMEOUT_S), "worker did not exit after completion rescue"
+
+        assert tuple(journal.events) == evidence_before_release
+        assert transport.shutdown_cleanup_dispatches == cleanup_dispatches_before_release
+        assert "pin_release" not in transport.shutdown_timeline
+        assert "pin_quarantine" not in transport.shutdown_timeline
+        assert cleanup_probe.dispositions == []
+        assert cleanup_probe.is_product_owned
+    finally:
+        release_completion.set()
+        transport.shutdown_poll_release.set()
+        owner.begin_close()
+        assert owner.join(_JOIN_TIMEOUT_S)
+        closer.join(_JOIN_TIMEOUT_S)
+
     assert not closer.is_alive()
 
 
