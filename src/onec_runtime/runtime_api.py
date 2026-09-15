@@ -23,12 +23,19 @@ import pandas as pd
 from onec_runtime.capture_evaluation import (
     AdmissionEnvelopeV1,
     CaptureEvaluationCoordinator,
+    CaptureFence,
     CaptureEvaluationTicket,
     CapturePhase,
     _CapturePinDispositionLease,
     _CaptureSubmission,
 )
-from onec_runtime.capture_inspection import CaptureView
+from onec_runtime.capture_inspection import (
+    CaptureView,
+    DebugFrame,
+    LocalStackAdapter,
+    ResolvedFrameSource,
+)
+from onec_runtime.capture_source import SourceVersionRef
 
 from onec_runtime.bsl import (
     DiagnosticStage,
@@ -122,7 +129,7 @@ from onec_runtime.prototype_runtime import (
     ContinuationAttemptSpec,
 )
 from onec_runtime.performance_profile import PhaseRecorder
-from onec_runtime.rdbg.models import ModuleLocation
+from onec_runtime.rdbg.models import ModuleLocation, StackFrame
 from onec_runtime.recovery_journal import RecoveryJournal
 from onec_runtime.server_worker import (
     NotebookWorkerArtifactBuilder,
@@ -152,7 +159,9 @@ from onec_runtime.worker_breakpoints import (
     WorkerBreakpointReloadReport,
     WorkerBreakpointStatus,
     WorkerSourceLocation,
+    map_generated_line,
     map_worker_stop,
+    require_exact_worker_module_or_native,
 )
 from onec_runtime.value_materialization import (
     MaterializationOptions,
@@ -669,6 +678,10 @@ class RuntimeController(Protocol):
         self, *, cursor: int, limit: int, timeout_s: float | None = None,
     ) -> Mapping[str, object]: ...
 
+    def capture_stack_inventory(
+        self, *, timeout_s: float | None = None,
+    ) -> tuple[StackFrame, ...]: ...
+
     def capture_frame(
         self, *, level: int, cursor: int, limit: int,
         name: str | None = None, timeout_s: float | None = None,
@@ -838,6 +851,18 @@ class _PreparedCaptureExecution:
             raise
 
 
+class _RuntimeStackInventoryBackend:
+    __slots__ = ("_runtime",)
+
+    def __init__(self, runtime: PrototypeRuntimeApi) -> None:
+        self._runtime = runtime
+
+    def read_stack(self, fence: object) -> tuple[StackFrame, ...]:
+        if not isinstance(fence, CaptureFence):
+            raise StaleCaptureError()
+        return self._runtime._read_capture_stack_inventory(fence)
+
+
 class PrototypeRuntimeApi:
     """Single-writer frontend boundary over the proven prototype Controller."""
 
@@ -875,6 +900,10 @@ class PrototypeRuntimeApi:
         self._capture_points = tuple(capture_points)
         self._capture_ticket: CaptureCorrelationTicket | None = None
         self._capture_inspection_quarantined = False
+        self._capture_stack_source_resolver: Callable[
+            [tuple[StackFrame, ...]], tuple[ResolvedFrameSource | None, ...]
+        ] | None = None
+        self._capture_stack_frame_binder: Callable[[DebugFrame], DebugFrame] | None = None
         self._user_breakpoints = tuple(user_breakpoints)
         self._lock = Lock()
         self._close_lock = RLock()
@@ -921,6 +950,10 @@ class PrototypeRuntimeApi:
         self._module_syntax_registry = ModuleSyntaxRegistry()
         self._worker_syntax_generations: dict[
             WorkerGenerationHandle, Mapping[str, ModuleSyntaxIndex]
+        ] = {}
+        self._worker_source_generations: dict[
+            WorkerGenerationHandle,
+            Mapping[str, tuple[WorkerModuleUnit, SourceVersionRef]],
         ] = {}
         self._worker_catalog_snapshot: CommonModuleCatalogSnapshot | None = None
         self._notebook_worker_revision = 0
@@ -1038,6 +1071,16 @@ class PrototypeRuntimeApi:
         )
 
     def current_capture(self) -> CaptureView:
+        return self._current_capture()
+
+    def _current_capture(
+        self,
+        *,
+        resolve_sources: Callable[
+            [tuple[StackFrame, ...]], tuple[ResolvedFrameSource | None, ...]
+        ] | None = None,
+        bind_frame: Callable[[DebugFrame], DebugFrame] | None = None,
+    ) -> CaptureView:
         owner = self._capture_control_owner()
         if owner is None:
             state = getattr(self._controller, "state", None)
@@ -1045,6 +1088,40 @@ class PrototypeRuntimeApi:
                 state.value if isinstance(state, OperationState) else None
             )
         fence = owner._fence
+        effective_resolver = resolve_sources or self._capture_stack_source_resolver
+        effective_binder = bind_frame or self._capture_stack_frame_binder
+        operation_pin = self._operation_generation_pin
+
+        def resolve_stack_sources(
+            frames: tuple[StackFrame, ...],
+        ) -> tuple[ResolvedFrameSource | None, ...]:
+            with self._capture_data_plane_writer():
+                self._require_available()
+                self._require_capture_inspection_available()
+                self._require_capture_stack_fence(fence)
+                resolved = self._capture_stack_sources(
+                    frames,
+                    operation_pin=operation_pin,
+                    configuration_resolver=effective_resolver,
+                )
+                if type(resolved) is not tuple or len(resolved) != len(frames) or any(
+                    item is not None and not isinstance(item, ResolvedFrameSource)
+                    for item in resolved
+                ):
+                    raise ProtocolError("capture stack source mapping is invalid")
+                self._require_capture_stack_fence(fence)
+                return resolved
+
+        command_timeout_s = getattr(self._controller, "command_timeout_s", 30.0)
+        adapter = LocalStackAdapter(
+            _RuntimeStackInventoryBackend(self),
+            fence,
+            resolve_sources=resolve_stack_sources,
+            is_runtime_frame=self._capture_stack_runtime_frame,
+            registry=self._module_syntax_registry,
+            command_timeout_s=float(command_timeout_s),
+            bind_frame=effective_binder,
+        )
 
         def is_current() -> bool:
             return (
@@ -1066,7 +1143,100 @@ class PrototypeRuntimeApi:
                 evaluation_id,
                 timeout_s,
             ),
+            adapter.stack,
         )
+
+    def _capture_stack_runtime_frame(self, frame: StackFrame) -> bool:
+        classifier = getattr(self._controller, "_same_kernel_module", None)
+        return callable(classifier) and classifier(frame.location) is True
+
+    def _require_capture_stack_fence(self, fence: CaptureFence) -> None:
+        owner = self._capture_control_owner()
+        if (
+            owner is None
+            or owner._fence != fence
+            or self._controller.operation_id != fence.operation_id
+            or self._controller.runtime_generation != fence.capture_generation
+            or getattr(self._controller, "stop_sequence", None) != fence.stop_sequence
+        ):
+            raise StaleCaptureError()
+        status = owner.status(fence)
+        if not status.can_inspect:
+            self._require_capture_data_plane_admission()
+            raise StaleCaptureError("CAPTURE inspection is unavailable")
+
+    def _read_capture_stack_inventory(
+        self, fence: CaptureFence,
+    ) -> tuple[StackFrame, ...]:
+        with self._capture_data_plane_writer():
+            self._require_available()
+            self._require_capture_inspection_available()
+            self._require_capture_stack_fence(fence)
+            read = getattr(self._controller, "capture_stack_inventory", None)
+            if not callable(read):
+                raise ProtocolError("Runtime controller cannot read a fresh capture stack")
+            with self._remaining_command_timeout() as remaining:
+                frames = read(timeout_s=remaining)
+            if type(frames) is not tuple or not frames or any(
+                type(frame) is not StackFrame for frame in frames
+            ):
+                raise ProtocolError("fresh capture stack inventory is invalid")
+            self._require_capture_stack_fence(fence)
+            return frames
+
+    def _capture_stack_sources(
+        self,
+        frames: tuple[StackFrame, ...],
+        *,
+        operation_pin: OperationGenerationPin | None,
+        configuration_resolver: Callable[
+            [tuple[StackFrame, ...]], tuple[ResolvedFrameSource | None, ...]
+        ] | None,
+    ) -> tuple[ResolvedFrameSource | None, ...]:
+        resolved: list[ResolvedFrameSource | None] = [None] * len(frames)
+        configuration_indexes: list[int] = []
+        worker_view = (
+            None
+            if operation_pin is None
+            else self._worker_universe._operation_debug_view(operation_pin)
+        )
+        worker_sources = (
+            {}
+            if operation_pin is None
+            else self._worker_source_generations.get(operation_pin.handle, {})
+        )
+        for index, frame in enumerate(frames):
+            module = (
+                None
+                if worker_view is None
+                else require_exact_worker_module_or_native(frame.location, worker_view)
+            )
+            if module is None:
+                configuration_indexes.append(index)
+                continue
+            mapped = map_generated_line(module, frame.location.line)
+            if mapped is None:
+                continue
+            source_entry = worker_sources.get(mapped.canonical_module)
+            if source_entry is None or source_entry[0].mapped_source.artifact.source_sha256 != mapped.source_unit.source_sha256:
+                continue
+            unit, version = source_entry
+            resolved[index] = ResolvedFrameSource(
+                unit.logical_name,
+                mapped.line,
+                self._worker_module_identity(unit),
+                version,
+            )
+        if configuration_resolver is not None and configuration_indexes:
+            configuration_frames = tuple(frames[index] for index in configuration_indexes)
+            configuration_sources = configuration_resolver(configuration_frames)
+            if type(configuration_sources) is not tuple or len(configuration_sources) != len(configuration_frames):
+                raise ProtocolError("configuration stack source mapping is invalid")
+            for index, source in zip(
+                configuration_indexes, configuration_sources, strict=True,
+            ):
+                resolved[index] = source
+        return tuple(resolved)
 
     def _capture_control_owner(self) -> CaptureEvaluationCoordinator | None:
         owner = getattr(self._controller, "_capture_evaluation_coordinator", None)
@@ -3651,10 +3821,32 @@ class PrototypeRuntimeApi:
                 module_syntax={name: models[name].syntax_index for name in ordered_names},
             )
             self._worker_active_modules = staged_active
+            self._worker_source_generations[handle] = self._worker_source_snapshot(
+                staged_active,
+                generation=handle.generation,
+            )
             self._worker_module_artifacts.update(cache_additions)
             self._worker_catalog_snapshot = catalog
             self._prune_worker_caches_locked()
             return handle
+
+    @staticmethod
+    def _worker_source_snapshot(
+        modules: Mapping[str, _ActiveWorkerModule],
+        *,
+        generation: int,
+    ) -> Mapping[str, tuple[WorkerModuleUnit, SourceVersionRef]]:
+        return MappingProxyType({
+            name: (
+                active.unit,
+                SourceVersionRef.worker(
+                    artifact_id=active.unit.mapped_source.artifact.source_sha256,
+                    generation=generation,
+                    source_text=active.unit.mapped_source.text,
+                ),
+            )
+            for name, active in modules.items()
+        })
 
     def confirmed_worker_module_units(
         self, handle: WorkerGenerationHandle,
@@ -4111,8 +4303,13 @@ class PrototypeRuntimeApi:
                 )
                 raise self._poisoned_error from error
         previous_api_owned_handle = self._api_owned_worker_generation_handle
+        inherited_sources = self._worker_source_generations.get(
+            self._worker_generation_handle,
+            MappingProxyType({}),
+        )
         self._worker_generation_handle = handle
         self._worker_syntax_generations[handle] = candidate_syntax
+        self._worker_source_generations[handle] = inherited_sources
         self._worker_generation_diagnostics[handle.manifest_sha256] = (
             candidate_diagnostics
         )
@@ -4663,6 +4860,7 @@ class PrototypeRuntimeApi:
         self._worker_module_artifacts.clear()
         self._worker_generation_diagnostics.clear()
         self._worker_syntax_generations.clear()
+        self._worker_source_generations.clear()
         self._module_syntax_registry = ModuleSyntaxRegistry()
         self._worker_active_modules.clear()
         self._notebook_method_set = None

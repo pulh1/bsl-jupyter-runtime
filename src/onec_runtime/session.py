@@ -48,7 +48,12 @@ from onec_runtime.capture_source import (
     ResolvedCapturePoint,
 )
 from onec_runtime.configuration_source import SourceLayer
-from onec_runtime.capture_inspection import CaptureView
+from onec_runtime.capture_inspection import (
+    CaptureView,
+    ConfigurationFrameResolver,
+    DebugFrame,
+    ResolvedFrameSource,
+)
 from onec_runtime.config import RuntimeConfig
 from onec_runtime.configurator_agent import ExtensionAgentEditor, edit_extension
 from onec_runtime.errors import (
@@ -84,7 +89,7 @@ from onec_runtime.prototype_runtime import (
     OperationState,
     PrototypeRuntimeController,
 )
-from onec_runtime.rdbg.models import ModuleLocation, TargetId
+from onec_runtime.rdbg.models import ModuleLocation, StackFrame, TargetId
 from onec_runtime.rdbg.session import RdbgSession
 from onec_runtime.rdbg.transport import RdbgTransport, TranscriptEntry
 from onec_runtime.recovery_journal import RecoveryJournal
@@ -613,6 +618,10 @@ class RuntimeSession:
         self._operation_lock = RLock()
         self._capture_locations: dict[tuple[str, int], object] = {}
         self._capture_source_catalog: CaptureSourceCatalog | None = None
+        self._capture_stack_source_resolver: Callable[
+            [tuple[StackFrame, ...]], tuple[ResolvedFrameSource | None, ...]
+        ] | None = None
+        self._capture_stack_frame_binder: Callable[[DebugFrame], DebugFrame] | None = None
         self._capture_worker_sources: dict[str, SourceVersionRef] = {}
         self._capture_source_resolver: CommonModuleCaptureResolver | None = None
         self._capture_source_bindings: dict[
@@ -1268,6 +1277,9 @@ class RuntimeSession:
             self._file_capture_points = ()
             self._capture_source_resolver = resolver
             self._capture_source_catalog = catalog
+            self._capture_stack_source_resolver = (
+                None if catalog is None else ConfigurationFrameResolver(catalog)
+            )
             self._capture_source_bindings = {}
             self._capture_locations = {}
 
@@ -1281,6 +1293,7 @@ class RuntimeSession:
             self._file_capture_points = ()
             self._capture_source_resolver = None
             self._capture_source_catalog = None
+            self._capture_stack_source_resolver = None
             self._capture_source_bindings = {}
             self._capture_locations = {}
 
@@ -2073,7 +2086,10 @@ class RuntimeSession:
         return self.runtime_api.status()
 
     def current_capture(self) -> CaptureView:
-        return self.runtime_api.current_capture()
+        return self.runtime_api._current_capture(
+            resolve_sources=getattr(self, "_capture_stack_source_resolver", None),
+            bind_frame=getattr(self, "_capture_stack_frame_binder", None),
+        )
 
     def namespace_snapshot(self) -> RuntimeNamespaceSnapshot:
         with self._operation_lock:

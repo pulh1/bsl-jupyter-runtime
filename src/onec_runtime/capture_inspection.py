@@ -54,6 +54,7 @@ class CaptureView:
     __wait_for_outcome: Callable[
         [float | None, str | None], CaptureEvaluationOutcome
     ] = field(repr=False, compare=False)
+    __stack: StackDescriptor | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         for name in ("operation_id", "capture_generation", "stop_sequence"):
@@ -69,6 +70,8 @@ class CaptureView:
             )
         ):
             raise TypeError("capture view readers must be callable")
+        if self.__stack is not None and not isinstance(self.__stack, StackDescriptor):
+            raise TypeError("capture stack descriptor is invalid")
 
     def __repr__(self) -> str:
         return (
@@ -96,6 +99,12 @@ class CaptureView:
         if not self.__is_current():
             raise StaleCaptureError()
         return self.__wait_for_outcome(timeout_s, evaluation_id)
+
+    @property
+    def stack(self) -> StackDescriptor:
+        if self.__stack is None:
+            raise CaptureSourceUnavailableError("capture stack inspection is not attached")
+        return self.__stack
 
 
 
@@ -316,6 +325,7 @@ class LocalStackAdapter:
         max_source_bytes: int = 2_000_000,
         parse_module: Callable[[str], ParsedModuleModel] = parse_full_ast_module,
         clock: Callable[[], float] = monotonic,
+        bind_frame: Callable[[DebugFrame], DebugFrame] | None = None,
     ) -> None:
         if not isfinite(command_timeout_s) or command_timeout_s <= 0:
             raise ValueError("command timeout must be finite and positive")
@@ -323,6 +333,7 @@ class LocalStackAdapter:
             raise ValueError("source size limit must be positive")
         self._backend, self._fence = backend, fence
         self._resolve_sources, self._is_runtime = resolve_sources, is_runtime_frame
+        self._bind_frame = bind_frame
         self._enricher = _MethodEnricher(registry, command_timeout_s, max_source_bytes, parse_module, clock)
 
     @property
@@ -362,7 +373,7 @@ class LocalStackAdapter:
                 continue
             hidden = self._is_runtime(entry)
             source = mapped[entry.level]
-            result.append(DebugFrame(
+            mapped_frame = DebugFrame(
                 native_level=entry.level,
                 source=source.source if source else "Модуль конфигурации",
                 line=None if hidden else source.line if source else entry.location.line,
@@ -374,7 +385,12 @@ class LocalStackAdapter:
                     entry.location.module_type[:256], entry.location.extension_name[:256],
                 ),
                 _resolved=source, _enricher=self._enricher,
-            ))
+            )
+            result.append(
+                self._bind_frame(mapped_frame)
+                if self._bind_frame is not None and not hidden
+                else mapped_frame
+            )
             visible_index += 1
         return StackPage(tuple(result), total, stop if start < stop < total else None,
                          native=native, _enricher=self._enricher)

@@ -1674,6 +1674,36 @@ class PrototypeRuntimeController:
             raise ProtocolError("capture target has changed")
         return self._capture_stack_frames
 
+    def capture_stack_inventory(
+        self, *, timeout_s: float | None = None,
+    ) -> tuple[StackFrame, ...]:
+        """Read the debugger's current native stack for the still-fenced stop."""
+        deadline = self._capture_command_deadline(timeout_s)
+        saved = self._require_capture_stack()
+        expected_target = self._capture_target_id
+        read = getattr(self.session, "read_current_stack", None)
+        if not callable(read):
+            raise ProtocolError("RDBG session cannot read the current stack")
+        stop = read(timeout_s=self._capture_remaining_timeout(deadline))
+        if not isinstance(stop, StopEvent) or stop.target_id != expected_target:
+            raise ProtocolError("fresh capture stack target has changed")
+        frames = tuple(stop.stack_frames)
+        levels = tuple(frame.level for frame in frames)
+        if (
+            not frames
+            or any(type(frame) is not StackFrame for frame in frames)
+            or any(frame.target_id != expected_target for frame in frames)
+            or len(set(levels)) != len(levels)
+            or levels != tuple(sorted(levels))
+            or levels[0] != 0
+            or tuple(frame.location for frame in frames) != stop.stack
+        ):
+            raise ProtocolError("fresh capture stack mapping is incoherent")
+        if frames[0].location != saved[0].location:
+            raise ProtocolError("fresh capture stack no longer names the captured stop")
+        self._capture_remaining_timeout(deadline)
+        return frames
+
     def capture_stack(
         self, *, cursor: int, limit: int, timeout_s: float | None = None,
     ) -> Mapping[str, object]:
