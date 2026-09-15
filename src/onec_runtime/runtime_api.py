@@ -13,7 +13,7 @@ from pathlib import Path
 from threading import Lock, RLock, get_ident, local
 from time import monotonic
 from types import MappingProxyType
-from typing import Callable, Iterator, Protocol
+from typing import Callable, Iterator, Protocol, TypeVar
 import re
 from uuid import UUID, uuid4
 from weakref import WeakKeyDictionary
@@ -178,6 +178,18 @@ from onec_runtime.value_transfer_backend import (
 MAX_PROJECTION_POSITION = 10_000_000
 _BSL_EXECUTION_FAILURE_SUMMARY = "BSL execution failed"
 _RESERVED_WORKER_ROOT_CONTEXT_SLOT = "RuntimeWorkerPinnedOperationGeneration"
+_WorkerSnapshotT = TypeVar("_WorkerSnapshotT")
+
+
+def _retain_live_worker_generation_snapshots(
+    snapshots: Mapping[WorkerGenerationHandle, _WorkerSnapshotT],
+    live_handles: frozenset[WorkerGenerationHandle],
+) -> dict[WorkerGenerationHandle, _WorkerSnapshotT]:
+    return {
+        handle: snapshot
+        for handle, snapshot in snapshots.items()
+        if handle in live_handles
+    }
 
 
 def _no_capture_primary_execution() -> None:
@@ -4766,11 +4778,14 @@ class PrototypeRuntimeApi:
             for manifest_sha256, diagnostics in self._worker_generation_diagnostics.items()
             if manifest_sha256 in inventory.manifest_sha256s
         }
-        self._worker_source_generations = {
-            handle: sources
-            for handle, sources in self._worker_source_generations.items()
-            if handle in inventory.generation_handles
-        }
+        self._worker_syntax_generations = _retain_live_worker_generation_snapshots(
+            self._worker_syntax_generations,
+            inventory.generation_handles,
+        )
+        self._worker_source_generations = _retain_live_worker_generation_snapshots(
+            self._worker_source_generations,
+            inventory.generation_handles,
+        )
 
     @contextmanager
     def _prune_worker_caches_after_failure_locked(self) -> Iterator[None]:
