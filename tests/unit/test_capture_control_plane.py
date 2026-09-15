@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import ast
 from contextlib import contextmanager
 from dataclasses import FrozenInstanceError
-from inspect import getmembers, isfunction
+from inspect import getmembers, getsource, isfunction
 from threading import Event, Lock, RLock, Thread, current_thread
 from time import monotonic, sleep
+from textwrap import dedent
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -1633,8 +1635,12 @@ def _invoke_capture_data_plane_route(
         api.prepare_main_for_capture("Результат = 902;")
     elif route == "project_to_df":
         api.project_to_df("Контекст.Результат", {"offset": 0, "limit": 1})
+    elif route == "project_to_df_invalid_selection":
+        api.project_to_df("Контекст.Результат", {"offset": 0, "limit": 0})
     elif route == "project_value":
         api.project_value("Контекст.Результат", {"offset": 0, "limit": 1})
+    elif route == "project_value_invalid_selection":
+        api.project_value("Контекст.Результат", {})
     elif route == "project_value_payload":
         api.project_value_payload(
             "Контекст.Результат",
@@ -1693,6 +1699,45 @@ def test_public_runtime_routes_have_an_exhaustive_capture_classification() -> No
 
 
 @pytest.mark.parametrize("route", sorted(_CAPTURE_DATA_PLANE_ROUTES))
+def test_capture_data_plane_admission_is_the_first_effectful_step(route: str) -> None:
+    method = getattr(PrototypeRuntimeApi, route)
+    if route == "prepare_main_for_capture":
+        method = PrototypeRuntimeApi._begin_prepared_operation_pin
+    parsed = ast.parse(dedent(getsource(method)))
+    function = parsed.body[0]
+    assert isinstance(function, ast.FunctionDef)
+    statements = list(function.body)
+    if (
+        statements
+        and isinstance(statements[0], ast.Expr)
+        and isinstance(statements[0].value, ast.Constant)
+        and isinstance(statements[0].value.value, str)
+    ):
+        statements.pop(0)
+    while statements and isinstance(statements[0], ast.Delete):
+        statements.pop(0)
+
+    assert statements, f"{route} has no admission boundary"
+    boundary = statements[0]
+    assert isinstance(boundary, ast.With), (
+        f"{route} performs work before capture data-plane admission"
+    )
+    first_context = boundary.items[0].context_expr
+    assert isinstance(first_context, ast.Call)
+    assert isinstance(first_context.func, ast.Attribute)
+    assert isinstance(first_context.func.value, ast.Name)
+    assert first_context.func.value.id == "self"
+    assert first_context.func.attr == "_capture_data_plane_writer"
+
+
+@pytest.mark.parametrize(
+    "route",
+    (
+        *sorted(_CAPTURE_DATA_PLANE_ROUTES),
+        "project_to_df_invalid_selection",
+        "project_value_invalid_selection",
+    ),
+)
 def test_every_public_capture_data_plane_route_respects_completion_reservation(
     route: str,
 ) -> None:
