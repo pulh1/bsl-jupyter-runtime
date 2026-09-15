@@ -6,6 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 from threading import Event, RLock, Thread, current_thread
+from time import monotonic
 from types import SimpleNamespace
 
 from IPython.core.interactiveshell import InteractiveShell
@@ -921,6 +922,197 @@ def test_unproven_close_finalizes_real_worker_ownership(
         rdbg.shutdown_poll_release.set()
         capture_owner.begin_close()
         assert capture_owner.join(2)
+        if not wrapper._closed:
+            wrapper.close()
+
+
+@pytest.mark.parametrize("first_entry", ("normal", "kernel"))
+@pytest.mark.parametrize("retry_entry", ("normal", "kernel", "api"))
+@pytest.mark.parametrize("late_exit_before_retry", (False, True))
+def test_target_death_finalizes_real_worker_after_abandoned_publication_retry(
+    tmp_path: Path,
+    first_entry: str,
+    retry_entry: str,
+    late_exit_before_retry: bool,
+) -> None:
+    """A direct retry must abandon a target Session has already destroyed."""
+
+    rdbg = _ServerShutdownCaptureSession(wake_on_invalidate=False)
+    journal = _FailFirstAbandonedJournal()
+    controller = captured_controller(
+        rdbg,
+        command_timeout_s=0.05,
+        journal=journal,
+    )
+    api, target, handle = _real_worker_shutdown_api(tmp_path, controller, journal)
+    host = api._worker_universe
+    target_registry = api._worker_universe_target
+    registration_keys = tuple(sorted(target_registry._registrations, key=str.casefold))
+    assert len(registration_keys) == 2
+    assert host.state is WorkerUniverseState.READY
+    assert {name: host.registration_refcount(name) for name in registration_keys} == {
+        name: 1 for name in registration_keys
+    }
+    pin = api._pin_capture_evaluation_locked()
+    assert pin is not None and pin.handle is handle
+    pin_lease = api._detach_capture_evaluation_pin_locked()
+    assert set(host._leases) == {pin.lease_id}
+    assert {name: host.registration_refcount(name) for name in registration_keys} == {
+        name: 2 for name in registration_keys
+    }
+    target_calls_before_close = tuple(target.sources)
+    capture_owner, ticket, cleanup_probe = start_shutdown_evaluation(
+        controller,
+        rdbg,
+        pin_lease=pin_lease,
+    )
+    evaluation_id = ticket.evaluation_id
+    del ticket, pin_lease
+    runtime = _shutdown_runtime_session(rdbg, api, server=True)
+    stopped: list[str] = []
+    wrapper = InteractiveRuntimeSession(
+        runtime,
+        SimpleNamespace(stop=lambda: stopped.append("stopped")),
+    )
+    shell = InteractiveShell()
+    wrapper._register_shutdown(shell)
+    first = wrapper.close if first_entry == "normal" else wrapper._close_at_shutdown
+    retry = {
+        "normal": wrapper.close,
+        "kernel": wrapper._close_at_shutdown,
+        "api": api.close,
+    }[retry_entry]
+    worker_released = False
+
+    try:
+        if first_entry == "normal":
+            with pytest.raises(
+                ProtocolError,
+                match="ZUP demo cleanup failed: ProtocolError",
+            ) as caught:
+                first()
+            assert "private transient shutdown journal failure" not in (
+                str(caught.value) + repr(caught.value)
+            )
+        else:
+            first()
+
+        # The Session has destroyed its target even though publication failed.
+        assert runtime.is_closed is False
+        assert runtime._server_session_terminated is True
+        assert runtime._processes_closed is True
+        assert runtime._debug_ui_detached is True
+        assert runtime._transport_closed is True
+        assert api._capture_shutdown_finished is False
+        assert api._data_plane_finalized is False
+        assert host.state is WorkerUniverseState.READY
+        assert set(host._leases) == {pin.lease_id}
+        assert {name: host.registration_refcount(name) for name in registration_keys} == {
+            name: 2 for name in registration_keys
+        }
+        assert len(target_registry._registrations) == 2
+        assert target_registry._broken is False
+        assert journal.abandoned_attempts == 1
+        assert not any(
+            event.event.startswith("capture_evaluation_shutdown_")
+            for event in journal.events
+        )
+        assert wrapper._closed is False
+        assert stopped == []
+        assert wrapper._shutdown_shell is shell
+
+        if late_exit_before_retry:
+            rdbg.shutdown_poll_release.set()
+            worker_released = True
+            assert capture_owner.join(1), "coordinator worker did not exit"
+
+        started = monotonic()
+        retry()
+        assert monotonic() - started < 1.0, "retry exceeded its shutdown bound"
+
+        if not late_exit_before_retry:
+            if retry_entry == "api":
+                # This is the P1 sequence: publication succeeds while the
+                # worker is alive, then the cached false join result must not
+                # prevent a later direct API retry from finishing locally.
+                assert api._capture_shutdown_finished is True
+                assert capture_owner.join(0) is False
+            rdbg.shutdown_poll_release.set()
+            worker_released = True
+            assert capture_owner.join(1), "coordinator worker did not exit"
+            api.close()
+        else:
+            # Every entry remains idempotent after the late worker exit.
+            api.close()
+
+        assert journal.abandoned_attempts == 2
+        abandoned = [
+            event
+            for event in journal.events
+            if event.event == "capture_evaluation_shutdown_abandoned"
+        ]
+        assert len(abandoned) == 1
+        assert abandoned[0].fields == {
+            "evaluation_id": evaluation_id,
+            "evaluation_kind": "user_bsl",
+            "termination_proven": False,
+            "elapsed_ms": abandoned[0].fields["elapsed_ms"],
+            "pin_disposition": "retained",
+            "cleanup_disposition": "retained",
+            "cleanup_lease_count": 1,
+        }
+        assert type(abandoned[0].fields["elapsed_ms"]) is int
+        for private in rdbg.shutdown_private_values:
+            assert private not in repr(abandoned[0])
+        assert cleanup_probe.dispositions == []
+        assert cleanup_probe.is_product_owned
+        assert rdbg.shutdown_cleanup_dispatches == 0
+        assert tuple(target.sources) == target_calls_before_close
+        assert target.disconnects == []
+
+        assert api._capture_shutdown_finished is True
+        assert api._data_plane_finalized is True
+        assert api._closed is True
+        assert host.state is WorkerUniverseState.CLOSED
+        assert host._leases == {}
+        assert host._registration_refcounts == {}
+        assert target_registry._registrations == {}
+        assert target_registry._broken is True
+        assert api._worker_generation_handle is None
+        assert api._api_owned_worker_generation_handle is None
+        assert api._operation_generation_pin is None
+        assert api._preparing_generation_pin is None
+        assert api._evaluation_generation_pin is None
+        assert api._worker_module_artifacts == {}
+        assert api._worker_generation_diagnostics == {}
+        assert api._worker_active_modules == {}
+        assert api._prepared_source_units == {}
+
+        # A direct API finalization leaves the Session able to observe the
+        # already-complete API axes and terminally release its Jupyter owner.
+        if not runtime.is_closed:
+            wrapper.close()
+        assert runtime.is_closed is True
+        assert wrapper._closed is True
+        assert stopped == ["stopped"]
+        assert wrapper._shutdown_shell is None
+
+        api.close()
+        wrapper.close()
+        wrapper._close_at_shutdown()
+        assert journal.abandoned_attempts == 2
+        assert stopped == ["stopped"]
+        assert target_registry._broken is True
+    finally:
+        if not worker_released:
+            rdbg.shutdown_poll_release.set()
+        capture_owner.begin_close()
+        assert capture_owner.join(2)
+        if not runtime.is_closed:
+            try:
+                runtime.close_for_kernel_shutdown()
+            except ProtocolError:
+                pass
         if not wrapper._closed:
             wrapper.close()
 
