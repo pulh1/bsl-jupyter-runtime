@@ -4,7 +4,7 @@ from uuid import UUID
 
 import pytest
 
-from onec_runtime.errors import ProtocolError
+from onec_runtime.errors import CaptureValueAccessDeniedError, CaptureValueCheckError, ProtocolError
 from onec_runtime.prototype_runtime import MainCompletion, OperationHandle, OperationState
 from onec_runtime.rdbg.models import CollectionCell, CollectionRow, EvaluationResult
 from onec_runtime.runtime_api import PrototypeRuntimeApi
@@ -21,19 +21,36 @@ class Controller:
         self.fields = ("Номер", "Название")
         self.calls = []
         self.admission_sources = []
+        self.target_requests = []
+        self.admission_outcome = "R"
 
     def execute_system_main(self, source):
         self.admission_sources.append(source)
+        self.target_requests.append(("precursor", source))
         return MainCompletion(OperationHandle(self.operation_id, source, source), "value", "", True)
 
-    def inspect_completion_fields(self, handle, *, table_row):
-        self.calls.append((handle, table_row, self.command_timeout_s))
+    def inspect_completion_fields(self, handle, *, table_row, worker_type_registrations=()):
+        self.calls.append((handle, table_row, self.command_timeout_s, worker_type_registrations))
+        self.target_requests.append(("completion", handle))
+        if self.admission_outcome != "R":
+            return EvaluationResult(
+                UUID(int=1), "ТаблицаЗначений", "", False,
+                collection_size=1,
+                collection_rows=(CollectionRow(0, (
+                    CollectionCell("Состояние", "Строка", "", value_string=self.admission_outcome),
+                    CollectionCell("Имя", "Строка", "", value_string=""),
+                )),),
+            )
         return EvaluationResult(
             UUID(int=1), "ТаблицаЗначений", "", False,
-            collection_size=len(self.fields),
-            collection_rows=tuple(CollectionRow(i, (
+            collection_size=len(self.fields) + 1,
+            collection_rows=(CollectionRow(0, (
+                CollectionCell("Состояние", "Строка", "", value_string="R"),
+                CollectionCell("Имя", "Строка", "", value_string=""),
+            )),) + tuple(CollectionRow(index + 1, (
+                CollectionCell("Состояние", "Строка", "", value_string="R"),
                 CollectionCell("Имя", "Строка", "", value_string=name),
-            )) for i, name in enumerate(self.fields)),
+            )) for index, name in enumerate(self.fields)),
         )
 
 
@@ -80,16 +97,30 @@ def test_completion_does_not_reuse_previous_fields_after_schema_failure():
     assert api.completion_fields("Контекст.Данные") == ()
 
 
-def test_completion_admits_before_the_schema_helper_without_changing_operation_state():
+def test_completion_is_one_consumer_owned_admission_and_schema_request():
     controller = Controller()
     api = PrototypeRuntimeApi(controller)
     api._worker_generation_handle = object()
     controller.state = OperationState.FAILED
     assert api.completion_fields("Контекст.Данные") == ("Номер", "Название")
     assert controller.state is OperationState.FAILED and controller.operation_id == 7
-    assert controller.admission_sources
-    source = controller.admission_sources[-1]
-    assert source.index("ДопуститьЗначение") < source.index("ПолучитьВидМатериализации")
+    assert controller.target_requests == [("completion", "Контекст.Данные")]
+    assert controller.calls[-1][-1] == ()
+
+
+@pytest.mark.parametrize(
+    ("outcome", "error_type"),
+    (("D|worker_generation_value", CaptureValueAccessDeniedError),
+     ("E|value_admission_failed", CaptureValueCheckError)),
+)
+def test_completion_denial_or_failure_has_no_second_schema_target_read(outcome, error_type):
+    controller = Controller()
+    controller.admission_outcome = outcome
+
+    with pytest.raises(error_type):
+        PrototypeRuntimeApi(controller).completion_fields("Контекст.Данные")
+
+    assert controller.target_requests == [("completion", "Контекст.Данные")]
 
 
 def test_admission_closed_api_and_quarantined_capture_refuse_inspection():

@@ -24,6 +24,7 @@ from onec_runtime_jupyter.extension import (
 from onec_runtime.capture_evaluation import CapturePhase, CaptureStatus
 from onec_runtime.capture_inspection import DebugFrame, StackPage
 from onec_runtime.capture_values import (
+    DeniedValueNode,
     SafeValuePath,
     ValueNode,
     ValuePage,
@@ -1073,7 +1074,9 @@ def test_extension_registers_capture_snapshot_formatters_without_global_alias() 
 
     load_ipython_extension(shell)  # type: ignore[arg-type]
 
-    expected = {CaptureStatus, StackPage, DebugFrame, ValuePage, ValueNode}
+    expected = {
+        CaptureStatus, StackPage, DebugFrame, ValuePage, ValueNode, DeniedValueNode,
+    }
     assert expected <= plain.type_printers.keys()
     assert expected <= html.type_printers.keys()
     assert deferred_key not in plain.deferred_printers

@@ -21,6 +21,7 @@ from onec_runtime.capture_inspection import (
     StackPage,
 )
 from onec_runtime.capture_values import (
+    DeniedValueNode,
     SafeValuePath,
     ValueNode,
     ValuePathSegmentKind,
@@ -287,16 +288,7 @@ def test_value_page_renders_hierarchy_redaction_cycles_and_pagination() -> None:
                 path.child(ValuePathSegmentKind.FIELD, "Данные"),
                 cycle=True,
             ),
-            ValueNode(
-                "СлужебноеЗначение",
-                "PRIVATE_TYPE",
-                "PRIVATE_PREVIEW",
-                999,
-                True,
-                ValueShape.APPLICATION_OBJECT,
-                path.child(ValuePathSegmentKind.FIELD, "СлужебноеЗначение"),
-                private=True,
-            ),
+            DeniedValueNode("СлужебноеЗначение"),
         ),
         total=9,
         next_cursor=3,
@@ -336,6 +328,17 @@ def test_value_node_protocol_exposes_plain_and_html_representations() -> None:
     assert repr(displayed) == render_capture_text(node)
     assert displayed._repr_html_() == render_capture_html(node)
     assert "Иванов &amp; Петров" in displayed._repr_html_()
+
+
+def test_denied_value_node_renders_from_its_exact_closed_contract_only() -> None:
+    node = DeniedValueNode("СлужебноеЗначение")
+
+    text = render_capture_text(node)
+    html = render_capture_html(node)
+
+    assert text == "СлужебноеЗначение: <private runtime value>"
+    assert "onec-capture-private" in html
+    assert CaptureSnapshotDisplay(node)._repr_html_() == html
 
 
 def test_rendering_saved_pages_twice_is_byte_identical_and_has_zero_io(

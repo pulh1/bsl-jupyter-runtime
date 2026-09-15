@@ -180,6 +180,23 @@ def test_generic_compact_serializer_uses_declared_schema_before_observed_values(
     )
 
 
+def test_compact_schema_classifier_never_reads_past_the_bounded_row_page() -> None:
+    """A sentinel after the page must be unreachable for ValueTable and query input."""
+    source = SERVICE_MODULE.read_text(encoding="utf-8-sig")
+    serializer = source.split("Функция СериализоватьКомпактнуюТаблицу", 1)[1].split(
+        "КонецФункции", 1
+    )[0]
+    classifier = source.split("Функция ОпределитьКомпактнуюСхемуКолонок", 1)[1].split(
+        "КонецФункции", 1
+    )[0]
+
+    assert "ОпределитьКомпактнуюСхемуКолонок(Таблица, ТипыОбъектовWorker, МаксимумСтрок)" in serializer
+    assert "(Таблица, ТипыОбъектовWorker, МаксимумСтрок)" in classifier
+    row_guard = classifier.index("КоличествоПроверенныхСтрок >= МаксимумСтрок")
+    cell_read = classifier.index("ЗначениеЯчейки = СтрокаТаблицы[Колонка.Имя]")
+    assert row_guard < cell_read
+
+
 def test_compact_serializer_checks_budgets_before_base64_construction() -> None:
     source = SERVICE_MODULE.read_text(encoding="utf-8-sig")
     serializer = source.split(
