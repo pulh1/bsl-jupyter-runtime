@@ -19,6 +19,7 @@ from time import monotonic
 from typing import TypeVar
 from uuid import uuid4
 
+from onec_runtime.breakpoint_workspace import BreakpointWorkspaceOutcomeUnknown
 from onec_runtime.errors import (
     BslExecutionError,
     CaptureBusyError,
@@ -606,6 +607,8 @@ class CaptureEvaluationRequest:
     returned value must also fit the public immutable scalar/tuple boundary.
     Internal results are delivered only through the initiating ticket.
     continuation is optional downstream work and is abandoned on detachment.
+    initiator_error_policy may restore controller-owned diagnostic detail for
+    that ticket only; public outcomes and journal evidence remain normalized.
     """
 
     fence: CaptureFence = field(repr=False)
@@ -621,6 +624,10 @@ class CaptureEvaluationRequest:
     step_policy: Callable[[CaptureStepContext, EvaluationResult], object] | None = field(default=None, repr=False)
     step_continuation: Callable[[CaptureStepContext, object], object] | None = field(default=None, repr=False)
     completion: Callable[[object, BaseException | None], object] | None = field(default=None, repr=False)
+    initiator_error_policy: Callable[[BaseException], BaseException] | None = field(
+        default=None,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.fence, CaptureFence):
@@ -640,9 +647,14 @@ class CaptureEvaluationRequest:
         if any(not isinstance(lease, CaptureCleanupLease) and not callable(lease)
                for lease in self.cleanup_leases):
             raise ValueError("cleanup must be a lease or callable")
-        for callback in (self.step_policy, self.step_continuation, self.completion):
+        for callback in (
+            self.step_policy,
+            self.step_continuation,
+            self.completion,
+            self.initiator_error_policy,
+        ):
             if callback is not None and not callable(callback):
-                raise ValueError("step policy and continuation must be callable")
+                raise ValueError("optional evaluation policies must be callable")
 
 
 @dataclass(slots=True, repr=False)
@@ -1098,6 +1110,12 @@ class CaptureEvaluationCoordinator:
             self._flush_evidence()
         except _RemoteStepFailure:
             raise
+        except BreakpointWorkspaceOutcomeUnknown:
+            raise _RemoteStepFailure(
+                CapturePhase.OUTCOME_UNKNOWN,
+                "workspace_shield_unknown",
+                uncertain=True,
+            ) from None
         except TargetLost:
             raise _RemoteStepFailure(CapturePhase.STALE, "target_lost", uncertain=True) from None
         except BaseException:
@@ -1176,7 +1194,8 @@ class CaptureEvaluationCoordinator:
             )
             try:
                 private_result = record.request.completion(
-                    private_result, _initiating_failure(record.evaluation_id, phase, provisional),
+                    private_result,
+                    self._initiator_failure(record, phase, provisional),
                 )
             except BaseException:
                 private_result = None
@@ -1202,7 +1221,11 @@ class CaptureEvaluationCoordinator:
             )
         with self._condition:
             record.private_result = private_result
-            record.initiating_error = _initiating_failure(record.evaluation_id, phase, candidate)
+            record.initiating_error = self._initiator_failure(
+                record,
+                phase,
+                candidate,
+            )
             if quarantine:
                 self._quarantined = record
             self._evidence_locked(record, "outcome_published", state=state.value,
@@ -1231,6 +1254,22 @@ class CaptureEvaluationCoordinator:
         # order. Only the worker drains it, before it can become idle or exit.
         # Journal latency never leaves a pending snapshot with final timing.
         self._flush_evidence()
+
+    @staticmethod
+    def _initiator_failure(
+        record: _CaptureEvaluationRecord,
+        phase: CapturePhase,
+        outcome: CaptureEvaluationOutcome,
+    ) -> BaseException | None:
+        error = _initiating_failure(record.evaluation_id, phase, outcome)
+        policy = record.request.initiator_error_policy
+        if error is None or policy is None:
+            return error
+        try:
+            replacement = policy(error)
+        except BaseException:
+            return error
+        return replacement if isinstance(replacement, BaseException) else error
 
     def _retain_locked(self, record: _CaptureEvaluationRecord) -> None:
         assert record.outcome is not None
@@ -1327,6 +1366,7 @@ def _diagnostic(code: str) -> CaptureFailureDiagnostic:
         "result_delivery_failed": "CAPTURE result delivery failed.",
         "continuation_failed": "CAPTURE downstream delivery failed.",
         "workspace_restore_failed": "CAPTURE workspace restoration failed.",
+        "workspace_shield_unknown": "CAPTURE workspace shielding could not be confirmed.",
         "cleanup_failed": "CAPTURE required cleanup failed.",
         "cleanup_uncertain": "CAPTURE required cleanup could not be confirmed.",
         "unexpected_stop": "An unexpected debugger stop interrupted CAPTURE evaluation.",

@@ -38,13 +38,32 @@ from onec_runtime.capture import (
     build_live_current_capture_call,
     build_temporary_storage_value_expression,
 )
+from onec_runtime.capture_evaluation import (
+    CaptureEvaluationCoordinator,
+    CaptureEvaluationKind,
+    CaptureEvaluationRequest,
+    CaptureEvaluationTicket,
+    CaptureFence,
+    CapturePhase,
+    CaptureRemoteStep,
+    CaptureStepContext,
+)
 from onec_runtime.breakpoint_workspace import (
     BreakpointWorkspaceController,
     BreakpointWorkspaceOutcomeUnknown,
     WorkspaceInstallReceipt,
     WorkspaceSnapshot,
 )
-from onec_runtime.errors import BslExecutionError, ProtocolError, RdbgTransportError
+from onec_runtime.errors import (
+    BslExecutionError,
+    CaptureBusyError,
+    CaptureEvaluationDeliveryError,
+    CaptureOutcomeUnknownError,
+    CaptureRecoveryRequiredError,
+    ProtocolError,
+    RdbgTransportError,
+    StaleCaptureError,
+)
 from onec_runtime.experiment import bsl_string_literal
 from onec_runtime.fault_injection import FaultPoint
 from onec_runtime.rdbg.models import (
@@ -174,6 +193,15 @@ class _PendingCaptureEvaluation:
     messages_intercepted: int
     message_collector_key: str
     cell_fields: Mapping[str, object] = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _CaptureInitiatingWaiter:
+    ticket: CaptureEvaluationTicket = field(repr=False)
+    timeout_s: float
+
+    def wait_initiator(self) -> object:
+        return self.ticket.wait_initiator(self.timeout_s)
 
 
 @dataclass(frozen=True, slots=True)
@@ -361,6 +389,11 @@ class PrototypeRuntimeController:
         self.stop_history: list[ClassifiedStop] = []
         self.last_debug_stop: DebugStop | None = None
         self.pending_capture_evaluation: _PendingCaptureEvaluation | None = None
+        self._capture_evaluation_coordinator: CaptureEvaluationCoordinator | None = None
+        self._capture_owned_submission: tuple[
+            Callable[[str], None],
+            Callable[[object, BaseException | None], object],
+        ] | None = None
         self.breakpoint_workspaces: list[BreakpointWorkspaceEvent] = []
         self._breakpoint_workspace = self.registry.full_locations
         self.breakpoint_workspace_owner = BreakpointWorkspaceController(
@@ -395,6 +428,217 @@ class PrototypeRuntimeController:
         self._capture_manager_paths.clear()
         self._capture_value_paths.clear()
         self._capture_metadata_handles.clear()
+
+    def _replace_capture_evaluation_coordinator(self) -> None:
+        previous = self._capture_evaluation_coordinator
+        if previous is not None:
+            previous.begin_close()
+            if not previous.join(min(1.0, self.command_timeout_s)):
+                raise ProtocolError("Previous CAPTURE coordinator did not stop")
+        if self.active_operation is None or self._capture_target_id is None:
+            raise ProtocolError("CAPTURE coordinator identity is incomplete")
+        fence = CaptureFence(
+            self.active_operation.operation_id,
+            self.runtime_generation,
+            self.stop_sequence,
+            self._capture_target_id,
+        )
+        self._capture_evaluation_coordinator = CaptureEvaluationCoordinator(
+            fence,
+            poll_interval_s=min(0.1, self.command_timeout_s),
+            journal=self.journal,
+        )
+
+    def _capture_evaluation_owner(self) -> CaptureEvaluationCoordinator:
+        owner = self._capture_evaluation_coordinator
+        if owner is None:
+            raise ProtocolError("CAPTURE evaluation coordinator is unavailable")
+        return owner
+
+    def _require_capture_evaluation_admission(self) -> None:
+        if self.state is OperationState.CAPTURED:
+            return
+        owner = self._capture_evaluation_coordinator
+        if owner is not None:
+            status = owner.status(owner._fence)
+            if status.phase is CapturePhase.EVALUATING and status.pending_evaluation_id:
+                assert status.evaluation_kind is not None
+                raise CaptureBusyError(
+                    status.pending_evaluation_id,
+                    status.evaluation_kind,
+                    status.phase,
+                )
+            if status.phase is CapturePhase.OUTCOME_UNKNOWN:
+                raise CaptureOutcomeUnknownError(
+                    status.last_evaluation_id,
+                    status.failure,
+                )
+            if status.phase is CapturePhase.RECOVERY_REQUIRED:
+                raise CaptureRecoveryRequiredError(status.failure)
+            if status.phase is CapturePhase.STALE:
+                raise StaleCaptureError()
+        self._require_state(OperationState.CAPTURED)
+
+    def _capture_remote_step(
+        self,
+        expression: str,
+        *,
+        stack_level: int,
+        max_text_size: int = 307_200,
+        timeout_s: float | None = None,
+        before_dispatch: Callable[[], None] | None = None,
+        pre_dispatch_cleanup: Callable[[], None] | None = None,
+        on_transport_dispatch: Callable[[], None] | None = None,
+        restore: Callable[[], None] | None = None,
+    ) -> CaptureRemoteStep:
+        def dispatch(dispatch_entered: Callable[[], None]) -> PendingEvaluation:
+            prepared = False
+            entered = False
+            if before_dispatch is not None:
+                before_dispatch()
+            prepared = True
+
+            def mark_transport_entry() -> None:
+                nonlocal entered
+                if on_transport_dispatch is not None:
+                    on_transport_dispatch()
+                dispatch_entered()
+                entered = True
+
+            try:
+                return self.session.start_evaluation(
+                    expression,
+                    max_text_size=max_text_size,
+                    stack_level=stack_level,
+                    timeout_s=(
+                        self.command_timeout_s
+                        if timeout_s is None
+                        else timeout_s
+                    ),
+                    on_transport_dispatch=mark_transport_entry,
+                )
+            except BaseException:
+                cleanup = pre_dispatch_cleanup or restore
+                if prepared and not entered and cleanup is not None:
+                    cleanup()
+                raise
+
+        def poll(
+            pending: PendingEvaluation,
+            timeout_s: float,
+        ) -> EvaluationResult | StopEvent:
+            return self.session.wait_evaluation_event(
+                pending,
+                timeout_s=timeout_s,
+            )
+
+        return CaptureRemoteStep(
+            dispatch,
+            poll,
+            restore if restore is not None else lambda: None,
+        )
+
+    def _complete_capture_lifecycle(
+        self,
+        value: object,
+        error: BaseException | None,
+    ) -> object:
+        self.pending_capture_evaluation = None
+        self.last_debug_stop = None
+        if isinstance(error, StaleCaptureError):
+            self.state = OperationState.LOST
+        elif isinstance(
+            error,
+            (CaptureOutcomeUnknownError, CaptureRecoveryRequiredError),
+        ):
+            self.state = OperationState.RECOVERING
+        else:
+            self.state = OperationState.CAPTURED
+        return value
+
+    def _submit_capture_request(
+        self,
+        request: CaptureEvaluationRequest,
+        *,
+        return_ticket: bool = False,
+        timeout_s: float | None = None,
+    ) -> object:
+        self.state = OperationState.EVALUATING_CAPTURE
+        try:
+            ticket = self._capture_evaluation_owner().submit_evaluation(request)
+        except BaseException:
+            if self.state is OperationState.EVALUATING_CAPTURE:
+                self.state = OperationState.CAPTURED
+            raise
+        if return_ticket:
+            return ticket
+        return ticket.wait_initiator(
+            self.command_timeout_s if timeout_s is None else timeout_s
+        )
+
+    def submit_capture_execution(
+        self,
+        execute: Callable[[], object],
+        *,
+        pin_lease: Callable[[str], None],
+        completion: Callable[[object, BaseException | None], object],
+    ) -> _CaptureInitiatingWaiter:
+        """Bind one RuntimeApi ownership handoff to its controller submission."""
+        if self._capture_owned_submission is not None:
+            raise ProtocolError("CAPTURE ownership submission is already active")
+        if not all(callable(callback) for callback in (execute, pin_lease, completion)):
+            raise TypeError("CAPTURE ownership callbacks must be callable")
+        self._capture_owned_submission = (pin_lease, completion)
+        try:
+            ticket = execute()
+        finally:
+            self._capture_owned_submission = None
+        if not isinstance(ticket, CaptureEvaluationTicket):
+            raise ProtocolError("CAPTURE ownership submission did not return a ticket")
+        return _CaptureInitiatingWaiter(ticket, self.command_timeout_s)
+
+    def _evaluate_capture_helper(
+        self,
+        expression: str,
+        *,
+        evaluation_kind: CaptureEvaluationKind,
+        stack_level: int,
+        max_text_size: int = 307_200,
+        result_policy: Callable[[EvaluationResult], object],
+        timeout_s: float | None = None,
+    ) -> object:
+        self._require_capture_evaluation_admission()
+        owner = self._capture_evaluation_owner()
+        policy_failure: BaseException | None = None
+
+        def apply_policy(result: EvaluationResult) -> object:
+            nonlocal policy_failure
+            try:
+                return result_policy(result)
+            except (BslExecutionError, ProtocolError) as error:
+                policy_failure = error
+                raise
+
+        step = self._capture_remote_step(
+            expression,
+            stack_level=stack_level,
+            max_text_size=max_text_size,
+            timeout_s=timeout_s,
+        )
+        try:
+            return self._submit_capture_request(CaptureEvaluationRequest(
+                owner._fence,
+                evaluation_kind,
+                step.dispatch,
+                step.poll,
+                apply_policy,
+                restore=step.restore,
+                completion=self._complete_capture_lifecycle,
+            ), timeout_s=timeout_s)
+        except (BslExecutionError, CaptureEvaluationDeliveryError):
+            if policy_failure is not None:
+                raise policy_failure
+            raise
 
     def invalidate_capture_inspection(self) -> None:
         """Revoke captured-frame handles without resuming the suspended target."""
@@ -1036,6 +1280,12 @@ class PrototypeRuntimeController:
         *,
         on_transport_dispatch: Callable[[], None] | None = None,
     ) -> MainCompletion | CapturedStop | CaptureCellResult | DebugStop:
+        if self.state is OperationState.RECOVERING:
+            owner = self._capture_evaluation_coordinator
+            if owner is not None:
+                status = owner.status(owner._fence)
+                if status.phase is CapturePhase.RECOVERY_REQUIRED:
+                    raise CaptureRecoveryRequiredError(status.failure)
         self._require_state(
             OperationState.DEBUG_STOPPED,
             OperationState.CAPTURE_DEBUG_STOPPED,
@@ -1127,6 +1377,7 @@ class PrototypeRuntimeController:
         self.stop_sequence += 1
         self.last_capture_location = stop.location
         self.state = OperationState.CAPTURED
+        self._replace_capture_evaluation_coordinator()
         captured = CapturedStop(
             self.active_operation,
             stop.location,
@@ -1198,7 +1449,7 @@ class PrototypeRuntimeController:
         *,
         on_transport_dispatch: Callable[[], None] | None = None,
     ) -> CaptureCellResult | DebugStop:
-        self._require_state(OperationState.CAPTURED)
+        self._require_capture_evaluation_admission()
         message_collector_key = self.message_collector_key(LoweringMode.CAPTURE)
         lowering = self.lowerer.lower(
             source,
@@ -1463,21 +1714,24 @@ class PrototypeRuntimeController:
             f"ТипЗнч({physical_path}) = "
             'Тип("МенеджерВременныхТаблиц")'
         )
-        try:
-            proof = self.session.evaluate(
-                expression,
-                stack_level=frame_stack_level,
-                timeout_s=self._capture_remaining_timeout(deadline),
-            )
-        except BaseException:
-            raise ProtocolError("capture manager origin is unavailable") from None
+
+        def admit_manager(proof: EvaluationResult) -> bool:
+            if (
+                proof.error_occurred
+                or proof.type_name != "Булево"
+                or evaluation_to_python(proof) is not True
+            ):
+                raise ProtocolError("capture manager origin is unavailable")
+            return True
+
+        self._evaluate_capture_helper(
+            expression,
+            evaluation_kind=CaptureEvaluationKind.INSPECTION,
+            stack_level=frame_stack_level,
+            result_policy=admit_manager,
+            timeout_s=self._capture_remaining_timeout(deadline),
+        )
         self._capture_remaining_timeout(deadline)
-        if (
-            proof.error_occurred
-            or proof.type_name != "Булево"
-            or evaluation_to_python(proof) is not True
-        ):
-            raise ProtocolError("capture manager origin is unavailable")
         handle = existing or "capture_manager_" + uuid4().hex
         self._capture_manager_paths[handle] = native_path
         return {"key": handle, "handle": handle, "type_name": "МенеджерВременныхТаблиц"}
@@ -1527,14 +1781,19 @@ class PrototypeRuntimeController:
             + ", " + bsl_string_literal(context_key)
             + f", {offset}, {row_limit}, " + columns_expression + ")"
         )
-        result = self.session.evaluate(
+        def accept_projection(result: EvaluationResult) -> None:
+            if result.error_occurred:
+                raise BslExecutionError(result.error_text)
+            return None
+
+        self._evaluate_capture_helper(
             expression,
+            evaluation_kind=CaptureEvaluationKind.INSPECTION,
             stack_level=self._required_capture_kernel_stack_level(),
+            result_policy=accept_projection,
             timeout_s=self._capture_remaining_timeout(deadline),
         )
         self._capture_remaining_timeout(deadline)
-        if result.error_occurred:
-            raise BslExecutionError(result.error_text)
         native_path = "Контекст." + context_key
         schema_result = self.inspect_declared_table_schema(
             native_path,
@@ -1834,6 +2093,7 @@ class PrototypeRuntimeController:
             source,
             mapped,
             visible_source_context=self._visible_context(mapped, source),
+            evaluation_kind=CaptureEvaluationKind.MATERIALIZATION_HELPER,
         )
 
     def install_capture_worker_generation_pin(
@@ -1841,29 +2101,40 @@ class PrototypeRuntimeController:
         manifest_sha256: str,
     ) -> None:
         """Bind the host-fenced Worker root into the ephemeral CAPTURE slot."""
-        self._require_state(OperationState.CAPTURED)
+        self._require_capture_evaluation_admission()
         if (
             not isinstance(manifest_sha256, str)
             or re.fullmatch(r"[0-9a-f]{64}", manifest_sha256) is None
         ):
             raise ProtocolError("CAPTURE Worker manifest identity is invalid")
-        result = self.session.evaluate(
+        def accept_pin(result: EvaluationResult) -> None:
+            if result.error_occurred or evaluation_to_python(result) is not True:
+                raise ProtocolError("CAPTURE Worker pin installation failed")
+            return None
+
+        self._evaluate_capture_helper(
             "RuntimeKernelServer.УстановитьПинПоколенияWorker(Контекст, "
             f"{bsl_string_literal(manifest_sha256)})",
+            evaluation_kind=CaptureEvaluationKind.MATERIALIZATION_HELPER,
             stack_level=self._required_capture_kernel_stack_level(),
+            result_policy=accept_pin,
         )
-        if result.error_occurred or evaluation_to_python(result) is not True:
-            raise ProtocolError("CAPTURE Worker pin installation failed")
 
     def clear_capture_worker_generation_pin(self) -> None:
         """Remove only the reserved ephemeral CAPTURE Worker slot."""
-        self._require_state(OperationState.CAPTURED)
-        result = self.session.evaluate(
+        self._require_capture_evaluation_admission()
+
+        def accept_cleanup(result: EvaluationResult) -> None:
+            if result.error_occurred or evaluation_to_python(result) is not True:
+                raise ProtocolError("CAPTURE Worker pin cleanup failed")
+            return None
+
+        self._evaluate_capture_helper(
             "RuntimeKernelServer.ОчиститьПинПоколенияWorker(Контекст)",
+            evaluation_kind=CaptureEvaluationKind.MATERIALIZATION_HELPER,
             stack_level=self._required_capture_kernel_stack_level(),
+            result_policy=accept_cleanup,
         )
-        if result.error_occurred or evaluation_to_python(result) is not True:
-            raise ProtocolError("CAPTURE Worker pin cleanup failed")
 
     def _execute_capture(
         self,
@@ -1877,8 +2148,9 @@ class PrototypeRuntimeController:
         worker_globals: tuple[str, ...] = (),
         dirty_roots: tuple[str, ...] = (),
         on_transport_dispatch: Callable[[], None] | None = None,
+        evaluation_kind: CaptureEvaluationKind = CaptureEvaluationKind.USER_BSL,
     ) -> CaptureCellResult | DebugStop:
-        self._require_state(OperationState.CAPTURED)
+        self._require_capture_evaluation_admission()
         if self.active_operation is None:
             raise ProtocolError("Capture cell has no active MAIN operation")
         mapped_lowered = (
@@ -1923,50 +2195,112 @@ class PrototypeRuntimeController:
             dirty_roots=list(dirty_roots),
             immediate_object_mutation_possible=True,
         )
-        try:
-            self.state = OperationState.EVALUATING_CAPTURE
-            try:
-                self._set_workspace(
-                    "capture-evaluation",
-                    self.registry.evaluation_locations,
+        stack_level = self._required_capture_kernel_stack_level()
+        operation = self.active_operation
+        owner = self._capture_evaluation_owner()
+        owned = self._capture_owned_submission
+        sealed_messages: tuple[str, ...] = ()
+        platform_error: BslExecutionError | None = None
+
+        def shield_workspace() -> None:
+            self._set_workspace(
+                "capture-evaluation",
+                self.registry.evaluation_locations,
+            )
+
+        def restore_workspace() -> None:
+            self._set_workspace("full-restore", self.registry.full_locations)
+
+        primary = self._capture_remote_step(
+            build_live_current_capture_call(lowered_text),
+            stack_level=stack_level,
+            before_dispatch=shield_workspace,
+            pre_dispatch_cleanup=restore_workspace,
+            on_transport_dispatch=on_transport_dispatch,
+            restore=None if messages_intercepted else restore_workspace,
+        )
+
+        def apply_result(
+            context: CaptureStepContext,
+            event: EvaluationResult,
+        ) -> object:
+            nonlocal sealed_messages, platform_error
+            if messages_intercepted:
+                message_step = self._capture_remote_step(
+                    "RuntimeKernelServer.ЗабратьСообщенияЯчейкиИзКонтекста(Контекст, "
+                    + bsl_string_literal(message_collector_key)
+                    + ")",
+                    stack_level=stack_level,
+                    restore=restore_workspace,
                 )
-            except BaseException as error:
-                if not isinstance(error, BreakpointWorkspaceOutcomeUnknown):
-                    self.state = OperationState.CAPTURED
-                raise
-            if on_transport_dispatch is not None:
-                on_transport_dispatch()
-            pending = self.session.start_evaluation(
-                build_live_current_capture_call(lowered_text),
-                stack_level=self._required_capture_kernel_stack_level(),
+                sealed_messages = self._decode_cell_messages(
+                    context.execute_inline(message_step)
+                )
+            if event.error_occurred:
+                platform_error = BslExecutionError(
+                    event.error_text,
+                    messages=sealed_messages,
+                    diagnostic=_safe_platform_diagnostic(
+                        event.error_text,
+                        executed_source,
+                        visible_source_context=visible_source_context,
+                    ),
+                )
+                return None
+            return evaluation_to_python(event)
+
+        def preserve_platform_error(error: BaseException) -> BaseException:
+            if isinstance(error, BslExecutionError) and platform_error is not None:
+                return platform_error
+            return error
+
+        external_completion = None if owned is None else owned[1]
+
+        def complete_cell(
+            value: object,
+            error: BaseException | None,
+        ) -> object:
+            self._complete_capture_lifecycle(value, error)
+            cell = (
+                CaptureCellResult(
+                    operation.operation_id,
+                    visible_source,
+                    lowered_text,
+                    value,
+                    sealed_messages,
+                )
+                if error is None
+                else None
             )
-            capture = _PendingCaptureEvaluation(
-                pending,
-                self.active_operation,
-                visible_source,
-                lowered_text,
-                executed_source,
-                visible_source_context,
-                messages_intercepted,
-                message_collector_key,
-                cell_fields,
-            )
-            self.pending_capture_evaluation = capture
-            event = self.session.wait_evaluation_event(
-                pending,
-                timeout_s=self.command_timeout_s,
-            )
-        except BaseException as error:
             self._record(
                 "write-journal.jsonl",
-                "cell_failed",
+                "cell_completed" if error is None else "cell_failed",
                 **cell_fields,
                 state_after=self.state.value,
-                error_type=type(error).__name__,
+                **({} if error is None else {"error_type": type(error).__name__}),
             )
             self._flush_journal()
-            raise
-        return self._handle_capture_evaluation_event(capture, event)
+            if external_completion is not None:
+                return external_completion(cell, error)
+            return cell
+
+        request = CaptureEvaluationRequest(
+            owner._fence,
+            evaluation_kind,
+            primary.dispatch,
+            primary.poll,
+            evaluation_to_python,
+            restore=primary.restore,
+            seal_messages=lambda: sealed_messages,
+            pin_lease=(lambda disposition: None) if owned is None else owned[0],
+            step_policy=apply_result,
+            completion=complete_cell,
+            initiator_error_policy=preserve_platform_error,
+        )
+        return self._submit_capture_request(
+            request,
+            return_ticket=owned is not None,
+        )  # type: ignore[return-value]
 
     def _handle_capture_evaluation_event(
         self,
@@ -2501,6 +2835,12 @@ class PrototypeRuntimeController:
         )
         if result.error_occurred:
             raise BslExecutionError(result.error_text)
+        return self._decode_cell_messages(result)
+
+    @staticmethod
+    def _decode_cell_messages(result: EvaluationResult) -> tuple[str, ...]:
+        if result.error_occurred:
+            raise BslExecutionError(result.error_text)
         payload = evaluation_to_python(result)
         if not isinstance(payload, str):
             raise ProtocolError("Cell message payload is not JSON text")
@@ -2521,26 +2861,39 @@ class PrototypeRuntimeController:
             raise ProtocolError("materialization context key is invalid")
         if type(max_text_size) is not int or max_text_size <= 0:
             raise ProtocolError("compact table maximum text size is invalid")
-        stack_level = (
-            self._required_capture_kernel_stack_level()
-            if self.state is OperationState.CAPTURED
-            else 0
-        )
-        result = self.session.evaluate(
+        expression = (
             "RuntimeKernelServer."
             "ЗабратьКомпактнуюМатериализациюИзКонтекста(Контекст, "
             + bsl_string_literal(key)
-            + ")",
+            + ")"
+        )
+
+        def decode_payload(result: EvaluationResult) -> str:
+            if result.error_occurred:
+                raise BslExecutionError(result.error_text)
+            value = evaluation_to_python(result)
+            if not isinstance(value, str):
+                raise ProtocolError("compact table payload is not a string")
+            return value
+
+        if self.state in {
+            OperationState.CAPTURED,
+            OperationState.EVALUATING_CAPTURE,
+            OperationState.RECOVERING,
+        }:
+            return self._evaluate_capture_helper(
+                expression,
+                evaluation_kind=CaptureEvaluationKind.MATERIALIZATION_HELPER,
+                stack_level=self._required_capture_kernel_stack_level(),
+                max_text_size=max_text_size,
+                result_policy=decode_payload,
+            )  # type: ignore[return-value]
+        return decode_payload(self.session.evaluate(
+            expression,
             timeout_s=self.command_timeout_s,
             max_text_size=max_text_size,
-            stack_level=stack_level,
-        )
-        if result.error_occurred:
-            raise BslExecutionError(result.error_text)
-        value = evaluation_to_python(result)
-        if not isinstance(value, str):
-            raise ProtocolError("compact table payload is not a string")
-        return value
+            stack_level=0,
+        ))
 
     def drop_context_value(self, key: str) -> None:
         if not re.fullmatch(
@@ -2548,21 +2901,34 @@ class PrototypeRuntimeController:
             key,
         ):
             raise ProtocolError("materialization context key is invalid")
-        stack_level = (
-            self._required_capture_kernel_stack_level()
-            if self.state is OperationState.CAPTURED
-            else 0
-        )
-        result = self.session.evaluate(
+        expression = (
             "RuntimeKernelServer."
             "УдалитьМатериализациюИзКонтекста(Контекст, "
             + bsl_string_literal(key)
-            + ")",
-            timeout_s=self.command_timeout_s,
-            stack_level=stack_level,
+            + ")"
         )
-        if result.error_occurred:
-            raise BslExecutionError(result.error_text)
+
+        def accept_drop(result: EvaluationResult) -> None:
+            if result.error_occurred:
+                raise BslExecutionError(result.error_text)
+
+        if self.state in {
+            OperationState.CAPTURED,
+            OperationState.EVALUATING_CAPTURE,
+            OperationState.RECOVERING,
+        }:
+            self._evaluate_capture_helper(
+                expression,
+                evaluation_kind=CaptureEvaluationKind.MATERIALIZATION_HELPER,
+                stack_level=self._required_capture_kernel_stack_level(),
+                result_policy=accept_drop,
+            )
+            return
+        accept_drop(self.session.evaluate(
+            expression,
+            timeout_s=self.command_timeout_s,
+            stack_level=0,
+        ))
 
     def inspect_table_sample(
         self,

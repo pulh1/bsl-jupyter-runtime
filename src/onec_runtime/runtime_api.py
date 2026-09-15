@@ -2347,8 +2347,15 @@ class PrototypeRuntimeApi:
                 self._finish_capture_evaluation_pin_locked(reply=reply)
 
     def _execute_prepared_capture_handoff(self, handoff: _PreparedCaptureExecution) -> object:
-        # Task 4 replaces this synchronous controller boundary with execute_owned.
-        return handoff.execute_sync()
+        submit_owned = getattr(self._controller, "submit_capture_execution", None)
+        if not callable(submit_owned):
+            return handoff.execute_sync()
+        return handoff.execute_owned(
+            lambda **ownership: submit_owned(
+                handoff.execute,
+                **ownership,
+            )
+        )
 
     def _capture_controller_fence(self) -> tuple[int, int, int, int]:
         values = (
@@ -2956,6 +2963,7 @@ class PrototypeRuntimeApi:
             )
             if self._controller.state is OperationState.CAPTURED:
                 execute_mapped = getattr(self._controller, "execute_mapped_capture", None)
+                handoff: _PreparedCaptureExecution | None = None
                 try:
                     if callable(execute_mapped):
                         assert source_maps.statement_execution is not None
@@ -2964,8 +2972,44 @@ class PrototypeRuntimeApi:
                             if lowering is None
                             else lowering.mapped_source
                         )
-                        reply = self._reply(
-                            execute_mapped(
+                        dirty_roots = (
+                            () if lowering is None else lowering.dirty_roots
+                        )
+
+                        def completion(
+                            result: object,
+                            error: BaseException | None,
+                        ) -> object:
+                            with self._lock:
+                                if error is None or isinstance(error, BslExecutionError):
+                                    for root in dirty_roots:
+                                        self._pending_dirty_roots.setdefault(
+                                            root.casefold(), root,
+                                        )
+                                if error is not None:
+                                    self._restore_namespace_context(
+                                        lowerer, context_before,
+                                    )
+                                    return None
+                                completed_reply = self._reply(result)
+                                if _reply_evidence is not None:
+                                    _reply_evidence(completed_reply)
+                                return self._finalize_namespace_reply(
+                                    completed_reply,
+                                    lowering=lowering,
+                                    context_before=context_before,
+                                    lowerer=lowerer,
+                                )
+
+                        def rejection(error: BaseException) -> None:
+                            del error
+                            with self._lock:
+                                self._restore_namespace_context(
+                                    lowerer, context_before,
+                                )
+
+                        handoff = _PreparedCaptureExecution(
+                            execute=lambda: execute_mapped(
                                 source,
                                 mapped_execution,
                                 visible_source_context=visible_source_context,
@@ -2977,12 +3021,18 @@ class PrototypeRuntimeApi:
                                 message_collector_key=message_collector_key,
                                 worker_messages=self._notebook_worker_messages_enabled(),
                                 worker_globals=self._notebook_worker_globals(),
-                                dirty_roots=(
-                                    () if lowering is None else lowering.dirty_roots
-                                ),
+                                dirty_roots=dirty_roots,
                                 on_transport_dispatch=_dispatch_evidence,
-                            )
+                            ),
+                            detach_pin=self._detach_capture_evaluation_pin_locked,
+                            completion=completion,
+                            release_writer=self._capture_owner_handoff,
+                            rejection=rejection,
                         )
+                        result = self._execute_prepared_capture_handoff(handoff)
+                        if handoff.transferred:
+                            return result  # type: ignore[return-value]
+                        reply = self._reply(result)
                     else:
                         raise ProtocolError(
                             "Runtime controller requires mapped CAPTURE execution"
@@ -3001,7 +3051,19 @@ class PrototypeRuntimeApi:
                         messages=error.messages,
                         diagnostic=diagnostic,
                     )
+                    if handoff is not None and handoff.transferred:
+                        if _reply_evidence is not None:
+                            _reply_evidence(reply)
+                        if handoff.submitted and lowering is not None:
+                            reply = replace(
+                                reply,
+                                changed_roots=lowering.persistent_write_roots,
+                                capture_dirty_roots=lowering.dirty_roots,
+                            )
+                        return reply
                 except BaseException:
+                    if handoff is not None and handoff.transferred:
+                        raise
                     self._restore_namespace_context(lowerer, context_before)
                     raise
                 if _reply_evidence is not None:

@@ -4,6 +4,7 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from enum import Enum
+from math import isfinite
 from time import monotonic, sleep
 from uuid import UUID, uuid4
 
@@ -517,6 +518,7 @@ class RdbgSession:
             expression,
             max_text_size=max_text_size,
             stack_level=stack_level,
+            timeout_s=timeout_s,
         )
         event = self.wait_evaluation_event(pending, timeout_s=timeout_s)
         if isinstance(event, StopEvent):
@@ -531,6 +533,8 @@ class RdbgSession:
         *,
         max_text_size: int = 307_200,
         stack_level: int = 0,
+        timeout_s: float = 30.0,
+        on_transport_dispatch: Callable[[], None] | None = None,
     ) -> PendingEvaluation:
         self._require(SessionState.READY)
         if self.target is None:
@@ -541,9 +545,27 @@ class RdbgSession:
             raise ValueError("max_text_size must be positive")
         if type(stack_level) is not int or stack_level < 0:
             raise ValueError("stack_level must be non-negative")
+        if (
+            isinstance(timeout_s, bool)
+            or not isinstance(timeout_s, (int, float))
+            or not isfinite(float(timeout_s))
+            or timeout_s <= 0
+        ):
+            raise ValueError("timeout_s must be finite and positive")
+        if on_transport_dispatch is not None and not callable(on_transport_dispatch):
+            raise TypeError("on_transport_dispatch must be callable")
         if self._pending_evaluation_states:
             raise ProtocolError("Another expression evaluation is already pending")
         result_id = uuid4()
+        request = build_eval_request(
+            self.alias,
+            self.ui_id,
+            self.target.target_id,
+            expression,
+            result_id,
+            max_text_size=max_text_size,
+            stack_level=stack_level,
+        )
         pending = PendingEvaluation(
             self.target.target_id,
             result_id,
@@ -552,18 +574,13 @@ class RdbgSession:
         self._pending_evaluation_states[id(pending)] = _PendingEvaluationState(
             pending
         )
-        response = self.transport.request(
-            "evalExpr",
-            build_eval_request(
-                self.alias,
-                self.ui_id,
-                self.target.target_id,
-                expression,
-                result_id,
-                max_text_size=max_text_size,
-                stack_level=stack_level,
-            ),
-        )
+        try:
+            if on_transport_dispatch is not None:
+                on_transport_dispatch()
+        except BaseException:
+            self._pending_evaluation_states.pop(id(pending), None)
+            raise
+        response = self.transport.request("evalExpr", request, timeout_s=float(timeout_s))
         if response.strip():
             try:
                 result = parse_eval_response(response)
