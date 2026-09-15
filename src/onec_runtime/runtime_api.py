@@ -960,7 +960,7 @@ class PrototypeRuntimeApi:
         ] = {}
         self._worker_source_generations: dict[
             WorkerGenerationHandle,
-            Mapping[SourceUnitRef, _WorkerStackSource],
+            Mapping[tuple[str, SourceUnitRef], _WorkerStackSource],
         ] = {}
         self._worker_catalog_snapshot: CommonModuleCatalogSnapshot | None = None
         self._notebook_worker_revision = 0
@@ -1224,7 +1224,10 @@ class PrototypeRuntimeApi:
             mapped = map_generated_line(module, frame.location.line)
             if mapped is None:
                 continue
-            source_entry = worker_sources.get(mapped.source_unit)
+            source_entry = worker_sources.get((
+                mapped.canonical_module,
+                mapped.source_unit,
+            ))
             if (
                 source_entry is None
                 or source_entry.version.source_sha256
@@ -3855,8 +3858,8 @@ class PrototypeRuntimeApi:
         modules: Mapping[str, _ActiveWorkerModule],
         *,
         generation: int,
-    ) -> Mapping[SourceUnitRef, _WorkerStackSource]:
-        result: dict[SourceUnitRef, _WorkerStackSource] = {}
+    ) -> Mapping[tuple[str, SourceUnitRef], _WorkerStackSource]:
+        result: dict[tuple[str, SourceUnitRef], _WorkerStackSource] = {}
         for active in modules.values():
             unit = active.unit
             version = SourceVersionRef.worker(
@@ -3872,7 +3875,7 @@ class PrototypeRuntimeApi:
                 and reference.source_sha256 == version.source_sha256
             }
             for reference in references:
-                result[reference] = _WorkerStackSource(
+                result[(unit.logical_name.casefold(), reference)] = _WorkerStackSource(
                     unit.logical_name,
                     self._worker_module_identity(unit),
                     version,
@@ -3881,25 +3884,25 @@ class PrototypeRuntimeApi:
 
     @staticmethod
     def _repin_worker_source_snapshot(
-        sources: Mapping[SourceUnitRef, _WorkerStackSource],
+        sources: Mapping[tuple[str, SourceUnitRef], _WorkerStackSource],
         *,
         generation: int,
-    ) -> Mapping[SourceUnitRef, _WorkerStackSource]:
+    ) -> Mapping[tuple[str, SourceUnitRef], _WorkerStackSource]:
         return MappingProxyType({
-            unit: _WorkerStackSource(
+            key: _WorkerStackSource(
                 source.source,
                 source.identity,
                 SourceVersionRef.worker(
                     artifact_id=(
                         source.version.artifact_id
                         or source.version.source_sha256
-                        or unit.source_sha256
+                        or key[1].source_sha256
                     ),
                     generation=generation,
                     source_text=source.version.read_text(),
                 ),
             )
-            for unit, source in sources.items()
+            for key, source in sources.items()
         })
 
     def _notebook_source_snapshot(
@@ -3907,14 +3910,14 @@ class PrototypeRuntimeApi:
         method_set: NotebookMethodSet,
         *,
         generation: int,
-    ) -> Mapping[SourceUnitRef, _WorkerStackSource]:
-        result: dict[SourceUnitRef, _WorkerStackSource] = {}
+    ) -> Mapping[tuple[str, SourceUnitRef], _WorkerStackSource]:
+        result: dict[tuple[str, SourceUnitRef], _WorkerStackSource] = {}
         for visible in method_set._visible_sources:
             mapped = visible.source_map.map_offset(0)
             unit = mapped.unit
             if unit is None or unit.source_sha256 != source_sha256(visible.text):
                 raise ProtocolError("Notebook source snapshot is invalid")
-            result[unit] = _WorkerStackSource(
+            result[("worker", unit)] = _WorkerStackSource(
                 "ЯчейкаНоутбука",
                 ModuleIdentity(
                     self._anonymous_notebook_id,
