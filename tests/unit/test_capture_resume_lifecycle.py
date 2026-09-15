@@ -39,6 +39,46 @@ class ResumeBarrierSession(ScriptedSession):
         return super().wait_for_any_stop(timeout_s=timeout_s)
 
 
+class ResumeBoundarySession(ScriptedSession):
+    """Hold exactly one controller-owned continuation boundary."""
+
+    def __init__(self, stage: str) -> None:
+        super().__init__((CAPTURE_A, SERVICE, SERVICE))
+        self.stage = stage
+        self.entered = Event()
+        self.release = Event()
+
+    def _block(self, stage: str) -> None:
+        if self.stage != stage:
+            return
+        self.entered.set()
+        assert self.release.wait(2), f"{stage} was not released"
+
+    def evaluate(self, expression: str, **kwargs: object):  # type: ignore[no-untyped-def]
+        if "ПоместитьЗначениеКонтекстаОтладки" in expression:
+            self._block("root")
+        if "ЗавершитьКонтекстОтладки" in expression:
+            self._block("cleanup")
+        return super().evaluate(expression, **kwargs)
+
+    def modify(self, variable: str, value_expression: str):  # type: ignore[no-untyped-def]
+        # Initial MAIN setup also writes the command identifier.  The resume
+        # writeback begins only after that MAIN has already continued once.
+        if self.continue_count >= 1:
+            self._block("modify")
+        return super().modify(variable, value_expression)
+
+    def continue_(self) -> None:
+        super().continue_()
+        if self.continue_count >= 2:
+            self._block("continue")
+
+    def wait_for_any_stop(self, *, timeout_s: float):  # type: ignore[no-untyped-def]
+        if self.continue_count >= 2:
+            self._block("wait")
+        return super().wait_for_any_stop(timeout_s=timeout_s)
+
+
 def eventually(predicate) -> None:  # type: ignore[no-untyped-def]
     deadline = monotonic() + 2
     while not predicate():
@@ -175,6 +215,43 @@ def test_keyboard_interrupt_detaches_resume_waiter_and_controller_finishes_once(
         controller.shutdown_capture_evaluation()
 
 
+@pytest.mark.parametrize("stage", ("root", "modify", "cleanup", "continue", "wait"))
+def test_interrupt_at_every_resume_boundary_keeps_the_same_worker_plan(
+    stage: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No boundary gives an interrupted caller back the resumed RDBG stream."""
+    rdbg = ResumeBoundarySession(stage)
+    controller = captured_controller(rdbg, command_timeout_s=1)
+    api = PrototypeRuntimeApi(controller)
+    original_wait = CaptureResumeTicket.wait_initiator
+
+    def interrupt_after_boundary(
+        ticket: CaptureResumeTicket,
+        timeout_s: float | None = None,
+    ) -> object:
+        assert rdbg.entered.wait(1), f"{stage} was never reached"
+        with ticket._coordinator._condition:
+            ticket._coordinator._detach_resume_locked(ticket._record)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(CaptureResumeTicket, "wait_initiator", interrupt_after_boundary)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            api.resume_capture(dirty_roots=("Скаляр",))
+        with pytest.raises(CaptureBusyError):
+            api.execute_bsl("НоваяКоманда = 1;")
+        assert api.status().state is OperationState.RESUMING
+
+        rdbg.release.set()
+        eventually(lambda: controller.state is OperationState.COMPLETED)
+        assert rdbg.continue_count == 2
+    finally:
+        rdbg.release.set()
+        monkeypatch.setattr(CaptureResumeTicket, "wait_initiator", original_wait)
+        controller.shutdown_capture_evaluation()
+
+
 def test_resume_timeout_detaches_waiter_without_redispatching_continue() -> None:
     """A bounded initiator wait never cancels the accepted controller request."""
     session = ResumeBarrierSession((CAPTURE_A, SERVICE))
@@ -193,6 +270,32 @@ def test_resume_timeout_detaches_waiter_without_redispatching_continue() -> None
     finally:
         session.release_root_export.set()
         session.release_next_stop.set()
+        controller.shutdown_capture_evaluation()
+
+
+def test_unproven_close_keeps_a_live_resume_record_until_its_worker_exits() -> None:
+    """Shutdown cannot call an in-flight resume finalized before it is joined."""
+    rdbg = ResumeBoundarySession("wait")
+    controller = captured_controller(rdbg, command_timeout_s=1)
+    api = PrototypeRuntimeApi(controller)
+    try:
+        with pytest.raises(TimeoutError, match="resume remains pending"):
+            api.resume_capture(dirty_roots=("Скаляр",), timeout_s=0.01)
+        assert rdbg.entered.wait(1)
+        owner = controller._capture_evaluation_coordinator
+        assert owner is not None
+
+        owner.begin_close()
+        owner.finish_close(False)
+
+        assert owner._active_resume is not None
+        assert owner._shutdown_finalized is False
+        rdbg.release.set()
+        assert owner.join(1)
+        owner.finish_close(True)
+        assert owner._shutdown_finalized is True
+    finally:
+        rdbg.release.set()
         controller.shutdown_capture_evaluation()
 
 
@@ -226,6 +329,48 @@ def test_attached_resume_notifies_session_listener_on_initiating_thread() -> Non
         # thread but blocks the coordinator worker.  Keeping this callback on
         # the caller side prevents the ticket/listener lock cycle.
         assert listener_threads == [get_ident()]
+    finally:
+        rdbg.release_root_export.set()
+        rdbg.release_next_stop.set()
+        controller.shutdown_capture_evaluation()
+
+
+def test_detached_session_waiter_is_retired_after_worker_terminal_delivery() -> None:
+    """Timeout detaches only the waiter; the worker later retires Session state."""
+    rdbg = ResumeBarrierSession((CAPTURE_A, SERVICE))
+    controller = captured_controller(rdbg, command_timeout_s=1)
+    api = PrototypeRuntimeApi(controller)
+    runtime = object.__new__(RuntimeSession)
+    runtime._operation_lock = RLock()
+    runtime._capture_resume_listeners = []
+    active = SimpleNamespace(
+        ticket_id="capture-ticket",
+        capture_intent_id="intent",
+        operation_id="operation",
+        capture_generation=1,
+        source_revision=1,
+        source_sha256="a" * 64,
+        stop_sequence=1,
+    )
+    runtime._active_capture_ticket = active
+    runtime.runtime_api = api
+    listener_threads: list[int] = []
+    runtime.add_capture_resume_listener(lambda _fence: listener_threads.append(get_ident()))
+    coordinator = controller._capture_evaluation_coordinator
+    assert coordinator is not None
+    coordinator_thread_id = coordinator._worker.ident
+    rdbg.release_root_export.set()
+    try:
+        with pytest.raises(TimeoutError, match="resume remains pending"):
+            runtime.resume_capture(dirty_roots=("Скаляр",), timeout_s=0.01)
+        assert rdbg.next_stop_wait_entered.wait(1)
+        assert runtime._active_capture_ticket is active
+        rdbg.release_next_stop.set()
+
+        eventually(lambda: runtime._active_capture_ticket is None)
+        assert listener_threads and listener_threads[0] != get_ident()
+        assert listener_threads[0] != coordinator_thread_id
+        assert rdbg.continue_count == 2
     finally:
         rdbg.release_root_export.set()
         rdbg.release_next_stop.set()
