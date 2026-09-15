@@ -1660,12 +1660,20 @@ class RuntimeSession:
                 error: BaseException | None,
             ) -> None:
                 nonlocal completion_seen
-                del error
                 with self._operation_lock:
                     completion_seen = True
                     current = self._active_capture_ticket
                     if current is not active or active is None:
                         return
+                    if error is not None:
+                        try:
+                            state = self.runtime_api.status().state
+                        except BaseException:
+                            state = None
+                        if state is OperationState.CAPTURED:
+                            # A confirmed rejection before any root mutation
+                            # leaves the old frame and its Session fence live.
+                            return
                     if (
                         reply is not None
                         and getattr(reply, "capture_ticket", None)

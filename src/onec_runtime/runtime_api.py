@@ -28,6 +28,7 @@ from onec_runtime.capture_evaluation import (
     CapturePhase,
     CaptureResumeTicket,
     _CapturePinDispositionLease,
+    _CaptureResumeSubmission,
     _CaptureSubmission,
 )
 from onec_runtime.capture_inspection import (
@@ -3883,9 +3884,10 @@ class PrototypeRuntimeApi:
                         if on_detached_completion is None
                         else on_detached_completion
                     )
+                    submission = _CaptureResumeSubmission()
                     ticket: CaptureResumeTicket | None = None
                     try:
-                        ticket = submit_resume(**resume_arguments)
+                        ticket = submission.submit(submit_resume, **resume_arguments)
                         if not isinstance(ticket, CaptureResumeTicket):
                             raise ProtocolError(
                                 "CAPTURE controller did not return a resume ticket"
@@ -3898,8 +3900,12 @@ class PrototypeRuntimeApi:
                             with self._capture_session_waiter_handoff():
                                 completed = ticket.wait_initiator(timeout_s)
                     except BaseException as error:
-                        if isinstance(error, KeyboardInterrupt) and ticket is not None:
-                            ticket.detach_initiator()
+                        # The coordinator may have adopted the resume before
+                        # Python assigned its normal ticket return.  Detach via
+                        # the receipt for every unwind path; it is idempotent
+                        # after a ticket wait has already detached itself.
+                        submission.detach_initiator()
+                        ticket = ticket or submission.ticket
                         if (
                             ticket is not None
                             and not ticket.initiator_detached

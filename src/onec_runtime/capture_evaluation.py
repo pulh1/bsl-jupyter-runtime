@@ -1019,6 +1019,42 @@ _capture_submission: ContextVar[_CaptureSubmission | None] = ContextVar(
 )
 
 
+@dataclass(slots=True, repr=False)
+class _CaptureResumeSubmission:
+    """Private receipt for a synchronous adapter-to-resume-owner handoff.
+
+    ``submit_resume()`` adopts the controller-owned record before its caller
+    receives the ordinary ticket return.  Keeping this receipt in dynamic scope
+    lets the caller detach the original waiter if that return or the immediate
+    handoff is interrupted.
+    """
+
+    ticket: CaptureResumeTicket | None = None
+
+    def submit(
+        self,
+        adapter: Callable[..., CaptureResumeTicket],
+        **kwargs: object,
+    ) -> CaptureResumeTicket:
+        if _capture_resume_submission.get() is not None or self.ticket is not None:
+            raise ProtocolError("CAPTURE resume handoff was already claimed")
+        token = _capture_resume_submission.set(self)
+        try:
+            return adapter(**kwargs)
+        finally:
+            _capture_resume_submission.reset(token)
+
+    def detach_initiator(self) -> None:
+        ticket = self.ticket
+        if ticket is not None:
+            ticket.detach_initiator()
+
+
+_capture_resume_submission: ContextVar[_CaptureResumeSubmission | None] = ContextVar(
+    "capture_resume_submission", default=None,
+)
+
+
 class CaptureEvaluationCoordinator:
     """One daemon event consumer and one active logical evaluation.
 
@@ -1140,14 +1176,30 @@ class CaptureEvaluationCoordinator:
                 raise StaleCaptureError()
             record = _CaptureResumeRecord(request)
             ticket = CaptureResumeTicket(record.resume_id, self, record)
+            submission = _capture_resume_submission.get()
+            if submission is not None and submission.ticket is not None:
+                raise ProtocolError("CAPTURE resume handoff was already claimed")
             # The callback changes controller state while the phase reservation
             # remains private. Once observers can see ``resuming``, no root
             # export or inspection can fit before it.
-            request.admit()
-            self._active_resume = record
-            self._phase = CapturePhase.RESUMING
-            self._condition.notify_all()
-            return ticket
+            try:
+                request.admit()
+                self._active_resume = record
+                if submission is not None:
+                    # Receipt publication is part of the adoption boundary.
+                    # If an interrupt lands in either adjacent assignment, the
+                    # handler below repairs it before releasing this mutex.
+                    submission.ticket = ticket
+                self._phase = CapturePhase.RESUMING
+                self._condition.notify_all()
+                return ticket
+            except BaseException:
+                if self._active_resume is record:
+                    if submission is not None:
+                        submission.ticket = ticket
+                    self._phase = CapturePhase.RESUMING
+                    self._detach_resume_locked(record)
+                raise
 
     def status(self, fence: CaptureFence) -> CaptureStatus:
         with self._condition:

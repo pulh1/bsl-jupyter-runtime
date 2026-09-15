@@ -2640,6 +2640,7 @@ class PrototypeRuntimeController:
                 stack_level=stack_level,
             ))
 
+        root_mutated = False
         for root in dirty_roots:
             try:
                 transfer = capture_step(build_live_capture_root_transfer_call(root))
@@ -2648,10 +2649,17 @@ class PrototypeRuntimeController:
                     attempt, root, "failed", error=type(error).__name__
                 )
                 self._mark_later_roots_unattempted(attempt, root)
+                # Exporting a root can fail before a frame mutation has even
+                # been attempted.  A confirmed local failure leaves the
+                # paused frame usable; transport loss remains ambiguous.
                 self.state = (
                     OperationState.RECOVERING
                     if isinstance(error, RdbgTransportError)
-                    else OperationState.PARTIAL_WRITEBACK_FAILURE
+                    else (
+                        OperationState.PARTIAL_WRITEBACK_FAILURE
+                        if root_mutated
+                        else OperationState.CAPTURED
+                    )
                 )
                 raise
             if transfer.error_occurred:
@@ -2659,7 +2667,11 @@ class PrototypeRuntimeController:
                     attempt, root, "failed", error=transfer.error_text
                 )
                 self._mark_later_roots_unattempted(attempt, root)
-                self.state = OperationState.PARTIAL_WRITEBACK_FAILURE
+                self.state = (
+                    OperationState.PARTIAL_WRITEBACK_FAILURE
+                    if root_mutated
+                    else OperationState.CAPTURED
+                )
                 raise PartialWritebackError(
                     f"Capture root {root} transfer failed: {transfer.error_text}"
                 )
@@ -2672,7 +2684,11 @@ class PrototypeRuntimeController:
                     error="invalid temporary-storage address",
                 )
                 self._mark_later_roots_unattempted(attempt, root)
-                self.state = OperationState.PARTIAL_WRITEBACK_FAILURE
+                self.state = (
+                    OperationState.PARTIAL_WRITEBACK_FAILURE
+                    if root_mutated
+                    else OperationState.CAPTURED
+                )
                 raise PartialWritebackError(
                     f"Capture root {root} temporary-storage address is invalid"
                 )
@@ -2732,6 +2748,7 @@ class PrototypeRuntimeController:
                 result_id=result.result_id,
             )
             self._mark_continuation_root(attempt, root, "succeeded")
+            root_mutated = True
             if sum(entry.succeeded for entry in self.write_journal) == 1:
                 self._inject(
                     FaultPoint.AFTER_FIRST_ROOT_WRITE,
