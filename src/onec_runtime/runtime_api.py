@@ -10,6 +10,7 @@ from math import isfinite
 from pathlib import Path
 from threading import Lock, get_ident
 from time import monotonic
+from types import MappingProxyType
 from typing import Callable, Iterator, Protocol
 import re
 from uuid import UUID, uuid4
@@ -50,6 +51,11 @@ from onec_runtime.bsl.module_universe import (
     lower_resolved_worker_module,
 )
 from onec_runtime.bsl.module_catalog import SessionCommonModuleCatalog
+from onec_runtime.bsl.module_syntax import (
+    ModuleIdentity,
+    ModuleSyntaxIndex,
+    ModuleSyntaxRegistry,
+)
 from onec_runtime.bsl.parser_target import BslParseError
 from onec_runtime.bsl.notebook_cells import NotebookCellProjection
 from onec_runtime.bsl.notebook_method_globals import bind_notebook_method_globals
@@ -879,6 +885,10 @@ class PrototypeRuntimeApi:
             tuple[str, str, int, str, str], WorkerModuleArtifact
         ] = {}
         self._worker_active_modules: dict[str, _ActiveWorkerModule] = {}
+        self._module_syntax_registry = ModuleSyntaxRegistry()
+        self._worker_syntax_generations: dict[
+            WorkerGenerationHandle, Mapping[str, ModuleSyntaxIndex]
+        ] = {}
         self._worker_catalog_snapshot: CommonModuleCatalogSnapshot | None = None
         self._notebook_worker_revision = 0
         self._notebook_method_set: NotebookMethodSet | None = None
@@ -918,6 +928,34 @@ class PrototypeRuntimeApi:
     @property
     def worker_generation_handle(self) -> WorkerGenerationHandle | None:
         return self._worker_generation_handle
+
+    @property
+    def module_syntax_registry(self) -> ModuleSyntaxRegistry:
+        """Shared exact-version source facts; publication alone is not activation."""
+        return self._module_syntax_registry
+
+    def _worker_module_identity(self, unit: WorkerModuleUnit) -> ModuleIdentity:
+        return ModuleIdentity(
+            namespace=self._anonymous_notebook_id,
+            source_kind="worker",
+            module_kind=unit.kind,
+            object_id=unit.logical_name.casefold(),
+            property_id="Module",
+        )
+
+    def _worker_module_syntax(
+        self, logical_name: str, *, generation: WorkerGenerationHandle | None = None,
+    ) -> ModuleSyntaxIndex | None:
+        """Select syntax through the physical frame's generation or MAIN pin.
+
+        This internal lookup does no parsing or transport. Capture callers must
+        still own the runtime single-writer scope, validate their stop fence
+        and apply strict Worker source mapping.
+        """
+        handle = (
+            generation or self.operation_worker_generation or self._worker_generation_handle
+        )
+        return self._worker_syntax_generations.get(handle, {}).get(logical_name.casefold())
 
     @property
     def operation_worker_generation(self) -> WorkerGenerationHandle | None:
@@ -3459,6 +3497,7 @@ class PrototypeRuntimeApi:
                 lowering_catalog=self._descriptor_catalog(descriptors),
                 profiler=profiler,
                 breakpoint_policy=breakpoint_policy,
+                module_syntax={name: models[name].syntax_index for name in ordered_names},
             )
             self._worker_active_modules = staged_active
             self._worker_module_artifacts.update(cache_additions)
@@ -3497,16 +3536,21 @@ class PrototypeRuntimeApi:
                 and current.model.source_sha256 == source_hash
                 and current.model.parser_identity == parser_identity
             ):
-                models[normalized] = current.model
-                continue
-            model = parse_full_ast_module(
-                unit.mapped_source.text,
-                profiler=profiler,
-            )
+                model = current.model
+            else:
+                model = parse_full_ast_module(
+                    unit.mapped_source.text,
+                    profiler=profiler,
+                )
             if model.source_sha256 != source_hash:
                 raise ProtocolError("Worker projected source identity changed")
             if model.parser_identity != parser_identity:
                 raise ProtocolError("Worker parser provenance changed during parse")
+            if model.syntax_index is None:
+                raise ProtocolError("Worker projected syntax index is unavailable")
+            self._module_syntax_registry.publish(
+                self._worker_module_identity(unit), model.syntax_index
+            )
             models[normalized] = model
         return models
 
@@ -3741,6 +3785,7 @@ class PrototypeRuntimeApi:
         prepared_catalog: tuple[object, ...] | None = None,
         before_promote: Callable[[], None] | None = None,
         on_prepared_generation: Callable[[WorkerGenerationHandle], None] | None = None,
+        module_syntax: Mapping[str, ModuleSyntaxIndex] | None = None,
         profiler: PhaseRecorder | None = None,
         breakpoint_policy: WorkerBreakpointReloadPolicy = (
             WorkerBreakpointReloadPolicy.STRICT
@@ -3749,6 +3794,12 @@ class PrototypeRuntimeApi:
         """Publish through the sole host/target universe and commit after swap."""
         if type(breakpoint_policy) is not WorkerBreakpointReloadPolicy:
             raise TypeError("worker breakpoint reload policy is required")
+        # Snapshot candidates before remote work. Notebook-only publications
+        # inherit the confirmed module versions without consulting MAIN's pin.
+        candidate_syntax = MappingProxyType(dict(
+            self._worker_syntax_generations.get(self._worker_generation_handle, {})
+            if module_syntax is None else module_syntax
+        ))
         effective_catalog = (
             None
             if lowering_catalog is None
@@ -3890,6 +3941,7 @@ class PrototypeRuntimeApi:
                 raise self._poisoned_error from error
         previous_api_owned_handle = self._api_owned_worker_generation_handle
         self._worker_generation_handle = handle
+        self._worker_syntax_generations[handle] = candidate_syntax
         self._worker_generation_diagnostics[handle.manifest_sha256] = (
             candidate_diagnostics
         )
@@ -4356,6 +4408,8 @@ class PrototypeRuntimeApi:
                 prune_binary_cache(frozenset())
             self._worker_module_artifacts.clear()
             self._worker_generation_diagnostics.clear()
+            self._worker_syntax_generations.clear()
+            self._module_syntax_registry = ModuleSyntaxRegistry()
             self._worker_active_modules.clear()
             self._notebook_method_set = None
             self._notebook_worker_descriptor = None

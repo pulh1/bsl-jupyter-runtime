@@ -27,6 +27,43 @@ from onec_runtime.bsl.worker_projection_model import (
 from onec_runtime.performance_profile import PhaseRecorder
 
 
+def test_shared_syntax_records_source_order_parameters_and_line_boundaries() -> None:
+    """Capture must see ordered parameters, decorations and inclusive end lines."""
+    source = (
+        "// before\r\n&НаСервере\r\n"
+        "Функция Z(Знач Второй, Первый = 1) Экспорт\r\n"
+        "Возврат Второй;\r\nКонецФункции\r\n\r\n"
+        "Процедура A()\r\nКонецПроцедуры\r\n"
+    )
+    profiler = PhaseRecorder()
+    model = parse_full_ast_module(source, profiler=profiler)
+    index = model.syntax_index
+    assert index.source_sha256 == source_sha256(source)
+    assert index.parser_identity == model.parser_identity == full_ast_parser_identity()
+    assert [(m.name, m.parameters, m.start_line, m.end_line) for m in index.methods] == [
+        ("Z", ("Второй", "Первый"), 2, 5), ("A", (), 7, 8),
+    ]
+    assert index.methods[0].span == SourceSpan(source.index("&"), source.index("\r\n\r\n"))
+    assert index.methods[1].span == SourceSpan(source.index("Процедура"), len(source) - 2)
+    assert [None if index.method_at_line(line) is None else index.method_at_line(line).name
+            for line in range(1, 10)] == [None, "Z", "Z", "Z", "Z", None, "A", "A", None]
+    for invalid in (0, -1, True, 1.5):
+        with pytest.raises(ValueError, match="line"):
+            index.method_at_line(invalid)
+    assert profiler.parser_calls.full_module_parses == 1
+
+
+def test_shared_syntax_uses_the_same_server_effective_branch() -> None:
+    source = (
+        "#Если Клиент Тогда\nПроцедура ClientOnly()\nКонецПроцедуры\n"
+        "#Иначе\nПроцедура ServerOnly(Arg)\nКонецПроцедуры\n#КонецЕсли"
+    )
+    model = parse_full_ast_module(source)
+    assert [m.name for m in model.syntax_index.methods] == ["ServerOnly"]
+    assert model.syntax_index.method_at_line(2) is None
+    assert model.syntax_index.method_at_line(5).parameters == ("Arg",)
+
+
 def test_neutral_full_ast_module_api_preserves_extracted_model() -> None:
     """Break caught: runtime cutover must retain the proven extractor contract."""
     source = "Процедура P()\nX = Y;\nКонецПроцедуры"
@@ -384,13 +421,14 @@ def test_full_ast_generated_error_has_product_contract() -> None:
 
 
 def test_projector_handles_5000_linked_statements_without_retaining_ast() -> None:
+    source = "Процедура P()\n" + "Продолжить;\n" * 5_000 + "КонецПроцедуры"
     span = SourceSpan(0, 0)
     code: object = generated.CodeBlock(None, None, span)
     for _ in range(5_000):
         code = generated.CodeBlock(generated.ContinueStatement(span), code, span)
     body = generated.MethodBody((), code, span)
     declaration = generated.ProcedureDeclaration("P", None, None, body, span)
-    method = generated.Method((), None, declaration, span)
+    method = generated.Method((), None, declaration, SourceSpan(0, len(source)))
     elements = generated.ModuleElements(
         method,
         generated.ModuleElements(None, None, span),
@@ -399,7 +437,7 @@ def test_projector_handles_5000_linked_statements_without_retaining_ast() -> Non
     root = generated.Module((), elements, span)
 
     model = project_full_ast_module(
-        "",
+        source,
         root,
         (),
         parser_identity=full_ast_parser_identity(),

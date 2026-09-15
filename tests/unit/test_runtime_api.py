@@ -4514,6 +4514,157 @@ def test_full_ast_module_cache_parses_first_source_once_and_reuses_it(
     assert parsed_sources == [module_a.mapped_source.text]
 
 
+@pytest.mark.parametrize("failure", [None, "staging", "wire", "unknown"])
+def test_syntax_candidates_activate_only_after_confirmed_worker_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str | None,
+) -> None:
+    """A parsed G2 must never retarget G1, even when promotion loses its reply."""
+    from onec_runtime.bsl.full_ast_worker_projection import full_ast_parser_identity
+    from onec_runtime.performance_profile import PhaseRecorder
+
+    catalog = _common_module_catalog("МодульА")
+    first = _worker_module_unit("МодульА", 1, catalog)
+    second = _worker_module_unit("МодульА", 2, catalog)
+    target = _SemanticSnapshotFailureTarget()
+    api = _semantic_snapshot_runtime(tmp_path, catalog, target=target)
+    g1 = api.load_worker_modules((first,), common_modules=catalog)
+    first_index = api._worker_module_syntax("МодульА", generation=g1)
+    assert first_index.source_sha256 == first.mapped_source.artifact.source_sha256
+    original_publish = api._publish_worker_artifacts_locked
+    staged = []
+
+    def observe_candidate(*args: object, **kwargs: object):
+        candidate = api.module_syntax_registry.get(
+            api._worker_module_identity(second), second.mapped_source.artifact.source_sha256,
+            full_ast_parser_identity(),
+        )
+        assert candidate is not None
+        staged.append(candidate)
+        assert api._worker_module_syntax("МодульА") is first_index
+        return original_publish(*args, **kwargs)
+
+    monkeypatch.setattr(api, "_publish_worker_artifacts_locked", observe_candidate)
+    target.failure = failure
+    profiler = PhaseRecorder()
+    if failure is None:
+        g2 = api.load_worker_modules((second,), common_modules=catalog, profiler=profiler)
+        assert api._worker_module_syntax("МодульА", generation=g2) is staged[0]
+        assert api._worker_module_syntax("МодульА") is staged[0]
+    else:
+        expected = WorkerPromotionOutcomeUnknown if failure == "unknown" else BslExecutionError
+        with pytest.raises(expected):
+            api.load_worker_modules((second,), common_modules=catalog, profiler=profiler)
+        assert api.worker_generation_handle is g1
+        assert api._worker_module_syntax("МодульА") is first_index
+        assert all(staged[0] not in entries.values()
+                   for entries in api._worker_syntax_generations.values())
+    assert len(staged) == 1
+    assert api._worker_module_syntax("МодульА", generation=g1) is first_index
+    assert api.module_syntax_registry.get(
+        api._worker_module_identity(second), second.mapped_source.artifact.source_sha256,
+        full_ast_parser_identity(),
+    ) is staged[0]
+    assert profiler.parser_calls.full_module_parses == 1
+
+
+def test_main_later_stop_keeps_g1_syntax_after_g2_and_next_main_uses_g2(tmp_path: Path) -> None:
+    """Default capture lookup must follow the operation pin, never latest source."""
+    catalog = _common_module_catalog("МодульА")
+    packer = _notebook_worker_builder(tmp_path)
+
+    class LaterStopController(_PinnedOperationController):
+        stop_again = True
+
+        def resume(self, **kwargs: object):
+            if self.stop_again:
+                self.stop_again = False
+                self.stop_sequence += 1
+                return CapturedStop(
+                    OperationHandle(self.operation_id, "visible", "lowered"),
+                    LOCATION, self.stop_sequence, (), self.operation_id,
+                )
+            return super().resume(**kwargs)
+
+    controller = LaterStopController()
+    api = PrototypeRuntimeApi(
+        controller, notebook_worker_builder=packer,
+        worker_module_builder=WorkerModuleArtifactBuilder(
+            packer, cache=WorkerModuleArtifactCache(), packer_version="worker-epf-v1",
+            target_profile=catalog.profile,
+        ), worker_instruction_executor=_UniverseInstructionExecutor(),
+    )
+    first = _worker_module_unit("МодульА", 1, catalog)
+    second = _worker_module_unit("МодульА", 2, catalog)
+    g1 = api.load_worker_modules((first,), common_modules=catalog)
+    assert api.execute_bsl("Результат = Capture();").kind is RuntimeReplyKind.CAPTURED
+    first_index = api._worker_module_syntax("МодульА")
+    g2 = api.load_worker_modules((second,), common_modules=catalog)
+    assert api.resume_capture().kind is RuntimeReplyKind.CAPTURED
+    assert controller.stop_sequence == 2
+    assert api.operation_worker_generation is g1
+    assert api._worker_module_syntax("МодульА") is first_index
+    assert first_index.source_sha256 == first.mapped_source.artifact.source_sha256
+    assert api.resume_capture().kind is RuntimeReplyKind.MAIN_COMPLETED
+    assert api.execute_bsl("Результат = Capture();").kind is RuntimeReplyKind.CAPTURED
+    assert api.operation_worker_generation is g2
+    assert api._worker_module_syntax("МодульА").source_sha256 == second.mapped_source.artifact.source_sha256
+
+
+def test_capture_syntax_lookup_and_reload_cache_hit_parse_zero_additional_times(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The registry and active-model cache must share the single original parse."""
+    from onec_runtime.bsl.full_ast_worker_projection import full_ast_parser_identity
+    from onec_runtime.bsl.parser_target import PythonParserTarget
+
+    catalog = _common_module_catalog("МодульА")
+    unit = _worker_module_unit("МодульА", 1, catalog)
+    api = _semantic_snapshot_runtime(tmp_path, catalog)
+    original_parse = PythonParserTarget.parse_tokens_ast
+    parses = []
+
+    def observe_parse(self, *args, **kwargs):
+        parses.append(args[1])
+        return original_parse(self, *args, **kwargs)
+
+    monkeypatch.setattr(PythonParserTarget, "parse_tokens_ast", observe_parse)
+    api.load_worker_modules((unit,), common_modules=catalog)
+    assert parses == ["Модуль"]
+    index = api.module_syntax_registry.get(
+        api._worker_module_identity(unit), unit.mapped_source.artifact.source_sha256,
+        full_ast_parser_identity(),
+    )
+    assert index.method_at_line(2).name == "Версия"
+    api.load_worker_modules((unit,), common_modules=catalog)
+    assert api._worker_module_syntax("модульа") is index
+    assert parses == ["Модуль"]
+
+
+def test_source_model_cache_hit_stages_syntax_for_the_new_logical_unit_kind(tmp_path: Path) -> None:
+    """Reusing source facts must not omit publication under a new module identity."""
+    from onec_runtime.bsl.full_ast_worker_projection import full_ast_parser_identity
+    from onec_runtime.performance_profile import PhaseRecorder
+
+    catalog = _common_module_catalog("МодульА")
+    unit = _worker_module_unit("МодульА", 1, catalog)
+    api = _semantic_snapshot_runtime(tmp_path, catalog)
+    api.load_worker_modules((unit,), common_modules=catalog)
+    source = unit.mapped_source.text
+    test_unit = WorkerModuleUnit(
+        "МодульА", "test-module", 2,
+        mapped_visible_source(source, SourceUnitRef(
+            SourceUnitKind.TEST_MODULE, "МодульА", 2, source_sha256(source),
+        )),
+    )
+    profiler = PhaseRecorder()
+    api.load_worker_modules((test_unit,), common_modules=catalog, profiler=profiler)
+    assert api._worker_module_identity(test_unit) != api._worker_module_identity(unit)
+    assert api.module_syntax_registry.get(
+        api._worker_module_identity(test_unit), source_sha256(source), full_ast_parser_identity(),
+    ) is api._worker_module_syntax("МодульА")
+    assert profiler.parser_calls.full_module_parses == 0
+
+
 def test_worker_module_load_upserts_into_the_full_active_universe(
     tmp_path: Path,
 ) -> None:
