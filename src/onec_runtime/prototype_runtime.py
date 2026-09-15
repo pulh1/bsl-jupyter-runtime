@@ -3088,7 +3088,8 @@ class PrototypeRuntimeController:
             + (", Истина, " if table_row else ", Ложь, ")
             + bsl_string_literal("\n".join(worker_type_registrations))
             + ")",
-            start_index=0, page_size=128, max_text_size=512,
+            # One admission-marker row plus the helper's bounded 128 names.
+            start_index=0, page_size=129, max_text_size=512,
             timeout_s=self.command_timeout_s, stack_level=stack_level,
         )
         if result.error_occurred:

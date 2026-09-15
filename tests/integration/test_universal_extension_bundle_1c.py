@@ -24,7 +24,7 @@ from onec_runtime.extension_bundle import (
 from onec_runtime.extension_state import ExtensionStateStore, VerifiedExtensionState
 from onec_runtime.performance_profile import PhaseRecorder
 from onec_runtime.processes import FileModeProcesses, OwnedProcess
-from onec_runtime.session import RuntimeSession, RuntimeSessionConfig
+from onec_runtime.session import ExtensionMode, RuntimeSession, RuntimeSessionConfig
 from onec_runtime.toolchain import (
     apply_product_extension,
     create_empty_infobase,
@@ -370,7 +370,9 @@ def test_compact_table_bound_is_executed_before_value_table_and_query_sentinel_c
     config = _config(tmp_path / "target", platform)
     create_empty_infobase(config)
     _install_cfe(config, bundle.cfe_path, tmp_path / "install")
-    session, _profile = _start(config, tmp_path / "evidence")
+    session = RuntimeSession.start(RuntimeSessionConfig(
+        config, tmp_path / "evidence", extension_mode=ExtensionMode.MANUAL
+    ))
     try:
         reply = session.execute_bsl('''
 Таблица = Новый ТаблицаЗначений;
@@ -392,8 +394,17 @@ def test_compact_table_bound_is_executed_before_value_table_and_query_sentinel_c
 КонецПопытки;
 
 Запрос = Новый Запрос;
-Запрос.УстановитьПараметр("ИсходнаяТаблица", Таблица);
-Запрос.Текст = "ВЫБРАТЬ ИсходнаяТаблица.Значение КАК Значение ИЗ &ИсходнаяТаблица КАК ИсходнаяТаблица";
+Запрос.Текст = "ВЫБРАТЬ
+|    \"\"safe\"\" КАК Значение
+|ОБЪЕДИНИТЬ ВСЕ
+|ВЫБРАТЬ
+|    \"\"safe\"\" КАК Значение
+|ОБЪЕДИНИТЬ ВСЕ
+|ВЫБРАТЬ
+|    \"\"safe\"\" КАК Значение
+|ОБЪЕДИНИТЬ ВСЕ
+|ВЫБРАТЬ
+|    \"\"__table_bound_sentinel__\"\" КАК Значение";
 ПроверкаЗапроса = "";
 Попытка
     МатериализацияЗапроса = RuntimeTableTransferServer.СериализоватьКомпактнуюТаблицу(

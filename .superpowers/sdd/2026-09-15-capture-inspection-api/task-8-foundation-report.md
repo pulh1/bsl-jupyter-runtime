@@ -104,3 +104,34 @@ The CFE above was rebuilt after these changes with Designer 8.3.27.2170.
 `python -m compileall -q src/onec_runtime packages/jupyter packages/mcp` and
 `git diff --check` pass. `ruff` is not installed in this uv environment, so it
 was not a validation gate.
+
+## Final Sol P2 remediation
+
+- Completion reserves the full closed page: one `R` marker plus 128 names.
+  The controller requests `page_size=129`; the Runtime API requires an exact
+  integer `collection_size` in `1..129` and requires that it equals the
+  received row count before it parses the marker or any name. The boundary
+  regression feeds a real `EvaluationResult` with the marker and 128 names,
+  and separately proves that a reported 129-row result truncated to 128 rows
+  raises `ProtocolError` rather than silently omitting `Поле127`.
+- The former independent Python sentinel model has been replaced by an opt-in
+  `live_1c` integration qualification. It builds a disposable CFE from the
+  product source with two local fault probes: one immediately after the actual
+  classifier cell read and one immediately before the actual query-result
+  cell copy. The test installs that CFE in a disposable empty infobase, passes
+  a 10,000-row `ТаблицаЗначений` with a sentinel immediately after
+  `max_rows=3`, and also serializes a real `РезультатЗапроса` whose fourth
+  row is the sentinel. The observed `bounded|bounded` result means neither
+  real BSL probe was reached.
+
+The opt-in live qualification ran with
+`ONEC_RUN_EXTENSION_BUNDLE_INTEGRATION=1`: `1 passed, 6 deselected in 51.34
+seconds`. This is live 1C evidence against a temporary infobase; it is not a
+claim about the static unit suite. The released product BSL sources did not
+change in this P2 pass, so the checked-in protocol-2/artifact-0.1.3 CFE and
+manifest remain the bundle recorded above.
+
+The final focused suite completed with `137 passed, 7 skipped` in 4.13
+seconds. The broader affected unit suite completed with `571 passed` in 36.76
+seconds. `python -m compileall -q src/onec_runtime packages/jupyter
+packages/mcp` and `git diff --check` pass after the final change.

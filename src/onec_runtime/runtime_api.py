@@ -1134,7 +1134,12 @@ class PrototypeRuntimeApi:
                     table_row=table_row,
                     worker_type_registrations=self._worker_type_registrations(),
                 )
-            if result.error_occurred or not result.collection_rows or len(result.collection_rows) > 129:
+            if (
+                result.error_occurred
+                or type(result.collection_size) is not int
+                or not 1 <= result.collection_size <= 129
+                or len(result.collection_rows) != result.collection_size
+            ):
                 raise ProtocolError("Invalid completion field schema")
             names: list[str] = []
             seen: set[str] = set()
