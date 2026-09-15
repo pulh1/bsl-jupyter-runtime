@@ -21,10 +21,13 @@ from onec_runtime.capture_evaluation import (
     CaptureStatus,
 )
 from onec_runtime.errors import (
+    CaptureBusyError,
     CaptureOutcomeUnknownError,
     CaptureRecoveryRequiredError,
     NoActiveCaptureError,
+    NoCaptureEvaluationError,
     StaleCaptureError,
+    TargetLost,
     WorkerPromotionOutcomeUnknown,
 )
 from onec_runtime.prototype_runtime import OperationState
@@ -88,6 +91,11 @@ class _CrossThreadRejectingLock:
 
     def __exit__(self, *_exc: object) -> None:
         self.release()
+
+    @property
+    def is_locked(self) -> bool:
+        with self._guard:
+            return self._owner is not None
 
 
 def _capture_runtime(*, timeout_s: float = 2.0):  # type: ignore[no-untyped-def]
@@ -169,7 +177,49 @@ def _eventually(predicate, *, timeout_s: float = 1.0) -> None:  # type: ignore[n
         sleep(0.002)
 
 
-def _submit_pending(owner: CaptureEvaluationCoordinator):  # type: ignore[no-untyped-def]
+def _start_api_lock_holder(api: PrototypeRuntimeApi):  # type: ignore[no-untyped-def]
+    acquired = Event()
+    release = Event()
+    errors: list[BaseException] = []
+
+    def hold() -> None:
+        try:
+            with api._lock:
+                acquired.set()
+                assert release.wait(_JOIN_TIMEOUT_S), "API lock holder was not released"
+        except BaseException as error:
+            errors.append(error)
+
+    thread = Thread(target=hold, name="capture-api-lock-holder")
+    thread.start()
+    assert acquired.wait(1), "API lock holder did not start"
+    return thread, release, errors
+
+
+def _start_observer(invoke):  # type: ignore[no-untyped-def]
+    finished = Event()
+    results: list[object] = []
+    errors: list[BaseException] = []
+
+    def observe() -> None:
+        try:
+            results.append(invoke())
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            finished.set()
+
+    thread = Thread(target=observe, name="capture-control-plane-observer")
+    thread.start()
+    return thread, finished, results, errors
+
+
+def _submit_pending(
+    owner: CaptureEvaluationCoordinator,
+    *,
+    kind: CaptureEvaluationKind = CaptureEvaluationKind.USER_BSL,
+    value: int = 901,
+):  # type: ignore[no-untyped-def]
     pending = PendingEvaluation(TARGET, uuid4(), object())
     release = Event()
     dispatch_count = 0
@@ -190,10 +240,10 @@ def _submit_pending(owner: CaptureEvaluationCoordinator):  # type: ignore[no-unt
 
     ticket = owner.submit_evaluation(CaptureEvaluationRequest(
         _owner_fence(owner),
-        CaptureEvaluationKind.USER_BSL,
+        kind,
         dispatch,
         poll,
-        lambda result: 901,
+        lambda result: value,
     ))
     return ticket, release, lambda: dispatch_count
 
@@ -268,6 +318,67 @@ def test_session_control_plane_bypasses_operation_lock_while_initiator_is_blocke
         close_owner(controller, transport)
 
 
+def test_session_releases_both_admission_locks_before_initiator_wait() -> None:
+    """A second data-plane call must reach coordinator busy admission promptly."""
+
+    api, controller, transport = _capture_runtime()
+    runtime = _runtime_session(api)
+    initiator: Thread | None = None
+    contender: Thread | None = None
+    contender_finished = Event()
+    contender_errors: list[BaseException] = []
+    starts_before = 0
+    session_lock_free = False
+    api_lock_free = False
+    contender_finished_while_pending = False
+
+    def contend() -> None:
+        try:
+            runtime.execute_bsl("ВтораяИнструкция = 2;")
+        except BaseException as error:
+            contender_errors.append(error)
+        finally:
+            contender_finished.set()
+
+    try:
+        initiator, initiator_finished, initiator_errors = _start_pending_capture(
+            lambda: runtime.execute_bsl("РезультатИнструкции = 901;"),
+            transport.accepted,
+        )
+        assert not initiator_finished.is_set()
+        session_lock_free = not runtime._operation_lock.is_locked
+        api_lock_free = api._lock.acquire(blocking=False)
+        if api_lock_free:
+            api._lock.release()
+
+        starts_before = transport.capture_start_count
+        contender = Thread(target=contend, name="capture-data-plane-contender")
+        contender.start()
+        contender_finished_while_pending = contender_finished.wait(0.2)
+    finally:
+        if not contender_finished_while_pending:
+            # Let a contract-violating contender leave the old Session lock
+            # after the primary call unwinds, without starting another wait.
+            transport.poll_error = TargetLost("synthetic RED cleanup")
+        elif transport.capture_pending is not None:
+            transport.complete()
+        if initiator is not None:
+            initiator.join(_JOIN_TIMEOUT_S)
+        if contender is not None:
+            contender.join(_JOIN_TIMEOUT_S)
+        close_owner(controller, transport)
+
+    assert session_lock_free, "RuntimeSession held admission through wait_initiator"
+    assert api_lock_free, "RuntimeApi held the writer through wait_initiator"
+    assert contender_finished_while_pending, "second data-plane admission blocked"
+    assert len(contender_errors) == 1
+    assert isinstance(contender_errors[0], CaptureBusyError), repr(contender_errors[0])
+    assert transport.capture_start_count == starts_before
+    assert not initiator.is_alive()
+    assert not contender.is_alive()
+    assert initiator_errors == []
+
+
 def test_capture_control_plane_bypasses_api_writer_availability_and_worker_guard(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -308,6 +419,70 @@ def test_capture_control_plane_bypasses_api_writer_availability_and_worker_guard
         assert not failures
     finally:
         _finish_pending(thread, transport)
+        close_owner(controller, transport)
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    ("current_capture", "capture.status", "capture.wait"),
+)
+def test_capture_control_plane_does_not_acquire_runtime_api_lock(
+    endpoint: str,
+) -> None:
+    """A blocking api._lock mutant must fail promptly and still tear down."""
+
+    api, controller, transport = _capture_runtime()
+    owner = _capture_owner(controller)
+    evaluation_release: Event | None = None
+    holder: Thread | None = None
+    observer: Thread | None = None
+    holder_release: Event | None = None
+    try:
+        capture = api.current_capture()
+        ticket, evaluation_release, dispatch_count = _submit_pending(owner)
+        _eventually(lambda: dispatch_count() == 1)
+
+        holder, holder_release, holder_errors = _start_api_lock_holder(api)
+        invocation = {
+            "current_capture": api.current_capture,
+            "capture.status": capture.status,
+            "capture.wait": lambda: capture.wait(
+                timeout_s=0,
+                evaluation_id=ticket.evaluation_id,
+            ),
+        }[endpoint]
+        observer, observer_finished, results, observer_errors = _start_observer(
+            invocation
+        )
+        finished_while_locked = observer_finished.wait(0.2)
+
+        # Unblock any bad implementation before asserting, so the test process
+        # cannot remain trapped behind a non-reentrant API lock.
+        holder_release.set()
+        holder.join(_JOIN_TIMEOUT_S)
+        observer.join(_JOIN_TIMEOUT_S)
+
+        assert finished_while_locked, f"{endpoint} waited behind api._lock"
+        assert holder_errors == []
+        assert observer_errors == []
+        assert len(results) == 1
+        if endpoint == "capture.wait":
+            assert isinstance(results[0], CaptureEvaluationOutcome)
+            assert results[0].state is CaptureEvaluationState.PENDING
+        elif endpoint == "capture.status":
+            assert isinstance(results[0], CaptureStatus)
+        assert dispatch_count() == 1
+    finally:
+        if holder_release is not None:
+            holder_release.set()
+        if holder is not None:
+            holder.join(_JOIN_TIMEOUT_S)
+            assert not holder.is_alive(), "API lock holder leaked"
+        if observer is not None:
+            observer.join(_JOIN_TIMEOUT_S)
+            assert not observer.is_alive(), "control-plane observer leaked"
+        if evaluation_release is not None:
+            evaluation_release.set()
         close_owner(controller, transport)
 
 
@@ -456,16 +631,20 @@ def test_capture_view_uses_the_exact_three_part_fence(field: str) -> None:
 
 def test_capture_view_reports_resuming_from_the_control_snapshot() -> None:
     api, controller, transport = _capture_runtime()
+    runtime = _runtime_session(api)
     try:
-        capture = api.current_capture()
+        saved = api.current_capture()
         owner = _capture_owner(controller)
         _force_phase(owner, CapturePhase.PAUSED, CapturePhase.RESUMING)
 
-        status = capture.status()
+        saved_status = saved.status()
+        api_status = api.current_capture().status()
+        session_status = runtime.current_capture().status()
 
-        assert status.phase is CapturePhase.RESUMING
-        assert status.can_inspect is False
-        assert status.can_resume_capture is False
+        assert saved_status == api_status == session_status
+        assert saved_status.phase is CapturePhase.RESUMING
+        assert saved_status.can_inspect is False
+        assert saved_status.can_resume_capture is False
     finally:
         close_owner(controller, transport)
 
@@ -474,8 +653,9 @@ def test_current_capture_exposes_recovery_required_state() -> None:
     transport = ControlledCaptureSession(fail_workspace_on_call=3)
     controller = captured_controller(transport, command_timeout_s=1)
     api = PrototypeRuntimeApi(controller)
+    runtime = _runtime_session(api)
     try:
-        capture = api.current_capture()
+        saved = api.current_capture()
         transport.events.put(EvaluationResult(uuid4(), "Число", "901", False))
         original_wait = transport.wait_evaluation_event
 
@@ -498,10 +678,13 @@ def test_current_capture_exposes_recovery_required_state() -> None:
         with pytest.raises(CaptureRecoveryRequiredError):
             controller.execute_capture("РезультатИнструкции = 901;")
 
-        status = capture.status()
-        assert status.phase is CapturePhase.RECOVERY_REQUIRED
-        assert status.failure is not None
-        assert status.failure.code == "workspace_restore_failed"
+        saved_status = saved.status()
+        api_status = api.current_capture().status()
+        session_status = runtime.current_capture().status()
+        assert saved_status == api_status == session_status
+        assert saved_status.phase is CapturePhase.RECOVERY_REQUIRED
+        assert saved_status.failure is not None
+        assert saved_status.failure.code == "workspace_restore_failed"
     finally:
         close_owner(controller, transport)
 
@@ -553,6 +736,104 @@ def test_capture_wait_timeout_and_repeated_observation_never_redispatch() -> Non
         close_owner(controller, transport)
 
 
+def test_capture_wait_routes_explicit_user_id_after_later_internal_outcome() -> None:
+    api, controller, transport = _capture_runtime()
+    owner = _capture_owner(controller)
+    releases: list[Event] = []
+    try:
+        capture = api.current_capture()
+        user_ticket, user_release, user_dispatches = _submit_pending(
+            owner,
+            value=101,
+        )
+        releases.append(user_release)
+        _eventually(lambda: user_dispatches() == 1)
+        user_release.set()
+        user_outcome = capture.wait(
+            timeout_s=1,
+            evaluation_id=user_ticket.evaluation_id,
+        )
+        assert user_outcome.result == 101
+
+        internal_ticket, internal_release, internal_dispatches = _submit_pending(
+            owner,
+            kind=CaptureEvaluationKind.INSPECTION,
+            value=202,
+        )
+        releases.append(internal_release)
+        _eventually(lambda: internal_dispatches() == 1)
+        observed_pending = capture.wait(
+            timeout_s=0,
+            evaluation_id=internal_ticket.evaluation_id,
+        )
+        assert observed_pending.state is CaptureEvaluationState.PENDING
+        internal_release.set()
+        internal_outcome = capture.wait(
+            timeout_s=1,
+            evaluation_id=internal_ticket.evaluation_id,
+        )
+
+        default_outcome = capture.wait(timeout_s=0)
+        selected_user = capture.wait(
+            timeout_s=0,
+            evaluation_id=user_ticket.evaluation_id,
+        )
+
+        assert default_outcome.evaluation_id == internal_outcome.evaluation_id
+        assert default_outcome.evaluation_kind is CaptureEvaluationKind.INSPECTION
+        assert selected_user == user_outcome
+        assert selected_user.evaluation_id == user_ticket.evaluation_id
+        assert selected_user.result == 101
+        assert user_dispatches() == internal_dispatches() == 1
+    finally:
+        for release in releases:
+            release.set()
+        close_owner(controller, transport)
+
+
+def test_capture_wait_rejects_unknown_and_evicted_ids_without_dispatch() -> None:
+    api, controller, transport = _capture_runtime()
+    owner = _capture_owner(controller)
+    releases: list[Event] = []
+    try:
+        capture = api.current_capture()
+        first_ticket, first_release, first_dispatches = _submit_pending(
+            owner,
+            value=101,
+        )
+        releases.append(first_release)
+        _eventually(lambda: first_dispatches() == 1)
+        first_release.set()
+        capture.wait(timeout_s=1, evaluation_id=first_ticket.evaluation_id)
+
+        with pytest.raises(NoCaptureEvaluationError) as unknown:
+            capture.wait(timeout_s=0, evaluation_id="missing-evaluation-id")
+        assert unknown.value.evaluation_id == "missing-evaluation-id"
+        assert first_dispatches() == 1
+
+        second_ticket, second_release, second_dispatches = _submit_pending(
+            owner,
+            value=202,
+        )
+        releases.append(second_release)
+        _eventually(lambda: second_dispatches() == 1)
+        second_release.set()
+        second = capture.wait(
+            timeout_s=1,
+            evaluation_id=second_ticket.evaluation_id,
+        )
+        assert second.result == 202
+
+        with pytest.raises(NoCaptureEvaluationError) as evicted:
+            capture.wait(timeout_s=0, evaluation_id=first_ticket.evaluation_id)
+        assert evicted.value.evaluation_id == first_ticket.evaluation_id
+        assert first_dispatches() == second_dispatches() == 1
+    finally:
+        for release in releases:
+            release.set()
+        close_owner(controller, transport)
+
+
 def test_capture_view_and_snapshots_are_typed_immutable_and_redacted() -> None:
     api, controller, transport = _capture_runtime()
     try:
@@ -596,27 +877,50 @@ def test_capture_view_and_snapshots_are_typed_immutable_and_redacted() -> None:
 
 def test_late_completion_does_not_need_runtime_api_lock() -> None:
     api, controller, transport = _capture_runtime()
-    thread: Thread | None = None
-    capture = None
+    initiator: Thread | None = None
+    holder: Thread | None = None
+    observer: Thread | None = None
+    holder_release: Event | None = None
     try:
         capture = api.current_capture()
-        thread, finished, failures = _start_pending_capture(
+        initiator, finished, failures = _start_pending_capture(
             lambda: api.execute_bsl("РезультатИнструкции = 901;"),
             transport.accepted,
         )
         assert not finished.is_set()
 
-        assert api._lock.acquire(blocking=False)
-        try:
-            transport.complete()
-            outcome = capture.wait(timeout_s=0.2)
-        finally:
-            api._lock.release()
+        holder, holder_release, holder_errors = _start_api_lock_holder(api)
+        transport.complete()
+        observer, observer_finished, outcomes, observer_errors = _start_observer(
+            lambda: capture.wait(timeout_s=0.2)
+        )
+        finished_while_locked = observer_finished.wait(0.3)
+        outcomes_while_locked = tuple(outcomes)
+        errors_while_locked = tuple(observer_errors)
 
-        assert outcome.state is CaptureEvaluationState.COMPLETED
-        thread.join(_JOIN_TIMEOUT_S)
-        assert not thread.is_alive()
+        # Always release before asserting: a CaptureView.wait implementation
+        # that incorrectly blocks on api._lock cannot hang this test process.
+        holder_release.set()
+        holder.join(_JOIN_TIMEOUT_S)
+        observer.join(_JOIN_TIMEOUT_S)
+        initiator.join(_JOIN_TIMEOUT_S)
+
+        assert finished_while_locked, "capture.wait blocked on api._lock"
+        assert errors_while_locked == ()
+        assert len(outcomes_while_locked) == 1
+        assert outcomes_while_locked[0].state is CaptureEvaluationState.COMPLETED
+        assert holder_errors == []
+        assert observer_errors == []
+        assert not initiator.is_alive()
         assert not failures
     finally:
-        _finish_pending(thread, transport)
+        if holder_release is not None:
+            holder_release.set()
+        if holder is not None:
+            holder.join(_JOIN_TIMEOUT_S)
+            assert not holder.is_alive(), "API lock holder leaked"
+        if observer is not None:
+            observer.join(_JOIN_TIMEOUT_S)
+            assert not observer.is_alive(), "late-result observer leaked"
+        _finish_pending(initiator, transport)
         close_owner(controller, transport)
