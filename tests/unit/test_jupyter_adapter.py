@@ -246,8 +246,13 @@ def test_failed_reply_is_an_ipython_error_with_safe_rich_diagnostics(
         rendered = captured.stdout + captured.stderr + json.dumps(
             captured.outputs[0].data, ensure_ascii=False
         ) + repr(result.error_in_exec)
-        for secret in ("RAW platform", "private-connection", "9182"):
-            assert secret not in rendered
+        assert "RAW platform" not in rendered
+        if normalized and magic.startswith("%%bsl"):
+            assert "private-connection" in rendered
+            assert "9182" in rendered
+        else:
+            assert "private-connection" not in rendered
+            assert "9182" not in rendered
     finally:
         InteractiveShell.clear_instance()
 
@@ -307,8 +312,12 @@ def test_retained_cell_diagnostic_keeps_issued_identity_without_new_cell_excerpt
     if mode == "diagnostic":
         assert payload["diagnostic_details"]["excerpt"] is None
     rendered = json.dumps(payload, ensure_ascii=False)
-    for forbidden in ("NEW_CELL_CONTENT", original, "private-connection"):
+    for forbidden in ("NEW_CELL_CONTENT", original):
         assert forbidden not in rendered
+    if mode == "diagnostic":
+        assert "private-connection" in rendered
+    else:
+        assert "private-connection" not in rendered
 
 
 @pytest.mark.parametrize("defect", ["hash", "unknown_unit", "replacement", "unload"])
@@ -623,7 +632,7 @@ def test_jupyter_public_identity_is_only_cell_revision_and_literal_source_hash()
         assert forbidden not in encoded
 
 
-def test_jupyter_diagnostic_mode_includes_only_bounded_redacted_expert_details() -> None:
+def test_jupyter_diagnostic_mode_includes_only_bounded_expert_details() -> None:
     """Break caught: diagnostic mode has no bounded expert projection."""
     reply, source = _failed_reply_with_exact_diagnostic()
 
@@ -640,13 +649,13 @@ def test_jupyter_diagnostic_mode_includes_only_bounded_redacted_expert_details()
     assert details["excerpt"] == "О"
     assert details["runtime_summary"] == "BSL execution failed"
     assert details["lowered_location"]["line"] == 5
-    assert len(details["platform_diagnostic"]) <= 4096
-    assert details["platform_diagnostic_redacted"] is True
+    assert len(details["platform_diagnostic"].encode("utf-8")) <= 64 * 1024
+    assert details["platform_diagnostic_redacted"] is False
     assert details["worker_generation"] is None
     assert details["worker_manifest_sha256"] is None
     encoded = json.dumps(details, ensure_ascii=False)
-    assert "9182" not in encoded
-    assert "private-connection" not in encoded
+    assert "9182" in encoded
+    assert "private-connection" in encoded
     assert "generated one" not in encoded
     assert source not in encoded
 
@@ -738,7 +747,7 @@ def test_public_and_expert_diagnostic_renderers_have_exact_allowlists_and_fail_c
     }
     assert public["runtime_summary"] == "BSL execution failed"
     assert "platform_diagnostic" not in json.dumps(public, ensure_ascii=False)
-    assert "9182" not in json.dumps(expert, ensure_ascii=False)
+    assert "9182" in json.dumps(expert, ensure_ascii=False)
     assert privacy.diagnostic_to_public_wire(
         replace(diagnostic, diagnostic_id="not-a-sha256")
     ) == {}
@@ -775,11 +784,11 @@ def test_public_and_expert_diagnostic_renderers_have_exact_allowlists_and_fail_c
         ),
     ),
 )
-def test_expert_renderer_conservatively_redacts_json_prose_and_camelcase_identities(
+def test_expert_renderer_preserves_json_prose_and_camelcase_identities(
     private_text: str,
     secrets: tuple[str, ...],
 ) -> None:
-    """Break caught: common runtime identity spellings bypass expert redaction."""
+    """Break caught: expert diagnostics redact platform-emitted text."""
     source = "Ошибка();"
     unit = SourceUnitRef(
         SourceUnitKind.NOTEBOOK_CELL,
@@ -799,9 +808,9 @@ def test_expert_renderer_conservatively_redacts_json_prose_and_camelcase_identit
     expert = privacy.diagnostic_to_expert_wire(diagnostic)
     encoded = json.dumps(expert, ensure_ascii=False)
 
-    assert expert["platform_diagnostic_redacted"] is True
-    assert len(expert["platform_diagnostic"]) <= 4096
-    assert all(secret not in encoded for secret in secrets)
+    assert expert["platform_diagnostic_redacted"] is False
+    assert len(expert["platform_diagnostic"].encode("utf-8")) <= 64 * 1024
+    assert all(secret in encoded for secret in secrets)
 
 
 @pytest.mark.parametrize(
@@ -831,11 +840,11 @@ def test_expert_renderer_conservatively_redacts_json_prose_and_camelcase_identit
         ('{"rdbg-connection":"hyphen-connection"}', "hyphen-connection"),
     ),
 )
-def test_platform_renderer_redacts_suffixless_rdbg_identity_assignments(
+def test_platform_renderer_preserves_rdbg_identity_assignments(
     platform_text: str,
     secret: str,
 ) -> None:
-    """Break caught: suffixless RDBG identity keys bypass redaction."""
+    """Break caught: expert platform diagnostics redact emitted identity text."""
     bounded, truncated, redacted = privacy.bounded_platform_diagnostic(
         platform_text,
         truncated=False,
@@ -843,11 +852,11 @@ def test_platform_renderer_redacts_suffixless_rdbg_identity_assignments(
     )
 
     assert bounded is not None
-    assert secret not in bounded
-    assert "<redacted>" in bounded
-    assert len(bounded) <= 4096
+    assert secret in bounded
+    assert bounded == platform_text
+    assert len(bounded.encode("utf-8")) <= 64 * 1024
     assert truncated is False
-    assert redacted is True
+    assert redacted is False
 
 
 def test_platform_renderer_preserves_non_assignment_rdbg_diagnostic_prose() -> None:
@@ -861,29 +870,27 @@ def test_platform_renderer_preserves_non_assignment_rdbg_diagnostic_prose() -> N
     ) == (prose, False, False)
 
 
-def test_platform_diagnostic_markers_distinguish_redaction_from_truncation() -> None:
-    """Break caught: pure truncation is mislabeled as identity redaction."""
+def test_platform_diagnostic_markers_preserve_caller_redaction_and_truncation() -> None:
+    """Break caught: expert diagnostic rendering changes caller markers."""
     pure_truncation = privacy.bounded_platform_diagnostic(
-        "x" * 4100,
+        "x" * (64 * 1024 + 4),
         truncated=False,
         redacted=False,
     )
-    pure_redaction = privacy.bounded_platform_diagnostic(
+    caller_redaction = privacy.bounded_platform_diagnostic(
         "token private-value",
         truncated=False,
         redacted=False,
     )
-    expansion_then_cut = privacy.bounded_platform_diagnostic(
-        "x" * 4090 + " pid=1",
+    preserved_redaction = privacy.bounded_platform_diagnostic(
+        "token private-value",
         truncated=False,
-        redacted=False,
+        redacted=True,
     )
 
-    assert pure_truncation == ("x" * 4096, True, False)
-    assert pure_redaction[1:] == (False, True)
-    assert "private-value" not in pure_redaction[0]
-    assert len(expansion_then_cut[0]) == 4096
-    assert expansion_then_cut[1:] == (True, True)
+    assert pure_truncation == ("x" * (64 * 1024), True, False)
+    assert caller_redaction == ("token private-value", False, False)
+    assert preserved_redaction == ("token private-value", False, True)
 
 
 def test_jupyter_source_units_are_session_scoped_monotonic_and_exact() -> None:

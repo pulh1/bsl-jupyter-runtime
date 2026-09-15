@@ -33,6 +33,7 @@ from onec_runtime_mcp.agent.service_client import ServiceClient
 from onec_runtime_mcp.agent.facade import AgentFacade, AgentFacadeError
 from onec_runtime_mcp.agent.mcp_profiles import McpProfile, tool_names
 from onec_runtime.privacy import bounded_platform_diagnostic
+from onec_runtime.runtime_contracts import MAX_PRIVATE_DIAGNOSTIC_BYTES
 
 
 _TOOL_NAMES = (
@@ -68,6 +69,10 @@ _CODE_MODE = Literal["main", "capture", "worker"]
 _WIRE_ID = Annotated[str, Field(min_length=1, max_length=256)]
 _WIRE_KEY = Annotated[str, Field(min_length=1, max_length=256)]
 _WIRE_TEXT = Annotated[str, Field(max_length=4096)]
+_PLATFORM_DIAGNOSTIC_TEXT = Annotated[
+    str,
+    Field(max_length=MAX_PRIVATE_DIAGNOSTIC_BYTES),
+]
 _WIRE_MESSAGE = Annotated[str, Field(max_length=4096)]
 _WIRE_STATUS = Annotated[str, Field(min_length=1, max_length=128)]
 _PARTIAL_STATUS = Literal[
@@ -178,7 +183,7 @@ class _ExpertDiagnosticWire(BaseModel):
     excerpt: _DIAGNOSTIC_EXCERPT | None
     synthetic_region: _DIAGNOSTIC_LABEL | None
     lowered_location: _LoweredDiagnosticLocationWire | None
-    platform_diagnostic: _WIRE_TEXT | None
+    platform_diagnostic: _PLATFORM_DIAGNOSTIC_TEXT | None
     platform_diagnostic_sha256: _LOWER_SHA256 | None
     platform_diagnostic_truncated: bool
     platform_diagnostic_redacted: bool
