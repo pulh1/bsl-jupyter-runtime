@@ -425,7 +425,11 @@ def test_runtime_session_close_is_bounded_while_operation_lock_stays_owned(
     entry: str,
     server: bool,
 ) -> None:
-    rdbg = ShutdownBlockingCaptureSession(wake_on_invalidate=True)
+    rdbg = (
+        _ServerShutdownCaptureSession(wake_on_invalidate=True)
+        if server
+        else ShutdownBlockingCaptureSession(wake_on_invalidate=True)
+    )
     journal = RecoveryJournal()
     controller = captured_controller(
         rdbg,
