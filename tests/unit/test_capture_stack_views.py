@@ -104,6 +104,35 @@ def test_visible_levels_skip_collapsed_runtime_markers_and_unknowns_stay_visible
     assert [frame.level for frame in resolutions[0]] == [2, 5]
 
 
+def test_visible_frame_labels_match_indexes_across_hidden_runs_and_nonzero_slices():
+    adapter, _, _ = setup_stack(runtime=(0, 1, 3, 4))
+    page = adapter.stack[:20]
+    frames = tuple(frame for frame in page.frames if isinstance(frame, api().DebugFrame))
+    assert [str(frame).split(" ", 1)[0] for frame in frames] == ["#0", "#1"]
+    assert [frame.visible_index for frame in frames] == [0, 1]
+    assert [frame.native_level for frame in frames] == [2, 5]
+    assert str(adapter.stack[0]).startswith("#0 ")
+    assert str(adapter.stack[1]).startswith("#1 ")
+    assert "#2 " not in str(page) and "#5 " not in str(page)
+
+    later = adapter.stack[1:2]
+    later_frame = next(frame for frame in later.frames if isinstance(frame, api().DebugFrame))
+    assert later_frame.visible_index == 1 and later_frame.native_level == 5
+    assert str(later_frame).startswith("#1 ")
+    enriched = later.with_methods()
+    enriched_frame = next(frame for frame in enriched.frames if isinstance(frame, api().DebugFrame))
+    assert enriched_frame.method_status == "resolved"
+    assert str(enriched_frame).startswith("#1 ") and enriched_frame.native_level == 5
+
+
+def test_native_frame_labels_explicitly_identify_the_physical_coordinate():
+    adapter, _, _ = setup_stack(runtime=(0, 1))
+    assert str(adapter.stack.native[0]).startswith("native #0 ")
+    frame = adapter.stack.native[3]
+    assert str(frame).startswith("native #3 ")
+    assert frame.visible_index is None and frame.native_level == 3
+
+
 def test_saved_page_rejects_a_mutable_frame_container():
     with pytest.raises(TypeError, match="tuple"):
         api().StackPage([], 0, None)
@@ -149,6 +178,37 @@ def test_stack_requests_reject_unbounded_or_invalid_coordinates_before_backend(k
     with pytest.raises((ValueError, TypeError)):
         adapter.stack[key]
     assert backend.calls == []
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("step", [True, False, 1.0, 2.0])
+def test_slice_rejects_boolean_and_float_steps_before_reading_inventory(native, step):
+    adapter, backend, resolutions = setup_stack()
+    descriptor = adapter.stack.native if native else adapter.stack
+    with pytest.raises(TypeError):
+        descriptor[slice(0, 2, step)]
+    assert backend.calls == [] and resolutions == []
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("start", [0, 1, 6, 9])
+def test_empty_slice_has_no_continuation_cursor(native, start):
+    adapter, backend, _ = setup_stack(runtime=(0, 1, 3, 4))
+    descriptor = adapter.stack.native if native else adapter.stack
+    page = descriptor[start:start:1]
+    assert page.frames == ()
+    assert page.next_cursor is None
+    assert page.total == (6 if native else 2)
+    assert backend.calls == [backend.fence]
+
+
+@pytest.mark.parametrize("step", [None, 1])
+def test_nonempty_unit_step_slices_advance_visible_cursor_then_end(step):
+    adapter, _, _ = setup_stack(runtime=(0, 1, 3, 4))
+    first = adapter.stack[slice(0, 1, step)]
+    assert first.next_cursor == 1 and first.total == 2
+    last = adapter.stack[slice(1, 2, step)]
+    assert last.next_cursor is None and last.total == 2
 
 
 def test_enrichment_parses_one_missing_exact_version_without_rereading_saved_frames():

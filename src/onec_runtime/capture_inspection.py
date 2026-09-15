@@ -110,6 +110,7 @@ class DebugFrame:
     native_level: int
     source: str
     line: int | None
+    visible_index: int | None = None
     source_status: str = "unavailable"
     detail: str = "line"
     method: MethodSyntaxInfo | None = None
@@ -127,9 +128,11 @@ class DebugFrame:
         return cast(DebugFrame, self._enricher.enrich((self,), work_budget_s)[0])
 
     def __str__(self) -> str:
+        label = (f"#{self.visible_index}" if self.visible_index is not None
+                 else f"native #{self.native_level}")
         if self.runtime_kernel:
-            return f"#{self.native_level} служебный кадр"
-        text = f"#{self.native_level} {self.source}:{self.line}"
+            return f"{label} служебный кадр"
+        text = f"{label} {self.source}:{self.line}"
         if self.method is not None:
             signature = f"{self.method.name}({', '.join(self.method.parameters)})"
             text += " — " + (signature if len(signature) <= 512 else signature[:511] + "…")
@@ -152,6 +155,8 @@ class RuntimeFrameMarker:
 
 @dataclass(frozen=True, slots=True, repr=False)
 class StackPage:
+    """Saved request result; an empty request has no continuation cursor."""
+
     frames: tuple[DebugFrame | RuntimeFrameMarker, ...]
     total: int
     next_cursor: int | None
@@ -194,7 +199,9 @@ class StackDescriptor:
     def __getitem__(self, key: int | slice) -> StackPage | DebugFrame:
         if type(key) is int:
             start, stop = key, key + 1
-        elif type(key) is slice and key.step in (None, 1):
+        elif type(key) is slice and (
+            key.step is None or type(key.step) is int and key.step == 1
+        ):
             start, stop = 0 if key.start is None else key.start, key.stop
         else:
             raise TypeError("stack requires a nonnegative index or bounded unit-step slice")
@@ -263,6 +270,7 @@ class LocalStackAdapter:
         sources = (None,) * len(selected) if native else self._resolve_sources(tuple(selected))
         mapped = dict(zip((frame.level for frame in selected), sources, strict=True))
         result = []
+        visible_index = start
         for entry in entries:
             if isinstance(entry, RuntimeFrameMarker):
                 result.append(entry)
@@ -273,6 +281,7 @@ class LocalStackAdapter:
                 native_level=entry.level,
                 source=source.source if source else "Модуль конфигурации",
                 line=None if hidden else source.line if source else entry.location.line,
+                visible_index=None if native else visible_index,
                 source_status=source.version.source_status if source else "unavailable",
                 runtime_kernel=hidden,
                 physical=None if hidden else PhysicalFrameIdentity(
@@ -281,7 +290,8 @@ class LocalStackAdapter:
                 ),
                 _resolved=source, _enricher=self._enricher,
             ))
-        return StackPage(tuple(result), total, stop if stop < total else None,
+            visible_index += 1
+        return StackPage(tuple(result), total, stop if start < stop < total else None,
                          native=native, _enricher=self._enricher)
 
 
