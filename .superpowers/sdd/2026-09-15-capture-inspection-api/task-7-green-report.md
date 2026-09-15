@@ -6,6 +6,47 @@ Branch: `feature/capture-resume`
 
 Base: `f6df29d` — approved Task 6 terminal-axis integration
 
+## Review remediation — 2026-09-16
+
+The independent Sol xhigh review at
+`task-7-sol-xhigh-review.md` found an interruption window between coordinator
+resume adoption and delivery of the ordinary `submit_resume()` return, plus
+missing resume-specific shutdown, Worker-ownership, and failure-classification
+coverage.
+
+### Additional RED commits
+
+- `440afed` — `test: cover interrupted resume ticket adoption`
+- `9fa760d` — `test: extend capture resume lifecycle coverage`
+
+### GREEN commit
+
+- `d37ecfc` — `fix: make capture resume handoff interruption-safe`
+
+`_CaptureResumeSubmission` is now a dynamic handoff receipt, matching the
+existing evaluation-submission pattern. The coordinator publishes its ticket
+under its condition with record adoption; the RuntimeApi detaches through that
+receipt for every `BaseException`, including a failure before Python assigns
+the normal local ticket. Detached completion therefore retires the Session
+ticket and listener exactly once.
+
+The controller now distinguishes a confirmed root-export rejection before any
+frame mutation from a writeback/cleanup/Continue failure after mutation. The
+former restores the paused CAPTURE fence; the latter remains recovery-required.
+
+The new matrix covers KeyboardInterrupt and timeout in the exact
+adoption-before-return window, all resume boundaries without test-side manual
+detachment, terminal MAIN/successor CAPTURE/user breakpoint routing, real
+Worker registry pin/lease/context/namespace continuity, normal and kernel
+shutdown with attached and detached post-Continue waiters, and a late worker
+exit after target-death finalization. The shutdown cases assert terminal API
+axes, empty Worker leases/registrations, generation-slot release, one Continue,
+and exact Session listener retirement.
+
+The selected regressions were run against the test-only state before the GREEN
+source was restored: two adoption rows and the pre-mutation fence row failed as
+expected. They then passed after the implementation.
+
 ## RED commits
 
 - `8e5511d` — `test: require controller-owned capture resume`
@@ -38,12 +79,13 @@ routing semantics. A detached Session ticket/listener is delivered by a short
 Session-owned notifier after coordinator ticket publication, avoiding a
 coordinator-to-MCP admission-lock cycle.
 
-Resume completion classifies the old fence explicitly. A confirmed failed
-writeback keeps the controller's existing `partial_writeback_failure` state
-for agent compatibility while exposing `recovery_required` through the
-control-plane snapshot and typed `CaptureRecoveryRequiredError`. A narrow
-RuntimeApi generation lock detaches the resume-owned pin slot before its
-Worker disposition or CAPTURE helper work runs.
+Resume completion classifies the old fence explicitly. A confirmed root-export
+rejection before any frame mutation keeps the paused capture and its Session
+fence usable. Post-mutation writeback, required cleanup, and uncertain Continue
+still expose `recovery_required` through the control-plane snapshot and typed
+`CaptureRecoveryRequiredError`. A narrow RuntimeApi generation lock detaches
+the resume-owned pin slot before its Worker disposition or CAPTURE helper work
+runs.
 
 For shutdown, an unproven close retains a live resume record until the worker
 has actually exited. It does not publish a false finalized state while a
@@ -80,3 +122,20 @@ event row passed 20/20 immediately afterwards; the complete retry passed.
 `python -m compileall -q src/onec_runtime packages/jupyter/src` and
 `git diff --check` passed. No live 1C qualification was run; all evidence is
 unit/scripted-transport coverage.
+
+## Remediation verification
+
+```text
+adoption receipt exact: 2 passed, repeated 10/10
+selected test-only RED baseline: 3 expected failures
+resume lifecycle: 22 passed
+resume shutdown regressions: 6 passed, repeated 5/5
+full Jupyter session shutdown: 59 passed
+controller/API focused group: 583 passed
+MCP capture-inspection/continue group: 67 passed
+Jupyter adapter: 81 passed
+Jupyter kernel process: 5 passed, 1 known Windows Proactor/pyzmq warning
+full unit: 4512 passed, 58 skipped, 1 known Windows Proactor/pyzmq warning
+python -m compileall -q src/onec_runtime packages/jupyter/src packages/mcp/src: exit 0
+git diff --check f6df29d..HEAD: exit 0
+```
