@@ -86,13 +86,13 @@ def test_completion_with_loaded_worker_does_not_run_main_privacy_instructions():
     assert controller.state is OperationState.FAILED and controller.operation_id == 7
 
 
-def test_closed_api_and_quarantined_capture_refuse_inspection():
+def test_admission_closed_api_and_quarantined_capture_refuse_inspection():
     controller = Controller()
     api = PrototypeRuntimeApi(controller)
-    api._closed = True
+    api._admission_closed = True
     with pytest.raises(ProtocolError):
         api.completion_fields("Контекст.Данные")
-    api._closed = False
+    api._admission_closed = False
     api._capture_inspection_quarantined = True
     controller.state = OperationState.CAPTURED
     with pytest.raises(ProtocolError):
