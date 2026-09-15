@@ -360,7 +360,7 @@ def test_runtime_session_close_joins_pending_capture_consumer_before_return() ->
         journal=journal,
     )
     api = PrototypeRuntimeApi(controller, journal=journal)
-    owner, _ticket = start_shutdown_evaluation(controller, rdbg)
+    owner, _ticket, _cleanup_probe = start_shutdown_evaluation(controller, rdbg)
     join_timeouts = observe_shutdown_control_plane(owner, rdbg.shutdown_timeline)
     runtime = _shutdown_runtime_session(rdbg, api, server=False)
     holder, release_operation, holder_errors = _start_lock_holder(
@@ -424,7 +424,7 @@ def test_jupyter_shutdown_from_another_thread_joins_pending_capture_consumer() -
         journal=journal,
     )
     api = PrototypeRuntimeApi(controller, journal=journal)
-    owner, _ticket = start_shutdown_evaluation(controller, rdbg)
+    owner, _ticket, _cleanup_probe = start_shutdown_evaluation(controller, rdbg)
     join_timeouts = observe_shutdown_control_plane(owner, rdbg.shutdown_timeline)
     runtime = _shutdown_runtime_session(rdbg, api, server=True)
     interactive = InteractiveRuntimeSession(runtime)

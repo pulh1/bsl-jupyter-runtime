@@ -4,6 +4,7 @@ import ast
 from contextlib import contextmanager
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone
+import gc
 import json
 from inspect import getmembers, getsource, isfunction
 import os
@@ -15,6 +16,7 @@ from time import monotonic, sleep
 from textwrap import dedent
 from types import SimpleNamespace
 from uuid import uuid4
+import weakref
 
 import pytest
 
@@ -398,6 +400,64 @@ class ShutdownBlockingCaptureSession(ControlledCaptureSession):
             self.shutdown_poll_release.set()
 
 
+class _ShutdownCleanupOwnershipToken:
+    """Observable state reachable strongly only through its cleanup lease."""
+
+    __slots__ = ("_dispositions", "_timeline", "__weakref__")
+
+    def __init__(
+        self,
+        dispositions: list[tuple[int, str]],
+        timeline: list[str],
+    ) -> None:
+        self._dispositions = dispositions
+        self._timeline = timeline
+
+    def dispose(self, lease_identity: int, disposition: str) -> None:
+        self._dispositions.append((lease_identity, disposition))
+        self._timeline.append("cleanup_" + disposition)
+
+
+class _ObservableShutdownCleanupLease(CaptureCleanupLease):
+    """A real cleanup lease with a test-only semantic shutdown observer."""
+
+    __slots__ = ("_shutdown_ownership", "__weakref__")
+
+    def __init__(
+        self,
+        private_key: str,
+        cleanup_step: CaptureRemoteStep,
+        ownership: _ShutdownCleanupOwnershipToken,
+    ) -> None:
+        super().__init__(private_key, cleanup_step)
+        object.__setattr__(self, "_shutdown_ownership", ownership)
+
+    def dispose_shutdown(self, disposition: str) -> None:
+        self._shutdown_ownership.dispose(id(self), disposition)
+
+
+class _ShutdownCleanupOwnershipProbe:
+    """Observe identity, disposition, and retention without owning the lease."""
+
+    def __init__(
+        self,
+        lease: _ObservableShutdownCleanupLease,
+        ownership: _ShutdownCleanupOwnershipToken,
+        dispositions: list[tuple[int, str]],
+    ) -> None:
+        self.lease_identity = id(lease)
+        self._lease = weakref.ref(lease)
+        self._ownership = weakref.ref(ownership)
+        self.dispositions = dispositions
+
+    @property
+    def is_product_owned(self) -> bool:
+        gc.collect()
+        lease = self._lease()
+        ownership = self._ownership()
+        return lease is not None and ownership is not None
+
+
 def start_shutdown_evaluation(
     controller: object,
     transport: ShutdownBlockingCaptureSession,
@@ -427,9 +487,20 @@ def start_shutdown_evaluation(
         transport.shutdown_timeline.append("cleanup_remote_completed")
         return EvaluationResult(pending.result_id, "Булево", "Истина", False)
 
-    cleanup = CaptureCleanupLease(
+    cleanup_dispositions: list[tuple[int, str]] = []
+    cleanup_ownership = _ShutdownCleanupOwnershipToken(
+        cleanup_dispositions,
+        transport.shutdown_timeline,
+    )
+    cleanup = _ObservableShutdownCleanupLease(
         transport.shutdown_private_values[1],
         CaptureRemoteStep(cleanup_dispatch, cleanup_poll),
+        cleanup_ownership,
+    )
+    cleanup_probe = _ShutdownCleanupOwnershipProbe(
+        cleanup,
+        cleanup_ownership,
+        cleanup_dispositions,
     )
 
     ticket = owner.submit_evaluation(CaptureEvaluationRequest(
@@ -444,7 +515,7 @@ def start_shutdown_evaluation(
         cleanup_leases=(cleanup,),
     ))
     assert transport.shutdown_poll_entered.wait(1), "evaluation poll did not start"
-    return owner, ticket
+    return owner, ticket, cleanup_probe
 
 
 def _run_close(
@@ -591,7 +662,10 @@ def runtime_api_writer_shutdown_probe() -> bool:
     api = PrototypeRuntimeApi(controller, journal=journal)
     if os.environ.get("ONEC_TEST_PERMANENT_SHUTDOWN_BLOCK") == "1":
         api.close = lambda: Event().wait()  # type: ignore[method-assign]
-    owner, _ticket = start_shutdown_evaluation(controller, transport)
+    owner, _ticket, _cleanup_probe = start_shutdown_evaluation(
+        controller,
+        transport,
+    )
     observe_shutdown_control_plane(owner, transport.shutdown_timeline)
     holder, release_writer, holder_errors = _start_api_lock_holder(api)
     closer, finished, close_errors = _run_close(
@@ -713,10 +787,15 @@ def test_runtime_api_close_invalidates_and_joins_before_pin_disposition(
         journal=journal,
     )
     api = PrototypeRuntimeApi(controller, journal=journal)
-    owner, ticket = start_shutdown_evaluation(controller, transport)
+    owner, ticket, cleanup_probe = start_shutdown_evaluation(controller, transport)
+    evaluation_id = ticket.evaluation_id
+    del ticket
     join_timeouts = observe_shutdown_control_plane(owner, transport.shutdown_timeline)
     started_at = datetime.now(timezone.utc)
-    closer, finished, close_errors = _run_close(api.close, transport.shutdown_timeline)
+    closer, finished, close_errors = _run_close(
+        lambda: (api.close(), api.close()),
+        transport.shutdown_timeline,
+    )
     caught: BaseException | None = None
     try:
         invalidation_entered = transport.shutdown_invalidate_entered.wait(0.4)
@@ -753,18 +832,29 @@ def test_runtime_api_close_invalidates_and_joins_before_pin_disposition(
     assert timeline_before_rescue.index("event_consumer_join_returned_true") < (
         timeline_before_rescue.index("pin_" + disposition)
     )
+    assert timeline_before_rescue.index("event_consumer_join_returned_true") < (
+        timeline_before_rescue.index("cleanup_" + disposition)
+    )
     assert timeline_before_rescue.index("pin_" + disposition) < (
+        timeline_before_rescue.index("close_returned")
+    )
+    assert timeline_before_rescue.index("cleanup_" + disposition) < (
         timeline_before_rescue.index("close_returned")
     )
     # Target teardown owns the registered temporary value during shutdown;
     # no cleanup evalExpr may be sent after transport invalidation.
     assert transport.shutdown_cleanup_dispatches == 0
     assert timeline_before_rescue.count("pin_" + disposition) == 1
+    assert timeline_before_rescue.count("cleanup_" + disposition) == 1
+    assert cleanup_probe.dispositions == [
+        (cleanup_probe.lease_identity, disposition)
+    ]
+    assert cleanup_probe.is_product_owned is (disposition == "quarantine")
     assert len(disposed) == 1
     assert_safe_shutdown_evidence(
         disposed[0],
         event_name="capture_evaluation_shutdown_disposed",
-        evaluation_id=ticket.evaluation_id,
+        evaluation_id=evaluation_id,
         termination_proven=True,
         pin_disposition=disposition,
         cleanup_disposition=disposition,
@@ -772,7 +862,7 @@ def test_runtime_api_close_invalidates_and_joins_before_pin_disposition(
         finished_at=finished_at,
         private_values=transport.shutdown_private_values,
     )
-    assert ticket.evaluation_id
+    assert evaluation_id
     assert not closer.is_alive()
 
 
@@ -788,10 +878,15 @@ def test_runtime_api_close_journals_unproven_poll_without_releasing_its_lease() 
         journal=journal,
     )
     api = PrototypeRuntimeApi(controller, journal=journal)
-    owner, ticket = start_shutdown_evaluation(controller, transport)
+    owner, ticket, cleanup_probe = start_shutdown_evaluation(controller, transport)
+    evaluation_id = ticket.evaluation_id
+    del ticket
     join_timeouts = observe_shutdown_control_plane(owner, transport.shutdown_timeline)
     started_at = datetime.now(timezone.utc)
-    closer, finished, close_errors = _run_close(api.close, transport.shutdown_timeline)
+    closer, finished, close_errors = _run_close(
+        lambda: (api.close(), api.close()),
+        transport.shutdown_timeline,
+    )
     caught: BaseException | None = None
     try:
         invalidation_entered = transport.shutdown_invalidate_entered.wait(0.4)
@@ -802,6 +897,7 @@ def test_runtime_api_close_journals_unproven_poll_without_releasing_its_lease() 
         close_join_timeouts = tuple(join_timeouts)
         timeline_before_rescue = tuple(transport.shutdown_timeline)
         status_before_rescue = owner.status(_owner_fence(owner))
+        cleanup_owned_before_rescue = cleanup_probe.is_product_owned
         abandoned = tuple(
             event
             for event in journal.events
@@ -835,6 +931,11 @@ def test_runtime_api_close_journals_unproven_poll_without_releasing_its_lease() 
     )
     assert "pin_release" not in timeline_before_rescue
     assert "pin_quarantine" not in timeline_before_rescue
+    assert "cleanup_release" not in timeline_before_rescue
+    assert "cleanup_quarantine" not in timeline_before_rescue
+    assert cleanup_probe.dispositions == []
+    assert cleanup_owned_before_rescue
+    assert cleanup_probe.is_product_owned
     assert transport.shutdown_cleanup_dispatches == 0
     assert status_before_rescue.phase is CapturePhase.STALE
     assert status_before_rescue.pending_evaluation_id is None
@@ -844,7 +945,7 @@ def test_runtime_api_close_journals_unproven_poll_without_releasing_its_lease() 
     assert_safe_shutdown_evidence(
         abandoned[0],
         event_name="capture_evaluation_shutdown_abandoned",
-        evaluation_id=ticket.evaluation_id,
+        evaluation_id=evaluation_id,
         termination_proven=False,
         pin_disposition="retained",
         cleanup_disposition="retained",
