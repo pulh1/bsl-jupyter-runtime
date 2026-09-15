@@ -1,0 +1,1 @@
+Synthetic metadata only. UUIDs and BSL are deliberately identical across Designer/EDT and base/extension trees. No exported customer configuration or live data. Only configuration identity, common-module scope, and module identities used by resolver tests are retained.

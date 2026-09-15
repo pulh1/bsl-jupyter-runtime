@@ -70,7 +70,16 @@ def test_common_module_resolver_maps_explicit_ut_location(tmp_path: Path) -> Non
 def test_common_module_resolver_qualifies_designer_extension_location(
     tmp_path: Path,
 ) -> None:
-    source_root, _source_path = _source_tree(tmp_path)
+    source_root, source_path = _source_tree(tmp_path)
+    # This fixture is a Designer export, including its module paths.
+    designer_source = source_path.parent / "Ext" / "Module.bsl"
+    designer_source.parent.mkdir()
+    designer_source.write_bytes(source_path.read_bytes())
+    (source_root / "CommonModules" / "Продажи.xml").write_text(
+        f'<MetaDataObject><CommonModule uuid="{MODULE_UUID}">'
+        '<Properties><Name>Продажи</Name></Properties>'
+        '</CommonModule></MetaDataObject>', encoding="utf-8",
+    )
     (source_root / "Configuration.xml").write_text(
         """<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses">
   <Configuration uuid="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee">

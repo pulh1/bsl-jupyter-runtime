@@ -350,3 +350,40 @@ def test_edt_rejects_windows_junctions_before_reading_metadata(tmp_path, monkeyp
     with pytest.raises(ProtocolError, match="source root is unsafe"):
         catalog = SessionCommonModuleCatalog(project, profile="server")
         catalog.ensure_modules(("Модуль",))
+
+@pytest.mark.parametrize('layout', ['designer', 'edt'])
+def test_hot_reload_catalog_and_capture_use_same_normalized_root(layout):
+    from tests.unit.test_configuration_source_layout import FIXTURES
+    import onec_runtime.capture_source as capture_source
+    configured = FIXTURES / f'{layout}_base'
+    hot_reload = SessionCommonModuleCatalog(configured, profile='server')
+    source = capture_source.CaptureSourceCatalog((capture_source.CaptureSourceConfig('demo', configured),))
+    assert hot_reload.source_root == source.bindings[0].normalized_root
+    assert hot_reload.ensure_modules(('Общий',)).require('Общий').canonical_name == 'Общий'
+
+
+def test_catalog_rejects_ambiguous_document_tree_even_if_common_modules_only_nested(tmp_path):
+    (tmp_path / 'Documents').mkdir()
+    (tmp_path / 'src' / 'CommonModules').mkdir(parents=True)
+    with pytest.raises(ProtocolError, match='ambiguous'):
+        SessionCommonModuleCatalog(tmp_path, profile='server')
+
+
+def test_worker_and_capture_cannot_select_alternate_layout_in_bound_tree(tmp_path):
+    import shutil
+    from tests.unit.test_configuration_source_layout import FIXTURES
+    from onec_runtime.capture_source import CommonModuleCaptureResolver
+    from onec_runtime.kernel import COMMON_MODULE_PROPERTY_ID
+    from uuid import UUID
+    root = tmp_path / 'project'
+    shutil.copytree(FIXTURES / 'designer_base', root)
+    module = root / 'CommonModules' / 'Общий'
+    (module / 'Общий.mdo').write_text('<CommonModule uuid="00000000-0000-0000-0000-000000000001"><name>Общий</name></CommonModule>', encoding='utf-8')
+    wrong = module / 'Module.bsl'
+    wrong.write_text('Процедура Выполнить()\n    Другое = 2;\nКонецПроцедуры', encoding='utf-8')
+    catalog = SessionCommonModuleCatalog(root, profile='server')
+    with pytest.raises(ProtocolError, match='path'):
+        catalog.read_worker_module_source(wrong)
+    location = CommonModuleCaptureResolver('demo', root).resolve_module_line('Общий', 2)
+    assert location.object_id == UUID('11111111-2222-3333-4444-555555555555')
+    assert location.property_id == UUID(COMMON_MODULE_PROPERTY_ID)

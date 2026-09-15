@@ -41,9 +41,12 @@ from onec_runtime.capture_source import (
     CaptureBinding,
     CapturePointRequest,
     CaptureSourceConfig,
+    CaptureSourceCatalog,
+    SourceVersionRef,
     CommonModuleCaptureResolver,
     ResolvedCapturePoint,
 )
+from onec_runtime.configuration_source import SourceLayer
 from onec_runtime.config import RuntimeConfig
 from onec_runtime.configurator_agent import ExtensionAgentEditor, edit_extension
 from onec_runtime.errors import (
@@ -581,6 +584,8 @@ class RuntimeSession:
         self._native_client_termination_requested = False
         self._operation_lock = RLock()
         self._capture_locations: dict[tuple[str, int], object] = {}
+        self._capture_source_catalog: CaptureSourceCatalog | None = None
+        self._capture_worker_sources: dict[str, SourceVersionRef] = {}
         self._capture_source_resolver: CommonModuleCaptureResolver | None = None
         self._capture_source_bindings: dict[
             tuple[str, int], CaptureBinding
@@ -839,9 +844,15 @@ class RuntimeSession:
                     raise
                 if config.capture_source is not None:
                     try:
+                        source_options = {}
+                        if config.capture_source.layer != SourceLayer.AUTO:
+                            source_options["layer"] = config.capture_source.layer
+                        if config.capture_source.extension_name is not None:
+                            source_options["extension_name"] = config.capture_source.extension_name
                         runtime_session.configure_capture_source(
                             config.capture_source.project,
                             config.capture_source.source_root,
+                            **source_options,
                         )
                     except BaseException as error:
                         try:
@@ -1186,16 +1197,33 @@ class RuntimeSession:
                 )
             return self.runtime_api.execute_bsl(source, **arguments)  # type: ignore[arg-type]
 
-    def configure_capture_source(self, project: str, source_root: Path | str) -> None:
+    def configure_capture_source(
+        self, project: str, source_root: Path | str, *,
+        layer: SourceLayer | str = SourceLayer.AUTO,
+        extension_name: str | None = None,
+    ) -> None:
         with self._operation_lock:
             if self._active_capture_ticket is not None:
                 raise ProtocolError(
                     "capture source cannot change during an active capture"
                 )
+            config = CaptureSourceConfig(project, source_root, layer, extension_name)
+            configured = Path(config.source_root)
+            native_metadata = any(path.is_file() for path in (
+                configured / "Configuration.xml",
+                configured / "Configuration" / "Configuration.mdo",
+                configured / "src" / "Configuration" / "Configuration.mdo",
+            ))
+            # Preserve lazy symbolic capture for legacy metadata-only roots.
+            # A native configuration or an explicit layer must bind immediately.
+            catalog = CaptureSourceCatalog((config,)) if (
+                native_metadata or config.layer != SourceLayer.AUTO or extension_name is not None
+            ) else None
             resolver = CommonModuleCaptureResolver(project, source_root)
             self.runtime_api.configure_capture_points(())
             self._file_capture_points = ()
             self._capture_source_resolver = resolver
+            self._capture_source_catalog = catalog
             self._capture_source_bindings = {}
             self._capture_locations = {}
 
@@ -1208,8 +1236,23 @@ class RuntimeSession:
             self.runtime_api.configure_capture_points(())
             self._file_capture_points = ()
             self._capture_source_resolver = None
+            self._capture_source_catalog = None
             self._capture_source_bindings = {}
             self._capture_locations = {}
+
+    def refresh_capture_sources(self) -> None:
+        """Advance configured source generations after external metadata edits."""
+        with self._operation_lock:
+            if self._active_capture_ticket is not None:
+                raise ProtocolError("capture source cannot change during an active capture")
+            catalog = getattr(self, "_capture_source_catalog", None)
+            if catalog is None:
+                raise CaptureSourceNotConfigured("Capture source catalog is not configured")
+            self.runtime_api.configure_capture_points(())
+            catalog.refresh()
+            self._capture_source_bindings = {}
+            self._capture_locations = {}
+            self._file_capture_points = ()
 
     def resolve_capture_points(
         self, points: Sequence[CapturePointRequest]
@@ -1701,6 +1744,21 @@ class RuntimeSession:
                     breakpoint_policy=breakpoint_policy,
                     profiler=profiler,
                 )
+                source_catalog = getattr(self, "_capture_source_catalog", None)
+                previous = getattr(self, "_capture_worker_sources", {})
+                published = {
+                    unit.logical_name.casefold(): SourceVersionRef.worker(
+                        artifact_id=unit.mapped_source.artifact.source_sha256,
+                        generation=generation.generation,
+                        source_text=unit.mapped_source.text,
+                    )
+                    for unit in units
+                }
+                # Retained SourceVersionRefs own old text; a successful
+                # promotion only publishes the next generation's lookup.
+                if source_catalog is not None and set(previous) != set(published):
+                    source_catalog.refresh()
+                self._capture_worker_sources = published
                 self._active_worker_file_units.clear()
                 return generation
 

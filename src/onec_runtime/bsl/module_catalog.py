@@ -13,6 +13,7 @@ import re
 from threading import RLock
 import xml.etree.ElementTree as ElementTree
 
+from onec_runtime.configuration_source import ConfigurationSourceLayout
 from onec_runtime.errors import ModuleUniverseAdmissionError, ProtocolError
 
 
@@ -87,38 +88,14 @@ class SessionCommonModuleCatalog:
         profile: str,
         preprocessor_profile: str = "server",
     ) -> None:
-        supplied = Path(source_root)
-        if _is_link(supplied):
+        self._layout = ConfigurationSourceLayout(source_root)
+        self._source_root = self._layout.normalized_root
+        self._configured_root = self._layout.configured_root
+        self._common_modules = self._layout.safe_path(
+            self._source_root / "CommonModules"
+        )
+        if not self._common_modules.is_dir():
             raise ProtocolError("common-module source root is unsafe")
-        try:
-            resolved = supplied.resolve(strict=True)
-            configured_root = resolved
-            direct = resolved / "CommonModules"
-            nested_root = resolved / "src"
-            nested = nested_root / "CommonModules"
-            if _is_link(direct) or _is_link(nested_root) or _is_link(nested):
-                raise ProtocolError("common-module source root is unsafe")
-            if direct.is_dir() and nested.is_dir():
-                raise ProtocolError("common-module source root is ambiguous")
-            if not direct.is_dir() and nested.is_dir():
-                resolved = nested_root.resolve(strict=True)
-            supplied_common_modules = resolved / "CommonModules"
-            if _is_link(supplied_common_modules):
-                raise ProtocolError("common-module source root is unsafe")
-            common_modules = supplied_common_modules.resolve(strict=True)
-        except (FileNotFoundError, OSError) as error:
-            raise ProtocolError("common-module source root is unsafe") from error
-        if (
-            not resolved.is_dir()
-            or _is_link(common_modules)
-            or not common_modules.is_dir()
-            or not common_modules.is_relative_to(resolved)
-            or common_modules.parent != resolved
-        ):
-            raise ProtocolError("common-module source root is unsafe")
-        self._source_root = resolved
-        self._configured_root = configured_root
-        self._common_modules = common_modules
         self._profile = profile
         self._preprocessor_profile = preprocessor_profile
         self._snapshot: CommonModuleCatalogSnapshot | None = None
@@ -178,11 +155,10 @@ class SessionCommonModuleCatalog:
             raise ProtocolError("Worker module source path is invalid")
         if not _is_bsl_identifier(name):
             raise ProtocolError("Worker module source path is invalid")
-        component = self._source_root
-        for part in parts:
-            component = component / part
-            if _is_link(component):
-                raise ProtocolError("Worker module source path is unsafe")
+        expected = self._layout.module_path("CommonModules", name, "Module")
+        if candidate != expected:
+            raise ProtocolError("Worker module source path does not match configured layout")
+        metadata = self._layout.metadata_path("CommonModules", name)
         try:
             resolved = candidate.resolve(strict=True)
             if (

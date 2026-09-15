@@ -260,3 +260,131 @@ def test_bootstrap_source_failure_closes_admitted_session_without_repair(
     assert "invalidate" not in lifecycle.events
     assert started.closed_attempts == [1]
     assert started.closed_transports == [1]
+
+
+def test_refresh_capture_sources_invalidates_negative_results_and_old_points(tmp_path):
+    from tests.unit.test_configuration_source_layout import FIXTURES
+    from tests.unit.test_capture_source_resolver import location, DOCUMENT
+    import shutil
+    from onec_runtime.kernel import OBJECT_MODULE_PROPERTY_ID
+
+    project = tmp_path / "project"
+    shutil.copytree(FIXTURES / "designer_base", project)
+    session = bare_capture_session(RecordingCaptureApi())
+    session.configure_capture_source("demo", project)
+    assert hasattr(session, "refresh_capture_sources"), (
+        "session refresh hook is missing"
+    )
+    source = session._capture_source_catalog
+    source.resolve_modules((location(),))
+    before = source.generation
+    session.refresh_capture_sources()
+    assert source.generation == before + 1
+    assert (
+        source.resolve_modules((location(DOCUMENT, OBJECT_MODULE_PROPERTY_ID),))[
+            0
+        ].canonical_name
+        == "Документ.ПриемНаРаботу.МодульОбъекта"
+    )
+
+
+def test_explicit_extension_configuration_rejects_mismatch_before_disarm():
+    from tests.unit.test_configuration_source_layout import FIXTURES
+
+    api = RecordingCaptureApi()
+    session = bare_capture_session(api)
+    with pytest.raises(ProtocolError, match="match"):
+        session.configure_capture_source(
+            "demo", FIXTURES / "designer_extension", layer="base"
+        )
+    assert api.calls == []
+
+
+def test_active_capture_rejects_refresh():
+    session = bare_capture_session(RecordingCaptureApi())
+    session._active_capture_ticket = ACTIVE_TICKET_FIXTURE
+    assert hasattr(session, "refresh_capture_sources"), (
+        "session refresh hook is missing"
+    )
+    with pytest.raises(ProtocolError, match="active capture"):
+        session.refresh_capture_sources()
+
+
+@pytest.mark.parametrize("root_suffix", ["", "src"])
+def test_symbolic_capture_uses_shared_edt_root_and_extension_layer(root_suffix):
+    from tests.unit.test_configuration_source_layout import FIXTURES
+
+    session = bare_capture_session(RecordingCaptureApi())
+    session.configure_capture_source("demo", FIXTURES / "edt_extension" / root_suffix)
+    point = CapturePointRequest("point", "demo", "Общий", "Выполнить", 2)
+    resolved = session.resolve_capture_points((point,))
+    assert (
+        session.verify_capture_points(resolved)[0].location.extension_name
+        == "Дополнение"
+    )
+
+
+@pytest.mark.parametrize("configured", [True, False])
+def test_successful_reload_publishes_owning_source_version_failure_keeps_old(
+    tmp_path, configured
+):
+    from tests.unit.test_configuration_source_layout import FIXTURES
+    from onec_runtime.bsl import (
+        SourceUnitKind,
+        SourceUnitRef,
+        mapped_visible_source,
+        source_sha256,
+    )
+    from onec_runtime.bsl.module_universe import WorkerModuleUnit
+    from onec_runtime.worker_universe import WorkerGenerationHandle
+    from onec_runtime.bsl.module_catalog import SessionCommonModuleCatalog
+
+    @dataclass
+    class ReloadApi(RecordingCaptureApi):
+        generation: int = 0
+
+        def load_worker_modules(self, units, **kwargs):
+            if self.failure:
+                raise self.failure
+            self.generation += 1
+            return WorkerGenerationHandle(1, 1, self.generation, "a" * 64)
+
+    api = ReloadApi()
+    session = bare_capture_session(api)
+    session._active_worker_file_units = {}
+    session._common_module_catalog = SessionCommonModuleCatalog(
+        FIXTURES / "designer_base", profile="server"
+    )
+    if configured:
+        session.configure_capture_source("demo", FIXTURES / "designer_base")
+
+    def unit(text, revision):
+        ref = SourceUnitRef(
+            SourceUnitKind.MODULE, "Общий", revision, source_sha256(text)
+        )
+        return WorkerModuleUnit(
+            "Общий", "module", revision, mapped_visible_source(text, ref)
+        )
+
+    first = unit("Процедура Выполнить()\nКонецПроцедуры", 1)
+    session.load_worker_modules((first,))
+    assert hasattr(session, "_capture_worker_sources"), (
+        "successful reload publication hook is missing"
+    )
+    old = session._capture_worker_sources["общий"]
+    old_generation = session._capture_source_catalog.generation if configured else None
+    second = unit("Процедура Выполнить()\n    Значение = 2;\nКонецПроцедуры", 2)
+    session.load_worker_modules((second,))
+    assert old.read_text() == first.mapped_source.text
+    assert old.generation == 1
+    assert (
+        session._capture_worker_sources["общий"].read_text()
+        == second.mapped_source.text
+    )
+    assert session._capture_worker_sources["общий"].generation == 2
+    if configured:
+        assert session._capture_source_catalog.generation == old_generation
+    api.failure = ProtocolError("promotion outcome unknown")
+    with pytest.raises(ProtocolError):
+        session.load_worker_modules((first,))
+    assert session._capture_worker_sources["общий"].generation == 2
