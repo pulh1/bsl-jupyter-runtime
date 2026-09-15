@@ -22,6 +22,27 @@ from onec_runtime.table_materialization import ReferencePolicy
 KEY = "__onec_compact_table_0123456789abcdef0123456789abcdef"
 
 
+def test_capture_compact_plan_exists_before_creation_and_caller_does_not_clean():
+    seen = []
+    expected = payload()
+    encoded = b64encode(expected).decode("ascii")
+    def execute_plan(plan):
+        seen.append(plan)
+        assert plan.private_key == KEY
+        assert KEY in plan.cleanup_instruction
+        assert "Результат = Истина;" in plan.cleanup_instruction
+        return plan.decode(f"3|5|{len(expected)}|{sha256(expected).hexdigest()}|{len(encoded)}", encoded)
+    transfer = CompactRuntimeTableTransfer(
+        lambda source: pytest.fail("caller dispatched CAPTURE"),
+        lambda key, maximum: pytest.fail("caller read CAPTURE"),
+        context_cleaner=lambda key: pytest.fail("caller cleaned CAPTURE"),
+        runtime_generation=lambda: 3, context_generation=5, key_factory=lambda: KEY,
+        capture_executor=execute_plan,
+    )
+    assert transfer.payload("Контекст.Таблица", ReferencePolicy(refs="both")) == expected
+    assert len(seen) == 1
+
+
 def payload() -> bytes:
     return (
         json.dumps(

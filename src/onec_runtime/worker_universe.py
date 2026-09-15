@@ -2591,6 +2591,26 @@ def _worker_debug_source_units(
     return tuple(units.values())
 
 
+@dataclass(frozen=True, slots=True)
+class WorkerMutationReservation:
+    token: UUID
+    commit: Callable[[object], object] = field(repr=False)
+    abort: Callable[[BaseException], object] = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedWorkerMutation:
+    instruction: str = field(repr=False)
+    reservation: WorkerMutationReservation = field(repr=False)
+    owner: ServerWorkerUniverseRegistry = field(repr=False)
+
+    def commit(self, result: object) -> object:
+        return self.owner.commit_mutation(self, result)
+
+    def abort(self, error: BaseException) -> object:
+        return self.owner.abort_mutation(self, error)
+
+
 class ServerWorkerUniverseRegistry:
     """Target-side counterpart for a host Worker universe registry."""
 
@@ -2601,6 +2621,7 @@ class ServerWorkerUniverseRegistry:
         *,
         target_incarnation_id: UUID | None = None,
         platform_build: str = _WORKER_LOCATOR_PLATFORM_BUILD,
+        mutation_executor: Callable[[PreparedWorkerMutation], object] | None = None,
     ) -> None:
         if not isinstance(host, WorkerUniverseRegistry):
             raise TypeError("host Worker universe registry is required")
@@ -2612,6 +2633,8 @@ class ServerWorkerUniverseRegistry:
             raise TypeError("platform build must be a non-empty string")
         self._host = host
         self._instruction_executor = instruction_executor
+        self._mutation_executor = mutation_executor
+        self._mutations: dict[UUID, PreparedWorkerMutation] = {}
         self._target_incarnation_id = target_incarnation_id or uuid4()
         self._platform_build = platform_build
         self._lock = RLock()
@@ -2630,6 +2653,46 @@ class ServerWorkerUniverseRegistry:
         self._orphan_urls: set[str] = set()
         self._broken = False
 
+    def reserve_mutation(
+        self, instruction: str, *, commit: Callable[[object], object],
+        abort: Callable[[BaseException], object],
+    ) -> PreparedWorkerMutation:
+        with self._lock:
+            if self._broken or self._mutations:
+                raise ProtocolError("Worker target mutation is unavailable")
+            reservation = WorkerMutationReservation(uuid4(), commit, abort)
+            prepared = PreparedWorkerMutation(instruction, reservation, self)
+            self._mutations[reservation.token] = prepared
+            return prepared
+
+    def _take_mutation(self, prepared: PreparedWorkerMutation) -> WorkerMutationReservation:
+        reservation = prepared.reservation
+        if self._mutations.get(reservation.token) is not prepared:
+            raise ProtocolError("Worker mutation reservation is stale or forged")
+        del self._mutations[reservation.token]
+        return reservation
+
+    def commit_mutation(self, prepared: PreparedWorkerMutation, result: object) -> object:
+        with self._lock:
+            reservation = self._take_mutation(prepared)
+            return reservation.commit(result)
+
+    def abort_mutation(self, prepared: PreparedWorkerMutation, error: BaseException) -> object:
+        with self._lock:
+            reservation = self._take_mutation(prepared)
+            return reservation.abort(error)
+
+    def execute_mutation(self, prepared: PreparedWorkerMutation) -> object:
+        # A coordinator adapter owns commit/abort after accepting this plan.
+        # In particular the caller must never abort its timed-out ticket.
+        if self._mutation_executor is not None:
+            return self._mutation_executor(prepared)
+        try:
+            result = self._instruction_executor(prepared.instruction)
+        except BaseException as error:
+            return self.abort_mutation(prepared, error)
+        return self.commit_mutation(prepared, result)
+
     def prepare(
         self,
         artifacts: tuple[WorkerModuleArtifact, ...],
@@ -2637,48 +2700,29 @@ class ServerWorkerUniverseRegistry:
         with self._lock:
             if self._broken:
                 raise ProtocolError("Worker target registry is broken")
+            if self._mutations:
+                raise ProtocolError("Worker target mutation is unavailable")
             candidate = self._host.prepare(artifacts)
             try:
                 activation = self._sealed_activation(candidate)
+                batches = self._stage_batches_from_activation(activation)
             except BaseException:
                 try:
                     self._host._discard_exact_pending_without_fence(candidate)
                 except BaseException:
                     self._break_pending(candidate)
                     raise _promotion_unknown(candidate) from None
-                self._candidate_registrations.pop(
-                    candidate.handle.generation,
-                    None,
-                )
+                self._candidate_registrations.pop(candidate.handle.generation, None)
                 raise
+        self._stage_candidate(candidate, batches=batches)
+        with self._lock:
             try:
-                self._stage_candidate(
-                    candidate,
-                    batches=self._stage_batches_from_activation(activation),
-                )
                 debug_view = self._build_candidate_debug_view(activation)
                 if debug_view is not None:
                     self._host._bind_candidate_debug_view(candidate, debug_view)
-            except BaseException:
-                if self._host.state is WorkerUniverseState.PREPARING:
-                    owned = self._candidate_registrations.get(
-                        candidate.handle.generation,
-                        set(),
-                    )
-                    if owned:
-                        self._break_pending(candidate)
-                        raise _promotion_unknown(candidate) from None
-                    try:
-                        self._host.discard(candidate)
-                    except BaseException:
-                        self._break_pending(candidate)
-                        raise _promotion_unknown(candidate) from None
-                    self._candidate_registrations.pop(
-                        candidate.handle.generation,
-                        None,
-                    )
-                raise
-            return candidate
+            except BaseException as error:
+                self._abort_pre_swap(candidate, error)
+        return candidate
 
     def stages(
         self,
@@ -2829,10 +2873,7 @@ class ServerWorkerUniverseRegistry:
         )
 
     def prepare_root(
-        self,
-        candidate: WorkerUniverseCandidate,
-        *,
-        transaction_id: UUID,
+        self, candidate: WorkerUniverseCandidate, *, transaction_id: UUID,
         profiler: PhaseRecorder | None = None,
     ) -> WorkerPreparedRootReceipt:
         if type(transaction_id) is not UUID:
@@ -2847,23 +2888,13 @@ class ServerWorkerUniverseRegistry:
                 batches = self._stage_batches_from_activation(activation)
             except BaseException as error:
                 self._abort_pre_swap(candidate, error)
-            staged_item_count = sum(len(batch.entries) for batch in batches)
-            if profiler is not None and staged_item_count:
-                profiler.measure(
-                    "artifact_staging",
-                    lambda: self._stage_candidate(
-                        candidate,
-                        batches=batches,
-                        profiler=profiler,
-                    ),
-                    item_count=lambda _result: staged_item_count,
-                )
-            else:
-                self._stage_candidate(
-                    candidate,
-                    batches=batches,
-                    profiler=profiler,
-                )
+        staged_item_count = sum(len(batch.entries) for batch in batches)
+        stage = lambda: self._stage_candidate(candidate, batches=batches, profiler=profiler)
+        if profiler is not None and staged_item_count:
+            profiler.measure("artifact_staging", stage, item_count=lambda _result: staged_item_count)
+        else:
+            stage()
+        with self._lock:
             if activation.debug_view is None:
                 try:
                     debug_view = self._build_candidate_debug_view(activation)
@@ -2871,120 +2902,127 @@ class ServerWorkerUniverseRegistry:
                         self._host._bind_candidate_debug_view(candidate, debug_view)
                 except BaseException as error:
                     self._abort_pre_swap(candidate, error)
+        mutation = self.reserve_prepare_root(candidate, transaction_id=transaction_id)
+        receipt = self.execute_mutation(mutation)
+        if profiler is not None:
+            profiler.record_duration("generation_create_wire_probe",
+                                     wall_ns=receipt.generation_create_wire_probe_ms * 1_000_000, item_count=1)
+        return receipt
+
+    def reserve_prepare_root(
+        self, candidate: WorkerUniverseCandidate, *, transaction_id: UUID,
+    ) -> PreparedWorkerMutation:
+        if type(transaction_id) is not UUID:
+            raise TypeError("worker root transaction id must be a UUID")
+        with self._lock:
+            if transaction_id in self._prepared_roots:
+                raise ProtocolError("Worker root transaction was already used")
+            self._sealed_activation(candidate)
             previous_root_key = self._host.active_root_key or ""
-            try:
-                result = self._instruction_executor(
-                    prepare_worker_root_instruction(
-                        candidate,
-                        transaction_id,
-                        previous_root_key,
-                    )
-                )
-            except BaseException as error:
+
+            def abort(error: BaseException) -> object:
                 if _worker_promotion_failure_phase(error) is not None:
                     self._record_uninstantiable_candidate_module(candidate, error)
                     self._abort_pre_swap(candidate, error)
                 self._break_pending(candidate)
                 raise _promotion_unknown(candidate) from None
-            try:
-                receipt = _worker_prepared_root_receipt(result)
-                if (
-                    receipt.transaction_id != transaction_id
-                    or receipt.generation != candidate.handle.generation
-                    or receipt.manifest_sha256 != candidate.manifest.sha256
-                    or receipt.candidate_root_key
-                    != _generation_root_key(candidate.handle.generation)
-                    or receipt.previous_root_key != previous_root_key
-                ):
-                    raise ProtocolError("Worker prepared root receipt is stale")
-            except BaseException:
+
+            def commit(result: object) -> WorkerPreparedRootReceipt:
+                try:
+                    receipt = _worker_prepared_root_receipt(result)
+                    if (
+                        receipt.transaction_id != transaction_id
+                        or receipt.generation != candidate.handle.generation
+                        or receipt.manifest_sha256 != candidate.manifest.sha256
+                        or receipt.candidate_root_key != _generation_root_key(candidate.handle.generation)
+                        or receipt.previous_root_key != previous_root_key
+                    ):
+                        raise ProtocolError("Worker prepared root receipt is stale")
+                except BaseException:
+                    self._break_pending(candidate)
+                    raise _promotion_unknown(candidate) from None
+                self._prepared_roots[transaction_id] = (candidate, receipt)
+                instantiated = {module.registration_name for module in candidate.manifest.modules}
+                self._instantiated_registrations.update(instantiated)
+                self._compile_failed_registrations.difference_update(instantiated)
+                return receipt
+
+            return self.reserve_mutation(
+                prepare_worker_root_instruction(candidate, transaction_id, previous_root_key),
+                commit=commit, abort=abort,
+            )
+
+    def _prepared_entry(self, prepared: WorkerPreparedRootReceipt) -> WorkerUniverseCandidate:
+        if self._broken:
+            raise ProtocolError("Worker target registry is broken")
+        entry = self._prepared_roots.get(getattr(prepared, "transaction_id", None))
+        if entry is None or entry[1] is not prepared:
+            raise ProtocolError("Worker prepared root is stale or forged")
+        return entry[0]
+
+    def reserve_swap_root(
+        self, prepared: WorkerPreparedRootReceipt, *,
+        profiler: PhaseRecorder | None = None,
+    ) -> PreparedWorkerMutation:
+        with self._lock:
+            candidate = self._prepared_entry(prepared)
+
+            def abort(error: BaseException) -> object:
+                if _worker_root_swap_failure_phase(error) is not None:
+                    raise error
                 self._break_pending(candidate)
                 raise _promotion_unknown(candidate) from None
-            self._prepared_roots[transaction_id] = (candidate, receipt)
-            instantiated = {
-                module.registration_name for module in candidate.manifest.modules
-            }
-            self._instantiated_registrations.update(instantiated)
-            self._compile_failed_registrations.difference_update(instantiated)
-            if profiler is not None:
-                profiler.record_duration(
-                    "generation_create_wire_probe",
-                    wall_ns=receipt.generation_create_wire_probe_ms * 1_000_000,
-                    item_count=1,
-                )
-            return receipt
+
+            def commit(result: object) -> WorkerGenerationHandle:
+                try:
+                    receipt = _worker_promotion_receipt(result)
+                    if (
+                        receipt.transaction_id != prepared.transaction_id
+                        or receipt.generation != prepared.generation
+                        or receipt.manifest_sha256 != prepared.manifest_sha256
+                        or receipt.root_key != prepared.candidate_root_key
+                        or receipt.previous_root_key != prepared.previous_root_key
+                        or receipt.generation_create_wire_probe_ms != prepared.generation_create_wire_probe_ms
+                    ):
+                        raise ProtocolError("Worker root swap receipt is stale")
+                    confirmation = self._host.confirm(candidate, receipt)
+                except BaseException:
+                    self._break_pending(candidate)
+                    raise _promotion_unknown(candidate) from None
+                del self._prepared_roots[prepared.transaction_id]
+                self._candidate_registrations.pop(candidate.handle.generation, None)
+                if profiler is not None:
+                    profiler.record_duration("root_swap", wall_ns=receipt.root_swap_ms * 1_000_000, item_count=1)
+                return confirmation.handle
+
+            return self.reserve_mutation(swap_worker_root_instruction(prepared), commit=commit, abort=abort)
 
     def swap_root(
-        self,
-        prepared: WorkerPreparedRootReceipt,
-        *,
-        profiler: PhaseRecorder | None = None,
+        self, prepared: WorkerPreparedRootReceipt, *, profiler: PhaseRecorder | None = None,
     ) -> WorkerGenerationHandle:
+        return self.execute_mutation(self.reserve_swap_root(prepared, profiler=profiler))
+
+    def reserve_discard_root(self, prepared: WorkerPreparedRootReceipt) -> PreparedWorkerMutation:
         with self._lock:
-            if self._broken:
-                raise ProtocolError("Worker target registry is broken")
-            entry = self._prepared_roots.get(
-                getattr(prepared, "transaction_id", None)
-            )
-            if entry is None or entry[1] is not prepared:
-                raise ProtocolError("Worker prepared root is stale or forged")
-            candidate, _exact_receipt = entry
-            try:
-                result = self._instruction_executor(
-                    swap_worker_root_instruction(prepared)
-                )
-            except BaseException as error:
-                if _worker_root_swap_failure_phase(error) is not None:
-                    raise
+            candidate = self._prepared_entry(prepared)
+
+            def abort(error: BaseException) -> object:
                 self._break_pending(candidate)
                 raise _promotion_unknown(candidate) from None
-            try:
-                receipt = _worker_promotion_receipt(result)
-                if (
-                    receipt.transaction_id != prepared.transaction_id
-                    or receipt.generation != prepared.generation
-                    or receipt.manifest_sha256 != prepared.manifest_sha256
-                    or receipt.root_key != prepared.candidate_root_key
-                    or receipt.previous_root_key != prepared.previous_root_key
-                    or receipt.generation_create_wire_probe_ms
-                    != prepared.generation_create_wire_probe_ms
-                ):
-                    raise ProtocolError("Worker root swap receipt is stale")
-                confirmation = self._host.confirm(candidate, receipt)
-            except BaseException:
-                self._break_pending(candidate)
-                raise _promotion_unknown(candidate) from None
-            if profiler is not None:
-                profiler.record_duration(
-                    "root_swap",
-                    wall_ns=receipt.root_swap_ms * 1_000_000,
-                    item_count=1,
-                )
-            del self._prepared_roots[prepared.transaction_id]
-            self._candidate_registrations.pop(candidate.handle.generation, None)
-            return confirmation.handle
+
+            def commit(result: object) -> None:
+                try:
+                    _worker_root_discard_receipt(result, prepared)
+                    self._host.discard(candidate)
+                except BaseException as error:
+                    abort(error)
+                del self._prepared_roots[prepared.transaction_id]
+                self._candidate_registrations.pop(candidate.handle.generation, None)
+
+            return self.reserve_mutation(discard_worker_root_instruction(prepared), commit=commit, abort=abort)
 
     def discard_root(self, prepared: WorkerPreparedRootReceipt) -> None:
-        with self._lock:
-            if self._broken:
-                raise ProtocolError("Worker target registry is broken")
-            entry = self._prepared_roots.get(
-                getattr(prepared, "transaction_id", None)
-            )
-            if entry is None or entry[1] is not prepared:
-                raise ProtocolError("Worker prepared root is stale or forged")
-            candidate, _exact_receipt = entry
-            try:
-                result = self._instruction_executor(
-                    discard_worker_root_instruction(prepared)
-                )
-                _worker_root_discard_receipt(result, prepared)
-                self._host.discard(candidate)
-            except BaseException:
-                self._break_pending(candidate)
-                raise _promotion_unknown(candidate) from None
-            del self._prepared_roots[prepared.transaction_id]
-            self._candidate_registrations.pop(candidate.handle.generation, None)
+        self.execute_mutation(self.reserve_discard_root(prepared))
 
     def quarantine_root(self, prepared: WorkerPreparedRootReceipt) -> None:
         """Retain both possible roots after another participant becomes unknown."""
@@ -3097,7 +3135,7 @@ class ServerWorkerUniverseRegistry:
         with self._lock:
             if self._broken:
                 raise ProtocolError("Worker target registry is broken")
-            self._host.release_pin(pin)
+        self._host.release_pin(pin)
 
     def preview_release(
         self,
@@ -3124,6 +3162,7 @@ class ServerWorkerUniverseRegistry:
             self._instantiated_registrations.clear()
             self._compile_failed_registrations.clear()
             self._prepared_roots.clear()
+            self._mutations.clear()
             self._orphan_urls.clear()
             self._storage_session_id = None
 
@@ -3142,127 +3181,76 @@ class ServerWorkerUniverseRegistry:
             self._instantiated_registrations.clear()
             self._compile_failed_registrations.clear()
             self._prepared_roots.clear()
+            self._mutations.clear()
             self._orphan_urls.clear()
             self._storage_session_id = None
             self._broken = True
 
     def _stage_candidate(
-        self,
-        candidate: WorkerUniverseCandidate,
-        *,
-        batches: tuple[WorkerStageBatch, ...],
+        self, candidate: WorkerUniverseCandidate, *, batches: tuple[WorkerStageBatch, ...],
         profiler: PhaseRecorder | None = None,
     ) -> None:
         if not batches:
             return
-        generation = candidate.handle.generation
-        possible_registrations = {
-            entry.registration_name
-            for batch in batches
-            for entry in batch.entries
-        }
-        batch_count = len(batches)
+        possible_registrations = {entry.registration_name for batch in batches for entry in batch.entries}
         transaction_id = uuid4()
         for batch in batches:
-            def stage_batch() -> None:
+            def stage_batch() -> object:
+                build = lambda: stage_worker_batch_instruction(
+                    batch, batch_count=len(batches), transaction_id=transaction_id,
+                )
                 try:
-                    instruction = (
-                        stage_worker_batch_instruction(
-                            batch,
-                            batch_count=batch_count,
-                            transaction_id=transaction_id,
-                        )
-                        if profiler is None
-                        else profiler.measure(
-                            "artifact_stage_base64",
-                            lambda: stage_worker_batch_instruction(
-                                batch,
-                                batch_count=batch_count,
-                                transaction_id=transaction_id,
-                            ),
-                            item_count=lambda _result: len(batch.entries),
-                        )
+                    instruction = build() if profiler is None else profiler.measure(
+                        "artifact_stage_base64", build, item_count=lambda _result: len(batch.entries),
                     )
                 except BaseException as error:
-                    self._abort_pre_swap(candidate, error)
-                try:
-                    result = (
-                        self._instruction_executor(instruction)
-                        if profiler is None
-                        else profiler.measure(
-                            "artifact_stage_executor",
-                            lambda: self._instruction_executor(instruction),
-                            item_count=lambda _result: len(batch.entries),
-                        )
-                    )
-                except BaseException:
-                    owned = self._candidate_registrations.setdefault(
-                        generation,
-                        set(),
-                    )
-                    owned.update(possible_registrations)
-                    self._break_pending(candidate)
-                    raise _promotion_unknown(candidate) from None
+                    with self._lock:
+                        self._abort_pre_swap(candidate, error)
+                mutation = self.reserve_stage_batch(
+                    candidate, batch, instruction=instruction, batch_count=len(batches),
+                    transaction_id=transaction_id, possible_registrations=possible_registrations,
+                )
+                execute = lambda: self.execute_mutation(mutation)
+                return execute() if profiler is None else profiler.measure(
+                    "artifact_stage_executor", execute, item_count=lambda _result: len(batch.entries),
+                )
+            if profiler is None:
+                stage_batch()
+            else:
+                profiler.measure("artifact_stage_batch", stage_batch, item_count=lambda _result: len(batch.entries))
+
+    def reserve_stage_batch(
+        self, candidate: WorkerUniverseCandidate, batch: WorkerStageBatch, *,
+        instruction: str, batch_count: int, transaction_id: UUID,
+        possible_registrations: set[str],
+    ) -> PreparedWorkerMutation:
+        with self._lock:
+            generation = candidate.handle.generation
+
+            def abort(error: BaseException) -> object:
+                self._candidate_registrations.setdefault(generation, set()).update(possible_registrations)
+                self._break_pending(candidate)
+                raise _promotion_unknown(candidate) from None
+
+            def commit(result: object) -> None:
                 try:
                     outcome = parse_worker_stage_batch_outcome(
-                        result,
-                        batch,
-                        batch_count=batch_count,
-                        transaction_id=transaction_id,
+                        result, batch, batch_count=batch_count, transaction_id=transaction_id,
                     )
-                except BaseException:
-                    owned = self._candidate_registrations.setdefault(
-                        generation,
-                        set(),
-                    )
-                    owned.update(possible_registrations)
-                    self._break_pending(candidate)
-                    raise _promotion_unknown(candidate) from None
-                try:
                     self._record_stage_entries(
-                        batch,
-                        outcome,
-                        self._candidate_registrations.setdefault(
-                            generation,
-                            set(),
-                        ),
+                        batch, outcome, self._candidate_registrations.setdefault(generation, set()),
                     )
-                except BaseException:
-                    owned = self._candidate_registrations.setdefault(
-                        generation,
-                        set(),
-                    )
-                    owned.update(possible_registrations)
-                    self._break_pending(candidate)
-                    raise _promotion_unknown(candidate) from None
-                if (
-                    outcome.failure is not None
-                    and outcome.failure.orphan_url is not None
-                ):
+                except BaseException as error:
+                    abort(error)
+                if outcome.failure is not None and outcome.failure.orphan_url is not None:
                     self._orphan_urls.add(outcome.failure.orphan_url)
                 if outcome.failure is None:
                     return
                 if outcome.failure.outcome == "known_pre_swap":
-                    self._abort_pre_swap(
-                        candidate,
-                        self._stage_failure_error(candidate, batch, outcome),
-                    )
-                owned = self._candidate_registrations.setdefault(
-                    generation,
-                    set(),
-                )
-                owned.update(possible_registrations)
-                self._break_pending(candidate)
-                raise _promotion_unknown(candidate) from None
+                    self._abort_pre_swap(candidate, self._stage_failure_error(candidate, batch, outcome))
+                abort(ProtocolError("Worker stage outcome is unknown"))
 
-            if profiler is None:
-                stage_batch()
-            else:
-                profiler.measure(
-                    "artifact_stage_batch",
-                    stage_batch,
-                    item_count=lambda _result: len(batch.entries),
-                )
+            return self.reserve_mutation(instruction, commit=commit, abort=abort)
 
     def _stage_failure_error(
         self,

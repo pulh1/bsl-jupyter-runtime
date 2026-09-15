@@ -62,6 +62,42 @@ SOURCE = (
 )
 
 
+@pytest.mark.parametrize("action", ["prepare", "promote", "discard"])
+def test_target_remote_mutations_do_not_hold_target_or_host_lock(tmp_path, action):
+    artifacts = _generation_artifacts(tmp_path)[:2]
+    host = worker_universe.WorkerUniverseRegistry(runtime_generation=7, context_generation=3)
+    target = _UniverseTargetExecutor()
+    ownership = []
+
+    def execute(source):
+        ownership.append((registry._lock._is_owned(), host._lock._is_owned()))
+        return target(source)
+
+    registry = worker_universe.ServerWorkerUniverseRegistry(host, execute)
+    if action == "prepare":
+        registry.prepare(artifacts)
+    else:
+        candidate = host.prepare(artifacts)
+        target.acknowledge(candidate)
+        if action == "promote":
+            registry.promote(candidate)
+        else:
+            prepared = registry.prepare_root(candidate, transaction_id=UUID(int=9))
+            registry.discard_root(prepared)
+    assert ownership and not any(any(held) for held in ownership), ownership
+
+
+def test_root_transaction_validation_precedes_any_staging(tmp_path):
+    host = worker_universe.WorkerUniverseRegistry(runtime_generation=7, context_generation=3)
+    candidate = host.prepare(_generation_artifacts(tmp_path)[:2])
+    target = _UniverseTargetExecutor()
+    registry = worker_universe.ServerWorkerUniverseRegistry(host, target)
+    with pytest.raises(TypeError, match="transaction id"):
+        registry.prepare_root(candidate, transaction_id="invalid")
+    assert not target.calls
+    assert not registry._registrations
+
+
 class _CountingArtifactBuilder:
     def __init__(self, wrapped: NotebookWorkerArtifactBuilder) -> None:
         self.wrapped = wrapped

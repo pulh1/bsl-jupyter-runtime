@@ -314,6 +314,86 @@ def test_prepared_capture_becomes_stale_after_notebook_publication(tmp_path):
         api.execute_prepared_capture_hypothesis(candidate)
 
 
+@pytest.mark.parametrize("uncertain", [False, True])
+def test_prepared_capture_coordinator_owns_pin_after_waiter_timeout(tmp_path, monkeypatch, uncertain):
+    from dataclasses import replace
+    from threading import Event, Thread
+    from onec_runtime.capture_evaluation import CaptureEvaluationCoordinator, CapturePhase
+    from onec_runtime.errors import CaptureEvaluationPendingError
+    from onec_runtime.prototype_runtime import CaptureCellResult
+    from test_capture_evaluation_coordinator import Driver, FENCE
+
+    api, controller, _ = runtime(tmp_path, captured=True)
+    api.execute_bsl(UPDATE)
+    api.execute_bsl('Результат = Б();')
+    prepared = api.prepare_capture_hypothesis('РезультатИнструкции = Б();')
+    original_pin = api._operation_generation_pin
+    coordinator = CaptureEvaluationCoordinator(FENCE, poll_interval_s=0.01)
+    driver = Driver()
+    tickets = []
+    caller_finished = Event()
+    errors = []
+    pin_dispositions = []
+    for method_name in ('release_pin', 'retain_outcome_unknown'):
+        original = getattr(api._worker_universe, method_name)
+        def checked(pin, original=original, method_name=method_name):
+            assert not api._lock.locked()
+            assert not api._evaluation_pin_lock.locked()
+            assert not api._worker_universe_target._lock._is_owned()
+            pin_dispositions.append(method_name)
+            return original(pin)
+        monkeypatch.setattr(api._worker_universe, method_name, checked)
+    def submit(*, pin_lease, completion):
+        assert not api._lock.locked(), "submission must not hold runtime writer"
+        assert api._evaluation_generation_pin is None, "pin slot must detach before dispatch"
+        def settle(value, error):
+            return completion(CaptureCellResult(controller.operation_id, "visible", "lowered", value), error)
+        ticket = coordinator.submit_evaluation(replace(
+            driver.request(cleanup_leases=()), completion=settle, pin_lease=pin_lease,
+        ))
+        tickets.append(ticket)
+        return ticket
+    monkeypatch.setattr(api, '_execute_prepared_capture_handoff', lambda handoff: handoff.execute_owned(submit))
+    # The real public ticket wait detaches; only its default timeout is shortened.
+    from onec_runtime.capture_evaluation import CaptureEvaluationTicket
+    wait = CaptureEvaluationTicket.wait_initiator
+    monkeypatch.setattr(CaptureEvaluationTicket, 'wait_initiator', lambda ticket, timeout_s=None: wait(ticket, 0.01))
+    def caller():
+        try:
+            api.execute_prepared_capture_hypothesis(prepared)
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            caller_finished.set()
+    thread = Thread(target=caller)
+    thread.start()
+    try:
+        assert caller_finished.wait(1)
+        assert len(errors) == 1 and isinstance(errors[0], CaptureEvaluationPendingError), errors
+        assert api._poisoned_error is None
+        assert len(api._worker_universe._leases) == 2
+        assert api._evaluation_generation_pin is None
+        assert api._operation_generation_pin is original_pin
+        if uncertain:
+            driver.events.put(OSError('private disconnected stream'))
+        else:
+            driver.result()
+        outcome = coordinator.wait(FENCE, tickets[0].evaluation_id, timeout_s=1)
+        if uncertain:
+            assert coordinator.status(FENCE).phase == CapturePhase.RECOVERY_REQUIRED
+            assert sum(lease.outcome_unknown for lease in api._worker_universe._leases.values()) == 1
+        else:
+            assert outcome.result == 42
+            assert len(api._worker_universe._leases) == 1
+        assert pin_dispositions == ['retain_outcome_unknown' if uncertain else 'release_pin']
+    finally:
+        coordinator.begin_close()
+        driver.closed.set()
+        assert coordinator.join(2)
+        thread.join(2)
+        assert not thread.is_alive()
+
+
 def test_mixed_capture_added_name_uses_new_catalog_and_releases_cell_lease(tmp_path):
     api, _, session = runtime(tmp_path, captured=True)
     api.execute_bsl(UPDATE)
@@ -405,6 +485,36 @@ def test_prepared_capture_dispatch_admission_failure_releases_only_evaluation_le
         api.execute_prepared_capture_hypothesis(candidate)
     assert api._operation_generation_pin is original
     assert len(api._worker_universe._leases) == 1
+
+
+def test_owned_capture_submission_rejection_restores_prepared_namespace(tmp_path, monkeypatch):
+    api, controller, _ = runtime(tmp_path, captured=True)
+    api.execute_bsl(UPDATE)
+    api.execute_bsl('Результат = Б();')
+    context_before = controller.lowerer.persistent_names
+    prepared = api.prepare_capture_hypothesis('НовоеЗначение = 12;')
+    def reject(**kwargs):
+        raise ProtocolError('rejected before record ownership')
+    monkeypatch.setattr(api, '_execute_prepared_capture_handoff', lambda handoff: handoff.execute_owned(reject))
+    with pytest.raises(ProtocolError, match='before record ownership'):
+        api.execute_prepared_capture_hypothesis(prepared)
+    assert controller.lowerer.persistent_names == context_before
+    assert len(api._worker_universe._leases) == 1
+
+
+def test_owned_capture_rejection_disposes_pin_even_when_completion_fails():
+    from contextlib import nullcontext
+    from onec_runtime.runtime_api import _PreparedCaptureExecution
+    dispositions = []
+    def fail_completion(result, error):
+        raise RuntimeError('local completion failed')
+    def reject(**kwargs):
+        raise ProtocolError('rejected before record ownership')
+    handoff = _PreparedCaptureExecution(lambda: None, lambda: dispositions.append,
+                                        fail_completion, nullcontext)
+    with pytest.raises(RuntimeError, match='local completion failed'):
+        handoff.execute_owned(reject)
+    assert dispositions == ['release']
 
 
 @pytest.mark.parametrize('prepared', [False, True])

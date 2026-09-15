@@ -11,6 +11,7 @@ from uuid import uuid4
 import pandas as pd
 
 from onec_runtime.compact_table import decode_compact_table_payload
+from onec_runtime.capture_evaluation import CaptureTransferPlan
 from onec_runtime.errors import ProtocolError
 from onec_runtime.experiment import bsl_string_literal
 from onec_runtime.performance_profile import PhaseRecorder
@@ -392,7 +393,9 @@ class CompactRuntimeTableTransfer:
         max_rows: int | None = None,
         key_factory: Callable[[], str] | None = None,
         profiler: PhaseRecorder | None = None,
+        capture_executor: Callable[[CaptureTransferPlan], bytes] | None = None,
     ) -> None:
+        self._capture_execute = capture_executor
         self._execute = instruction_executor
         self._read = context_reader
         self._runtime_generation = runtime_generation
@@ -424,7 +427,7 @@ class CompactRuntimeTableTransfer:
             item_count=lambda frame: len(frame.index),
         )
 
-    def payload(self, handle: str, policy: ReferencePolicy) -> bytes:
+    def prepare_payload(self, handle: str, policy: ReferencePolicy) -> CaptureTransferPlan:
         generation = self._runtime_generation()
         if generation != self._expected_runtime_generation:
             raise ProtocolError("table materializer runtime generation is stale")
@@ -443,19 +446,34 @@ class CompactRuntimeTableTransfer:
             max_rows=self._max_rows or None,
             max_payload_bytes=self._max_payload_bytes,
         )
-        metadata = self._profile(
-            "table.prepare_jsonl",
-            lambda: self._execute(source),
-            input_bytes=len(source.encode("utf-8")),
+
+        def decode(metadata: object, content: str) -> bytes:
+            byte_count, base64_count, payload_hash = self._validate_metadata(metadata, generation)
+            if len(content) != base64_count:
+                raise ProtocolError("compact table metadata is invalid")
+            try:
+                payload = self._profile(
+                    "table.decode_base64",
+                    lambda: b64decode("".join(content.split()), validate=True),
+                    input_bytes=len(content.encode("ascii")),
+                    output_bytes=len,
+                )
+            except (ValueError, binascii.Error) as error:
+                raise ProtocolError("compact table Base64 payload is invalid") from error
+            if len(payload) != byte_count or sha256(payload).hexdigest() != payload_hash:
+                raise ProtocolError("compact table payload integrity check failed")
+            return payload
+
+        return CaptureTransferPlan(
+            source, key, f"Контекст.Удалить({bsl_string_literal(key)});\nРезультат = Истина;",
+            self._max_text_size, decode,
         )
+
+    def _validate_metadata(self, metadata: object, generation: int) -> tuple[int, int, str]:
         if not isinstance(metadata, str):
-            if self._clean is not None:
-                self._clean(key)
             raise ProtocolError("compact table metadata is not a string")
         fields = metadata.split("|")
         if len(fields) != 5:
-            if self._clean is not None:
-                self._clean(key)
             raise ProtocolError("compact table metadata field count is invalid")
         try:
             observed_runtime = int(fields[0])
@@ -463,8 +481,6 @@ class CompactRuntimeTableTransfer:
             byte_count = int(fields[2])
             base64_count = int(fields[4])
         except ValueError as error:
-            if self._clean is not None:
-                self._clean(key)
             raise ProtocolError("compact table metadata number is invalid") from error
         payload_hash = fields[3]
         if (
@@ -476,25 +492,25 @@ class CompactRuntimeTableTransfer:
             or base64_count > self._max_text_size
             or not _HASH.fullmatch(payload_hash)
         ):
-            if self._clean is not None:
-                self._clean(key)
             raise ProtocolError("compact table metadata is invalid")
+        return byte_count, base64_count, payload_hash
+
+    def payload(self, handle: str, policy: ReferencePolicy) -> bytes:
+        plan = self.prepare_payload(handle, policy)
+        if self._capture_execute is not None:
+            return self._capture_execute(plan)
+        metadata = self._profile(
+            "table.prepare_jsonl", lambda: self._execute(plan.instruction),
+            input_bytes=len(plan.instruction.encode("utf-8")),
+        )
+        try:
+            self._validate_metadata(metadata, self._expected_runtime_generation)
+        except ProtocolError:
+            if self._clean is not None:
+                self._clean(plan.private_key)
+            raise
         content = self._profile(
-            "table.transfer_base64",
-            lambda: self._read(key, self._max_text_size),
+            "table.transfer_base64", lambda: self._read(plan.private_key, self._max_text_size),
             output_bytes=lambda value: len(value.encode("ascii")),
         )
-        if len(content) != base64_count:
-            raise ProtocolError("compact table metadata is invalid")
-        try:
-            payload = self._profile(
-                "table.decode_base64",
-                lambda: b64decode("".join(content.split()), validate=True),
-                input_bytes=len(content.encode("ascii")),
-                output_bytes=len,
-            )
-        except (ValueError, binascii.Error) as error:
-            raise ProtocolError("compact table Base64 payload is invalid") from error
-        if len(payload) != byte_count or sha256(payload).hexdigest() != payload_hash:
-            raise ProtocolError("compact table payload integrity check failed")
-        return payload
+        return plan.decode(metadata, content)

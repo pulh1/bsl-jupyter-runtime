@@ -7,6 +7,7 @@ from hashlib import sha256
 import re
 from uuid import uuid4
 
+from onec_runtime.capture_evaluation import CaptureTransferPlan
 from onec_runtime.errors import ProtocolError
 from onec_runtime.experiment import bsl_string_literal
 from onec_runtime.performance_profile import PhaseRecorder
@@ -77,7 +78,9 @@ class RuntimeValueTransfer:
         context_generation: int,
         key_factory: Callable[[], str] | None = None,
         profiler: PhaseRecorder | None = None,
+        capture_executor: Callable[[CaptureTransferPlan], bytes] | None = None,
     ) -> None:
+        self._capture_execute = capture_executor
         self._execute = instruction_executor
         self._read = context_reader
         self._clean = context_cleaner
@@ -95,7 +98,7 @@ class RuntimeValueTransfer:
             input_bytes=len(payload),
         )
 
-    def payload(self, handle: str, options: MaterializationOptions) -> bytes:
+    def prepare_payload(self, handle: str, options: MaterializationOptions) -> CaptureTransferPlan:
         generation = self._runtime_generation()
         if generation != self._expected_runtime_generation:
             raise ProtocolError("value materializer runtime generation is stale")
@@ -107,24 +110,10 @@ class RuntimeValueTransfer:
             runtime_generation=generation,
             context_generation=self._context_generation,
         )
-        consumed = False
-        primary_error: BaseException | None = None
-        try:
-            metadata = self._profile(
-                "value.prepare",
-                lambda: self._execute(source),
-                input_bytes=len(source.encode("utf-8")),
-            )
-            maximum_transfer_bytes = max(
-                options.max_bytes, _ERROR_ENVELOPE_MAX_BYTES
-            )
-            maximum_text_size = _base64_length(maximum_transfer_bytes)
-            content = self._profile(
-                "value.transfer_base64",
-                lambda: self._read(key, maximum_text_size),
-                output_bytes=lambda value: len(value.encode("ascii")),
-            )
-            consumed = True
+        maximum_transfer_bytes = max(options.max_bytes, _ERROR_ENVELOPE_MAX_BYTES)
+        maximum_text_size = _base64_length(maximum_transfer_bytes)
+
+        def decode(metadata: object, content: str) -> bytes:
             observed = _parse_metadata(metadata)
             if (
                 observed[0] != generation
@@ -148,13 +137,34 @@ class RuntimeValueTransfer:
             if len(payload) != observed[2] or sha256(payload).hexdigest() != observed[3]:
                 raise ProtocolError("value materialization payload integrity check failed")
             return payload
+
+        return CaptureTransferPlan(
+            source, key, f"Контекст.Удалить({bsl_string_literal(key)});\nРезультат = Истина;",
+            maximum_text_size, decode,
+        )
+
+    def payload(self, handle: str, options: MaterializationOptions) -> bytes:
+        plan = self.prepare_payload(handle, options)
+        if self._capture_execute is not None:
+            return self._capture_execute(plan)
+        consumed = False
+        primary_error: BaseException | None = None
+        try:
+            metadata = self._profile("value.prepare", lambda: self._execute(plan.instruction),
+                                     input_bytes=len(plan.instruction.encode("utf-8")))
+            content = self._profile("value.transfer_base64",
+                                    lambda: self._read(plan.private_key, plan.max_text_size),
+                                    output_bytes=lambda value: len(value.encode("ascii")))
+            consumed = True
+            return plan.decode(metadata, content)
         except BaseException as error:
             primary_error = error
             raise
         finally:
+            # Synchronous MAIN transport has no coordinator-owned request.
             if not consumed:
                 try:
-                    self._clean(key)
+                    self._clean(plan.private_key)
                 except BaseException as cleanup_error:
                     if primary_error is not None:
                         primary_error.add_note(

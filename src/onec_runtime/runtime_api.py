@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -15,6 +15,8 @@ from uuid import UUID, uuid4
 from weakref import WeakKeyDictionary
 
 import pandas as pd
+
+from onec_runtime.capture_evaluation import CaptureEvaluationTicket
 
 from onec_runtime.bsl import (
     DiagnosticStage,
@@ -724,6 +726,43 @@ class _RuntimeContinuationAdmission:
             self._closed = True
 
 
+@dataclass(slots=True, repr=False)
+class _PreparedCaptureExecution:
+    """Prepared controller call with an explicit, one-way ownership handoff.
+
+    The synchronous controller retains its existing behavior. A coordinator
+    adapter consumes execute_owned and then owns pin disposition and mandatory
+    completion independently of the waiting caller.
+    """
+
+    execute: Callable[[], object]
+    detach_pin: Callable[[], Callable[[str], None]]
+    completion: Callable[[object, BaseException | None], object]
+    release_writer: Callable[[], AbstractContextManager[None]]
+    transferred: bool = False
+
+    def execute_sync(self) -> object:
+        if self.transferred:
+            raise ProtocolError("Prepared CAPTURE execution was already transferred")
+        return self.execute()
+
+    def execute_owned(self, submit: Callable[..., CaptureEvaluationTicket]) -> object:
+        if self.transferred:
+            raise ProtocolError("Prepared CAPTURE execution was already transferred")
+        lease = self.detach_pin()
+        self.transferred = True
+        with self.release_writer():
+            try:
+                ticket = submit(pin_lease=lease, completion=self.completion)
+            except BaseException as error:
+                try:
+                    self.completion(None, error)
+                finally:
+                    lease("release")
+                raise
+            return ticket.wait_initiator()
+
+
 class PrototypeRuntimeApi:
     """Single-writer frontend boundary over the proven prototype Controller."""
 
@@ -817,6 +856,7 @@ class PrototypeRuntimeApi:
         self._operation_generation_pin: OperationGenerationPin | None = None
         self._preparing_generation_pin: OperationGenerationPin | None = None
         self._evaluation_generation_pin: OperationGenerationPin | None = None
+        self._evaluation_pin_lock = Lock()
         self._worker_instruction_executor = (
             worker_instruction_executor or self._execute_worker_instruction
         )
@@ -2197,6 +2237,7 @@ class PrototypeRuntimeApi:
                 capture_dispatched = True
 
             evaluation_pin = self._pin_capture_evaluation_locked()
+            handoff = None
             try:
                 lowerer.restore_persistent_names(lowering.context_names)
                 self._require_operation_pin_dispatch_fence_locked(
@@ -2204,12 +2245,25 @@ class PrototypeRuntimeApi:
                     mode=LoweringMode.CAPTURE,
                     capture_evaluation=True,
                 )
+                def completion(result: object, error: BaseException | None) -> object:
+                    # Mandatory local completion is owned by the record,
+                    # including after its initiating waiter detaches.
+                    with self._lock:
+                        if error is not None:
+                            lowerer.restore_persistent_names(context_before)
+                            return None
+                        reply = self._reply(result)
+                        for root in lowering.dirty_roots:
+                            self._pending_dirty_roots.setdefault(root.casefold(), root)
+                        return self._finalize_namespace_reply(
+                            reply, lowering=lowering, context_before=context_before, lowerer=lowerer,
+                        )
+
                 try:
                     if callable(execute_mapped):
-                        reply = self._reply(
-                            execute_mapped(
-                                source,
-                                lowering.mapped_source,
+                        handoff = _PreparedCaptureExecution(
+                            execute=lambda: execute_mapped(
+                                source, lowering.mapped_source,
                                 visible_source_context=visible_source_context,
                                 messages_intercepted=lowering.messages_intercepted,
                                 message_collector_key=message_collector_key,
@@ -2217,8 +2271,15 @@ class PrototypeRuntimeApi:
                                 worker_globals=self._notebook_worker_globals(),
                                 dirty_roots=lowering.dirty_roots,
                                 on_transport_dispatch=mark_capture_dispatched,
-                            )
+                            ),
+                            detach_pin=self._detach_capture_evaluation_pin_locked,
+                            completion=completion,
+                            release_writer=self._capture_owner_handoff,
                         )
+                        result = self._execute_prepared_capture_handoff(handoff)
+                        if handoff.transferred:
+                            return result
+                        reply = self._reply(result)
                     else:
                         raise ProtocolError(
                             "Runtime controller requires mapped CAPTURE execution"
@@ -2238,6 +2299,8 @@ class PrototypeRuntimeApi:
                         diagnostic=diagnostic,
                     )
             except BaseException:
+                if handoff is not None and handoff.transferred:
+                    raise
                 try:
                     lowerer.restore_persistent_names(context_before)
                 finally:
@@ -2251,6 +2314,10 @@ class PrototypeRuntimeApi:
                 )
             finally:
                 self._finish_capture_evaluation_pin_locked(reply=reply)
+
+    def _execute_prepared_capture_handoff(self, handoff: _PreparedCaptureExecution) -> object:
+        # Task 4 replaces this synchronous controller boundary with execute_owned.
+        return handoff.execute_sync()
 
     def _capture_controller_fence(self) -> tuple[int, int, int, int]:
         values = (
@@ -2311,21 +2378,52 @@ class PrototypeRuntimeApi:
         return pin.export_catalog
 
     def _pin_capture_evaluation_locked(self) -> OperationGenerationPin | None:
-        if self._evaluation_generation_pin is not None:
-            raise ProtocolError("CAPTURE evaluation already owns a generation pin")
-        if self._worker_generation_handle is None:
-            return None
-        pin = self._worker_universe.pin_active()
-        if pin.handle is not self._worker_generation_handle:
-            self._release_generation_pin_locked(pin)
-            raise ProtocolError("Active Worker generation changed while pinning CAPTURE")
-        self._evaluation_generation_pin = pin
-        return pin
+        with self._evaluation_pin_lock:
+            if self._evaluation_generation_pin is not None:
+                raise ProtocolError("CAPTURE evaluation already owns a generation pin")
+            if self._worker_generation_handle is None:
+                return None
+            pin = self._worker_universe.pin_active()
+            if pin.handle is self._worker_generation_handle:
+                self._evaluation_generation_pin = pin
+                return pin
+        self._release_generation_pin_locked(pin)
+        raise ProtocolError("Active Worker generation changed while pinning CAPTURE")
+
+    def _detach_capture_evaluation_pin_locked(self) -> Callable[[str], None]:
+        with self._evaluation_pin_lock:
+            pin = self._evaluation_generation_pin
+            self._evaluation_generation_pin = None
+        lease_lock = Lock()
+        disposed = False
+
+        def dispose(disposition: str) -> None:
+            nonlocal disposed
+            if disposition not in {"release", "quarantine"}:
+                raise ValueError("invalid CAPTURE pin disposition")
+            with lease_lock:
+                if disposed:
+                    return
+                disposed = True
+            # Neither the pin slot nor the one-shot lease lock is held while
+            # disposing Worker ownership or updating breakpoint workspaces.
+            if pin is None:
+                return
+            if disposition == "quarantine":
+                try:
+                    self._worker_universe.retain_outcome_unknown(pin)
+                finally:
+                    self._poisoned_error = WorkerPromotionOutcomeUnknown(
+                        pin.handle.generation, pin.handle.manifest_sha256,
+                    )
+            else:
+                self._release_generation_pin_locked(pin)
+
+        return dispose
 
     def _finish_capture_evaluation_pin_locked(
         self, *, reply: RuntimeReply | None = None, outcome_unknown: bool = False
     ) -> None:
-        pin = self._evaluation_generation_pin
         if self._poisoned_error is not None:
             # Publication may already have quarantined the universe. Its
             # leases remain owned until teardown; release cannot be trusted.
@@ -2337,18 +2435,8 @@ class PrototypeRuntimeApi:
             and self._controller.state is OperationState.CAPTURE_DEBUG_STOPPED
         ):
             return
-        self._evaluation_generation_pin = None
-        if pin is None:
-            return
-        if outcome_unknown:
-            try:
-                self._worker_universe.retain_outcome_unknown(pin)
-            finally:
-                self._poisoned_error = WorkerPromotionOutcomeUnknown(
-                    pin.handle.generation, pin.handle.manifest_sha256
-                )
-        else:
-            self._release_generation_pin_locked(pin)
+        dispose = self._detach_capture_evaluation_pin_locked()
+        dispose("quarantine" if outcome_unknown else "release")
 
     def _require_operation_pin_dispatch_fence_locked(
         self,
@@ -5028,6 +5116,20 @@ class PrototypeRuntimeApi:
                 raise ProtocolError("materialization deadline exceeded")
         finally:
             setattr(self._controller, "command_timeout_s", original)
+
+    @contextmanager
+    def _capture_owner_handoff(self) -> Iterator[None]:
+        """Drop the caller's writer boundary while the coordinator owns work."""
+        owns_writer = self._writer_owner == get_ident()
+        if owns_writer:
+            self._writer_owner = None
+            self._lock.release()
+        try:
+            yield
+        finally:
+            if owns_writer:
+                self._lock.acquire()
+                self._writer_owner = get_ident()
 
     @contextmanager
     def _single_writer(self) -> Iterator[None]:

@@ -513,6 +513,78 @@ class CaptureFence:
 
 
 @dataclass(frozen=True, slots=True)
+class CaptureRemoteStep:
+    """One private transport capability, consumed on the active record."""
+
+    dispatch: Callable[[Callable[[], None]], PendingEvaluation] = field(repr=False)
+    poll: Callable[[PendingEvaluation, float], EvaluationResult | StopEvent] = field(repr=False)
+    restore: Callable[[], None] = field(default=_nothing, repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureCleanupLease:
+    private_key: str = field(repr=False)
+    cleanup_step: CaptureRemoteStep = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureTransferPlan:
+    """All temporary ownership is known before the creating instruction runs."""
+
+    instruction: str = field(repr=False)
+    private_key: str = field(repr=False)
+    cleanup_instruction: str = field(repr=False)
+    max_text_size: int
+    decode: Callable[[object, str], bytes] = field(repr=False)
+
+    def capture_request(
+        self, fence: CaptureFence, *,
+        step_factory: Callable[[str], CaptureRemoteStep],
+        read: Callable[[CaptureStepContext, str, int], str],
+        pin_lease: Callable[[str], None] = _no_pin,
+    ) -> CaptureEvaluationRequest:
+        first = step_factory(self.instruction)
+        cleanup = CaptureCleanupLease(self.private_key, step_factory(self.cleanup_instruction))
+
+        def continuation(context: CaptureStepContext, metadata: object) -> bytes:
+            return self.decode(metadata, read(context, self.private_key, self.max_text_size))
+
+        return CaptureEvaluationRequest(
+            fence, CaptureEvaluationKind.MATERIALIZATION_HELPER,
+            first.dispatch, first.poll, lambda result: result.presentation,
+            restore=first.restore, pin_lease=pin_lease, cleanup_leases=(cleanup,),
+            step_continuation=continuation,
+        )
+
+
+class _RemoteStepFailure(Exception):
+    """Transport failure already classified by the capability owner."""
+
+    def __init__(self, phase: CapturePhase, code: str, *, uncertain: bool = False):
+        super().__init__(code)
+        self.phase = phase
+        self.code = code
+        self.uncertain = uncertain
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class CaptureStepContext:
+    _coordinator: CaptureEvaluationCoordinator
+    _record: _CaptureEvaluationRecord
+
+    def execute_inline(self, step: CaptureRemoteStep) -> EvaluationResult:
+        owner = self._coordinator
+        if current_thread() is not owner._worker:
+            raise ProtocolError("CAPTURE inline steps require the coordinator worker")
+        with owner._condition:
+            if owner._active is not self._record or self._record.outcome is not None:
+                raise ProtocolError("CAPTURE inline steps require the active record")
+            if self._record.capability is not None:
+                raise ProtocolError("CAPTURE record already owns a remote capability")
+        return owner._execute_remote_step(self._record, step)
+
+
+@dataclass(frozen=True, slots=True)
 class CaptureEvaluationRequest:
     """Transfer all callbacks and leases before any remote work can start.
 
@@ -537,7 +609,10 @@ class CaptureEvaluationRequest:
     continuation: Callable[[object], object] | None = field(default=None, repr=False)
     seal_messages: Callable[[], tuple[str, ...]] = field(default=_no_messages, repr=False)
     pin_lease: Callable[[str], None] = field(default=_no_pin, repr=False)
-    cleanup_leases: tuple[Callable[[], None], ...] = field(default=(), repr=False)
+    cleanup_leases: tuple[CaptureCleanupLease | Callable[[], None], ...] = field(default=(), repr=False)
+    step_policy: Callable[[CaptureStepContext, EvaluationResult], object] | None = field(default=None, repr=False)
+    step_continuation: Callable[[CaptureStepContext, object], object] | None = field(default=None, repr=False)
+    completion: Callable[[object, BaseException | None], object] | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.fence, CaptureFence):
@@ -548,12 +623,18 @@ class CaptureEvaluationRequest:
         object.__setattr__(self, "cleanup_leases", tuple(self.cleanup_leases))
         callbacks = (
             self.dispatch, self.poll, self.result_policy, self.restore,
-            self.seal_messages, self.pin_lease, *self.cleanup_leases,
+            self.seal_messages, self.pin_lease,
         )
         if not all(callable(callback) for callback in callbacks):
             raise ValueError("evaluation callbacks must be callable")
         if self.continuation is not None and not callable(self.continuation):
             raise ValueError("continuation must be callable")
+        if any(not isinstance(lease, CaptureCleanupLease) and not callable(lease)
+               for lease in self.cleanup_leases):
+            raise ValueError("cleanup must be a lease or callable")
+        for callback in (self.step_policy, self.step_continuation, self.completion):
+            if callback is not None and not callable(callback):
+                raise ValueError("step policy and continuation must be callable")
 
 
 @dataclass(slots=True, repr=False)
@@ -818,90 +899,14 @@ class CaptureEvaluationCoordinator:
                          diagnostic=_diagnostic("coordinator_closed"))
             return
 
-        def dispatch_entered() -> None:
-            if current_thread() is not self._worker:
-                raise ProtocolError("Dispatch evidence must come from the CAPTURE worker")
-            with self._condition:
-                self._require_fence_locked(request.fence)
-                if record.dispatch_entered:
-                    raise ProtocolError("CAPTURE dispatch was already entered")
-                record.dispatch_entered = True
-                record.remote_step_count = 1
-                self._evidence_locked(record, "dispatch_entered", step_index=1)
-            self._flush_evidence()
-
+        context = CaptureStepContext(self, record)
         try:
-            capability = request.dispatch(dispatch_entered)
-            if not isinstance(capability, PendingEvaluation):
-                raise ProtocolError("CAPTURE dispatch did not return a pending capability")
-            with self._condition:
-                record.capability = capability
-                record.acknowledged = True
-                self._evidence_locked(record, "rdbg_acknowledged", step_index=1)
-            self._flush_evidence()
-        except TargetLost:
-            self._finish(record, CapturePhase.STALE, CaptureEvaluationState.FAILED,
-                         diagnostic=_diagnostic("target_lost"), quarantine=True)
+            event = context.execute_inline(CaptureRemoteStep(
+                request.dispatch, request.poll, request.restore,
+            ))
+        except _RemoteStepFailure as error:
+            self._finish_remote_failure(record, error)
             return
-        except BaseException:
-            if record.dispatch_entered:
-                diagnostic = _diagnostic("dispatch_uncertain")
-                self._finish(record, CapturePhase.OUTCOME_UNKNOWN, CaptureEvaluationState.UNKNOWN,
-                             diagnostic=diagnostic, quarantine=True)
-            else:
-                self._finish(record, CapturePhase.PAUSED, CaptureEvaluationState.FAILED,
-                             diagnostic=_diagnostic("pre_dispatch_failed"))
-            return
-
-        while True:
-            with self._condition:
-                closing = self._closing
-            if closing:
-                self._finish(record, CapturePhase.STALE, CaptureEvaluationState.FAILED,
-                             diagnostic=_diagnostic("coordinator_closed"), quarantine=True)
-                return
-            try:
-                event = request.poll(capability, self._poll_interval_s)
-            except CommandTimeout:
-                self._poll_evidence(record)
-                continue
-            except TargetLost:
-                self._finish(record, CapturePhase.STALE, CaptureEvaluationState.FAILED,
-                             diagnostic=_diagnostic("target_lost"), quarantine=True)
-                return
-            except BaseException as error:
-                code = "unexpected_stop" if isinstance(error, UnexpectedStop) else "evaluation_stream_failed"
-                self._finish(record, CapturePhase.RECOVERY_REQUIRED, CaptureEvaluationState.FAILED,
-                             diagnostic=_diagnostic(code), quarantine=True)
-                return
-            self._poll_evidence(record)
-            if isinstance(event, StopEvent):
-                self._finish(record, CapturePhase.RECOVERY_REQUIRED, CaptureEvaluationState.FAILED,
-                             diagnostic=_diagnostic("unexpected_stop"), quarantine=True)
-                return
-            if not isinstance(event, EvaluationResult) or event.result_id != capability.result_id:
-                self._finish(record, CapturePhase.RECOVERY_REQUIRED, CaptureEvaluationState.FAILED,
-                             diagnostic=_diagnostic("evaluation_stream_failed"), quarantine=True)
-                return
-            with self._condition:
-                record.capability = None
-                self._evidence_locked(record, "result_received", step_index=1)
-            self._flush_evidence()
-            break
-
-        try:
-            request.restore()
-        except TargetLost:
-            self._finish(record, CapturePhase.STALE, CaptureEvaluationState.FAILED,
-                         diagnostic=_diagnostic("target_lost"), quarantine=True)
-            return
-        except BaseException:
-            self._finish(record, CapturePhase.RECOVERY_REQUIRED, CaptureEvaluationState.FAILED,
-                         diagnostic=_diagnostic("workspace_restore_failed"), quarantine=True)
-            return
-        with self._condition:
-            self._evidence_locked(record, "workspace_restored")
-        self._flush_evidence()
 
         value = None
         private_result = None
@@ -910,7 +915,8 @@ class CaptureEvaluationCoordinator:
         state = CaptureEvaluationState.COMPLETED
         failure_category = "result_policy_failed"
         try:
-            value = request.result_policy(event)
+            value = (request.step_policy(context, event) if request.step_policy is not None
+                     else request.result_policy(event))
             if event.error_occurred:
                 raise BslExecutionError("CAPTURE BSL evaluation failed")
             if request.evaluation_kind is CaptureEvaluationKind.USER_BSL:
@@ -918,12 +924,25 @@ class CaptureEvaluationCoordinator:
             private_result = value
             with self._condition:
                 # This is the linearization point for starting optional work.
-                run_continuation = record.initiator_attached and not self._closing and request.continuation is not None
+                run_continuation = record.initiator_attached and not self._closing and (request.continuation is not None or request.step_continuation is not None)
                 record.continuation_started = run_continuation
             if run_continuation:
-                assert request.continuation is not None
                 failure_category = "continuation_failed"
-                private_result = request.continuation(value)
+                if request.step_continuation is not None:
+                    private_result = request.step_continuation(context, value)
+                else:
+                    assert request.continuation is not None
+                    private_result = request.continuation(value)
+        except _RemoteStepFailure as error:
+            if error.phase is not CapturePhase.PAUSED:
+                self._finish_remote_failure(record, error, followup=True)
+                return
+            # The earlier creating step settled. A later local rejection has
+            # no pending capability and must still drain its cleanup leases.
+            state = CaptureEvaluationState.FAILED
+            diagnostic = _diagnostic(error.code)
+            value = None
+            private_result = None
         except TargetLost:
             self._finish(record, CapturePhase.STALE, CaptureEvaluationState.FAILED,
                          diagnostic=_diagnostic("target_lost"), quarantine=True)
@@ -937,8 +956,22 @@ class CaptureEvaluationCoordinator:
 
         try:
             for cleanup in request.cleanup_leases:
-                cleanup()
+                if isinstance(cleanup, CaptureCleanupLease):
+                    result = context.execute_inline(cleanup.cleanup_step)
+                    if result.error_occurred:
+                        raise BslExecutionError("CAPTURE required cleanup failed")
+                else:
+                    cleanup()
             record.cleanup_status = "completed"
+        except _RemoteStepFailure as error:
+            record.cleanup_status = "unknown" if error.uncertain else "failed"
+            self._finish(record,
+                         CapturePhase.STALE if error.phase is CapturePhase.STALE else CapturePhase.RECOVERY_REQUIRED,
+                         CaptureEvaluationState.FAILED,
+                         diagnostic=_diagnostic("target_lost" if error.phase is CapturePhase.STALE else
+                                                "cleanup_uncertain" if error.uncertain else "cleanup_failed"),
+                         quarantine=True)
+            return
         except TargetLost:
             record.cleanup_status = "unknown"
             self._finish(record, CapturePhase.STALE, CaptureEvaluationState.FAILED,
@@ -973,6 +1006,92 @@ class CaptureEvaluationCoordinator:
         self._finish(record, CapturePhase.PAUSED, candidate.state, candidate=candidate,
                      private_result=private_result, diagnostic=diagnostic, messages=messages)
 
+    def _execute_remote_step(
+        self, record: _CaptureEvaluationRecord, step: CaptureRemoteStep,
+    ) -> EvaluationResult:
+        entered = False
+        with self._condition:
+            if self._closing:
+                raise _RemoteStepFailure(CapturePhase.STALE, "coordinator_closed", uncertain=True)
+            step_index = record.remote_step_count + 1
+
+        def dispatch_entered() -> None:
+            nonlocal entered
+            if current_thread() is not self._worker:
+                raise ProtocolError("Dispatch evidence must come from the CAPTURE worker")
+            with self._condition:
+                self._require_fence_locked(record.request.fence)
+                if entered:
+                    raise ProtocolError("CAPTURE dispatch was already entered")
+                entered = True
+                record.dispatch_entered = True
+                record.remote_step_count = step_index
+                self._evidence_locked(record, "dispatch_entered", step_index=step_index)
+            self._flush_evidence()
+
+        try:
+            capability = step.dispatch(dispatch_entered)
+            if not isinstance(capability, PendingEvaluation):
+                raise ProtocolError("CAPTURE dispatch did not return a pending capability")
+            with self._condition:
+                record.capability = capability
+                record.acknowledged = True
+                self._evidence_locked(record, "rdbg_acknowledged", step_index=step_index)
+            self._flush_evidence()
+        except TargetLost:
+            raise _RemoteStepFailure(CapturePhase.STALE, "target_lost", uncertain=True) from None
+        except BaseException:
+            raise _RemoteStepFailure(
+                CapturePhase.OUTCOME_UNKNOWN if entered else CapturePhase.PAUSED,
+                "dispatch_uncertain" if entered else "pre_dispatch_failed", uncertain=entered,
+            ) from None
+
+        while True:
+            with self._condition:
+                if self._closing:
+                    raise _RemoteStepFailure(CapturePhase.STALE, "coordinator_closed", uncertain=True)
+            try:
+                event = step.poll(capability, self._poll_interval_s)
+            except CommandTimeout:
+                self._poll_evidence(record)
+                continue
+            except TargetLost:
+                raise _RemoteStepFailure(CapturePhase.STALE, "target_lost", uncertain=True) from None
+            except BaseException as error:
+                code = "unexpected_stop" if isinstance(error, UnexpectedStop) else "evaluation_stream_failed"
+                raise _RemoteStepFailure(CapturePhase.RECOVERY_REQUIRED, code, uncertain=True) from None
+            self._poll_evidence(record)
+            if isinstance(event, StopEvent):
+                raise _RemoteStepFailure(CapturePhase.RECOVERY_REQUIRED, "unexpected_stop", uncertain=True)
+            if not isinstance(event, EvaluationResult) or event.result_id != capability.result_id:
+                raise _RemoteStepFailure(CapturePhase.RECOVERY_REQUIRED, "evaluation_stream_failed", uncertain=True)
+            with self._condition:
+                record.capability = None
+                self._evidence_locked(record, "result_received", step_index=step_index)
+            self._flush_evidence()
+            break
+        try:
+            step.restore()
+        except TargetLost:
+            raise _RemoteStepFailure(CapturePhase.STALE, "target_lost", uncertain=True) from None
+        except BaseException:
+            raise _RemoteStepFailure(CapturePhase.RECOVERY_REQUIRED, "workspace_restore_failed") from None
+        with self._condition:
+            self._evidence_locked(record, "workspace_restored", step_index=step_index)
+        self._flush_evidence()
+        return event
+
+    def _finish_remote_failure(
+        self, record: _CaptureEvaluationRecord, error: _RemoteStepFailure,
+        *, followup: bool = False,
+    ) -> None:
+        phase = error.phase
+        if followup and phase is CapturePhase.OUTCOME_UNKNOWN:
+            phase = CapturePhase.RECOVERY_REQUIRED
+        self._finish(record, phase,
+                     CaptureEvaluationState.UNKNOWN if phase is CapturePhase.OUTCOME_UNKNOWN else CaptureEvaluationState.FAILED,
+                     diagnostic=_diagnostic(error.code), quarantine=phase is not CapturePhase.PAUSED)
+
     def _finish(
         self,
         record: _CaptureEvaluationRecord,
@@ -986,6 +1105,20 @@ class CaptureEvaluationCoordinator:
         messages: tuple[str, ...] = (),
     ) -> None:
         # All leases are disposed outside the condition, before outcome visibility.
+        if record.request.completion is not None:
+            provisional = candidate or CaptureEvaluationOutcome(
+                record.evaluation_id, record.request.evaluation_kind, state,
+                diagnostic=diagnostic,
+            )
+            try:
+                private_result = record.request.completion(
+                    private_result, _initiating_failure(record.evaluation_id, phase, provisional),
+                )
+            except BaseException:
+                private_result = None
+                state = CaptureEvaluationState.FAILED
+                diagnostic = _diagnostic("result_delivery_failed")
+                candidate = None
         try:
             record.request.pin_lease("quarantine" if quarantine else "release")
         except BaseException:
