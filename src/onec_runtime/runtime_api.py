@@ -1091,7 +1091,7 @@ class PrototypeRuntimeApi:
         self, handle: str, *, table_row: bool = False, timeout_s: float = 1.0
     ) -> tuple[str, ...]:
         """Read current field names only; never evaluate caller-provided expressions."""
-        with self._single_writer(), self._bounded_command_timeout(timeout_s):
+        with self._capture_data_plane_writer(), self._bounded_command_timeout(timeout_s):
             self._require_available()
             if self._controller.state not in self._WORKER_STATES:
                 raise ProtocolError("Completion requires an idle or captured runtime")
@@ -1141,7 +1141,7 @@ class PrototypeRuntimeApi:
         self,
         locations: tuple[ModuleLocation, ...],
     ) -> None:
-        with self._single_writer():
+        with self._capture_data_plane_writer():
             self._require_available()
             if self._controller.state not in self._MAIN_READY_STATES:
                 raise ProtocolError(
@@ -1162,8 +1162,7 @@ class PrototypeRuntimeApi:
         self, locations: tuple[ModuleLocation, ...]
     ) -> None:
         """Atomically replace only the successor capture points while paused."""
-        with self._single_writer():
-            self._require_capture_data_plane_admission()
+        with self._capture_data_plane_writer():
             self._require_available()
             if self._controller.state is not OperationState.CAPTURED:
                 raise ProtocolError("Continuation capture points require a captured runtime")
@@ -1185,7 +1184,7 @@ class PrototypeRuntimeApi:
         enabled: bool = True,
         column: int | None = None,
     ) -> WorkerBreakpointStatus:
-        with self._single_writer():
+        with self._capture_data_plane_writer():
             self._require_worker_breakpoint_mutation_boundary_locked()
             plan = self._worker_breakpoints.prepare_add(
                 source_unit,
@@ -1198,7 +1197,7 @@ class PrototypeRuntimeApi:
             return self._worker_breakpoints.status(plan.result_id)
 
     def remove_worker_breakpoint(self, breakpoint_id: UUID) -> None:
-        with self._single_writer():
+        with self._capture_data_plane_writer():
             self._require_worker_breakpoint_mutation_boundary_locked()
             plan = self._worker_breakpoints.prepare_remove(breakpoint_id)
             self._apply_worker_breakpoint_plan_locked(plan)
@@ -1208,7 +1207,7 @@ class PrototypeRuntimeApi:
         breakpoint_id: UUID,
         enabled: bool,
     ) -> WorkerBreakpointStatus:
-        with self._single_writer():
+        with self._capture_data_plane_writer():
             self._require_worker_breakpoint_mutation_boundary_locked()
             plan = self._worker_breakpoints.prepare_enabled(
                 breakpoint_id,
@@ -1270,8 +1269,7 @@ class PrototypeRuntimeApi:
         locations: tuple[ModuleLocation, ...],
     ) -> _RuntimeContinuationAdmission:
         """Snapshot API metadata around the controller's physical admission."""
-        with self._single_writer():
-            self._require_capture_data_plane_admission()
+        with self._capture_data_plane_writer():
             self._require_available()
             if self._controller.state is not OperationState.CAPTURED:
                 raise ProtocolError(
@@ -1333,8 +1331,7 @@ class PrototypeRuntimeApi:
         The returned controller number remains internal to the runtime/session
         boundary; agent-facing capture views never serialize it.
         """
-        with self._single_writer():
-            self._require_capture_data_plane_admission()
+        with self._capture_data_plane_writer():
             self._require_available()
             if self._controller.state not in (*self._MAIN_READY_STATES, OperationState.CAPTURED):
                 raise ProtocolError("Capture ticket requires a main-ready or captured runtime")
@@ -1360,7 +1357,7 @@ class PrototypeRuntimeApi:
         return ticket
 
     def _begin_prepared_operation_pin(self) -> OperationGenerationPin | None:
-        with self._single_writer():
+        with self._capture_data_plane_writer():
             self._require_available()
             if self._controller.state not in self._MAIN_READY_STATES:
                 raise ProtocolError("MAIN preparation requires a main-ready runtime")
@@ -1638,7 +1635,7 @@ class PrototypeRuntimeApi:
 
     def activate_prepared_main_for_capture(self, prepared: object) -> object:
         """Activate an already-built Worker and reseal the prepared user MAIN."""
-        with self._single_writer():
+        with self._capture_data_plane_writer():
             self._require_available()
             if not isinstance(prepared, _PreparedMainExecution):
                 raise ProtocolError("Runtime API requires a prepared main")
@@ -1813,7 +1810,7 @@ class PrototypeRuntimeApi:
         _dispatch_evidence: Callable[[], None] | None = None,
     ) -> RuntimeReply:
         """Consume one post-activation MAIN without parsing, building, or lowering."""
-        with self._single_writer():
+        with self._capture_data_plane_writer():
             self._require_available()
             if not isinstance(prepared, _ActivatedPreparedMainExecution):
                 raise ProtocolError("Runtime API requires an activated prepared main")
@@ -1959,7 +1956,7 @@ class PrototypeRuntimeApi:
 
     def discard_prepared_main_for_capture(self, prepared: object) -> None:
         """Consume one unused MAIN capability and release its operation pin."""
-        with self._single_writer():
+        with self._capture_data_plane_writer():
             if isinstance(prepared, _PreparedMainExecution):
                 payload = prepared.contents(self._prepared_main_owner)
                 token = payload.token
@@ -2230,8 +2227,7 @@ class PrototypeRuntimeApi:
         namespace is restored before the single-writer fence is released; the
         sealed result is committed only by its one execution consumer.
         """
-        with self._single_writer():
-            self._require_capture_data_plane_admission()
+        with self._capture_data_plane_writer():
             self._require_available()
             self._require_capture_inspection_available()
             if self._controller.state is not OperationState.CAPTURED:
@@ -2370,8 +2366,7 @@ class PrototypeRuntimeApi:
 
     def execute_prepared_capture_hypothesis(self, prepared: object) -> RuntimeReply:
         """Consume one exact prepared CAPTURE lowering without lowering again."""
-        with self._single_writer():
-            self._require_capture_data_plane_admission()
+        with self._capture_data_plane_writer():
             self._require_available()
             self._require_capture_inspection_available()
             if not isinstance(prepared, _PreparedCaptureHypothesis):
@@ -2939,8 +2934,7 @@ class PrototypeRuntimeApi:
             Callable[[OperationExecutionProvenance], None] | None
         ) = None,
     ) -> RuntimeReply:
-        with self._single_writer():
-            self._require_capture_data_plane_admission()
+        with self._capture_data_plane_writer():
             self._require_available()
             pin, shared_capture_pin = self._begin_user_operation_pin_locked()
             user_bsl_dispatched = False
@@ -3395,7 +3389,7 @@ class PrototypeRuntimeApi:
         *,
         timeout_s: float | None = None,
     ) -> RuntimeReply:
-        with self._single_writer(), self._bounded_command_timeout(timeout_s):
+        with self._capture_data_plane_writer(), self._bounded_command_timeout(timeout_s):
             self._require_available()
             return self._resume_debug_stop_locked()
 
@@ -3472,8 +3466,7 @@ class PrototypeRuntimeApi:
         dirty_roots: tuple[str, ...] = (),
         continuation_attempt_id: str | None = None,
     ) -> RuntimeReply:
-        with self._single_writer():
-            self._require_capture_data_plane_admission()
+        with self._capture_data_plane_writer():
             self._require_available()
             if self._controller.state is OperationState.CAPTURED:
                 combined = dict(self._pending_dirty_roots)
@@ -3559,7 +3552,7 @@ class PrototypeRuntimeApi:
     ) -> WorkerGenerationHandle:
         """Upsert modules and atomically publish the complete active graph."""
         with (
-            self._single_writer(),
+            self._capture_data_plane_writer(),
             self._prune_worker_caches_after_failure_locked(),
         ):
             self._require_available()
@@ -4436,7 +4429,7 @@ class PrototypeRuntimeApi:
 
     def release_worker_generation(self, handle: WorkerGenerationHandle) -> None:
         """Release the current API-owned generation; superseded handles are stale."""
-        with self._single_writer():
+        with self._capture_data_plane_writer():
             self._require_available()
             try:
                 self._release_worker_lifecycle_locked(handle)
@@ -4631,7 +4624,7 @@ class PrototypeRuntimeApi:
         chunk_size: int = 65_536,
         profiler: PhaseRecorder | None = None,
     ) -> pd.DataFrame:
-        with self._single_writer():
+        with self._capture_data_plane_writer():
             self._require_available()
             safe_handle = self._resolve_value_handle_locked(handle)
             return self._materialize_table_locked(
@@ -4657,7 +4650,7 @@ class PrototypeRuntimeApi:
         profiler: PhaseRecorder | None = None,
     ) -> object:
         del chunk_size
-        with self._single_writer(), self._bounded_command_timeout(timeout_s):
+        with self._capture_data_plane_writer(), self._bounded_command_timeout(timeout_s):
             self._require_available()
             safe_handle = self._resolve_value_handle_locked(handle)
             route = self._materialization_kind_locked(safe_handle)
@@ -4693,7 +4686,7 @@ class PrototypeRuntimeApi:
     def materialization_kind(
         self, handle: str, *, timeout_s: float | None = None
     ) -> str:
-        with self._single_writer(), self._bounded_command_timeout(timeout_s):
+        with self._capture_data_plane_writer(), self._bounded_command_timeout(timeout_s):
             self._require_available()
             return self._materialization_kind_locked(self._resolve_value_handle_locked(handle))
 
@@ -4708,7 +4701,7 @@ class PrototypeRuntimeApi:
         timeout_s: float | None = None,
         profiler: PhaseRecorder | None = None,
     ) -> bytes:
-        with self._single_writer(), self._bounded_command_timeout(timeout_s):
+        with self._capture_data_plane_writer(), self._bounded_command_timeout(timeout_s):
             self._require_available()
             safe_handle = self._resolve_value_handle_locked(handle)
             if self._materialization_kind_locked(safe_handle) != "value":
@@ -4738,7 +4731,7 @@ class PrototypeRuntimeApi:
         timeout_s: float | None = None,
         profiler: PhaseRecorder | None = None,
     ) -> bytes:
-        with self._single_writer(), self._bounded_command_timeout(timeout_s):
+        with self._capture_data_plane_writer(), self._bounded_command_timeout(timeout_s):
             self._require_available()
             safe_handle = self._resolve_value_handle_locked(handle)
             if self._materialization_kind_locked(safe_handle) != "table":
@@ -4779,7 +4772,7 @@ class PrototypeRuntimeApi:
         uuid_suffix: str = "__uuid",
     ) -> tuple[str, bytes]:
         """Build and serialize a bounded projection without scanning past its limit."""
-        with self._single_writer(), self._bounded_command_timeout(timeout_s):
+        with self._capture_data_plane_writer(), self._bounded_command_timeout(timeout_s):
             self._require_available()
             safe_handle = self._resolve_value_handle_locked(handle)
             return self._project_value_payload_locked(
@@ -4913,7 +4906,7 @@ class PrototypeRuntimeApi:
     ) -> pd.DataFrame:
         del chunk_size
         offset, limit = self._bounded_slice(selection, maximum=max_rows)
-        with self._single_writer(), self._bounded_command_timeout(timeout_s):
+        with self._capture_data_plane_writer(), self._bounded_command_timeout(timeout_s):
             self._require_available()
             safe_handle = self._resolve_value_handle_locked(handle)
             kind, payload = self._project_value_payload_locked(
@@ -4953,7 +4946,7 @@ class PrototypeRuntimeApi:
     ) -> object:
         del chunk_size
         offset, limit = self._bounded_slice(selection, maximum=max_items)
-        with self._single_writer(), self._bounded_command_timeout(timeout_s):
+        with self._capture_data_plane_writer(), self._bounded_command_timeout(timeout_s):
             self._require_available()
             safe_handle = self._resolve_value_handle_locked(handle)
             route = self._materialization_kind_locked(safe_handle)
@@ -5082,13 +5075,13 @@ class PrototypeRuntimeApi:
 
     def require_public_value_handle(self, handle: str) -> None:
         """Reject target Worker roots/modules before any public proxy can escape."""
-        with self._single_writer():
+        with self._capture_data_plane_writer():
             self._require_available()
             self._require_public_value_handle_locked(handle)
 
     def require_public_value_handles(self, handles: tuple[str, ...]) -> None:
         """Prove every handle public with at most one target privacy instruction."""
-        with self._single_writer():
+        with self._capture_data_plane_writer():
             self._require_available()
             if not isinstance(handles, tuple) or any(
                 not isinstance(handle, str) for handle in handles
@@ -5576,6 +5569,13 @@ class PrototypeRuntimeApi:
             yield
 
     @contextmanager
+    def _capture_data_plane_writer(self) -> Iterator[None]:
+        """Reserve the public data plane before validation or state mutation."""
+        with self._single_writer():
+            self._require_capture_data_plane_admission()
+            yield
+
+    @contextmanager
     def _single_writer(self) -> Iterator[None]:
         if not self._lock.acquire(blocking=False):
             raise ProtocolError("Runtime is already executing another request")
@@ -5755,7 +5755,7 @@ class PrototypeRuntimeApi:
 
     def invalidate_capture_inspection(self) -> None:
         """Fail closed after uncertain preparation without resuming execution."""
-        with self._single_writer():
+        with self._capture_data_plane_writer():
             self._capture_inspection_quarantined = True
             self._capture_ticket = None
             invalidate = getattr(
@@ -5768,7 +5768,7 @@ class PrototypeRuntimeApi:
             invalidate()
 
     def capture_frame_variables(self, *, filters: Mapping[str, object], cursor: int, limit: int, timeout_s: float | None = None) -> Mapping[str, object]:
-        with self._single_writer():
+        with self._capture_data_plane_writer():
             self._require_available()
             self._require_capture_inspection_available()
             with self._bounded_command_timeout(timeout_s):
@@ -5779,7 +5779,7 @@ class PrototypeRuntimeApi:
                     )
 
     def capture_stack(self, *, cursor: int, limit: int, timeout_s: float | None = None) -> Mapping[str, object]:
-        with self._single_writer():
+        with self._capture_data_plane_writer():
             self._require_available()
             self._require_capture_inspection_available()
             with self._bounded_command_timeout(timeout_s):
@@ -5789,7 +5789,7 @@ class PrototypeRuntimeApi:
                     )
 
     def capture_frame(self, *, level: int, cursor: int, limit: int, name: str | None = None, timeout_s: float | None = None) -> Mapping[str, object]:
-        with self._single_writer():
+        with self._capture_data_plane_writer():
             self._require_available()
             self._require_capture_inspection_available()
             with self._bounded_command_timeout(timeout_s):
@@ -5800,7 +5800,7 @@ class PrototypeRuntimeApi:
                     )
 
     def resolve_capture_manager_origin(self, origin: ManagerOrigin, *, timeout_s: float | None = None) -> Mapping[str, object]:
-        with self._single_writer():
+        with self._capture_data_plane_writer():
             self._require_available()
             self._require_capture_inspection_available()
             if not isinstance(origin, ManagerOrigin) or origin.namespace != "frame":
@@ -5813,7 +5813,7 @@ class PrototypeRuntimeApi:
                         )
 
     def capture_temporary_tables(self, manager_handle: str, *, names: tuple[str, ...] | None, cursor: int, limit: int, selection: ValueSelection | None, timeout_s: float | None = None) -> Mapping[str, object]:
-        with self._single_writer():
+        with self._capture_data_plane_writer():
             self._require_available()
             self._require_capture_inspection_available()
             if selection is not None and (
