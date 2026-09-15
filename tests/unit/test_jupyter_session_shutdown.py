@@ -14,7 +14,7 @@ from traitlets.config import Config
 import pytest
 
 from onec_runtime.runtime_api import RuntimeNamespaceSnapshot
-from onec_runtime.errors import StaleCaptureError
+from onec_runtime.errors import ProtocolError, StaleCaptureError
 from onec_runtime.recovery_journal import RecoveryJournal
 from onec_runtime.runtime_api import PrototypeRuntimeApi
 from onec_runtime_jupyter import InteractiveRuntimeSession, install_runtime
@@ -79,6 +79,24 @@ class _ServerShutdownCaptureSession(ShutdownBlockingCaptureSession):
 
     def detach(self) -> None:
         self.shutdown_timeline.append("debug_ui_detached")
+
+
+class _FailFirstAbandonedJournal(RecoveryJournal):
+    def __init__(self) -> None:
+        super().__init__()
+        self.abandoned_attempts = 0
+
+    def record(
+        self,
+        stream: str,
+        event: str,
+        **fields: object,
+    ):  # type: ignore[no-untyped-def]
+        if event == "capture_evaluation_shutdown_abandoned":
+            self.abandoned_attempts += 1
+            if self.abandoned_attempts == 1:
+                raise OSError("private transient shutdown journal failure")
+        return super().record(stream, event, **fields)
 
 
 def _shutdown_runtime_session(
@@ -625,6 +643,112 @@ def test_interactive_owner_retains_guardian_and_hooks_until_core_close_finishes(
     assert wrapper._closed is True
     assert stopped == ["stopped"]
     assert wrapper._shutdown_shell is None
+
+
+@pytest.mark.parametrize("retry_entry", ("normal", "kernel"))
+def test_late_worker_exit_keeps_abandoned_shutdown_retryable(
+    retry_entry: str,
+) -> None:
+    rdbg = _ServerShutdownCaptureSession(wake_on_invalidate=False)
+    journal = _FailFirstAbandonedJournal()
+    controller = captured_controller(
+        rdbg,
+        command_timeout_s=0.05,
+        journal=journal,
+    )
+    api = PrototypeRuntimeApi(controller, journal=journal)
+    capture_owner, ticket, cleanup_probe = start_shutdown_evaluation(
+        controller,
+        rdbg,
+    )
+    evaluation_id = ticket.evaluation_id
+    del ticket
+    runtime = _shutdown_runtime_session(rdbg, api, server=True)
+    stopped: list[str] = []
+    wrapper = InteractiveRuntimeSession(
+        runtime,
+        SimpleNamespace(stop=lambda: stopped.append("stopped")),
+    )
+    shell = InteractiveShell()
+    wrapper._register_shutdown(shell)
+
+    try:
+        with pytest.raises(
+            ProtocolError,
+            match="ZUP demo cleanup failed: ProtocolError",
+        ) as caught:
+            runtime.close()
+        assert "private transient shutdown journal failure" not in (
+            str(caught.value) + repr(caught.value)
+        )
+        assert runtime.is_closed is False
+        assert wrapper._closed is False
+        assert stopped == []
+        assert wrapper._shutdown_shell is shell
+        assert journal.abandoned_attempts == 1
+        assert not any(
+            event.event.startswith("capture_evaluation_shutdown_")
+            for event in journal.events
+        )
+
+        rdbg.shutdown_poll_release.set()
+        assert capture_owner.join(1), "coordinator worker did not exit after rescue"
+
+        if retry_entry == "normal":
+            wrapper.close()
+        else:
+            wrapper._close_at_shutdown()
+
+        assert runtime.is_closed is True
+        assert wrapper._closed is True
+        assert stopped == ["stopped"]
+        assert wrapper._shutdown_shell is None
+        assert journal.abandoned_attempts == 2
+        abandoned = [
+            event
+            for event in journal.events
+            if event.event == "capture_evaluation_shutdown_abandoned"
+        ]
+        assert len(abandoned) == 1
+        assert abandoned[0].fields == {
+            "evaluation_id": evaluation_id,
+            "evaluation_kind": "user_bsl",
+            "termination_proven": False,
+            "elapsed_ms": abandoned[0].fields["elapsed_ms"],
+            "pin_disposition": "retained",
+            "cleanup_disposition": "retained",
+            "cleanup_lease_count": 1,
+        }
+        assert type(abandoned[0].fields["elapsed_ms"]) is int
+        assert 0 <= abandoned[0].fields["elapsed_ms"] <= 0x7FFFFFFF
+        assert not any(
+            event.event == "capture_evaluation_shutdown_disposed"
+            for event in journal.events
+        )
+        assert cleanup_probe.dispositions == []
+        assert cleanup_probe.is_product_owned
+        assert rdbg.shutdown_cleanup_dispatches == 0
+        assert "pin_release" not in rdbg.shutdown_timeline
+        assert "pin_quarantine" not in rdbg.shutdown_timeline
+        for private in rdbg.shutdown_private_values:
+            assert private not in repr(abandoned[0])
+
+        wrapper.close()
+        wrapper._close_at_shutdown()
+        assert stopped == ["stopped"]
+        assert journal.abandoned_attempts == 2
+        assert cleanup_probe.dispositions == []
+    finally:
+        rdbg.shutdown_poll_release.set()
+        capture_owner.begin_close()
+        assert capture_owner.join(2)
+        if not runtime.is_closed:
+            try:
+                runtime.close_for_kernel_shutdown()
+            except ProtocolError:
+                pass
+        if not wrapper._closed:
+            wrapper.close()
 
 
 def test_jupyter_shutdown_from_another_thread_joins_pending_capture_consumer() -> None:
