@@ -59,14 +59,10 @@ class Backend:
         return api().PrivateValueProjection(tuple(entries), total,
                                             request.stop if request.stop < total else None)
 
-    def is_private_value(self, fence, handle):
-        self.calls.append(("guard", fence, handle))
-        return handle in self.private
-
     @staticmethod
     def _entry(name, preview):
         return api().PrivateProjectedValue(
-            name, name.casefold(),
+            name,
             lambda: api().ValueMetadata("Строка", preview, None, api().ValueShape.SCALAR),
         )
 
@@ -78,7 +74,7 @@ def setup_adapter(*, parameters=("ПервыйПараметр", "ВторойП
         resolver = lambda root: parameters
     adapter = module.LocalCaptureValueAdapter(
         backend, backend.fence,
-        policy=module.CaptureValuePolicy(backend.is_private_value),
+        policy=module.CaptureValuePolicy(),
         resolve_parameters=resolver,
     )
     return adapter, backend

@@ -187,11 +187,11 @@ class ValueMetadata:
 
 @dataclass(frozen=True, slots=True, repr=False)
 class PrivateProjectedValue:
-    """Private backend result; metadata must not be read before its guard."""
+    """One backend-admitted result; metadata is absent for a denied value."""
 
     name: str | int
-    handle: object = field(repr=False, compare=False)
     describe: Callable[[], ValueMetadata] = field(repr=False, compare=False)
+    denied: bool = False
     cycle: bool = False
 
     def __post_init__(self) -> None:
@@ -202,6 +202,8 @@ class PrivateProjectedValue:
             _identifier(self.name, what="projected name")
         if not callable(self.describe):
             raise CaptureValueCheckError("projected metadata reader is invalid")
+        if type(self.denied) is not bool:
+            raise CaptureValueCheckError("projected admission state is invalid")
         if type(self.cycle) is not bool:
             raise CaptureValueCheckError("projected cycle marker is invalid")
 
@@ -241,8 +243,9 @@ class CaptureValueBackend(Protocol):
 
     ``validate_inspection`` must validate the exact fence and lifecycle without
     privacy or source work.  Each later call must validate the same fence again
-    while it runs.  Projection and guard calls are coordinator-owned inspection
-    operations; temporary-handle cleanup is a materialization-helper step.
+    while it runs. A projection owns the target-side admission decision for
+    its root and selected children before it returns. Temporary-handle cleanup
+    is a materialization-helper step.
     Variable projections apply the requested role before paging.  Parameter
     pages must preserve absolute source order and publish totals/cursors for the
     classified parameter inventory.  The adapter verifies this contract; only
@@ -261,14 +264,11 @@ class CaptureValueBackend(Protocol):
 
 @dataclass(frozen=True, slots=True, repr=False)
 class CaptureValuePolicy:
-    private_guard: Callable[[object, object], bool] = field(repr=False, compare=False)
     max_depth: int = 16
     max_items: int = MAX_PAGE_ITEMS
     max_bytes: int = 64 * 1024
 
     def __post_init__(self) -> None:
-        if not callable(self.private_guard):
-            raise TypeError("capture private-value guard must be callable")
         if type(self.max_depth) is not int or self.max_depth < 0 or self.max_depth > 64:
             raise ValueError("capture value depth budget is invalid")
         if (type(self.max_items) is not int or self.max_items < 1
@@ -276,31 +276,6 @@ class CaptureValuePolicy:
             raise ValueError("capture value item budget is invalid")
         if type(self.max_bytes) is not int or self.max_bytes < 1:
             raise ValueError("capture value byte budget is invalid")
-
-    def is_private(self, fence: object, handle: object) -> bool:
-        check_failed = False
-        try:
-            result = self.private_guard(fence, handle)
-        except (
-            CaptureBusyError,
-            CaptureEvaluationPendingError,
-            CaptureOutcomeUnknownError,
-            CaptureRecoveryRequiredError,
-            CaptureValueAccessDeniedError,
-            CaptureValueCheckError,
-            NoActiveCaptureError,
-            StaleCaptureError,
-        ):
-            raise
-        except Exception:
-            check_failed = True
-            result = None
-        if check_failed:
-            raise CaptureValueCheckError("capture public-value check failed") from None
-        if type(result) is not bool:
-            raise CaptureValueCheckError("public-value guard returned an invalid result")
-        return result
-
 
 @dataclass(frozen=True, slots=True, repr=False)
 class ValueNode:
@@ -311,7 +286,6 @@ class ValueNode:
     expandable: bool
     shape: ValueShape | None
     path: SafeValuePath
-    private: bool = False
     cycle: bool = False
     _owner: LocalCaptureValueAdapter | None = field(
         repr=False, compare=False, default=None,
@@ -343,8 +317,6 @@ class ValueNode:
         return self._owner
 
     def __str__(self) -> str:
-        if self.private:
-            return f"{self.name}: <private runtime value>"
         marker = " ▸" if self.expandable else ""
         return f"{self.name}: {self.type_name} = {self.preview}{marker}"
 
@@ -352,8 +324,29 @@ class ValueNode:
 
 
 @dataclass(frozen=True, slots=True, repr=False)
+class DeniedValueNode:
+    """The only public representation of a denied selected child."""
+
+    name: str | int
+    access: str = field(init=False, default="denied")
+    expandable: bool = field(init=False, default=False)
+
+    def __post_init__(self) -> None:
+        if type(self.name) is int:
+            if self.name < 0:
+                raise CaptureValueCheckError("projected index is invalid")
+        else:
+            _identifier(self.name, what="projected name")
+
+    def __str__(self) -> str:
+        return f"{self.name}: <private runtime value>"
+
+    __repr__ = __str__
+
+
+@dataclass(frozen=True, slots=True, repr=False)
 class ValuePage:
-    items: tuple[ValueNode, ...]
+    items: tuple[ValueNode | DeniedValueNode, ...]
     total: int
     next_cursor: int | None
     path: SafeValuePath
@@ -363,7 +356,7 @@ class ValuePage:
 
     def __post_init__(self) -> None:
         if type(self.items) is not tuple or any(
-            not isinstance(item, ValueNode) for item in self.items
+            not isinstance(item, (ValueNode, DeniedValueNode)) for item in self.items
         ):
             raise TypeError("value page items must be an immutable tuple")
 
@@ -637,8 +630,6 @@ class LocalCaptureValueAdapter:
         self, node: ValueNode, alias: str | None, key: str | int | slice,
     ) -> ValueNode | ValuePage:
         self._validate_first()
-        if node.private:
-            raise CaptureValueAccessDeniedError("capture value is private")
         if node.cycle:
             raise CapturePathError("capture value cycle cannot be expanded")
         depth = max(0, len(node.path.segments) - 1)
@@ -665,7 +656,7 @@ class LocalCaptureValueAdapter:
             return self._empty_page(node.path, view.value, start=start, stop=stop)
 
         root_record = self._backend.resolve_value(self._fence, node.path)
-        if self._policy.is_private(self._fence, root_record.handle):
+        if root_record.denied:
             raise CaptureValueAccessDeniedError("capture value is private")
         root_metadata = self._describe(root_record)
         if not isinstance(root_metadata, ValueMetadata) or root_metadata.shape is not node.shape:
@@ -785,7 +776,7 @@ class LocalCaptureValueAdapter:
         exact_access: bool,
         segment_kind: ValuePathSegmentKind = ValuePathSegmentKind.VARIABLE,
     ) -> ValuePage:
-        nodes: list[ValueNode] = []
+        nodes: list[ValueNode | DeniedValueNode] = []
         for entry in projection.entries:
             name = entry.name
             if segment_kind in {
@@ -798,16 +789,12 @@ class LocalCaptureValueAdapter:
                 checked_name = name
             else:
                 raise CaptureValueCheckError("projected child index is invalid")
-            path = request.path.child(segment_kind, checked_name)
-            private = self._policy.is_private(self._fence, entry.handle)
-            if private:
+            if entry.denied:
                 if exact_access:
                     raise CaptureValueAccessDeniedError("capture value is private")
-                node = ValueNode(
-                    checked_name, None, "<private runtime value>", None, False,
-                    None, path, private=True, _owner=self,
-                )
+                node = DeniedValueNode(checked_name)
             else:
+                path = request.path.child(segment_kind, checked_name)
                 metadata = self._describe(entry)
                 if not isinstance(metadata, ValueMetadata):
                     raise CaptureValueCheckError("capture value metadata is invalid")
@@ -907,4 +894,7 @@ class LocalCaptureValueAdapter:
             )]
             if len(matches) != 1:
                 raise CaptureLookupError("capture value lookup is ambiguous")
-        return page.items[0]
+        item = page.items[0]
+        if isinstance(item, DeniedValueNode):
+            raise CaptureValueAccessDeniedError("capture value is private")
+        return item

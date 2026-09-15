@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from base64 import b64decode
+import binascii
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
@@ -19,6 +21,7 @@ from weakref import WeakKeyDictionary
 import pandas as pd
 
 from onec_runtime.capture_evaluation import (
+    AdmissionEnvelopeV1,
     CaptureEvaluationCoordinator,
     CaptureEvaluationTicket,
     CapturePhase,
@@ -94,6 +97,8 @@ from onec_runtime.errors import (
     CaptureBusyError,
     CaptureOutcomeUnknownError,
     CaptureRecoveryRequiredError,
+    CaptureValueAccessDeniedError,
+    CaptureValueCheckError,
     NoActiveCaptureError,
     PoisonedRuntimeError,
     ProtocolError,
@@ -1118,10 +1123,11 @@ class PrototypeRuntimeApi:
                 name.casefold() for name in self._namespace_names
             }:
                 raise ProtocolError("Completion root is not in the current namespace")
-            # The schema helper admits only table/structure types and excludes
-            # private Worker container shapes. Do not run the general MAIN
-            # privacy instruction here: completion must preserve operation state.
             self._validate_value_reference_locked(handle)
+            # The admission is part of the target instruction before the
+            # completion helper reads fields.  The returned route is immaterial
+            # here: the helper supplies the narrower structure/table schema.
+            self._materialization_kind_locked(handle)
             with self._remaining_command_timeout():
                 result = self._controller.inspect_completion_fields(handle, table_row=table_row)
             if result.error_occurred or len(result.collection_rows) > 128:
@@ -4793,8 +4799,6 @@ class PrototypeRuntimeApi:
         with self._capture_data_plane_writer(), self._bounded_command_timeout(timeout_s):
             self._require_available()
             safe_handle = self._resolve_value_handle_locked(handle)
-            if self._materialization_kind_locked(safe_handle) != "value":
-                raise ProtocolError("1C value is not a recursive value payload")
             transfer = RuntimeValueTransfer(
                 self._execute_worker_instruction,
                 self._take_context_string,
@@ -4824,8 +4828,6 @@ class PrototypeRuntimeApi:
         with self._capture_data_plane_writer(), self._bounded_command_timeout(timeout_s):
             self._require_available()
             safe_handle = self._resolve_value_handle_locked(handle)
-            if self._materialization_kind_locked(safe_handle) != "table":
-                raise ProtocolError("1C value is not a tabular payload")
             transfer = CompactRuntimeTableTransfer(
                 self._execute_worker_instruction,
                 self._take_context_string,
@@ -4898,6 +4900,11 @@ class PrototypeRuntimeApi:
         ref_columns: dict[str, str | ReferenceMode] | None,
         uuid_suffix: str,
     ) -> tuple[str, bytes]:
+        if any(
+            type(value) is not int or value <= 0
+            for value in (max_depth, max_items, max_rows, max_bytes)
+        ):
+            raise ProtocolError("projection materialization budgets must be positive")
         if (
             type(offset) is not int
             or offset < 0
@@ -4928,7 +4935,13 @@ class PrototypeRuntimeApi:
             raise ProtocolError("projection kind is unsupported")
 
         context_key = f"__onec_projection_{uuid4().hex}"
-        projection_handle = f"Контекст.{context_key}"
+        if kind != "table_rows":
+            MaterializationOptions(
+                refs.value if isinstance(refs, ReferenceMode) else refs,
+                max_depth,
+                max_items,
+                max_bytes,
+            )
         instruction = self._projection_instruction(
             safe_handle,
             context_key=context_key,
@@ -4937,50 +4950,60 @@ class PrototypeRuntimeApi:
             limit=limit,
             columns=columns,
             names=names,
+            refs=refs,
+            ref_columns=ref_columns,
+            max_depth=max_depth,
+            max_items=max_items,
+            max_rows=max_rows,
+            max_bytes=max_bytes,
+            runtime_generation=self._controller.runtime_generation,
+            context_generation=self._context_generation,
+            worker_type_registrations=self._worker_type_registrations(),
         )
         try:
-            self._execute_worker_instruction(instruction)
+            metadata = self._execute_worker_instruction(instruction)
+            payload = self._consume_projection_payload_locked(
+                metadata,
+                context_key=context_key,
+                max_bytes=max_bytes,
+            )
             if kind == "table_rows":
-                transfer = CompactRuntimeTableTransfer(
-                    self._execute_worker_instruction,
-                    self._take_context_string,
-                    runtime_generation=lambda: self._controller.runtime_generation,
-                    context_generation=self._context_generation,
-                    context_cleaner=self._drop_context_value,
-                    worker_type_registrations=self._worker_type_registrations,
-                    max_text_size=((max_bytes + 2) // 3) * 4,
-                    max_payload_bytes=max_bytes,
-                    max_rows=limit,
-                )
-                return (
-                    "compact_table",
-                    transfer.payload(
-                        projection_handle,
-                        ReferencePolicy(refs, ref_columns, uuid_suffix),
-                    ),
-                )
-            transfer = RuntimeValueTransfer(
-                self._execute_worker_instruction,
-                self._take_context_string,
-                context_cleaner=self._drop_context_value,
-                runtime_generation=lambda: self._controller.runtime_generation,
-                context_generation=self._context_generation,
-                worker_type_registrations=self._worker_type_registrations,
-            )
-            return (
-                "value",
-                transfer.payload(
-                    projection_handle,
-                    MaterializationOptions(
-                        refs.value if isinstance(refs, ReferenceMode) else refs,
-                        max_depth,
-                        max_items,
-                        max_bytes,
-                    ),
-                ),
-            )
+                return "compact_table", payload
+            return "value", payload
         finally:
             self._drop_context_value(context_key)
+
+    def _consume_projection_payload_locked(
+        self,
+        metadata: object,
+        *,
+        context_key: str,
+        max_bytes: int,
+    ) -> bytes:
+        max_base64_chars = ((max_bytes + 2) // 3) * 4
+        envelope = AdmissionEnvelopeV1.parse(
+            metadata,
+            max_payload_bytes=max_bytes,
+            max_base64_chars=max_base64_chars,
+        )
+        if (
+            envelope.runtime_generation != self._controller.runtime_generation
+            or envelope.context_generation != self._context_generation
+        ):
+            raise CaptureValueCheckError("CAPTURE value admission result is invalid")
+        content = self._take_context_string(context_key, max_base64_chars)
+        if len(content) != envelope.base64_chars:
+            raise CaptureValueCheckError("CAPTURE value admission result is invalid")
+        try:
+            payload = b64decode("".join(content.split()), validate=True)
+        except (ValueError, binascii.Error) as error:
+            raise ProtocolError("projection Base64 payload is invalid") from error
+        if (
+            len(payload) != envelope.payload_bytes
+            or sha256(payload).hexdigest() != envelope.payload_sha256
+        ):
+            raise CaptureValueCheckError("CAPTURE value payload integrity check failed")
+        return payload
 
     def project_to_df(
         self,
@@ -5102,17 +5125,50 @@ class PrototypeRuntimeApi:
         limit: int | None,
         columns: tuple[str, ...],
         names: tuple[str, ...],
+        refs: str | ReferenceMode = ReferenceMode.PRESENTATION,
+        ref_columns: dict[str, str | ReferenceMode] | None = None,
+        max_depth: int = 32,
+        max_items: int = 100_000,
+        max_rows: int = 100_000,
+        max_bytes: int = 64 * 1024 * 1024,
+        runtime_generation: int = 1,
+        context_generation: int = 1,
+        worker_type_registrations: tuple[str, ...] = (),
     ) -> str:
-        lines: list[str]
+        if any(
+            not isinstance(registration, str) or not registration
+            for registration in worker_type_registrations
+        ):
+            raise ProtocolError("projection Worker type registrations are invalid")
+        if runtime_generation <= 0 or context_generation <= 0:
+            raise ProtocolError("projection generations must be positive")
+        if kind == "table_rows":
+            try:
+                reference_mode = ReferenceMode(refs).value
+            except ValueError as error:
+                raise ProtocolError("unknown table reference mode") from error
+            overrides = dict(ref_columns or {})
+            for column, mode in overrides.items():
+                if not isinstance(column, str) or not column:
+                    raise ProtocolError("table reference column name is invalid")
+                try:
+                    ReferenceMode(mode)
+                except ValueError as error:
+                    raise ProtocolError("unknown table reference mode") from error
+        else:
+            reference_mode = "presentation"
+            overrides = {}
+
+        projection_lines: list[str]
         if kind == "slice":
-            lines = [
+            projection_lines = [
                 "ПроекцияЗначения = Новый Массив;",
                 f"Для ИндексПроекции = {offset} По Мин({handle}.Количество() - 1, {offset + (limit or 0) - 1}) Цикл",
                 f"    ПроекцияЗначения.Добавить({handle}[ИндексПроекции]);",
                 "КонецЦикла;",
             ]
         elif kind == "table_rows":
-            lines = [
+            projection_lines = [
                 "СтрокиПроекции = Новый Массив;",
                 f"Для ИндексПроекции = {offset} По Мин({handle}.Количество() - 1, {offset + (limit or 0) - 1}) Цикл",
                 f"    СтрокиПроекции.Добавить({handle}[ИндексПроекции]);",
@@ -5123,36 +5179,106 @@ class PrototypeRuntimeApi:
                 if not columns
                 else ", " + bsl_string_literal(",".join(columns))
             )
-            lines.append(
+            projection_lines.append(
                 f"ПроекцияЗначения = {handle}.Скопировать(СтрокиПроекции{column_argument});"
             )
         elif kind == "fields":
-            lines = ["ПроекцияЗначения = Новый Структура;"]
-            lines.extend(
+            projection_lines = ["ПроекцияЗначения = Новый Структура;"]
+            projection_lines.extend(
                 "ПроекцияЗначения.Вставить("
                 f"{bsl_string_literal(name)}, {handle}.{name});"
                 for name in names
             )
         else:
-            lines = ["ПроекцияЗначения = Новый Соответствие;"]
-            lines.extend(
+            projection_lines = ["ПроекцияЗначения = Новый Соответствие;"]
+            projection_lines.extend(
                 "ПроекцияЗначения.Вставить("
                 f"{bsl_string_literal(name)}, {handle}.Получить({bsl_string_literal(name)}));"
                 for name in names
             )
-        lines.extend(
-            (
-                f"Контекст.Вставить({bsl_string_literal(context_key)}, ПроекцияЗначения);",
-                "Результат = Истина;",
+        lines = ["Попытка", "ТипыОбъектовWorker = Новый Массив;"]
+        for index, registration in enumerate(worker_type_registrations):
+            lines.extend((
+                f"ВременныйОбъектWorker{index} = ВнешниеОбработки.Создать("
+                f"{bsl_string_literal(registration)}, Ложь);",
+                f"ТипыОбъектовWorker.Добавить(ТипЗнч(ВременныйОбъектWorker{index}));",
+            ))
+        lines.extend((
+            "Если Не RuntimeValueTransferServer.ДопуститьЗначение("
+            f"{handle}, ТипыОбъектовWorker) Тогда",
+            '    Результат = "D|worker_generation_value";',
+            "Иначе",
+            *(f"    {line}" for line in projection_lines),
+        ))
+        if kind == "table_rows":
+            lines.append("    РежимыСсылокМатериализации = Новый Соответствие;")
+            for column in sorted(overrides):
+                lines.append(
+                    "    РежимыСсылокМатериализации.Вставить("
+                    f"{bsl_string_literal(column)}, "
+                    f"{bsl_string_literal(ReferenceMode(overrides[column]).value)});"
+                )
+            lines.append(
+                "    Материализация = RuntimeTableTransferServer."
+                "СериализоватьКомпактнуюТаблицу("
+                f"ПроекцияЗначения, {bsl_string_literal(reference_mode)}, "
+                "РежимыСсылокМатериализации, ТипыОбъектовWorker, "
+                f"{limit or 0}, {max_bytes});"
             )
-        )
+        else:
+            lines.append(
+                "    Материализация = RuntimeValueTransferServer."
+                "СериализоватьЗначение("
+                f"ПроекцияЗначения, {bsl_string_literal(refs.value if isinstance(refs, ReferenceMode) else refs)}, "
+                f"{max_depth}, {max_items}, {max_bytes}, ТипыОбъектовWorker);"
+            )
+        lines.extend((
+            "    Если Не Материализация.Доступ Тогда",
+            '        Результат = "D|worker_generation_value";',
+            "    Иначе",
+            f"        Контекст.Вставить({bsl_string_literal(context_key)}, Материализация.Base64);",
+            "        Результат = \"R|\" + "
+            f"Формат({runtime_generation}, \"ЧГ=0; ЧДЦ=0\") + \"|\" + "
+            f"Формат({context_generation}, \"ЧГ=0; ЧДЦ=0\") + \"|\" + "
+            "Формат(Материализация.Размер, \"ЧГ=0; ЧДЦ=0\") + \"|\" + "
+            "Материализация.Хеш + \"|\" + "
+            "Формат(СтрДлина(Материализация.Base64), \"ЧГ=0; ЧДЦ=0\");",
+            "    КонецЕсли;",
+            "КонецЕсли;",
+            "Исключение",
+            '    Результат = "E|value_admission_failed";',
+            "КонецПопытки;",
+        ))
         return "\n".join(lines)
 
     def _materialization_kind_locked(self, safe_handle: str) -> str:
-        route = self._execute_worker_instruction(
-            "Результат = RuntimeValueTransferServer."
-            f"ПолучитьВидМатериализации({safe_handle});"
-        )
+        registrations = self._worker_type_registrations()
+        lines = ["Попытка", "ТипыОбъектовWorker = Новый Массив;"]
+        for index, registration in enumerate(registrations):
+            lines.extend((
+                f"ВременныйОбъектWorker{index} = ВнешниеОбработки.Создать("
+                f"{bsl_string_literal(registration)}, Ложь);",
+                f"ТипыОбъектовWorker.Добавить(ТипЗнч(ВременныйОбъектWorker{index}));",
+            ))
+        lines.extend((
+            "Если Не RuntimeValueTransferServer.ДопуститьЗначение("
+            f"{safe_handle}, ТипыОбъектовWorker) Тогда",
+            '    Результат = "D|worker_generation_value";',
+            "Иначе",
+            "    Результат = RuntimeValueTransferServer."
+            f"ПолучитьВидМатериализации({safe_handle});",
+            "КонецЕсли;",
+            "Исключение",
+            '    Результат = "E|value_admission_failed";',
+            "КонецПопытки;",
+        ))
+        route = self._execute_worker_instruction("\n".join(lines))
+        if route == AdmissionEnvelopeV1.denied():
+            raise CaptureValueAccessDeniedError(
+                "Worker generation objects are not public values"
+            )
+        if route == AdmissionEnvelopeV1.failed():
+            raise CaptureValueCheckError("CAPTURE value admission failed")
         if route not in {"value", "table"}:
             raise ProtocolError("1C value materialization route is invalid")
         return route

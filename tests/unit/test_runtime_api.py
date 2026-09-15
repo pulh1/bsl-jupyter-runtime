@@ -3855,7 +3855,6 @@ def test_api_enforces_table_payload_row_budget_before_transport() -> None:
     controller.context_value = encoded
     controller.worker_results.extend(
         (
-            "table",
             f"R|1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}",
         )
     )
@@ -3865,7 +3864,7 @@ def test_api_enforces_table_payload_row_budget_before_transport() -> None:
     )
 
     assert payload == content
-    assert "ТипыОбъектовWorker, 3, 4096);" in controller.main_sources[1]
+    assert "ТипыОбъектовWorker, 3, 4096);" in controller.main_sources[0]
 
 
 def test_api_project_to_df_transfers_only_bounded_table_projection() -> None:
@@ -3890,7 +3889,7 @@ def test_api_project_to_df_transfers_only_bounded_table_projection() -> None:
     encoded = b64encode(content).decode()
     controller.context_value = encoded
     controller.worker_results.extend(
-        (True, f"R|1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}")
+        (f"R|1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}",)
     )
 
     frame = api.project_to_df(
@@ -3903,7 +3902,7 @@ def test_api_project_to_df_transfers_only_bounded_table_projection() -> None:
     assert frame.to_dict("records") == [{"Имя": "А"}]
     assert "Для ИндексПроекции = 20" in controller.main_sources[0]
     assert "Контекст.Таблица.Скопировать" in controller.main_sources[0]
-    assert "ТипыОбъектовWorker, 10, 4096);" in controller.main_sources[1]
+    assert "ТипыОбъектовWorker, 10, 4096);" in controller.main_sources[0]
     assert controller.context_drops[-1].startswith("__onec_projection_")
 
 
@@ -3923,7 +3922,6 @@ def test_api_project_value_decodes_only_bounded_array_projection() -> None:
     controller.worker_results.extend(
         (
             "value",
-            True,
             f"R|1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}",
         )
     )
@@ -3964,7 +3962,6 @@ def test_api_project_value_preserves_table_materialize_dataframe_semantics() -> 
     controller.worker_results.extend(
         (
             "table",
-            True,
             f"R|1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}",
         )
     )
@@ -3999,13 +3996,12 @@ def test_api_project_value_keeps_route_and_projection_under_one_writer(
     controller.worker_results.extend(
         (
             "value",
-            True,
             f"R|1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}",
         )
     )
     route_returned = Event()
     continue_projection = Event()
-    original_materialization_kind = api.materialization_kind
+    original_materialization_kind = api._materialization_kind_locked
 
     def pause_after_public_route(handle: str) -> str:
         result = original_materialization_kind(handle)
@@ -4013,7 +4009,7 @@ def test_api_project_value_keeps_route_and_projection_under_one_writer(
         assert continue_projection.wait(timeout=2)
         return result
 
-    monkeypatch.setattr(api, "materialization_kind", pause_after_public_route)
+    monkeypatch.setattr(api, "_materialization_kind_locked", pause_after_public_route)
     results: list[object] = []
     failures: list[BaseException] = []
 
@@ -4074,10 +4070,9 @@ def test_api_routes_recursive_value_materialization_without_active_worker() -> N
 
     assert result == {"Name": "value"}
     assert len(controller.main_sources) == 2
-    assert (
-        controller.main_sources[0]
-        == "Результат = RuntimeValueTransferServer."
-        "ПолучитьВидМатериализации(Контекст.Данные);"
+    assert "RuntimeValueTransferServer.ДопуститьЗначение(Контекст.Данные" in controller.main_sources[0]
+    assert controller.main_sources[0].index("ДопуститьЗначение") < controller.main_sources[0].index(
+        "ПолучитьВидМатериализации"
     )
     assert "СериализоватьЗначение(Контекст.Данные, \"both\", 7, 99, 4096, ТипыОбъектовWorker)" in (
         controller.main_sources[1]

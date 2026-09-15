@@ -23,8 +23,8 @@
 
 `tools/build_runtime_extension_bundle.py` ran with the installed 1C Designer
 `8.3.27.2170`, artifact `0.1.3`, and protocol `2`. It produced
-`OnecInteractiveRuntime.cfe` (21,210 bytes), whose SHA-256 is
-`87a8e7ac511ff919f083f4355ed8d3b3fe6fa6460754a3782dad5f2f0e9ca3e6`.
+`OnecInteractiveRuntime.cfe` (21,371 bytes), whose SHA-256 is
+`5bdda3410e15f4ca59d755e8ee2a1cd05f7e5f8a5086b75a02ab49d5f2ef554b`.
 This is a Designer compilation and bundle build, not live-infobase
 qualification.
 
@@ -39,13 +39,35 @@ that follows Task 7. This foundation does not claim that integration.
 
 ## Validation
 
-The combined focused and nearby suite completed with `1261 passed, 1 skipped,
-1 warning` in 63.26 seconds. The warning is the existing Windows Proactor
-`add_reader` warning from the real-ipykernel test. The command included the
-capture evaluation, both transports, extension bundle/build/lifecycle/session,
-runtime API, prototype, Jupyter, MCP, and ZUP Worker-universe suites.
+The focused remediation suite completed with `310 passed` in 6.12 seconds. It
+includes both BSL serializers, their Python instruction builders, generic
+table transport, Runtime API projection/materialization routes, completion,
+and capture-value redaction models.
 
-`python -m compileall` and `git diff --check` are run with the final source
-before commit. The final source inventory also checks that no executable
-standalone public-value guard, guard evaluation kind, or batch guard API
-remains.
+The nearby suite completed with `707 passed, 1 skipped` in 11.88 seconds. It
+includes capture-evaluation models, both transports, extension
+bundle/build/lifecycle/session, Runtime API, completion, Jupyter value proxy,
+and the materialization bridge. Its lifecycle coverage retains the MANUAL
+protocol-`1` rejection before any target materialization or inspection call.
+
+`python -m compileall -q src/onec_runtime packages/jupyter packages/mcp` and
+`git diff --check` pass with the final source.
+
+## Review remediation
+
+- Both successful BSL serializers now return `Доступ = Истина`. A behavioral
+  unit test faithfully executes the emitted BSL `Структура.Вставить` success
+  branches against each generated protocol-2 instruction and reaches `R`, so
+  a missing dynamic property cannot be hidden by Designer syntax compilation.
+- `materialization_kind`, completion, and projection paths generate inline
+  root admission before target type/schema/descendant reads. Projection builds
+  and serializes its bounded result in that same instruction; only admitted
+  Base64 is written to the temporary context key.
+- Value-inspection backends now return admission decisions as part of each
+  projection. There is no callable `CaptureValuePolicy.private_guard`; a
+  non-exact denial is an immutable exact wire object containing only `name`,
+  `access: "denied"`, and `expandable: false`.
+- Generic compact-table classification uses declared types before observations,
+  preserving enumerations and all-null reference columns for per-column
+  reference modes. The obsolete `columns` and `schema_reader` compatibility
+  parameters are absent from the generic Python transport.

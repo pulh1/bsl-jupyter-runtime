@@ -5,7 +5,7 @@ from uuid import UUID
 import pytest
 
 from onec_runtime.errors import ProtocolError
-from onec_runtime.prototype_runtime import OperationState
+from onec_runtime.prototype_runtime import MainCompletion, OperationHandle, OperationState
 from onec_runtime.rdbg.models import CollectionCell, CollectionRow, EvaluationResult
 from onec_runtime.runtime_api import PrototypeRuntimeApi
 from onec_runtime.session import RuntimeSession
@@ -20,6 +20,11 @@ class Controller:
         self.lowerer = SimpleNamespace(persistent_names=("Данные",))
         self.fields = ("Номер", "Название")
         self.calls = []
+        self.admission_sources = []
+
+    def execute_system_main(self, source):
+        self.admission_sources.append(source)
+        return MainCompletion(OperationHandle(self.operation_id, source, source), "value", "", True)
 
     def inspect_completion_fields(self, handle, *, table_row):
         self.calls.append((handle, table_row, self.command_timeout_s))
@@ -75,15 +80,16 @@ def test_completion_does_not_reuse_previous_fields_after_schema_failure():
     assert api.completion_fields("Контекст.Данные") == ()
 
 
-def test_completion_with_loaded_worker_does_not_run_main_privacy_instructions():
+def test_completion_admits_before_the_schema_helper_without_changing_operation_state():
     controller = Controller()
-    def forbidden_instruction(source):
-        raise AssertionError("Completion must not execute a MAIN instruction")
-    api = PrototypeRuntimeApi(controller, worker_instruction_executor=forbidden_instruction)
+    api = PrototypeRuntimeApi(controller)
     api._worker_generation_handle = object()
     controller.state = OperationState.FAILED
     assert api.completion_fields("Контекст.Данные") == ("Номер", "Название")
     assert controller.state is OperationState.FAILED and controller.operation_id == 7
+    assert controller.admission_sources
+    source = controller.admission_sources[-1]
+    assert source.index("ДопуститьЗначение") < source.index("ПолучитьВидМатериализации")
 
 
 def test_admission_closed_api_and_quarantined_capture_refuse_inspection():

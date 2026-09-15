@@ -178,9 +178,6 @@ def test_reads_one_scalar_and_verifies_compact_payload() -> None:
         lambda key, maximum: reads.append((key, maximum)) or encoded,
         runtime_generation=lambda: 3,
         context_generation=5,
-        schema_reader=lambda handle: (
-            CompactColumn("Employee", "reference", is_reference=True),
-        ),
         key_factory=lambda: KEY,
     )
 
@@ -239,9 +236,6 @@ def test_rejects_payload_integrity_mismatch_after_atomic_take() -> None:
         lambda key, _maximum: reads.append(key) or encoded,
         runtime_generation=lambda: 1,
         context_generation=1,
-        schema_reader=lambda handle: (
-            CompactColumn("Employee", "reference", is_reference=True),
-        ),
         key_factory=lambda: KEY,
     )
 
@@ -261,9 +255,6 @@ def test_rejects_declared_payload_over_byte_budget_before_atomic_take() -> None:
         runtime_generation=lambda: 1,
         context_generation=1,
         context_cleaner=lambda _key: None,
-        schema_reader=lambda _handle: (
-            CompactColumn("Employee", "reference", is_reference=True),
-        ),
         max_payload_bytes=len(content) - 1,
         key_factory=lambda: KEY,
     )
@@ -272,18 +263,6 @@ def test_rejects_declared_payload_over_byte_budget_before_atomic_take() -> None:
         transfer.payload("Контекст.Таблица", ReferencePolicy())
 
     assert reads == []
-
-
-def test_precomputed_schema_cannot_bypass_server_admission_policy() -> None:
-    with pytest.raises(ProtocolError, match="precomputed compact table schemas"):
-        build_compact_transfer_instruction(
-            "Контекст.Таблица",
-            ReferencePolicy(refs="uuid"),
-            KEY,
-            runtime_generation=3,
-            context_generation=5,
-            columns=(CompactColumn("Amount", "number", is_reference=False),),
-        )
 
 
 def test_generic_table_transport_has_no_specialized_schema_compatibility_surface() -> None:
@@ -415,9 +394,6 @@ def test_records_each_materialization_boundary_without_payload_values() -> None:
         lambda _key, _maximum: encoded,
         runtime_generation=lambda: 3,
         context_generation=5,
-        schema_reader=lambda _handle: (
-            CompactColumn("Employee", "reference", is_reference=True),
-        ),
         key_factory=lambda: KEY,
         profiler=recorder,
     )

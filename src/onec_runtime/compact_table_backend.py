@@ -127,7 +127,6 @@ def build_compact_transfer_instruction(
     *,
     runtime_generation: int,
     context_generation: int,
-    columns: tuple[CompactColumn, ...] | None = None,
     max_rows: int | None = None,
     max_payload_bytes: int | None = None,
     worker_type_registrations: tuple[str, ...] = (),
@@ -144,8 +143,6 @@ def build_compact_transfer_instruction(
     bounded_bytes = _optional_budget(max_payload_bytes, "table byte budget")
     default = _reference_mode(policy.refs)
     overrides = dict(policy.ref_columns or {})
-    if columns is not None:
-        raise ProtocolError("precomputed compact table schemas are unsupported")
     if any(not isinstance(registration, str) or not registration for registration in worker_type_registrations):
         raise ProtocolError("table Worker type registrations are invalid")
     lines = ["Попытка", "ТипыОбъектовWorker = Новый Массив;"]
@@ -211,7 +208,6 @@ class CompactRuntimeTableTransfer:
         runtime_generation: Callable[[], int],
         context_generation: int,
         context_cleaner: Callable[[str], None] | None = None,
-        schema_reader: Callable[[str], tuple[CompactColumn, ...] | None] | None = None,
         max_text_size: int = 100_000_000,
         max_payload_bytes: int = 75_000_000,
         max_rows: int | None = None,
@@ -226,7 +222,6 @@ class CompactRuntimeTableTransfer:
         self._runtime_generation = runtime_generation
         self._context_generation = context_generation
         self._clean = context_cleaner
-        self._schema_reader = schema_reader
         self._expected_runtime_generation = runtime_generation()
         self._max_text_size = max_text_size
         if max_payload_bytes <= 0:

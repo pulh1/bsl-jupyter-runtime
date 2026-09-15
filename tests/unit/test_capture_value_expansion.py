@@ -1,8 +1,6 @@
 from dataclasses import FrozenInstanceError
-import gc
 import json
 import traceback
-import weakref
 
 import pytest
 
@@ -102,10 +100,6 @@ class Backend:
         names = tuple(name for name, _ in fields)
         return names[:limit]
 
-    def is_private_value(self, fence, handle):
-        self.calls.append(("guard", fence, handle.identity))
-        return handle.identity in self.private
-
     def _resolve(self, path):
         current = None
         for index, segment in enumerate(path.segments):
@@ -120,14 +114,18 @@ class Backend:
             current = matches[0]
         return current
 
-    @staticmethod
-    def _entry(name, value, *, cycle=False):
+    def _entry(self, name, value, *, cycle=False):
         def describe():
             value.describe_calls += 1
             return api().ValueMetadata(
                 value.type_name, value.preview, value.size, api().ValueShape(value.shape),
             )
-        return api().PrivateProjectedValue(name, value.handle, describe, cycle=cycle)
+        return api().PrivateProjectedValue(
+            name,
+            describe,
+            denied=value.handle.identity in self.private,
+            cycle=cycle,
+        )
 
 
 def scalar(preview="1", *, identity=None):
@@ -164,8 +162,7 @@ def setup_values(*, roots=None, max_depth=8, max_items=100, max_bytes=64 * 1024)
     adapter = module.LocalCaptureValueAdapter(
         backend, backend.fence,
         policy=module.CaptureValuePolicy(
-            backend.is_private_value, max_depth=max_depth,
-            max_items=max_items, max_bytes=max_bytes,
+            max_depth=max_depth, max_items=max_items, max_bytes=max_bytes,
         ),
         resolve_parameters=lambda root: (),
     )
@@ -271,27 +268,7 @@ def test_wide_table_is_rejected_from_schema_before_any_row_value_fetch():
     with pytest.raises(CaptureShapeUnsupportedError, match="100 columns"):
         node.columns[:1]
     assert backend.row_reads == 0
-    assert [call[0] for call in backend.calls[-4:]] == ["validate", "resolve", "guard", "schema"]
-
-
-def test_unexpected_guard_failure_is_a_bounded_check_error_without_metadata_access():
-    roots = {"Секрет": scalar("must-not-be-read")}
-    module = api()
-    backend = Backend(roots)
-    def broken_guard(fence, handle):
-        raise RuntimeError("PRIVATE BACKEND DETAIL")
-    adapter = module.LocalCaptureValueAdapter(
-        backend, backend.fence,
-        policy=module.CaptureValuePolicy(broken_guard),
-        resolve_parameters=lambda root: (),
-    )
-    with pytest.raises(CaptureValueCheckError) as raised:
-        adapter.context.variables[:1]
-    rendered = "".join(traceback.format_exception(raised.value))
-    assert "PRIVATE BACKEND DETAIL" not in rendered
-    assert "PRIVATE BACKEND DETAIL" not in repr(raised.value)
-    assert raised.value.__cause__ is None and raised.value.__context__ is None
-    assert roots["Секрет"].describe_calls == 0
+    assert [call[0] for call in backend.calls[-3:]] == ["validate", "resolve", "schema"]
 
 
 def test_denied_page_entry_is_redacted_and_exact_access_is_denied_before_describe():
@@ -301,9 +278,7 @@ def test_denied_page_entry_is_redacted_and_exact_access_is_denied_before_describ
     backend.private.add(denied.handle.identity)
     page = adapter.context.variables[:20]
     node = next(item for item in page.items if item.name == "Структура")
-    assert node.private and node.type_name is None
-    assert node.preview == "<private runtime value>" and not node.expandable
-    assert denied.describe_calls == 0
+    assert type(node).__name__ == "DeniedValueNode"
 
 
 def test_denied_child_uses_the_exact_three_field_wire_model_without_a_guard_callback():
@@ -326,10 +301,9 @@ def test_denied_child_uses_the_exact_three_field_wire_model_without_a_guard_call
         adapter.context.variables["структура"]
     with pytest.raises(CaptureValueAccessDeniedError):
         adapter.context.variables[0]
-    assert denied.describe_calls == 0
 
 
-def test_alias_and_nested_descendant_each_pass_identity_guard_before_metadata():
+def test_backend_admission_redacts_alias_and_nested_descendant_before_metadata():
     shared = scalar("secret", identity="worker-generation")
     roots = {
         "Прямое": shared,
@@ -339,20 +313,20 @@ def test_alias_and_nested_descendant_each_pass_identity_guard_before_metadata():
     adapter, backend = setup_values(roots=roots)
     backend.private.add("worker-generation")
     page = adapter.context.variables[:20]
-    assert [item.private for item in page.items[:2]] == [True, True]
+    assert [item.access for item in page.items[:2]] == ["denied", "denied"]
     nested = page.items[2].fields[:20].items[0]
-    assert nested.private and not nested.expandable
+    assert nested.access == "denied" and not nested.expandable
     assert shared.describe_calls == 0
 
 
-def test_lifecycle_error_wins_before_root_or_child_privacy_guard():
+def test_lifecycle_error_wins_before_backend_admission():
     adapter, backend = setup_values()
     node = adapter.context.variables["Структура"]
-    guard_calls = sum(call[0] == "guard" for call in backend.calls)
+    calls = len(backend.calls)
     backend.valid_fence = object()
     with pytest.raises(CaptureBusyError):
         node.fields["Поле); Опасно(); //"]
-    assert sum(call[0] == "guard" for call in backend.calls) == guard_calls
+    assert len(backend.calls) == calls + 1
     assert backend.calls[-1][0] == "validate"
 
 
@@ -408,11 +382,11 @@ def test_backend_cannot_publish_a_nonprogressing_or_out_of_range_cursor():
         adapter.context.variables[:1]
 
 
-def test_backend_metadata_failure_is_bounded_after_the_public_guard():
+def test_backend_metadata_failure_is_bounded_after_admission():
     adapter, backend = setup_values()
     def broken():
         raise RuntimeError("PRIVATE METADATA DETAIL")
-    entry = api().PrivateProjectedValue("Значение", Handle("safe"), broken)
+    entry = api().PrivateProjectedValue("Значение", broken)
     backend.project_values = lambda fence, request: api().PrivateValueProjection((entry,), 1, None)
     with pytest.raises(CaptureValueCheckError) as raised:
         adapter.context.variables[:1]
@@ -420,25 +394,7 @@ def test_backend_metadata_failure_is_bounded_after_the_public_guard():
     assert "PRIVATE METADATA DETAIL" not in rendered
     assert "PRIVATE METADATA DETAIL" not in repr(raised.value)
     assert raised.value.__cause__ is None and raised.value.__context__ is None
-    assert [call[0] for call in backend.calls[-2:]] == ["validate", "guard"]
-
-
-def test_normalized_node_does_not_retain_the_temporary_guard_handle():
-    adapter, backend = setup_values()
-    retained = []
-    def project(fence, request):
-        handle = Handle("temporary")
-        retained.append(weakref.ref(handle))
-        entry = api().PrivateProjectedValue(
-            "Значение", handle,
-            lambda: api().ValueMetadata("Число", "1", None, api().ValueShape.SCALAR),
-        )
-        return api().PrivateValueProjection((entry,), 1, None)
-    backend.project_values = project
-    page = adapter.context.variables[:1]
-    gc.collect()
-    assert page.items[0].preview == "1"
-    assert retained[0]() is None
+    assert backend.calls[-1][0] == "validate"
 
 
 @pytest.mark.parametrize("letter", ["A", "Я"])

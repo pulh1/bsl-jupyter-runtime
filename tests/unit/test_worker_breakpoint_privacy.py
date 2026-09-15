@@ -91,7 +91,7 @@ def test_capture_value_snapshots_expose_only_normalized_public_fields() -> None:
     serialized = json.dumps((node_wire, page_wire), ensure_ascii=False, default=str)
     assert set(node_wire) == {
         "name", "type_name", "preview", "size", "expandable", "shape",
-        "path", "private", "cycle",
+        "path", "cycle",
     }
     assert set(page_wire) == {
         "items", "total", "next_cursor", "path", "view", "start", "stop",
@@ -112,7 +112,7 @@ def test_attached_frame_and_live_descriptors_never_publish_inspection_capabiliti
     secret_backend = SimpleNamespace(private="PRIVATE_BACKEND_CAPABILITY")
     adapter = LocalCaptureValueAdapter(
         secret_backend, secret_fence,
-        policy=CaptureValuePolicy(secret_callback),
+        policy=CaptureValuePolicy(),
         resolve_parameters=secret_callback,
     )
     original = DebugFrame(

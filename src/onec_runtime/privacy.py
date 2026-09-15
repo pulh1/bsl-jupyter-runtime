@@ -180,8 +180,13 @@ def public_artifact_value(value: Any) -> Any:
             "expandable": value.expandable,
             "shape": public_artifact_value(value.shape),
             "path": public_artifact_value(value.path),
-            "private": value.private,
             "cycle": value.cycle,
+        }
+    if kind == "DeniedValueNode":
+        return {
+            "name": value.name,
+            "access": "denied",
+            "expandable": False,
         }
     if kind == "ValuePage":
         return {
