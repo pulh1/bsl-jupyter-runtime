@@ -7,8 +7,8 @@ from time import monotonic, sleep
 import pytest
 
 from onec_runtime.capture_evaluation import CapturePhase, CaptureResumeTicket
-from onec_runtime.errors import CaptureBusyError
-from onec_runtime.prototype_runtime import OperationState
+from onec_runtime.errors import CaptureBusyError, CaptureRecoveryRequiredError
+from onec_runtime.prototype_runtime import OperationState, PartialWritebackError
 from onec_runtime.runtime_api import PrototypeRuntimeApi, RuntimeReplyKind
 from onec_runtime.session import RuntimeSession
 
@@ -270,6 +270,25 @@ def test_resume_timeout_detaches_waiter_without_redispatching_continue() -> None
     finally:
         session.release_root_export.set()
         session.release_next_stop.set()
+        controller.shutdown_capture_evaluation()
+
+
+def test_failed_writeback_publishes_typed_recovery_instead_of_stale_capture() -> None:
+    """A confirmed failed root does not make recovery look like a stale frame."""
+    rdbg = ScriptedSession((CAPTURE_A,), failed_roots=("Скаляр",))
+    controller = captured_controller(rdbg, command_timeout_s=1)
+    api = PrototypeRuntimeApi(controller)
+    old_view = api.current_capture()
+    try:
+        with pytest.raises(PartialWritebackError, match="Скаляр"):
+            api.resume_capture(dirty_roots=("Скаляр",))
+
+        assert controller.state is OperationState.PARTIAL_WRITEBACK_FAILURE
+        assert old_view.status().phase is CapturePhase.RECOVERY_REQUIRED
+        assert api.status().state is OperationState.RECOVERING
+        with pytest.raises(CaptureRecoveryRequiredError):
+            api.resume_capture()
+    finally:
         controller.shutdown_capture_evaluation()
 
 
