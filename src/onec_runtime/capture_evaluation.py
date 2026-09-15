@@ -523,6 +523,79 @@ class CaptureRemoteStep:
     restore: Callable[[], None] = field(default=_nothing, repr=False)
 
 
+class _CapturePinDispositionState(StrEnum):
+    UNCLAIMED = "unclaimed"
+    IN_FLIGHT = "in_flight"
+    SUCCEEDED = "succeeded"
+    FAILED_OR_UNKNOWN = "failed_or_unknown"
+    RETAINED = "retained"
+
+
+class _CapturePinDispositionLease:
+    """One physical pin outcome shared by worker and shutdown supervisor."""
+
+    __slots__ = ("_callback", "_disposition", "_lock", "_state", "__weakref__")
+
+    def __init__(self, callback: Callable[[str], None]) -> None:
+        if not callable(callback):
+            raise ValueError("pin disposition callback must be callable")
+        self._callback = callback
+        self._disposition: str | None = None
+        self._lock = Lock()
+        self._state = _CapturePinDispositionState.UNCLAIMED
+
+    def retain(self) -> _CapturePinDispositionState:
+        """Atomically transfer an unclaimed lease to supervised retention."""
+        with self._lock:
+            if self._state is _CapturePinDispositionState.UNCLAIMED:
+                self._state = _CapturePinDispositionState.RETAINED
+            return self._state
+
+    def dispose(
+        self,
+        disposition: str,
+        *,
+        allow_retained: bool = False,
+    ) -> _CapturePinDispositionState:
+        if disposition not in {"release", "quarantine"}:
+            raise ValueError("invalid CAPTURE pin disposition")
+        with self._lock:
+            if (
+                self._disposition is not None
+                and self._disposition != disposition
+            ):
+                return _CapturePinDispositionState.FAILED_OR_UNKNOWN
+            if self._state in {
+                _CapturePinDispositionState.SUCCEEDED,
+                _CapturePinDispositionState.FAILED_OR_UNKNOWN,
+                _CapturePinDispositionState.IN_FLIGHT,
+            }:
+                return self._state
+            if (
+                self._state is _CapturePinDispositionState.RETAINED
+                and not allow_retained
+            ):
+                return self._state
+            self._disposition = disposition
+            self._state = _CapturePinDispositionState.IN_FLIGHT
+        try:
+            self._callback(disposition)
+        except BaseException:
+            with self._lock:
+                self._state = _CapturePinDispositionState.FAILED_OR_UNKNOWN
+            return _CapturePinDispositionState.FAILED_OR_UNKNOWN
+        with self._lock:
+            self._state = _CapturePinDispositionState.SUCCEEDED
+            return self._state
+
+    def __call__(self, disposition: str) -> None:
+        outcome = self.dispose(disposition, allow_retained=True)
+        if outcome is not _CapturePinDispositionState.SUCCEEDED:
+            raise ProtocolError(
+                "CAPTURE pin disposition could not be proven"
+            ) from None
+
+
 @dataclass(frozen=True, slots=True)
 class CaptureCleanupLease:
     private_key: str = field(repr=False)
@@ -629,7 +702,10 @@ class CaptureEvaluationRequest:
     restore: Callable[[], None] = field(default=_nothing, repr=False)
     continuation: Callable[[object], object] | None = field(default=None, repr=False)
     seal_messages: Callable[[], tuple[str, ...]] = field(default=_no_messages, repr=False)
-    pin_lease: Callable[[str], None] = field(default=_no_pin, repr=False)
+    pin_lease: _CapturePinDispositionLease | Callable[[str], None] = field(
+        default=_no_pin,
+        repr=False,
+    )
     cleanup_leases: tuple[CaptureCleanupLease | Callable[[], None], ...] = field(default=(), repr=False)
     step_policy: Callable[[CaptureStepContext, EvaluationResult], object] | None = field(default=None, repr=False)
     step_continuation: Callable[[CaptureStepContext, object], object] | None = field(default=None, repr=False)
@@ -646,6 +722,12 @@ class CaptureEvaluationRequest:
             self.evaluation_kind, CaptureEvaluationKind, name="evaluation_kind",
         ))
         object.__setattr__(self, "cleanup_leases", tuple(self.cleanup_leases))
+        if not isinstance(self.pin_lease, _CapturePinDispositionLease):
+            object.__setattr__(
+                self,
+                "pin_lease",
+                _CapturePinDispositionLease(self.pin_lease),
+            )
         callbacks = (
             self.dispatch, self.poll, self.result_policy, self.restore,
             self.seal_messages, self.pin_lease,
@@ -788,6 +870,7 @@ class CaptureEvaluationCoordinator:
         self._shutdown_disposition: str | None = None
         self._shutdown_finalized = False
         self._shutdown_abandoned = False
+        self._shutdown_publication: str | None = None
         self._events: deque[tuple[str, dict[str, object]]] = deque()
         self._worker = Thread(target=self._run, name="capture-evaluation-owner", daemon=True)
         self._worker.start()
@@ -919,6 +1002,8 @@ class CaptureEvaluationCoordinator:
         with self._condition:
             if self._shutdown_finalized:
                 return
+            if self._shutdown_publication is not None:
+                return
             if termination_proven and self._worker.is_alive():
                 raise ProtocolError(
                     "CAPTURE shutdown termination has not been proven"
@@ -933,10 +1018,16 @@ class CaptureEvaluationCoordinator:
                 self._shutdown_abandoned = True
                 self._shutdown_record = record
                 self._quarantined = record
-                if self._active is record:
-                    self._active = None
                 self._phase = CapturePhase.STALE
                 self._failure = None
+                pin_state = record.request.pin_lease.retain()
+                if pin_state is not _CapturePinDispositionState.RETAINED:
+                    self._condition.notify_all()
+                    raise ProtocolError(
+                        "CAPTURE shutdown disposition remains unresolved"
+                    ) from None
+                if self._active is record:
+                    self._active = None
                 self._condition.notify_all()
                 event = "capture_evaluation_shutdown_abandoned"
                 disposition = "retained"
@@ -947,13 +1038,16 @@ class CaptureEvaluationCoordinator:
                         "CAPTURE shutdown record has no terminal disposition"
                     )
                 event = "capture_evaluation_shutdown_disposed"
+            self._shutdown_publication = event
 
         if termination_proven:
             failed_resources = 0
             if not record.shutdown_pin_disposed:
-                try:
-                    record.request.pin_lease(disposition)
-                except BaseException:
+                pin_state = record.request.pin_lease.dispose(
+                    disposition,
+                    allow_retained=True,
+                )
+                if pin_state is not _CapturePinDispositionState.SUCCEEDED:
                     failed_resources += 1
                 else:
                     record.shutdown_pin_disposed = True
@@ -969,6 +1063,9 @@ class CaptureEvaluationCoordinator:
                 else:
                     record.shutdown_cleanup_disposed.add(index)
             if failed_resources:
+                with self._condition:
+                    if self._shutdown_publication == event:
+                        self._shutdown_publication = None
                 raise ProtocolError(
                     "CAPTURE shutdown disposition failed "
                     f"(failed_resources={failed_resources})"
@@ -987,12 +1084,16 @@ class CaptureEvaluationCoordinator:
                     cleanup_lease_count=cleanup_count,
                 )
             except BaseException:
+                with self._condition:
+                    if self._shutdown_publication == event:
+                        self._shutdown_publication = None
                 raise ProtocolError(
                     "CAPTURE shutdown evidence could not be recorded"
                 ) from None
             record.shutdown_evidence_published = True
         with self._condition:
             self._shutdown_finalized = True
+            self._shutdown_publication = None
             if termination_proven:
                 self._shutdown_record = None
                 if disposition == "quarantine":
@@ -1383,14 +1484,30 @@ class CaptureEvaluationCoordinator:
                 "quarantine" if quarantine else "release",
             )
             return
-        try:
-            record.request.pin_lease("quarantine" if quarantine else "release")
-        except BaseException:
+        disposition = "quarantine" if quarantine else "release"
+        pin_state = record.request.pin_lease.dispose(disposition)
+        if pin_state is _CapturePinDispositionState.FAILED_OR_UNKNOWN:
             quarantine = True
             phase = CapturePhase.RECOVERY_REQUIRED
             state = CaptureEvaluationState.FAILED
             diagnostic = _diagnostic("pin_disposition_failed")
             candidate = None
+        with self._condition:
+            shutdown_claimed = (
+                self._closing
+                or self._shutdown_abandoned
+                or self._active is not record
+                or pin_state in {
+                    _CapturePinDispositionState.IN_FLIGHT,
+                    _CapturePinDispositionState.RETAINED,
+                }
+            )
+        if shutdown_claimed:
+            self._defer_shutdown(
+                record,
+                "quarantine" if quarantine else disposition,
+            )
+            return
         if candidate is None:
             candidate = CaptureEvaluationOutcome(
                 record.evaluation_id, record.request.evaluation_kind, state,

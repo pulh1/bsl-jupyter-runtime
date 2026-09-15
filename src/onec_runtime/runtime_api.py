@@ -22,6 +22,7 @@ from onec_runtime.capture_evaluation import (
     CaptureEvaluationCoordinator,
     CaptureEvaluationTicket,
     CapturePhase,
+    _CapturePinDispositionLease,
     _CaptureSubmission,
 )
 from onec_runtime.capture_inspection import CaptureView
@@ -2632,23 +2633,16 @@ class PrototypeRuntimeApi:
         self._release_generation_pin_locked(pin)
         raise ProtocolError(failure)
 
-    def _detach_capture_evaluation_pin_locked(self) -> Callable[[str], None]:
+    def _detach_capture_evaluation_pin_locked(self) -> _CapturePinDispositionLease:
         with self._generation_lock:
             pin = self._evaluation_generation_pin
             self._evaluation_generation_pin = None
-        lease_lock = Lock()
-        disposed = False
 
-        def dispose(disposition: str) -> None:
-            nonlocal disposed
+        def dispose_physical(disposition: str) -> None:
             if disposition not in {"release", "quarantine"}:
                 raise ValueError("invalid CAPTURE pin disposition")
-            with lease_lock:
-                if disposed:
-                    return
-                disposed = True
-            # Neither the pin slot nor the one-shot lease lock is held while
-            # disposing Worker ownership or updating breakpoint workspaces.
+            # The shared lease owns idempotence and the physical outcome. No
+            # RuntimeApi lock is held while Worker ownership is disposed.
             if pin is None:
                 return
             if disposition == "quarantine":
@@ -2661,7 +2655,7 @@ class PrototypeRuntimeApi:
             else:
                 self._release_generation_pin_locked(pin)
 
-        return dispose
+        return _CapturePinDispositionLease(dispose_physical)
 
     def _capture_execution_callbacks_locked(
         self,
