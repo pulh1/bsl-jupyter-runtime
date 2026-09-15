@@ -1918,6 +1918,61 @@ def test_status_is_read_only_and_reports_generation_and_worker(tmp_path: Path) -
     assert status.worker_generation == handle
 
 
+def test_status_reads_capture_control_plane_while_api_writer_is_owned() -> None:
+    """Break caught: status must not wait on or enter the data-plane writer."""
+    from test_capture_evaluation_lifecycle import (
+        ControlledCaptureSession,
+        close_owner,
+    )
+    from test_prototype_runtime import captured_controller
+
+    transport = ControlledCaptureSession()
+    controller = captured_controller(transport, command_timeout_s=2.0)
+    api = PrototypeRuntimeApi(controller)
+    initiator_errors: list[BaseException] = []
+    observer_errors: list[BaseException] = []
+    observed = []
+
+    def initiate() -> None:
+        try:
+            api.execute_bsl("РезультатИнструкции = 901;")
+        except BaseException as error:
+            initiator_errors.append(error)
+
+    def observe() -> None:
+        try:
+            observed.append(api.status())
+        except BaseException as error:
+            observer_errors.append(error)
+
+    initiator = Thread(target=initiate, name="capture-status-initiator")
+    observer = Thread(target=observe, name="capture-status-observer")
+    try:
+        initiator.start()
+        assert transport.accepted.wait(1)
+        controller.state = OperationState.CAPTURED
+        assert api._lock.acquire(blocking=False)
+        try:
+            observer.start()
+            observer.join(0.2)
+        finally:
+            api._lock.release()
+
+        assert not observer.is_alive(), "status waited behind the API writer"
+        assert observer_errors == []
+        assert len(observed) == 1
+        assert observed[0].state is OperationState.EVALUATING_CAPTURE
+        assert initiator_errors == []
+    finally:
+        if transport.capture_pending is not None:
+            transport.complete()
+        initiator.join(2)
+        observer.join(2)
+        assert not initiator.is_alive()
+        assert not observer.is_alive()
+        close_owner(controller, transport)
+
+
 def _catalog_snapshot(
     revision: int,
     *modules: tuple[str, CommonModuleScope],
