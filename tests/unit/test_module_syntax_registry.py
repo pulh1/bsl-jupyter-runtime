@@ -5,6 +5,47 @@ import pytest
 from onec_runtime.bsl.full_ast_worker_projection import parse_full_ast_module
 
 
+@pytest.mark.parametrize(
+    ("source", "expected_intervals", "ambiguous_line", "neighbor_names"),
+    [
+        (
+            "Procedure P(PArg)\n"
+            "X = 1; EndProcedure Procedure Q(QArg)\n"
+            "EndProcedure",
+            [("P", 1, 2), ("Q", 2, 3)],
+            2,
+            ("P", "Q"),
+        ),
+        (
+            "Procedure P(PArg) EndProcedure Procedure Q(QArg) EndProcedure",
+            [("P", 1, 1), ("Q", 1, 1)],
+            1,
+            (None, None),
+        ),
+        (
+            "Procedure P(PArg)\n"
+            "X = 1; EndProcedure Procedure Q(QArg) EndProcedure Procedure R(RArg)\n"
+            "EndProcedure",
+            [("P", 1, 2), ("Q", 2, 2), ("R", 2, 3)],
+            2,
+            ("P", "R"),
+        ),
+    ],
+)
+def test_method_lookup_does_not_claim_a_signature_for_an_ambiguous_line(
+    source, expected_intervals, ambiguous_line, neighbor_names,
+) -> None:
+    """A physical line without a column must not select one of several methods."""
+    index = parse_full_ast_module(source).syntax_index
+    assert [(method.name, method.start_line, method.end_line)
+            for method in index.methods] == expected_intervals
+    assert index.method_at_line(ambiguous_line) is None
+    before = index.method_at_line(ambiguous_line - 1) if ambiguous_line > 1 else None
+    after = index.method_at_line(ambiguous_line + 1)
+    assert (None if before is None else before.name,
+            None if after is None else after.name) == neighbor_names
+
+
 def _syntax_api():
     from onec_runtime.bsl import module_syntax
 

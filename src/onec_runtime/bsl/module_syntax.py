@@ -100,11 +100,16 @@ class ModuleSyntaxIndex:
                 raise ValueError("methods must be ordered and non-overlapping")
 
     def method_at_line(self, line: int) -> MethodSyntaxInfo | None:
-        """Find a method at a one-based source line, including decorations/end."""
+        """Find the unique method at a one-based line; ambiguous lines return None."""
         if type(line) is not int or line < 1:
             raise ValueError("line must be a positive integer")
         position = bisect_right(self.methods, line, key=lambda method: method.start_line) - 1
         if position >= 0 and line <= self.methods[position].end_line:
+            # Character spans are disjoint, but adjacent methods can share a
+            # line. Ordered intervals make the immediate predecessor sufficient
+            # to detect ambiguity, even when several methods occupy one line.
+            if position > 0 and line <= self.methods[position - 1].end_line:
+                return None
             return self.methods[position]
         return None
 
