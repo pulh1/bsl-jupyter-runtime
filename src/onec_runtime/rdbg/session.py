@@ -5,6 +5,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from enum import Enum
 from math import isfinite
+from threading import Lock
 from time import monotonic, sleep
 from uuid import UUID, uuid4
 
@@ -105,6 +106,8 @@ class RdbgSession:
         self._event_queue: deque[StopEvent | EvaluationResult] = deque()
         self._evaluation_owner = object()
         self._pending_evaluation_states: dict[int, _PendingEvaluationState] = {}
+        self._request_admission_lock = Lock()
+        self._requests_invalidated = False
         self.profiler: PhaseRecorder | None = None
 
     def _profile(self, phase: str, operation, **metadata):  # type: ignore[no-untyped-def]
@@ -119,9 +122,35 @@ class RdbgSession:
                 f"RDBG operation requires state {expected}; current state is {self.state.value}"
             )
 
+    def _request(
+        self,
+        command: str,
+        payload: bytes = b"",
+        **options: object,
+    ) -> bytes:
+        """Admit one normal request atomically against session invalidation.
+
+        The gate protects only admission. Network I/O remains concurrent and
+        an admitted request may finish after invalidation; its owner must then
+        retain or quarantine any unsettled capability.
+        """
+        with self._request_admission_lock:
+            if self._requests_invalidated:
+                raise ProtocolError("RDBG session was invalidated")
+        return self.transport.request(command, payload, **options)
+
+    def _teardown_request(
+        self,
+        command: str,
+        payload: bytes = b"",
+        **options: object,
+    ) -> bytes:
+        """Send an explicit close-owned request after normal admission closes."""
+        return self.transport.request(command, payload, **options)
+
     def initialize(self) -> None:
         self._require(SessionState.DETACHED)
-        self.transport.request(
+        self._request(
             "attachDebugUI", build_attach_request(self.alias, self.ui_id)
         )
         # Registration already succeeded; later initialization failures must
@@ -131,13 +160,13 @@ class RdbgSession:
             self._preexisting_target_ids = {
                 target.target_id.id for target in self.list_targets()
             }
-        self.transport.request(
+        self._request(
             "initSettings",
             build_init_settings_request(
                 self.alias, self.ui_id, break_on_next=self.break_on_next
             ),
         )
-        self.transport.request(
+        self._request(
             "setAutoAttachSettings",
             build_auto_attach_request(
                 self.alias, self.ui_id, target_types=self._auto_attach_target_types()
@@ -172,7 +201,7 @@ class RdbgSession:
         ):
             raise ProtocolError("Managed client launch identity does not match the owned process")
         self._bound_client_target = self.target.target_id
-        self.transport.request(
+        self._request(
             "setAutoAttachSettings",
             build_auto_attach_request(
                 self.alias, self.ui_id, target_types=self._auto_attach_target_types()
@@ -214,7 +243,7 @@ class RdbgSession:
         return candidates
 
     def list_targets(self) -> list[DebugTarget]:
-        payload = self.transport.request(
+        payload = self._request(
             "getDbgAllTargetStates", build_get_targets_request(self.alias, self.ui_id)
         )
         return parse_targets(payload)
@@ -223,7 +252,7 @@ class RdbgSession:
         """Stop our server calls, then client; return whether native client exit was requested."""
         if self.server_target_type != "Server" or self._bound_client_target is None:
             return False
-        payload = self.transport.request(
+        payload = self._teardown_request(
             "getDbgAllTargetStates", build_get_targets_request(self.alias, self.ui_id),
             timeout_s=10.0,
         )
@@ -232,7 +261,7 @@ class RdbgSession:
             if target.target_type == "Server"
         )
         if targets:
-            response = self.transport.request(
+            response = self._teardown_request(
                 "terminateDbgTarget",
                 build_terminate_request(self.alias, self.ui_id, targets, payload),
                 timeout_s=10.0,
@@ -242,14 +271,14 @@ class RdbgSession:
         # Hard-killing a managed client leaves a stale subject in the shared
         # debugger. Let 1C remove its own subject after the server calls stop.
         # Rediscover the full identity: the server termination may change it.
-        payload = self.transport.request(
+        payload = self._teardown_request(
             "getDbgAllTargetStates", build_get_targets_request(self.alias, self.ui_id),
             timeout_s=10.0,
         )
         client = self._bound_client_target
         if not any(target.target_id.id == client.id for target in parse_targets(payload)):
             return False
-        response = self.transport.request(
+        response = self._teardown_request(
             "terminateDbgTarget",
             build_terminate_request(
                 self.alias, self.ui_id, (client,), payload, target_type="ManagedClient",
@@ -281,11 +310,11 @@ class RdbgSession:
 
     def attach_target(self, target: DebugTarget) -> None:
         self._require(SessionState.ATTACHED)
-        self.transport.request(
+        self._request(
             "clearBreakOnNextStatement",
             build_clear_break_request(self.alias, self.ui_id),
         )
-        self.transport.request(
+        self._request(
             "attachDetachDbgTargets",
             build_attach_target_request(
                 self.alias, self.ui_id, target.target_id, attach=True
@@ -300,7 +329,7 @@ class RdbgSession:
     def verify_registration(self) -> None:
         """Probe this UI before starting the client whose first stop it owns."""
         self._require(SessionState.ATTACHED)
-        self.transport.request(
+        self._request(
             "pingDebugUIParams",
             b"",
             timeout_s=0.2,
@@ -311,7 +340,7 @@ class RdbgSession:
         self._require(SessionState.ATTACHED, SessionState.READY)
         if not locations:
             raise ValueError("At least one breakpoint location is required")
-        response = self.transport.request(
+        response = self._request(
             "setBreakpoints",
             build_breakpoints_request(self.alias, self.ui_id, locations),
         )
@@ -332,7 +361,7 @@ class RdbgSession:
         }
         payload = self._profile(
             "rdbg.ping.request",
-            lambda: self.transport.request(
+            lambda: self._request(
                 "pingDebugUIParams",
                 b"",
                 timeout_s=timeout_s,
@@ -385,11 +414,11 @@ class RdbgSession:
             if target.target_id.id in self.attached_targets:
                 continue
             if not self.break_on_next:
-                self.transport.request(
+                self._request(
                     "clearBreakOnNextStatement",
                     build_clear_break_request(self.alias, self.ui_id),
                 )
-            self.transport.request(
+            self._request(
                 "attachDetachDbgTargets",
                 build_attach_target_request(
                     self.alias, self.ui_id, target.target_id, attach=True
@@ -397,7 +426,7 @@ class RdbgSession:
             )
             self.attached_targets[target.target_id.id] = target
             if self._breakpoint_installed:
-                self.transport.request(
+                self._request(
                     "setBreakpoints",
                     build_breakpoints_request(
                         self.alias, self.ui_id, self._breakpoint_locations
@@ -484,7 +513,7 @@ class RdbgSession:
         self._require(SessionState.ATTACHED, SessionState.READY)
         if self.target is None:
             raise TargetLost("No target has been selected")
-        payload = self.transport.request(
+        payload = self._request(
             "getCallStack",
             build_call_stack_request(self.alias, self.ui_id, self.target.target_id),
             timeout_s=timeout_s,
@@ -577,10 +606,14 @@ class RdbgSession:
         try:
             if on_transport_dispatch is not None:
                 on_transport_dispatch()
+            response = self._request(
+                "evalExpr",
+                request,
+                timeout_s=float(timeout_s),
+            )
         except BaseException:
             self._pending_evaluation_states.pop(id(pending), None)
             raise
-        response = self.transport.request("evalExpr", request, timeout_s=float(timeout_s))
         if response.strip():
             try:
                 result = parse_eval_response(response)
@@ -716,7 +749,7 @@ class RdbgSession:
         metadata = {"page_start": start_index, "result_id": str(result_id)}
         response = self._profile(
             "rdbg.collection.eval_request",
-            lambda: self.transport.request(
+            lambda: self._request(
                 "evalExpr",
                 request,
                 timeout_s=remaining_timeout(),
@@ -795,7 +828,7 @@ class RdbgSession:
             if remaining <= 0:
                 raise CommandTimeout("Timed out waiting for local variables")
             result_id = uuid4()
-            response = self.transport.request(
+            response = self._request(
                 "evalLocalVariables",
                 build_local_variables_request(
                     self.alias,
@@ -841,7 +874,7 @@ class RdbgSession:
         if self.target is None:
             raise TargetLost("No target has been selected")
         result_id = uuid4()
-        response = self.transport.request(
+        response = self._request(
             "modifyValue",
             build_modify_request(
                 self.alias,
@@ -866,7 +899,7 @@ class RdbgSession:
         self._require(SessionState.READY)
         if self.target is None:
             raise TargetLost("No target has been selected")
-        self.transport.request(
+        self._request(
             "step", build_step_request(self.alias, self.ui_id, self.target.target_id)
         )
         self.state = SessionState.EXECUTING
@@ -875,6 +908,9 @@ class RdbgSession:
         self._require(SessionState.READY)
         if self.target is None:
             raise TargetLost("No target has been selected")
+        with self._request_admission_lock:
+            if self._requests_invalidated:
+                raise ProtocolError("RDBG session was invalidated")
         rtt_ms = self.transport.test_server()
         # The platform expires the registered Debug UI unless its dedicated
         # long-poll endpoint is called. Server and target probes alone do not
@@ -889,13 +925,15 @@ class RdbgSession:
         return {"rtt_ms": rtt_ms, "target_state": matches[0].state}
 
     def invalidate(self) -> None:
-        self.state = SessionState.FAILED
-        self.target = None
-        self.attached_targets.clear()
-        self._pending_evaluations.clear()
-        self._pending_local_variables.clear()
-        self._event_queue.clear()
-        self._pending_evaluation_states.clear()
+        with self._request_admission_lock:
+            self._requests_invalidated = True
+            self.state = SessionState.FAILED
+            self.target = None
+            self.attached_targets.clear()
+            self._pending_evaluations.clear()
+            self._pending_local_variables.clear()
+            self._event_queue.clear()
+            self._pending_evaluation_states.clear()
 
     def detach(self) -> None:
         if self.state is SessionState.DETACHED:
@@ -903,7 +941,7 @@ class RdbgSession:
         target_errors: list[BaseException] = []
         for target in self.attached_targets.values():
             try:
-                self.transport.request(
+                self._teardown_request(
                     "attachDetachDbgTargets",
                     build_attach_target_request(
                         self.alias, self.ui_id, target.target_id, attach=False
@@ -913,7 +951,7 @@ class RdbgSession:
             except BaseException as error:
                 target_errors.append(error)
         try:
-            self.transport.request(
+            self._teardown_request(
                 "detachDebugUI",
                 build_detach_request(self.alias, self.ui_id),
                 timeout_s=10.0,

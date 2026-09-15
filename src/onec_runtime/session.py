@@ -7,6 +7,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from hashlib import sha256
+from math import isfinite
 from pathlib import Path
 from threading import Event, RLock, Thread, current_thread
 from time import sleep
@@ -578,6 +579,8 @@ class RuntimeSession:
         self._active_worker_file_units: dict[str, SourceUnitRef] = {}
         self._closed = False
         self._close_lock = RLock()
+        self._supervised_close_thread: Thread | None = None
+        self._supervised_close_error: ProtocolError | None = None
         self._transport_closed = False
         self._processes_closed = False
         self._runtime_api_closed = False
@@ -2095,7 +2098,7 @@ class RuntimeSession:
         """
         self._close(shutdown=self.config.runtime.is_server_infobase)
 
-    def _close(self, *, shutdown: bool) -> None:
+    def _close(self, *, shutdown: bool, _supervised: bool = False) -> None:
         with self._close_lock:
             if self._closed:
                 return
@@ -2125,7 +2128,22 @@ class RuntimeSession:
                         errors.append(error)
                     else:
                         self._runtime_api_closed = True
-            with self._operation_lock:
+            acquired_operation = (
+                self._operation_lock.acquire()
+                if _supervised
+                else self._operation_lock.acquire(
+                    timeout=self._close_operation_timeout_s()
+                )
+            )
+            if not acquired_operation:
+                self._start_supervised_close_locked(shutdown)
+                if errors:
+                    raise ProtocolError(
+                        "ZUP demo cleanup failed: "
+                        + ", ".join(type(error).__name__ for error in errors)
+                    ) from errors[0]
+                return
+            try:
                 if self.config.runtime.is_server_infobase:
                     if not self._server_session_terminated:
                         try:
@@ -2183,6 +2201,8 @@ class RuntimeSession:
                     # Local Worker generations die with this kernel. The
                     # authenticated server target and client have been closed.
                     self._runtime_api_closed = True
+            finally:
+                self._operation_lock.release()
             if (
                 self._runtime_api_closed
                 and self._debug_ui_detached
@@ -2195,6 +2215,40 @@ class RuntimeSession:
                     "ZUP demo cleanup failed: "
                     + ", ".join(type(error).__name__ for error in errors)
                 ) from errors[0]
+
+    def _close_operation_timeout_s(self) -> float:
+        controller = getattr(self.runtime_api, "_controller", None)
+        timeout_s = getattr(controller, "command_timeout_s", 1.0)
+        if (
+            isinstance(timeout_s, bool)
+            or not isinstance(timeout_s, (int, float))
+            or not isfinite(float(timeout_s))
+            or float(timeout_s) <= 0
+        ):
+            return 1.0
+        return min(1.0, float(timeout_s))
+
+    def _start_supervised_close_locked(self, shutdown: bool) -> None:
+        existing = getattr(self, "_supervised_close_thread", None)
+        if existing is not None and existing.is_alive():
+            return
+
+        def finish() -> None:
+            try:
+                self._close(shutdown=shutdown, _supervised=True)
+            except BaseException as error:
+                self._supervised_close_error = ProtocolError(
+                    "Supervised runtime cleanup failed: "
+                    + type(error).__name__
+                )
+
+        thread = Thread(
+            target=finish,
+            name="onec-runtime-supervised-close",
+            daemon=True,
+        )
+        self._supervised_close_thread = thread
+        thread.start()
 
     def owned_process_snapshot(self) -> tuple[dict[str, object], ...]:
         """Return exact identities needed for crash-safe owner reconciliation."""

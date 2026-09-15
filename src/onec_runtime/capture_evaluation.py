@@ -1226,6 +1226,9 @@ class CaptureEvaluationCoordinator:
                 else:
                     assert request.continuation is not None
                     private_result = request.continuation(value)
+        except _ShutdownStepSettled as settled:
+            self._defer_shutdown(record, settled.disposition)
+            return
         except _RemoteStepFailure as error:
             if error.phase is not CapturePhase.PAUSED:
                 self._finish_remote_failure(record, error, followup=True)
@@ -1379,8 +1382,9 @@ class CaptureEvaluationCoordinator:
             with self._condition:
                 record.capability = None
                 self._evidence_locked(record, "result_received", step_index=step_index)
-                closing = self._closing
             self._flush_evidence()
+            with self._condition:
+                closing = self._closing
             if closing:
                 raise _ShutdownStepSettled("release")
             break
