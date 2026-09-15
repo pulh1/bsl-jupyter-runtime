@@ -9,7 +9,9 @@ from onec_runtime.bsl.full_ast_worker_projection import (
 )
 from onec_runtime.bsl.module_syntax import ModuleIdentity, ModuleSyntaxRegistry
 from onec_runtime.capture_source import SourceVersionRef
-from onec_runtime.errors import ProtocolError, StaleCaptureError
+from onec_runtime.errors import (
+    CaptureSourceUnavailableError, ProtocolError, StaleCaptureError,
+)
 from onec_runtime.rdbg.models import ModuleLocation, StackFrame, StopEvent, TargetId
 from onec_runtime.runtime_api import PrototypeRuntimeApi
 
@@ -488,6 +490,15 @@ def test_runtime_native_stack_bypasses_config_source_resolution_and_ast() -> Non
 
     assert page.total == 3 and session.stack_reads == 1
     assert source_calls == []
+
+
+def test_runtime_frame_scope_is_explicitly_deferred_to_value_binding() -> None:
+    runtime, _, _ = captured_stack_api()
+    frame = runtime.current_capture().stack[0]
+
+    for attribute in ("variables", "parameters", "locals"):
+        with pytest.raises(CaptureSourceUnavailableError, match="not attached"):
+            getattr(frame, attribute)
 
 
 def test_session_current_capture_binds_sources_methods_and_frame_value_scope() -> None:
