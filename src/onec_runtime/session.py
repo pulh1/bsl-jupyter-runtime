@@ -51,6 +51,7 @@ from onec_runtime.capture_inspection import CaptureView
 from onec_runtime.config import RuntimeConfig
 from onec_runtime.configurator_agent import ExtensionAgentEditor, edit_extension
 from onec_runtime.errors import (
+    CaptureBusyError,
     CaptureSourceNotConfigured,
     CommandTimeout,
     ExtensionHandshakeError,
@@ -1617,6 +1618,10 @@ class RuntimeSession:
                     dirty_roots=dirty_roots,
                     continuation_attempt_id=continuation_attempt_id,
                 )
+            except CaptureBusyError:
+                # The coordinator still owns this exact capture. A rejected
+                # resume does not end the Session fence or notify listeners.
+                raise
             except BaseException:
                 # A non-CAPTURED runtime is not inspectable even when transport
                 # outcome is unknown; expire the service fence before it can

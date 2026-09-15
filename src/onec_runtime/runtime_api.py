@@ -1163,6 +1163,7 @@ class PrototypeRuntimeApi:
     ) -> None:
         """Atomically replace only the successor capture points while paused."""
         with self._single_writer():
+            self._require_capture_data_plane_admission()
             self._require_available()
             if self._controller.state is not OperationState.CAPTURED:
                 raise ProtocolError("Continuation capture points require a captured runtime")
@@ -1331,6 +1332,7 @@ class PrototypeRuntimeApi:
         boundary; agent-facing capture views never serialize it.
         """
         with self._single_writer():
+            self._require_capture_data_plane_admission()
             self._require_available()
             if self._controller.state not in (*self._MAIN_READY_STATES, OperationState.CAPTURED):
                 raise ProtocolError("Capture ticket requires a main-ready or captured runtime")
@@ -2227,6 +2229,7 @@ class PrototypeRuntimeApi:
         sealed result is committed only by its one execution consumer.
         """
         with self._single_writer():
+            self._require_capture_data_plane_admission()
             self._require_available()
             self._require_capture_inspection_available()
             if self._controller.state is not OperationState.CAPTURED:
