@@ -7,6 +7,7 @@ from typing import get_type_hints
 import pytest
 
 from onec_runtime.capture_evaluation import (
+    AdmissionEnvelopeV1,
     MAX_CAPTURE_TIMING_COUNT,
     MAX_CAPTURE_TIMING_MS,
     CaptureEvaluationKind,
@@ -23,10 +24,92 @@ from onec_runtime.errors import (
     CaptureEvaluationPendingError,
     CaptureOutcomeUnknownError,
     CaptureRecoveryRequiredError,
+    CaptureValueAccessDeniedError,
+    CaptureValueCheckError,
     NoActiveCaptureError,
     NoCaptureEvaluationError,
     StaleCaptureError,
 )
+
+
+def test_admission_envelope_v1_round_trips_the_only_ready_shape() -> None:
+    envelope = AdmissionEnvelopeV1(
+        runtime_generation=3,
+        context_generation=5,
+        payload_bytes=33,
+        payload_sha256="a" * 64,
+        base64_chars=44,
+    )
+
+    encoded = envelope.encode()
+
+    assert encoded == f"R|3|5|33|{'a' * 64}|44"
+    assert AdmissionEnvelopeV1.parse(
+        encoded,
+        max_payload_bytes=33,
+        max_base64_chars=44,
+    ) == envelope
+
+
+@pytest.mark.parametrize(
+    ("encoded", "error_type"),
+    [
+        ("D|worker_generation_value", CaptureValueAccessDeniedError),
+        ("E|value_admission_failed", CaptureValueCheckError),
+    ],
+)
+def test_admission_envelope_v1_maps_closed_nonready_tags(
+    encoded: str, error_type: type[Exception]
+) -> None:
+    with pytest.raises(error_type) as caught:
+        AdmissionEnvelopeV1.parse(
+            encoded,
+            max_payload_bytes=1,
+            max_base64_chars=1,
+        )
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "encoded",
+    [
+        None,
+        "",
+        "R|3|5|33|" + "a" * 64,
+        "R|3|5|33|" + "a" * 64 + "|44|extra",
+        "R|+3|5|33|" + "a" * 64 + "|44",
+        "R|0|5|33|" + "a" * 64 + "|44",
+        f"R|{2**63}|5|33|" + "a" * 64 + "|44",
+        "R|3|5|34|" + "a" * 64 + "|44",
+        "R|3|5|33|" + "A" * 64 + "|44",
+        "R|3|5|33|" + "a" * 64 + "|45",
+        "D|private target detail",
+        "E|value_admission_failed|private target detail",
+        "X|private target detail",
+        "Е|value_admission_failed",
+        "E|" + "x" * 191,
+    ],
+)
+def test_admission_envelope_v1_rejects_malformed_or_over_budget_results(
+    encoded: object,
+) -> None:
+    with pytest.raises(CaptureValueCheckError) as caught:
+        AdmissionEnvelopeV1.parse(
+            encoded,
+            max_payload_bytes=33,
+            max_base64_chars=44,
+        )
+
+    assert "private target detail" not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+def test_admission_envelope_v1_builds_only_literal_denied_and_error_results() -> None:
+    assert AdmissionEnvelopeV1.denied() == "D|worker_generation_value"
+    assert AdmissionEnvelopeV1.failed() == "E|value_admission_failed"
 
 
 def test_safe_enums_have_the_public_wire_values() -> None:
