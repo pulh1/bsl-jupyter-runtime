@@ -3055,19 +3055,39 @@ class PrototypeRuntimeController:
             raise BslExecutionError(result.error_text)
         return result
 
-    def inspect_completion_fields(self, handle: str, *, table_row: bool) -> EvaluationResult:
-        """Inspect bounded column/key names, without serializing field values."""
+    def inspect_completion_fields(
+        self,
+        handle: str,
+        *,
+        table_row: bool,
+        worker_type_registrations: tuple[str, ...],
+    ) -> EvaluationResult:
+        """Admit and inspect bounded field names in one target operation."""
         if (not isinstance(handle, str) or len(handle) > 512
                 or not re.fullmatch(r"Контекст\.[^\W\d]\w*(?:\.[^\W\d]\w*){0,7}", handle)
                 or type(table_row) is not bool):
             raise ProtocolError("Completion requires a direct or dotted Context path")
+        if (
+            type(worker_type_registrations) is not tuple
+            or any(
+                not isinstance(registration, str)
+                or not registration
+                or "\n" in registration
+                or "\r" in registration
+                for registration in worker_type_registrations
+            )
+        ):
+            raise ProtocolError("Completion Worker type registrations are invalid")
         stack_level = (
             self._required_capture_kernel_stack_level()
             if self.state is OperationState.CAPTURED else 0
         )
         result = self.session.evaluate_collection(
-            "RuntimeValueTransferServer.ПолучитьИменаСвойствДляПодсказки("
-            + handle + (", Истина)" if table_row else ", Ложь)"),
+            "RuntimeValueTransferServer.ПолучитьДопущенныеИменаСвойствДляПодсказки("
+            + handle
+            + (", Истина, " if table_row else ", Ложь, ")
+            + bsl_string_literal("\n".join(worker_type_registrations))
+            + ")",
             start_index=0, page_size=128, max_text_size=512,
             timeout_s=self.command_timeout_s, stack_level=stack_level,
         )

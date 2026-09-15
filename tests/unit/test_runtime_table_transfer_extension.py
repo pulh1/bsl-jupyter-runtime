@@ -143,7 +143,10 @@ def test_compact_serializer_admits_root_and_cells_before_type_or_payload() -> No
     assert serializer.index("ЭтоПриватноеЗначениеWorker(Таблица") < serializer.index(
         "ПодготовитьТабличноеЗначение(Таблица"
     )
-    assert "ОпределитьКомпактнуюСхемуКолонок(Таблица, ТипыОбъектовWorker)" in serializer
+    assert (
+        "ОпределитьКомпактнуюСхемуКолонок(Таблица, ТипыОбъектовWorker, "
+        "МаксимумСтрок)" in serializer
+    )
     assert classifier.index("ЭтоПриватноеЗначениеWorker(") < classifier.index(
         "КомпактныйВидЗначения("
     )
@@ -196,6 +199,24 @@ def test_compact_schema_classifier_never_reads_past_the_bounded_row_page() -> No
     cell_read = classifier.index("ЗначениеЯчейки = СтрокаТаблицы[Колонка.Имя]")
     assert row_guard < cell_read
 
+    class SentinelRow:
+        def __getitem__(self, column: str) -> str:
+            raise AssertionError(f"classifier touched row outside its page: {column}")
+
+    def bounded_classifier_reads(rows: list[object], maximum_rows: int) -> list[object]:
+        """The BSL loop's guard must run before its cell access."""
+        inspected = 0
+        observed: list[object] = []
+        for row in rows:
+            if inspected >= maximum_rows:
+                break
+            observed.append(row["Колонка"])  # type: ignore[index]
+            inspected += 1
+        return observed
+
+    page = [{"Колонка": "first"}, {"Колонка": "second"}, SentinelRow()]
+    assert bounded_classifier_reads(page, 2) == ["first", "second"]
+
 
 def test_compact_serializer_checks_budgets_before_base64_construction() -> None:
     source = SERVICE_MODULE.read_text(encoding="utf-8-sig")
@@ -238,7 +259,10 @@ def test_compact_serializer_classifies_columns_once_before_full_row_loop() -> No
         "КонецФункции", 1
     )[0]
 
-    assert "ОпределитьКомпактнуюСхемуКолонок(Таблица, ТипыОбъектовWorker)" in serializer
+    assert (
+        "ОпределитьКомпактнуюСхемуКолонок(Таблица, ТипыОбъектовWorker, "
+        "МаксимумСтрок)" in serializer
+    )
     assert "КомпактныйВидЗначения(СтрокаТаблицы" not in serializer
     assert "КомпактноеЗначение(" in serializer
     assert "СсылочныеКолонки[ИндексКолонки]" in serializer

@@ -23,8 +23,8 @@
 
 `tools/build_runtime_extension_bundle.py` ran with the installed 1C Designer
 `8.3.27.2170`, artifact `0.1.3`, and protocol `2`. It produced
-`OnecInteractiveRuntime.cfe` (21,371 bytes), whose SHA-256 is
-`5bdda3410e15f4ca59d755e8ee2a1cd05f7e5f8a5086b75a02ab49d5f2ef554b`.
+`OnecInteractiveRuntime.cfe` (21,798 bytes), whose SHA-256 is
+`f52fa7d8d036035ad98bd6f857eb05ea18330e19b66c043c14ff129c616ebd7f`.
 This is a Designer compilation and bundle build, not live-infobase
 qualification.
 
@@ -71,3 +71,36 @@ protocol-`1` rejection before any target materialization or inspection call.
   preserving enumerations and all-null reference columns for per-column
   reference modes. The obsolete `columns` and `schema_reader` compatibility
   parameters are absent from the generic Python transport.
+
+## Final Sol P1 remediation
+
+- Jupyter now formats the exact closed `DeniedValueNode` contract. It never
+  reads a removed `ValueNode.private` property or any path, type, preview, or
+  handle from a denied node.
+- Completion has one consumer-owned target operation:
+  `ПолучитьДопущенныеИменаСвойствДляПодсказки` constructs Worker types, admits
+  the root, and reads the bounded collection schema only after admission. Its
+  first row is an `R` marker; `D|worker_generation_value` and
+  `E|value_admission_failed` return without a second schema request.
+- The compact BSL classifier receives `МаксимумСтрок` and checks the bounded
+  row counter before each cell access. It retains declared types for enum and
+  all-null reference columns, then verifies later serialized cells against
+  that bounded classification. The regression includes a sentinel row after
+  the allowed page.
+
+## Final validation
+
+The exact new-review regression suite completed with `232 passed` in 4.64
+seconds. It covers the denied Jupyter renderer, adapter registration, one
+completion target-request spy with D/E cases, BSL completion instruction, and
+the bounded compact-classifier sentinel.
+
+The transport/runtime nearby suite completed with `398 passed` in 8.48
+seconds. The Jupyter, bundle, extension-lifecycle, and runtime-session suite
+completed with `324 passed, 1 skipped` in 28.27 seconds; the materialization
+bridge completed with `6 passed` in 3.03 seconds.
+
+The CFE above was rebuilt after these changes with Designer 8.3.27.2170.
+`python -m compileall -q src/onec_runtime packages/jupyter packages/mcp` and
+`git diff --check` pass. `ruff` is not installed in this uv environment, so it
+was not a validation gate.

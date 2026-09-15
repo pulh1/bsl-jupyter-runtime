@@ -12,6 +12,7 @@ from onec_runtime.bsl.module_syntax import MethodSyntaxInfo
 from onec_runtime.capture_evaluation import CaptureStatus
 from onec_runtime.capture_inspection import DebugFrame, RuntimeFrameMarker, StackPage
 from onec_runtime.capture_values import (
+    DeniedValueNode,
     SafeValuePath,
     ValueNode,
     ValuePage,
@@ -26,8 +27,12 @@ MAX_METHOD_PARAMETERS = 32
 MAX_LABEL_CHARS = 512
 MAX_PATH_CHARS = 1_024
 
-CaptureSnapshot: TypeAlias = CaptureStatus | StackPage | DebugFrame | ValueNode | ValuePage
-_SNAPSHOT_TYPES = (CaptureStatus, StackPage, DebugFrame, ValueNode, ValuePage)
+CaptureSnapshot: TypeAlias = (
+    CaptureStatus | StackPage | DebugFrame | ValueNode | DeniedValueNode | ValuePage
+)
+_SNAPSHOT_TYPES = (
+    CaptureStatus, StackPage, DebugFrame, ValueNode, DeniedValueNode, ValuePage,
+)
 
 
 def _clean(value: str, limit: int = MAX_LABEL_CHARS) -> str:
@@ -185,11 +190,13 @@ def _path_text(path: SafeValuePath) -> str:
     return text
 
 
-def _node_text(node: ValueNode) -> str:
+def _node_text(node: ValueNode | DeniedValueNode) -> str:
     name = _clean(str(node.name), 256)
-    if node.private:
-        # Privacy-denied nodes intentionally ignore every presentation field
-        # except the containing variable name.
+    if type(node) is DeniedValueNode:
+        # The denied node intentionally owns no path, type, preview, size, or
+        # handle.  Rendering reads only its closed wire contract.
+        if node.access != "denied" or node.expandable:
+            raise TypeError("denied capture node contract is invalid")
         return f"{name}: <private runtime value>"
     type_name = "unknown" if node.type_name is None else _clean(node.type_name, 256)
     text = f"{name}: {type_name} = {_clean(node.preview)}"
@@ -285,8 +292,12 @@ def _frame_html(frame: DebugFrame) -> str:
     )
 
 
-def _node_html(node: ValueNode) -> str:
-    css_class = "onec-capture-private" if node.private else "onec-capture-value"
+def _node_html(node: ValueNode | DeniedValueNode) -> str:
+    css_class = (
+        "onec-capture-private"
+        if type(node) is DeniedValueNode
+        else "onec-capture-value"
+    )
     return f'<span class="{css_class}">{_html_text(_node_text(node))}</span>'
 
 

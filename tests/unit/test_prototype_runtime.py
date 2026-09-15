@@ -829,10 +829,12 @@ def test_completion_fields_use_bounded_schema_helper_in_capture_kernel_frame() -
     controller.state = runtime_module().OperationState.CAPTURED
     controller.capture_kernel_stack_level = 2
 
-    controller.inspect_completion_fields("Контекст.Данные", table_row=True)
+    controller.inspect_completion_fields(
+        "Контекст.Данные", table_row=True, worker_type_registrations=(),
+    )
 
     assert ("evaluate_collection", (
-        "RuntimeValueTransferServer.ПолучитьИменаСвойствДляПодсказки(Контекст.Данные, Истина)",
+        "RuntimeValueTransferServer.ПолучитьДопущенныеИменаСвойствДляПодсказки(Контекст.Данные, Истина, \"\")",
         0, 128, 2,
     )) in session.calls
 

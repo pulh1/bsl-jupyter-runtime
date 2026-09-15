@@ -565,7 +565,11 @@ class RuntimeController(Protocol):
     state: OperationState
 
     def inspect_completion_fields(
-        self, handle: str, *, table_row: bool
+        self,
+        handle: str,
+        *,
+        table_row: bool,
+        worker_type_registrations: tuple[str, ...],
     ) -> EvaluationResult: ...
 
     def execute_main(
@@ -1124,20 +1128,37 @@ class PrototypeRuntimeApi:
             }:
                 raise ProtocolError("Completion root is not in the current namespace")
             self._validate_value_reference_locked(handle)
-            # The admission is part of the target instruction before the
-            # completion helper reads fields.  The returned route is immaterial
-            # here: the helper supplies the narrower structure/table schema.
-            self._materialization_kind_locked(handle)
             with self._remaining_command_timeout():
-                result = self._controller.inspect_completion_fields(handle, table_row=table_row)
-            if result.error_occurred or len(result.collection_rows) > 128:
+                result = self._controller.inspect_completion_fields(
+                    handle,
+                    table_row=table_row,
+                    worker_type_registrations=self._worker_type_registrations(),
+                )
+            if result.error_occurred or not result.collection_rows or len(result.collection_rows) > 129:
                 raise ProtocolError("Invalid completion field schema")
             names: list[str] = []
             seen: set[str] = set()
-            for row in result.collection_rows:
-                if len(row.cells) != 1 or row.cells[0].name != "Имя":
+            for index, row in enumerate(result.collection_rows):
+                if (
+                    len(row.cells) != 2
+                    or row.cells[0].name != "Состояние"
+                    or row.cells[1].name != "Имя"
+                ):
                     raise ProtocolError("Invalid completion field schema")
-                name = row.cells[0].value_string
+                outcome = row.cells[0].value_string
+                if outcome == AdmissionEnvelopeV1.denied():
+                    raise CaptureValueAccessDeniedError(
+                        "Worker generation objects are not public values"
+                    )
+                if outcome == AdmissionEnvelopeV1.failed():
+                    raise CaptureValueCheckError("CAPTURE value admission failed")
+                if outcome != "R":
+                    raise ProtocolError("Invalid completion admission result")
+                name = row.cells[1].value_string
+                if index == 0:
+                    if name != "":
+                        raise ProtocolError("Invalid completion admission result")
+                    continue
                 if (not isinstance(name, str) or len(name) > 128
                         or not re.fullmatch(r"[^\W\d]\w*", name)
                         or name.casefold() in seen):

@@ -54,6 +54,7 @@ def test_value_transfer_module_parses_and_exports_only_public_boundary() -> None
 
     assert set(binding.exported_method_names) == {
         "ПолучитьИменаСвойствДляПодсказки",
+        "ПолучитьДопущенныеИменаСвойствДляПодсказки",
         "ПолучитьВидМатериализации",
         "ДопуститьЗначение",
         "СериализоватьЗначение",
