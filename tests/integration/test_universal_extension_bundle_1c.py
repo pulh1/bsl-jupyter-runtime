@@ -360,13 +360,24 @@ def _install_cfe(config: RuntimeConfig, cfe: Path, root: Path) -> None:
 
 
 @pytest.mark.live_1c
+@pytest.mark.parametrize(
+    ("move_serializer_guard_after_read", "expected"),
+    ((False, "bounded|bounded"), (True, "serializer_probe|bounded")),
+    ids=("bounded", "guard_after_read_is_detected"),
+)
 def test_compact_table_bound_is_executed_before_value_table_and_query_sentinel_cells(
     tmp_path: Path,
     _track_owned_runtime_processes: _OwnedProcessTracker,
+    move_serializer_guard_after_read: bool,
+    expected: str,
 ) -> None:
     """Opt-in live qualification of the instrumented product BSL CFE, not a unit model."""
     platform = _platform_bin()
-    bundle = _build_table_bound_instrumented_bundle(tmp_path / "instrumented", platform)
+    bundle = _build_table_bound_instrumented_bundle(
+        tmp_path / "instrumented",
+        platform,
+        move_serializer_guard_after_read=move_serializer_guard_after_read,
+    )
     config = _config(tmp_path / "target", platform)
     create_empty_infobase(config)
     _install_cfe(config, bundle.cfe_path, tmp_path / "install")
@@ -420,7 +431,7 @@ def test_compact_table_bound_is_executed_before_value_table_and_query_sentinel_c
         session.close()
 
     assert reply.succeeded
-    assert reply.result == "bounded|bounded"
+    assert reply.result == expected
     _assert_no_owned_1c_process(config, _track_owned_runtime_processes)
 
 
