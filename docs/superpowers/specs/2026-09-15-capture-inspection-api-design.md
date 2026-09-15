@@ -1,7 +1,7 @@
 # Capture Inspection API Design
 
 **Date:** 2026-09-15
-**Status:** Approved in design discussion; awaiting written-spec review
+**Status:** Approved after independent written-spec review; ready for implementation
 
 ## Problem
 
@@ -32,6 +32,7 @@ acquire the current capture, confirm the source location quickly, inspect
   public-value guard reached through `OnecValueProxy.to_df()`.
 - Keep every live object fenced to the exact capture stop.
 - Reuse syntax information already produced by hot reload.
+- Resolve configuration sources in both Designer export and EDT project layouts.
 - Keep the core data model suitable for a later MCP adapter.
 
 ## Non-goals
@@ -51,6 +52,7 @@ acquire the current capture, confirm the source location quickly, inspect
 - Generic expansion of every 1C collection or object type. Version one supports
   only the shapes listed in the value-expansion matrix below.
 - New MCP tools in the first version.
+- Source layouts other than Designer export and EDT project/`src` layouts.
 - Compatibility guarantees for the current low-level capture dictionaries.
 
 ## User-facing entry point
@@ -376,6 +378,20 @@ guard, so they cannot be mistranslated into a Worker-object error.
 
 ## Source module resolution
 
+The resolver supports the two source layouts already accepted by the runtime:
+
+- Designer export, where metadata descriptions are `Type/Name.xml` and module
+  files are under `Type/Name/Ext`;
+- EDT, where the configured root may be the project containing `src` or the
+  `src` directory itself, metadata descriptions are `Type/Name/Name.mdo`, and
+  module files are stored directly under `Type/Name`.
+
+Root normalization and layout detection are shared with the existing
+Designer/EDT common-module catalog. A root containing both a direct metadata
+tree and an EDT `src` metadata tree is rejected as ambiguous. Format-native
+configuration metadata supplies base/extension identity; a file-name pattern
+alone never decides that identity.
+
 The resolver does not build a complete configuration index at startup. For a
 stack page it collects the distinct unresolved physical module identities and
 resolves them as one batch:
@@ -390,6 +406,8 @@ The resolver:
 
 - checks positive and negative caches first;
 - scans only source roots and metadata kinds relevant to the unresolved batch;
+- uses a layout adapter to map the same `(object_id, property_id, extension)`
+  identity to the appropriate Designer or EDT metadata/module path;
 - caches descriptions encountered during the scan;
 - stops early when all requested identities are found;
 - keeps base configuration and extension identities separate;
@@ -409,7 +427,9 @@ Positive mappings for an unchanged metadata description remain cached. A
 negative result remains valid only for the catalog generation in which it was
 created, so an explicit refresh makes a newly added module discoverable.
 
-The fast stack requires this module mapping but never requires an AST.
+The fast stack requires this module mapping but never requires an AST. Both
+layouts must resolve at least common-module modules and document object modules,
+including `Документ.ПриемНаРаботу.МодульОбъекта`, through the same public model.
 
 ## Shared syntax registry and hot reload
 
@@ -453,9 +473,9 @@ not activate the candidate syntax version.
 
 Source selection is performed for each physical frame. Worker frames use the
 owning artifact/generation and the existing strict Worker source mapping.
-Configuration frames use the explicitly configured Designer-format export and
-carry `source_status="trusted_export"`; matching metadata UUIDs do not upgrade
-that status to runtime verification.
+Configuration frames use the explicitly configured Designer or EDT source tree
+and carry `source_status="trusted_export"`; matching metadata UUIDs do not
+upgrade that status to runtime verification.
 
 The fast page pins each trusted-export file's path, size and modification time.
 `with_methods()` opens the pinned path and checks that signature both before
@@ -892,6 +912,7 @@ never reclassifies the pending value as a Worker privacy denial.
   `CaptureEvaluationCoordinator` for user and internal evaluations;
 - bounded RDBG operation plans and safe value paths;
 - `CaptureValuePolicy`, backed by the existing public-value guard;
+- shared Designer/EDT source-root normalization and layout adapters;
 - demand-driven configuration source resolution;
 - pinned `SourceVersionRef` resolution;
 - the shared `ModuleSyntaxRegistry` used by capture and hot reload.
@@ -985,7 +1006,7 @@ OnecValueProxy.to_df()
 
 ## Testing strategy
 
-Core tests use synthetic RDBG responses and small synthetic Designer-format
+Core tests use synthetic RDBG responses and paired small Designer-format and EDT
 source trees. They must prove behavior rather than depend on a live infobase.
 
 Required tests cover:
@@ -1008,6 +1029,11 @@ Required tests cover:
 - basic stack rendering with zero parser calls;
 - native-to-visible frame indexing and collapsed runtime markers;
 - one batched directory scan for multiple unresolved stack modules;
+- equivalent module identity, name, role and source-line resolution for Designer
+  roots, EDT project roots and EDT `src` roots, covering a common module and the
+  `ПриемНаРаботу` document object module;
+- rejection of an ambiguous root containing both direct and nested `src`
+  metadata trees;
 - positive and generation-scoped negative resolver caching, hot-reload
   invalidation and explicit source refresh;
 - `with_methods()` parsing each missing source version once;
@@ -1107,11 +1133,13 @@ Performance contracts are asserted primarily with work counters:
   while raw unpaged RDBG response size is measured as a protocol cost and only
   the command-time limit can stop a slow request.
 
-A separate benchmark uses a large synthetic configuration tree and a stack of
-15–20 distinct modules. Live 1C qualification remains opt-in and is reported
-separately from static and synthetic tests. Every value shape advertised as a
-live platform capability receives an opt-in live qualification; synthetic
-normalizer tests alone do not establish RDBG behavior.
+A separate benchmark uses equivalent large synthetic Designer and EDT
+configuration trees and a stack of 15–20 distinct modules. The EDT case is run
+with both the project root and its `src` directory as configuration inputs. Live
+1C qualification remains opt-in and is reported separately from static and
+synthetic tests. Every value shape advertised as a live platform capability
+receives an opt-in live qualification; synthetic normalizer tests alone do not
+establish RDBG behavior.
 
 Jupyter tests render prepared pages and assert that the renderer performs no
 runtime calls. Any generated acceptance notebook remains under
