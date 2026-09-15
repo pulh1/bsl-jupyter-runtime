@@ -123,7 +123,6 @@ def test_safe_enums_have_the_public_wire_values() -> None:
     ]
     assert {kind.value for kind in CaptureEvaluationKind} == {
         "user_bsl",
-        "public_value_guard",
         "inspection",
         "materialization_helper",
     }
@@ -487,7 +486,7 @@ def test_outcome_accepts_only_immutable_public_scalars_and_hides_internal_result
     assert outcome.result == (None, True, 4, 1.5, "value")
 
     for kind in (
-        CaptureEvaluationKind.PUBLIC_VALUE_GUARD,
+        CaptureEvaluationKind.MATERIALIZATION_HELPER,
         CaptureEvaluationKind.INSPECTION,
         CaptureEvaluationKind.MATERIALIZATION_HELPER,
     ):
@@ -501,15 +500,15 @@ def test_outcome_accepts_only_immutable_public_scalars_and_hides_internal_result
 
 
 def test_pending_and_busy_errors_expose_only_safe_evaluation_facts() -> None:
-    pending = CaptureEvaluationPendingError("eval-1", CaptureEvaluationKind.PUBLIC_VALUE_GUARD)
+    pending = CaptureEvaluationPendingError("eval-1", CaptureEvaluationKind.MATERIALIZATION_HELPER)
     busy = CaptureBusyError(
-        "eval-1", CaptureEvaluationKind.PUBLIC_VALUE_GUARD, CapturePhase.EVALUATING
+        "eval-1", CaptureEvaluationKind.MATERIALIZATION_HELPER, CapturePhase.EVALUATING
     )
 
     assert pending.evaluation_id == "eval-1"
-    assert pending.evaluation_kind is CaptureEvaluationKind.PUBLIC_VALUE_GUARD
+    assert pending.evaluation_kind is CaptureEvaluationKind.MATERIALIZATION_HELPER
     assert busy.evaluation_id == "eval-1"
-    assert busy.evaluation_kind is CaptureEvaluationKind.PUBLIC_VALUE_GUARD
+    assert busy.evaluation_kind is CaptureEvaluationKind.MATERIALIZATION_HELPER
     assert busy.phase is CapturePhase.EVALUATING
     for error in (pending, busy):
         rendered = repr(error) + str(error)

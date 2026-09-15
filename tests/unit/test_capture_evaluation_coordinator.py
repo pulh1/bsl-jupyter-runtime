@@ -173,7 +173,7 @@ def test_late_result_has_one_owner_after_repeated_interval_timeouts(environment)
     create, _ = environment
     coordinator, driver, _ = create()
     ticket = coordinator.submit_evaluation(driver.request(
-        kind=Kind.PUBLIC_VALUE_GUARD, continuation=driver.continuation,
+        kind=Kind.MATERIALIZATION_HELPER, continuation=driver.continuation,
     ))
     assert driver.polling.wait(1)
     with pytest.raises(CaptureEvaluationPendingError) as caught:
@@ -181,7 +181,7 @@ def test_late_result_has_one_owner_after_repeated_interval_timeouts(environment)
     eventually(lambda: driver.poll_count >= 5)
     pending = coordinator.status(FENCE)
     assert (pending.phase, pending.pending_evaluation_id, pending.evaluation_kind) == (
-        Phase.EVALUATING, ticket.evaluation_id, Kind.PUBLIC_VALUE_GUARD,
+        Phase.EVALUATING, ticket.evaluation_id, Kind.MATERIALIZATION_HELPER,
     )
     assert caught.value.evaluation_id == ticket.evaluation_id
     assert pending.evaluation_timing.initiating_waiter_detached_ms is not None
@@ -354,7 +354,7 @@ def test_retention_preserves_user_and_only_qualifying_internal_records(environme
     assert coordinator.wait(FENCE, user_ticket.evaluation_id, 0) is user_outcome
 
     replacement = Driver()
-    replacement_ticket = coordinator.submit_evaluation(replacement.request(kind=Kind.PUBLIC_VALUE_GUARD))
+    replacement_ticket = coordinator.submit_evaluation(replacement.request(kind=Kind.MATERIALIZATION_HELPER))
     assert replacement.polling.wait(1)
     with pytest.raises(CaptureEvaluationPendingError):
         replacement_ticket.wait_initiator(0)
@@ -388,7 +388,7 @@ def test_failure_boundaries_keep_result_and_cleanup_distinct(
     changes = {"before_dispatch": "dispatch", "dispatch": "dispatch", "policy": "result_policy",
                "restore": "restore", "cleanup": "cleanup_leases", "cleanup_timeout": "cleanup_leases"}
     name = changes[boundary]
-    request = driver.request(kind=Kind.PUBLIC_VALUE_GUARD, **{name: (fail,) if name == "cleanup_leases" else fail})
+    request = driver.request(kind=Kind.MATERIALIZATION_HELPER, **{name: (fail,) if name == "cleanup_leases" else fail})
     ticket = coordinator.submit_evaluation(request)
     if boundary not in {"before_dispatch", "dispatch"}:
         driver.result()
@@ -871,7 +871,7 @@ def test_pre_entry_interrupt_detaches_acknowledged_initiator(environment, monkey
     create, _ = environment
     coordinator, driver, journal = create()
     ticket = coordinator.submit_evaluation(driver.request(
-        kind=Kind.PUBLIC_VALUE_GUARD, continuation=driver.continuation,
+        kind=Kind.MATERIALIZATION_HELPER, continuation=driver.continuation,
     ))
     assert driver.polling.wait(1)
     caller = current_thread().ident
@@ -914,7 +914,7 @@ def test_pre_entry_interrupt_detaches_acknowledged_initiator(environment, monkey
     assert names.index("capture_evaluation_initiating_waiter_detached") < names.index("capture_evaluation_outcome_published")
 
 
-@pytest.mark.parametrize("kind", [Kind.USER_BSL, Kind.PUBLIC_VALUE_GUARD])
+@pytest.mark.parametrize("kind", [Kind.USER_BSL, Kind.MATERIALIZATION_HELPER])
 def test_delayed_delivery_interrupt_cannot_replace_newer_retained_outcome(environment, monkeypatch, kind):
     create, threads = environment
     coordinator, older, journal = create()
@@ -979,7 +979,7 @@ def test_delayed_delivery_interrupt_cannot_replace_newer_retained_outcome(enviro
 def test_delayed_retention_of_detached_internal_record_preserves_settlement_order(environment):
     create, _ = environment
     coordinator, older, _ = create()
-    older_ticket = coordinator.submit_evaluation(older.request(kind=Kind.PUBLIC_VALUE_GUARD))
+    older_ticket = coordinator.submit_evaluation(older.request(kind=Kind.MATERIALIZATION_HELPER))
     assert older.polling.wait(1)
     with pytest.raises(CaptureEvaluationPendingError):
         older_ticket.wait_initiator(0)
@@ -1145,7 +1145,7 @@ def test_terminal_state_and_timing_are_visible_before_journal_io(environment, cl
     create, _ = environment
     journal = PublicationBarrierJournal()
     coordinator, driver, _ = create(journal=journal)
-    ticket = coordinator.submit_evaluation(driver.request(kind=Kind.PUBLIC_VALUE_GUARD))
+    ticket = coordinator.submit_evaluation(driver.request(kind=Kind.MATERIALIZATION_HELPER))
     coordinator.wait(FENCE, None, 0)
     driver.result(42)
     assert journal.entered.wait(1)
@@ -1187,7 +1187,7 @@ def test_pending_detachment_is_included_in_atomic_terminal_timing(environment):
         driver.pin(disposition)
 
     ticket = coordinator.submit_evaluation(driver.request(
-        kind=Kind.PUBLIC_VALUE_GUARD, pin_lease=pin,
+        kind=Kind.MATERIALIZATION_HELPER, pin_lease=pin,
     ))
     driver.result(0)
     assert disposing_pin.wait(1)
@@ -1253,7 +1253,7 @@ def test_pending_interrupt_detaches_before_condition_exit_allows_late_result(env
     create, threads = environment
     coordinator, driver, journal = create()
     ticket = coordinator.submit_evaluation(driver.request(
-        kind=Kind.PUBLIC_VALUE_GUARD, continuation=driver.continuation,
+        kind=Kind.MATERIALIZATION_HELPER, continuation=driver.continuation,
     ))
     assert driver.polling.wait(1)
     coordinator.wait(FENCE, None, 0)

@@ -76,6 +76,34 @@ def test_value_encoder_has_explicit_recursive_adapters_and_limits() -> None:
     assert "ПолучитьОбъект()" not in source
 
 
+def test_value_serializer_admits_root_and_each_descendant_before_encoding() -> None:
+    source = MODULE.read_text(encoding="utf-8-sig")
+    serializer = source.split("Функция СериализоватьЗначение", 1)[1].split(
+        "КонецФункции", 1
+    )[0]
+    encoder = source.split("Функция КодироватьЗначение", 1)[1].split(
+        "КонецФункции", 1
+    )[0]
+
+    assert (
+        "(Значение, РежимСсылок, МаксимальнаяГлубина, МаксимумЭлементов, "
+        "МаксимумБайт, ТипыОбъектовWorker) Экспорт"
+    ) in serializer
+    assert 'КонтекстСериализации.Вставить("ОтказДоступа", Ложь)' in serializer
+    assert serializer.index("КодироватьЗначение(") < serializer.index(
+        "Base64БезРазрывов"
+    )
+    assert "Если КонтекстСериализации.ОтказДоступа Тогда" in serializer
+    assert encoder.index("ЭтоПриватноеЗначениеWorker(") < encoder.index(
+        "ТипЗнч(Значение)"
+    )
+    assert 'КонтекстСериализации.ОтказДоступа = Истина' in encoder
+    assert "Функция ЭтоПриватноеЗначениеWorker" in source
+    assert 'Свойство("ManifestSha256")' in source
+    assert 'Свойство("Modules")' in source
+    assert 'Свойство("Exports")' in source
+
+
 def test_object_adapter_reads_metadata_attributes_but_not_section_rows() -> None:
     source = MODULE.read_text(encoding="utf-8-sig")
 

@@ -784,6 +784,30 @@ def test_manual_handshake_accepts_common_custom_artifact_version_without_marker(
     ]
 
 
+def test_manual_handshake_rejects_predecessor_protocol_before_target_work(
+    tmp_path: Path,
+) -> None:
+    tools = FakeExtensionTools(fail_on_any_call=True)
+    fixture = make_lifecycle(
+        tmp_path,
+        tools=tools,
+        marker_matches=False,
+    )
+    assert fixture.manifest.protocol_version == "2"
+
+    with pytest.raises(ExtensionLifecycleError, match="packaged manifest"):
+        fixture.lifecycle.accept_manual_handshake(
+            _handshake_pair(
+                fixture,
+                artifact_version="0.1.2-user-managed",
+                protocol_version="1",
+            )
+        )
+
+    assert tools.calls == []
+    assert fixture.state_store.read() is None
+
+
 @pytest.mark.parametrize(  # type: ignore[untyped-decorator]
     ("mutate", "message"),
     [

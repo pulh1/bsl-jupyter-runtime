@@ -13,7 +13,11 @@ from onec_runtime.compact_table_backend import (
     infer_declared_compact_columns,
     infer_compact_columns,
 )
-from onec_runtime.errors import ProtocolError
+from onec_runtime.errors import (
+    CaptureValueAccessDeniedError,
+    CaptureValueCheckError,
+    ProtocolError,
+)
 from onec_runtime.performance_profile import PhaseRecorder
 from onec_runtime.rdbg.models import CollectionCell, CollectionRow
 from onec_runtime.table_materialization import ReferencePolicy
@@ -77,6 +81,58 @@ def test_builds_one_compact_preparation_with_safe_reference_overrides() -> None:
     assert f'Контекст.Вставить("{KEY}"' in source
     assert "ПолучитьЧасть" not in source
     assert "RuntimeWorker" not in source
+
+
+def test_compact_instruction_builds_protocol_two_admission_before_publication() -> None:
+    source = build_compact_transfer_instruction(
+        "Контекст.Таблица",
+        ReferencePolicy(),
+        KEY,
+        runtime_generation=3,
+        context_generation=5,
+        worker_type_registrations=("Worker.Extension",),
+    )
+
+    assert 'ВнешниеОбработки.Создать("Worker.Extension", Ложь)' in source
+    assert source.index("ТипыОбъектовWorker") < source.index(
+        "RuntimeTableTransferServer.СериализоватьКомпактнуюТаблицу("
+    )
+    assert "ТипыОбъектовWorker" in source.split(
+        "RuntimeTableTransferServer.СериализоватьКомпактнуюТаблицу(", 1
+    )[1]
+    assert source.index("Если Не Материализация.Доступ Тогда") < source.index(
+        f'Контекст.Вставить("{KEY}"'
+    )
+    assert 'Результат = "D|worker_generation_value"' in source
+    assert 'Результат = "E|value_admission_failed"' in source
+    assert '"R|" + Формат(3, "ЧГ=0; ЧДЦ=0")' in source
+
+
+@pytest.mark.parametrize(
+    ("metadata", "error_type"),
+    [
+        ("D|worker_generation_value", CaptureValueAccessDeniedError),
+        ("E|value_admission_failed", CaptureValueCheckError),
+        ("3|5|33|" + "0" * 64 + "|44", CaptureValueCheckError),
+    ],
+)
+def test_nonready_or_predecessor_table_metadata_never_fetches_payload(
+    metadata: str, error_type: type[Exception]
+) -> None:
+    reads: list[str] = []
+    transfer = CompactRuntimeTableTransfer(
+        lambda _source: metadata,
+        lambda key, _maximum: reads.append(key) or "private-payload",
+        runtime_generation=lambda: 3,
+        context_generation=5,
+        key_factory=lambda: KEY,
+        context_cleaner=lambda _key: None,
+    )
+
+    with pytest.raises(error_type):
+        transfer.payload("Контекст.Таблица", ReferencePolicy())
+
+    assert reads == []
 
 
 def test_builds_compact_transfer_for_validated_tabular_section_path() -> None:

@@ -127,6 +127,35 @@ def test_compact_serializer_passes_row_budget_into_query_normalization() -> None
     )
 
 
+def test_compact_serializer_admits_root_and_cells_before_type_or_payload() -> None:
+    source = SERVICE_MODULE.read_text(encoding="utf-8-sig")
+    serializer = source.split(
+        "Функция СериализоватьКомпактнуюТаблицу", 1
+    )[1].split("КонецФункции", 1)[0]
+    classifier = source.split(
+        "Функция ОпределитьКомпактнуюСхемуКолонок", 1
+    )[1].split("КонецФункции", 1)[0]
+
+    assert (
+        "(Знач Таблица, РежимСсылок, РежимыСсылокКолонок, "
+        "ТипыОбъектовWorker, МаксимумСтрок = 0, МаксимумБайт = 0) Экспорт"
+    ) in serializer
+    assert serializer.index("ЭтоПриватноеЗначениеWorker(Таблица") < serializer.index(
+        "ПодготовитьТабличноеЗначение(Таблица"
+    )
+    assert "ОпределитьКомпактнуюСхемуКолонок(Таблица, ТипыОбъектовWorker)" in serializer
+    assert classifier.index("ЭтоПриватноеЗначениеWorker(") < classifier.index(
+        "КомпактныйВидЗначения("
+    )
+    assert "Если СхемаКолонок = Неопределено Тогда" in serializer
+    assert serializer.index("ЭтоПриватноеЗначениеWorker(ЗначениеЯчейки") < serializer.index(
+        "КомпактноеЗначение(ЗначениеЯчейки"
+    )
+    assert serializer.index("Если ОтказДоступа Тогда") < serializer.index(
+        "ЗавершитьКомпактнуюМатериализацию"
+    )
+
+
 def test_compact_serializer_checks_budgets_before_base64_construction() -> None:
     source = SERVICE_MODULE.read_text(encoding="utf-8-sig")
     serializer = source.split(

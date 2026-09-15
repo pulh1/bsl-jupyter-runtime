@@ -198,6 +198,42 @@ def test_dump_fingerprint_normalizes_bsl_line_endings(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
+    "relative",
+    [
+        Path("CommonModules/RuntimeTableTransferServer/Ext/Module.bsl"),
+        Path("CommonModules/RuntimeValueTransferServer/Ext/Module.bsl"),
+    ],
+)
+def test_dump_fingerprint_binds_each_protocol_serializer(
+    tmp_path: Path, relative: Path
+) -> None:
+    dump = write_dump_fixture(tmp_path)
+    before = fingerprint_extension_dump(dump)
+    module = dump / relative
+    module.write_text(
+        module.read_text(encoding="utf-8-sig") + "\n// incompatible serializer change\n",
+        encoding="utf-8-sig",
+        newline="",
+    )
+
+    after = fingerprint_extension_dump(dump)
+
+    assert after.artifact.source_sha256 != before.artifact.source_sha256
+    assert after.artifact_sha256 != before.artifact_sha256
+
+
+def test_manifest_parser_rejects_predecessor_protocol_one(tmp_path: Path) -> None:
+    path = write_manifest_fixture(
+        tmp_path,
+        cfe_sha256="0" * 64,
+        protocol_version="1",
+    )
+
+    with pytest.raises(ExtensionBundleError, match="protocol 2"):
+        read_extension_manifest(path)
+
+
+@pytest.mark.parametrize(
     ("property_name", "value", "message"),
     [
         ("ConfigurationExtensionPurpose", "Customization", "purpose"),

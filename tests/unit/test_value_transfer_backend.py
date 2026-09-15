@@ -6,7 +6,12 @@ import json
 
 import pytest
 
-from onec_runtime.errors import MaterializationLimitError, ProtocolError
+from onec_runtime.errors import (
+    CaptureValueAccessDeniedError,
+    CaptureValueCheckError,
+    MaterializationLimitError,
+    ProtocolError,
+)
 from onec_runtime.value_materialization import MaterializationOptions, ONEC_NULL
 from onec_runtime.value_transfer_backend import (
     VALUE_CONTEXT_KEY_PREFIX,
@@ -84,6 +89,56 @@ def test_builds_bounded_recursive_value_instruction_for_safe_path() -> None:
     assert f'Контекст.Вставить("{KEY}"' in source
     assert 'Формат(3, "ЧГ=0; ЧДЦ=0")' in source
     assert 'Формат(5, "ЧГ=0; ЧДЦ=0")' in source
+
+
+def test_value_instruction_builds_protocol_two_admission_before_publication() -> None:
+    source = build_value_transfer_instruction(
+        "Контекст.Документ.Товары",
+        MaterializationOptions(max_bytes=4567),
+        KEY,
+        runtime_generation=3,
+        context_generation=5,
+        worker_type_registrations=("Worker.Extension",),
+    )
+
+    assert 'ВнешниеОбработки.Создать("Worker.Extension", Ложь)' in source
+    assert source.index("ТипыОбъектовWorker") < source.index(
+        "RuntimeValueTransferServer.СериализоватьЗначение("
+    )
+    assert "4567, ТипыОбъектовWorker" in source
+    assert source.index("Если Не МатериализацияЗначения.Доступ Тогда") < source.index(
+        f'Контекст.Вставить("{KEY}"'
+    )
+    assert 'Результат = "D|worker_generation_value"' in source
+    assert 'Результат = "E|value_admission_failed"' in source
+    assert '"R|" + Формат(3, "ЧГ=0; ЧДЦ=0")' in source
+
+
+@pytest.mark.parametrize(
+    ("metadata", "error_type"),
+    [
+        ("D|worker_generation_value", CaptureValueAccessDeniedError),
+        ("E|value_admission_failed", CaptureValueCheckError),
+        ("3|5|33|" + "0" * 64 + "|44", CaptureValueCheckError),
+    ],
+)
+def test_nonready_or_predecessor_value_metadata_never_fetches_payload(
+    metadata: str, error_type: type[Exception]
+) -> None:
+    reads: list[str] = []
+    transfer = RuntimeValueTransfer(
+        lambda _source: metadata,
+        lambda key, _maximum: reads.append(key) or "private-payload",
+        runtime_generation=lambda: 3,
+        context_generation=5,
+        key_factory=lambda: KEY,
+        context_cleaner=lambda _key: None,
+    )
+
+    with pytest.raises(error_type):
+        transfer.payload("Контекст.Значение", MaterializationOptions())
+
+    assert reads == []
 
 
 @pytest.mark.parametrize(
