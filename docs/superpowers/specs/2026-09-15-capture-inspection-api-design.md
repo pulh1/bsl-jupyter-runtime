@@ -787,6 +787,25 @@ breakpoint remains stopped until separately resumed. `RuntimeSession.status()`
 uses the same lock-independent control-plane snapshot so a later notebook cell
 can distinguish these cases while the original resume waiter is detached.
 
+This transition does not restart the Jupyter kernel, `RuntimeSession`, owned 1C
+session, `runtime_generation` or `context_generation`. Ordinary notebook names
+continue to resolve through the persistent `Контекст`, and successfully
+published Worker modules/methods remain available. The resumed old MAIN keeps
+its existing operation-generation pin; after its terminal completion a new MAIN
+gets a new operation ID and pins the then-active Worker generation. Thus a hot
+reload published during CAPTURE can be used by the next MAIN without retargeting
+the already-running one.
+
+`КонтекстОтладки` has narrower lifetime. Dirty scalar/object roots are written
+back to the suspended frame so the old MAIN continues with those values. When
+that call terminates, its frame locals and parameters are not promoted into the
+persistent notebook `Контекст`; its live capture descriptors stay stale.
+Previously created immutable pages remain displayable. Persistent-context value
+proxies remain valid only while their existing runtime/context generation fence
+still matches. A successful terminal reply publishes pending notebook namespace
+names; a failed terminal reply does not publish them. Neither case promises to
+roll back already executed 1C side effects or in-place mutations.
+
 ### Control-plane diagnostics and timing
 
 `runtime.current_capture()`, `capture.status()` and `capture.wait()` use a
