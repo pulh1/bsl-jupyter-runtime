@@ -4905,8 +4905,8 @@ class PrototypeRuntimeApi:
         timeout_s: float | None = None,
     ) -> pd.DataFrame:
         del chunk_size
-        offset, limit = self._bounded_slice(selection, maximum=max_rows)
         with self._capture_data_plane_writer(), self._bounded_command_timeout(timeout_s):
+            offset, limit = self._bounded_slice(selection, maximum=max_rows)
             self._require_available()
             safe_handle = self._resolve_value_handle_locked(handle)
             kind, payload = self._project_value_payload_locked(
@@ -4945,8 +4945,8 @@ class PrototypeRuntimeApi:
         timeout_s: float | None = None,
     ) -> object:
         del chunk_size
-        offset, limit = self._bounded_slice(selection, maximum=max_items)
         with self._capture_data_plane_writer(), self._bounded_command_timeout(timeout_s):
+            offset, limit = self._bounded_slice(selection, maximum=max_items)
             self._require_available()
             safe_handle = self._resolve_value_handle_locked(handle)
             route = self._materialization_kind_locked(safe_handle)
