@@ -492,3 +492,56 @@ worktree root so the checked-in root `integration` package is importable.
 `python -m compileall -q src/onec_runtime` and `git diff --check` passed.
 No live 1C qualification was run; all evidence is unit/scripted transport
 coverage.
+
+## Concurrent terminal-fact remediation
+
+The next Sol xhigh rereview found a lost update between Session's target-death
+publication and a concurrent direct API close. Session had already read capture
+publication as pending when direct close published the retained abandoned
+classification under the API close lock. Direct close saw no target death and
+returned with its false coordinator proof; Session then set target death but
+used its stale snapshot and skipped the post-target finalizer. Both calls had
+returned with the two monotonic facts true, yet the Worker host remained ready
+until a third close.
+
+The correction is split into:
+
+- `a0ee6c4` — `test: converge concurrent shutdown facts`
+- `255b040` — `fix: converge concurrent shutdown facts`
+
+`PrototypeRuntimeApi._mark_target_terminated()` now remains inside the API
+close lock after publishing target death. If capture publication is already
+finalized, that target-death publisher enters the existing single-writer local
+finalizer immediately with `target_terminated=True`. This uses
+`abandon_target()` exactly once and cannot be lost to a stale Session snapshot.
+The reverse order remains convergent because `RuntimeApi.close()` observes the
+already-published target fact after it publishes capture completion. No Session
+terminal-axis rule was changed.
+
+The deterministic real-Worker barrier has normal and kernel first-close rows
+for both fact orders. In the failing order it stops Session after its
+post-teardown API-backed snapshot and before `_mark_target_terminated()`;
+direct `api.close()` then publishes abandoned capture completion while the
+coordinator remains alive, returns, and only then allows Session to publish
+target death. Before any third core close, the test requires data-plane and
+Session terminal state, a closed/broken host, zero leases and registration
+ledgers, cleared generation/pin/cache ownership, one private abandoned event,
+no remote cleanup, and no direct errors. The reverse target-then-capture order
+uses the same barriers. Later API and wrapper close calls prove idempotency and
+finish the documented guardian/hook owner.
+
+Concurrent terminal-fact verification:
+
+```text
+RED barrier matrix: 2 failed, 2 passed in 3.16s
+  capture-then-target rows: data_plane_finalized=False after both calls returned
+GREEN barrier matrix: 4 passed in 2.74s
+GREEN barrier matrix repeated: 10/10 invocations passed (four rows each)
+Jupyter shutdown file: 53 passed, 1 known Windows Proactor/pyzmq warning in 32.62s
+RuntimeApi/control-plane/completion focused: 359 passed in 12.49s
+Worker/server/prototype/guardian/kernel nearby: 381 passed, 1 known Windows Proactor/pyzmq warning in 19.40s
+full unit suite: 4285 passed, 57 skipped, 1 known Windows Proactor/pyzmq warning in 244.11s
+```
+
+No live 1C qualification was run; all evidence is unit/scripted transport
+coverage.
