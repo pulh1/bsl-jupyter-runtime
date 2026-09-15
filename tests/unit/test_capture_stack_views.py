@@ -130,6 +130,52 @@ def test_visible_frame_labels_match_indexes_across_hidden_runs_and_nonzero_slice
     assert str(enriched_frame).startswith("#1 ") and enriched_frame.native_level == 5
 
 
+def test_native_stack_uses_physical_levels_across_parser_gaps():
+    from onec_runtime.rdbg.xml_codec import parse_call_stack
+
+    def frame(level: int, *, addressable: bool = True) -> str:
+        module = (
+            f"<moduleID><type>ConfigModule</type>"
+            f"<objectID>{UUID(int=100 + level)}</objectID>"
+            f"<propertyID>{UUID(int=200 + level)}</propertyID></moduleID>"
+            if addressable
+            else "<moduleID/>"
+        )
+        return f"<callStack>{module}<lineNo>{10 + level}</lineNo></callStack>"
+
+    payload = (
+        "<response>"
+        + frame(3)
+        + frame(2)
+        + frame(1, addressable=False)
+        + frame(0)
+        + "</response>"
+    ).encode()
+    parsed = tuple(parse_call_stack(payload, TARGET))
+    assert [item.level for item in parsed] == [0, 2, 3]
+    adapter, backend, _ = setup_stack()
+    backend.frames = parsed
+
+    assert adapter.stack.native[2].native_level == 2
+    with pytest.raises(IndexError):
+        adapter.stack.native[1]
+    middle = adapter.stack.native[1:3]
+    last = adapter.stack.native[3:4]
+    visible = adapter.stack[:20]
+
+    assert middle.total == last.total == 4
+    assert [item.native_level for item in middle.frames] == [2]
+    assert middle.next_cursor == 3
+    assert [item.native_level for item in last.frames] == [3]
+    assert last.next_cursor is None
+    visible_frames = tuple(
+        item for item in visible.frames if isinstance(item, api().DebugFrame)
+    )
+    assert visible.total == 3
+    assert [item.visible_index for item in visible_frames] == [0, 1, 2]
+    assert [item.native_level for item in visible_frames] == [0, 2, 3]
+
+
 def test_native_frame_labels_explicitly_identify_the_physical_coordinate():
     adapter, _, _ = setup_stack(runtime=(0, 1))
     assert str(adapter.stack.native[0]).startswith("native #0 ")
@@ -477,6 +523,61 @@ def test_runtime_stack_validates_the_exact_capture_fence_before_rdbg() -> None:
         capture.stack[:1]
 
     assert session.stack_reads == 0
+
+
+def test_public_stack_sanitizes_actual_rdbg_http_failure() -> None:
+    import traceback
+
+    import httpx
+
+    from onec_runtime.privacy import public_artifact_value
+    from onec_runtime.rdbg.models import DebugTarget
+    from onec_runtime.rdbg.session import RdbgSession, SessionState
+    from onec_runtime.rdbg.transport import RdbgTransport
+
+    private_url = "file:///private/customer/CommonModules/Payroll/Ext/Module.bsl"
+    private_source = "СекретныйРасчет = ЗарплатаСотрудника;"
+    private_body = (
+        f"<error><target>{private_url}</target>"
+        f"<source>{private_source}</source></error>"
+    ).encode()
+    client = httpx.Client(transport=httpx.MockTransport(
+        lambda _request: httpx.Response(500, content=private_body)
+    ))
+    transport = RdbgTransport("private-rdbg.customer.internal", 19542, client=client)
+    _, controller, _ = captured_stack_api()
+    rdbg = RdbgSession(transport, CAPTURE_A, alias="PrivateCustomerBase")
+    rdbg.target = DebugTarget(
+        controller._capture_target_id,
+        "ServerEmulation",
+        "stopped",
+    )
+    rdbg.state = SessionState.READY
+    controller.session = rdbg
+    runtime = PrototypeRuntimeApi(controller)
+
+    with pytest.raises(
+        ProtocolError, match="fresh capture stack inventory is unavailable"
+    ) as caught:
+        runtime.current_capture().stack[:20]
+    client.close()
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    rendered = "\n".join((
+        str(caught.value),
+        repr(caught.value),
+        "".join(traceback.format_exception(caught.value)),
+        repr(public_artifact_value(caught.value)),
+    ))
+    for private in (
+        private_url,
+        private_source,
+        "private-rdbg.customer.internal",
+        "PrivateCustomerBase",
+        private_body.decode(),
+    ):
+        assert private not in rendered
 
 
 def test_runtime_native_stack_bypasses_config_source_resolution_and_ast() -> None:
