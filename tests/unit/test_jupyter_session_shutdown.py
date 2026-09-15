@@ -5,7 +5,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from threading import Event, RLock, Thread
+from threading import Event, RLock, Thread, current_thread
 from types import SimpleNamespace
 
 from IPython.core.interactiveshell import InteractiveShell
@@ -149,6 +149,27 @@ def _start_lock_holder(lock: RLock):  # type: ignore[valid-type, no-untyped-def]
     thread.start()
     assert acquired.wait(1), "operation lock holder did not start"
     return thread, release, errors
+
+
+class _ObservedOperationLock:
+    def __init__(self) -> None:
+        self._lock = RLock()
+        self.supervisor_waiting = Event()
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        if current_thread().name == "onec-runtime-supervised-close":
+            self.supervisor_waiting.set()
+        return self._lock.acquire(blocking, timeout)
+
+    def release(self) -> None:
+        self._lock.release()
+
+    def __enter__(self) -> "_ObservedOperationLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.release()
 
 
 def start_owned(monkeypatch, shell, runtime):
@@ -442,7 +463,7 @@ def test_runtime_session_close_is_bounded_while_operation_lock_stays_owned(
     invocation = (
         runtime.close
         if entry == "normal"
-        else InteractiveRuntimeSession(runtime)._close_at_shutdown
+        else runtime.close_for_kernel_shutdown
     )
     holder, release_operation, holder_errors = _start_lock_holder(
         runtime._operation_lock
@@ -480,6 +501,130 @@ def test_runtime_session_close_is_bounded_while_operation_lock_stays_owned(
 
     assert not holder.is_alive()
     assert not closer.is_alive()
+
+
+@pytest.mark.parametrize(("entry", "server"), (("normal", False), ("kernel", True)))
+def test_repeated_close_stays_bounded_while_supervisor_waits_for_operation_lock(
+    entry: str,
+    server: bool,
+) -> None:
+    rdbg = (
+        _ServerShutdownCaptureSession(wake_on_invalidate=True)
+        if server
+        else ShutdownBlockingCaptureSession(wake_on_invalidate=True)
+    )
+    journal = RecoveryJournal()
+    controller = captured_controller(
+        rdbg,
+        command_timeout_s=0.05,
+        journal=journal,
+    )
+    api = PrototypeRuntimeApi(controller, journal=journal)
+    owner, _ticket, _cleanup_probe = start_shutdown_evaluation(controller, rdbg)
+    runtime = _shutdown_runtime_session(rdbg, api, server=server)
+    runtime._operation_lock = _ObservedOperationLock()
+    invocation = (
+        runtime.close
+        if entry == "normal"
+        else runtime.close_for_kernel_shutdown
+    )
+    holder, release_operation, holder_errors = _start_lock_holder(
+        runtime._operation_lock
+    )
+    first, first_finished, first_errors = _start_shutdown_thread(
+        invocation,
+        rdbg.shutdown_timeline,
+    )
+    second: Thread | None = None
+    try:
+        assert first_finished.wait(0.3), "first close exceeded its deadline"
+        assert runtime._operation_lock.supervisor_waiting.wait(0.3), (
+            "supervisor did not enter the real operation-lock wait"
+        )
+        second, second_finished, second_errors = _start_shutdown_thread(
+            invocation,
+            rdbg.shutdown_timeline,
+        )
+        second_bounded = second_finished.wait(0.3)
+    finally:
+        release_operation.set()
+        rdbg.shutdown_poll_release.set()
+        holder.join(2)
+        first.join(2)
+        if second is not None:
+            second.join(2)
+        owner.begin_close()
+        assert owner.join(2)
+
+    assert second_bounded, "retry close blocked behind the supervised owner"
+    assert first_errors == []
+    assert second_errors == []
+    assert holder_errors == []
+    assert not holder.is_alive()
+    assert not first.is_alive()
+    assert second is not None and not second.is_alive()
+
+
+@pytest.mark.parametrize("entry", ("normal", "kernel"))
+def test_interactive_owner_retains_guardian_and_hooks_until_core_close_finishes(
+    entry: str,
+) -> None:
+    rdbg = _ServerShutdownCaptureSession(wake_on_invalidate=True)
+    journal = RecoveryJournal()
+    controller = captured_controller(
+        rdbg,
+        command_timeout_s=0.05,
+        journal=journal,
+    )
+    api = PrototypeRuntimeApi(controller, journal=journal)
+    capture_owner, _ticket, _cleanup_probe = start_shutdown_evaluation(
+        controller,
+        rdbg,
+    )
+    runtime = _shutdown_runtime_session(rdbg, api, server=True)
+    stopped: list[str] = []
+    guardian = SimpleNamespace(stop=lambda: stopped.append("stopped"))
+    wrapper = InteractiveRuntimeSession(runtime, guardian)
+    shell = InteractiveShell()
+    wrapper._register_shutdown(shell)
+    holder, release_operation, holder_errors = _start_lock_holder(
+        runtime._operation_lock
+    )
+    invocation = wrapper.close if entry == "normal" else wrapper._close_at_shutdown
+    closer, finished, errors = _start_shutdown_thread(
+        invocation,
+        rdbg.shutdown_timeline,
+    )
+    try:
+        assert finished.wait(0.3), "interactive close exceeded its deadline"
+        assert runtime._closed is False
+        assert wrapper._closed is False
+        assert stopped == []
+        assert wrapper._shutdown_shell is shell
+
+        release_operation.set()
+        assert runtime._processes.closed.wait(1)
+        deadline = 100
+        while not runtime._closed and deadline:
+            Event().wait(0.01)
+            deadline -= 1
+        assert runtime._closed is True
+        wrapper.close()
+    finally:
+        release_operation.set()
+        rdbg.shutdown_poll_release.set()
+        holder.join(2)
+        closer.join(2)
+        capture_owner.begin_close()
+        assert capture_owner.join(2)
+        if not wrapper._closed:
+            wrapper.close()
+
+    assert errors == []
+    assert holder_errors == []
+    assert wrapper._closed is True
+    assert stopped == ["stopped"]
+    assert wrapper._shutdown_shell is None
 
 
 def test_jupyter_shutdown_from_another_thread_joins_pending_capture_consumer() -> None:
