@@ -42,6 +42,7 @@ from test_capture_evaluation_lifecycle import (
 )
 from test_notebook_method_runtime import UPDATE
 from test_prototype_runtime import (
+    CAPTURE_A,
     TARGET,
     captured_controller,
 )
@@ -1248,4 +1249,103 @@ def test_session_prepared_capture_releases_admission_lock_while_waiting(
             initiator.join(_JOIN_TIMEOUT_S)
         if contender is not None:
             contender.join(_JOIN_TIMEOUT_S)
+        close_owner(controller, transport)
+
+
+@pytest.mark.parametrize("route", ("hypothesis", "rearm", "ticket"))
+def test_capture_stateful_preparation_respects_completion_reservation(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    route: str,
+) -> None:  # type: ignore[no-untyped-def]
+    api, controller, transport = controlled_notebook_runtime(tmp_path)
+    original_finalize = api._finalize_namespace_reply
+    completion_entered = Event()
+    release_completion = Event()
+    rearm_calls: list[tuple[object, ...]] = []
+    initiator: Thread | None = None
+
+    def blocked_finalize(*args, **kwargs):  # type: ignore[no-untyped-def]
+        completion_entered.set()
+        assert release_completion.wait(_JOIN_TIMEOUT_S)
+        return original_finalize(*args, **kwargs)
+
+    def observed_rearm(points):  # type: ignore[no-untyped-def]
+        rearm_calls.append(tuple(points))
+        raise AssertionError("rearm entered during CAPTURE completion")
+
+    try:
+        assert api.execute_bsl(UPDATE).succeeded
+        assert api.execute_bsl("Результат = Б();").kind.value == "captured"
+        owner = _capture_owner(controller)
+        monkeypatch.setattr(api, "_finalize_namespace_reply", blocked_finalize)
+        monkeypatch.setattr(controller, "rearm_capture_successor", observed_rearm)
+        initiator, _finished, failures = _start_pending_capture(
+            lambda: api.execute_bsl("РезультатИнструкции = Б();"),
+            transport.accepted,
+        )
+        pending_id = api.current_capture().status().pending_evaluation_id
+        prepared_before = tuple(api._prepared_source_units)
+        ticket_before = api._capture_ticket
+        transport.complete()
+        assert completion_entered.wait(1), "completion barrier was not reached"
+        assert controller.state is OperationState.CAPTURED
+        assert owner.status(owner._fence).phase is CapturePhase.EVALUATING
+
+        with pytest.raises(CaptureBusyError) as caught:
+            if route == "hypothesis":
+                api.prepare_capture_hypothesis("РезультатИнструкции = Б();")
+            elif route == "rearm":
+                api.configure_continuation_capture_points((CAPTURE_A,))
+            else:
+                api.prepare_capture_ticket()
+
+        assert pending_id is not None
+        assert caught.value.evaluation_id == pending_id
+        assert tuple(api._prepared_source_units) == prepared_before
+        assert api._capture_ticket is ticket_before
+        assert rearm_calls == []
+        assert failures == []
+    finally:
+        release_completion.set()
+        if initiator is not None:
+            initiator.join(_JOIN_TIMEOUT_S)
+            assert not initiator.is_alive(), "stateful-route initiator leaked"
+        close_owner(controller, transport)
+
+
+def test_busy_session_resume_preserves_the_active_capture_ticket() -> None:
+    api, controller, transport = _capture_runtime()
+    runtime = _runtime_session(api)
+    fence = SimpleNamespace(
+        ticket_id="capture-ticket",
+        capture_intent_id="intent",
+        operation_id="operation",
+        capture_generation=controller.runtime_generation,
+        source_revision=1,
+        source_sha256="synthetic",
+        stop_sequence=controller.stop_sequence,
+    )
+    runtime._active_capture_ticket = fence
+    ended: list[object] = []
+    runtime._capture_resume_listeners = [ended.append]
+    initiator: Thread | None = None
+    try:
+        initiator, _finished, failures = _start_pending_capture(
+            lambda: api.execute_bsl("РезультатИнструкции = 901;"),
+            transport.accepted,
+        )
+        pending_id = api.current_capture().status().pending_evaluation_id
+
+        with pytest.raises(CaptureBusyError) as caught:
+            runtime.resume_capture()
+
+        assert pending_id is not None
+        assert caught.value.evaluation_id == pending_id
+        assert runtime._active_capture_ticket is fence
+        assert ended == []
+        runtime._require_capture_fence(fence)
+        assert failures == []
+    finally:
+        _finish_pending(initiator, transport)
         close_owner(controller, transport)
