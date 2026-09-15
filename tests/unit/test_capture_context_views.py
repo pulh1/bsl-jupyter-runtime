@@ -296,3 +296,18 @@ def test_value_adapter_can_bind_native_frame_scope_without_changing_stack_coordi
     assert frame.locals[:1].items[0].name == "Локальная"
     with pytest.raises(CaptureSourceUnavailableError, match="not attached"):
         original.variables[:1]
+
+
+def test_current_capture_exposes_a_typed_live_context_view() -> None:
+    """The public capture view owns the already-tested local context adapter."""
+    from onec_runtime.capture_values import CaptureContextView
+    from test_capture_control_plane import _capture_runtime, close_owner
+
+    runtime, controller, transport = _capture_runtime()
+    try:
+        capture = runtime.current_capture()
+
+        assert isinstance(capture.context, CaptureContextView)
+        assert capture.context is capture.context
+    finally:
+        close_owner(controller, transport)
