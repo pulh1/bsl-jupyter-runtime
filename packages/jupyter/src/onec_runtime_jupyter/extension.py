@@ -31,7 +31,6 @@ from onec_runtime.runtime_api import (
     RuntimeStatus,
 )
 from onec_runtime.privacy import (
-    bounded_platform_diagnostic,
     diagnostic_to_expert_wire,
     diagnostic_to_public_wire,
     public_artifact_value,
@@ -45,12 +44,6 @@ _DISPLAY_CONFIG_NAME = "_onec_runtime_display"
 _NAMESPACE_BRIDGE_NAME = "_onec_runtime_bsl_bridge"
 _SOURCE_SESSION_NAME = "_onec_runtime_source_session"
 _DIAGNOSTIC_EXCERPT_LIMIT = 512
-_PRESENTATION_REASON_LIMIT = 512
-_PLATFORM_LOCATION_PREFIX = re.compile(
-    r"^\{[^{}\r\n]{1,512}\([0-9]{1,10}(?:\s*,\s*[0-9]{1,10})?\)\}:\s*"
-)
-
-
 class BslCellError(RuntimeError):
     """A failed BSL reply surfaced as a Jupyter execution error."""
 
@@ -863,28 +856,11 @@ def _display_reply(
 
 
 def _safe_platform_reason(diagnostic: object) -> str | None:
-    """Show a bounded 1C cause while withholding redacted private evidence."""
+    """Map known platform categories to fixed presentation-only prose."""
     safe = sanitize_normalized_diagnostic(diagnostic)
     if safe is None or safe.platform_diagnostic is None:
         return None
     message = safe.platform_diagnostic.casefold()
-    bounded, _, redacted = bounded_platform_diagnostic(
-        safe.platform_diagnostic,
-        truncated=safe.platform_diagnostic_truncated,
-        redacted=safe.platform_diagnostic_redacted,
-    )
-    lines = () if bounded is None or redacted else tuple(
-        line.strip() for line in bounded.splitlines() if line.strip()
-    )
-    for index in range(len(lines) - 1, -1, -1):
-        marker = re.match(r"по причине:\s*(.*)", lines[index], re.IGNORECASE)
-        if marker is None:
-            continue
-        cause = marker.group(1) or (
-            lines[index + 1] if index + 1 < len(lines) else ""
-        )
-        if readable := _presentation_platform_line(cause):
-            return readable
     if "ошибка при вызове метода контекста (выполнить)" in message:
         return "Ошибка при выполнении запроса 1С"
     if "тип не определен" in message or "неизвестный тип" in message:
@@ -897,17 +873,7 @@ def _safe_platform_reason(diagnostic: object) -> str | None:
         return "Метод объекта не обнаружен"
     if "деление на 0" in message or "деление на ноль" in message:
         return "Деление на ноль"
-    return _presentation_platform_line(lines[0]) if lines else None
-
-
-def _presentation_platform_line(value: str) -> str | None:
-    line = _PLATFORM_LOCATION_PREFIX.sub("", value).strip()
-    line = re.sub(r"\s+", " ", line)
-    if not line:
-        return None
-    if len(line) > _PRESENTATION_REASON_LIMIT:
-        return line[: _PRESENTATION_REASON_LIMIT - 1].rstrip() + "…"
-    return line
+    return None
 
 
 def _diagnostic_source_unit(

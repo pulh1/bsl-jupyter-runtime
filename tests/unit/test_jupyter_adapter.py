@@ -247,12 +247,8 @@ def test_failed_reply_is_an_ipython_error_with_safe_rich_diagnostics(
             captured.outputs[0].data, ensure_ascii=False
         ) + repr(result.error_in_exec)
         assert "RAW platform" not in rendered
-        if normalized and magic.startswith("%%bsl"):
-            assert "private-connection" in rendered
-            assert "9182" in rendered
-        else:
-            assert "private-connection" not in rendered
-            assert "9182" not in rendered
+        assert "private-connection" not in rendered
+        assert "9182" not in rendered
     finally:
         InteractiveShell.clear_instance()
 
@@ -472,7 +468,7 @@ def test_presentation_mode_suppresses_worker_loaded_status() -> None:
         ),
     ],
 )
-def test_presentation_mode_shows_nested_platform_cause(stage, platform_text, expected):
+def test_presentation_mode_omits_nested_platform_cause(stage, platform_text, expected):
     source = "Элемент.Записать();"
     unit = SourceUnitRef(
         SourceUnitKind.NOTEBOOK_CELL, "nested-error", 1, source_sha256(source),
@@ -491,11 +487,11 @@ def test_presentation_mode_shows_nested_platform_cause(stage, platform_text, exp
         visible_source=source, source_unit=unit,
     )
 
-    assert expected in displayed.text
+    assert expected not in displayed.text
     assert "строка 1" in displayed.text
 
 
-def test_presentation_mode_shows_write_cause_when_platform_has_no_cell_location():
+def test_presentation_mode_omits_unlocated_platform_cause():
     source = "Элемент.Записать();"
     unit = SourceUnitRef(
         SourceUnitKind.NOTEBOOK_CELL, "unlocated-write", 1, source_sha256(source),
@@ -526,7 +522,7 @@ def test_presentation_mode_shows_write_cause_when_platform_has_no_cell_location(
         execution_provenance=provenance,
     )
 
-    assert "Не заполнено обязательное поле Наименование" in displayed.text
+    assert "Не заполнено обязательное поле Наименование" not in displayed.text
     assert "строка" not in displayed.text
 
 

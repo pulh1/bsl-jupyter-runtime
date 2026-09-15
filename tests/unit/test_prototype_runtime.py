@@ -586,7 +586,7 @@ def test_main_platform_failure_returns_visible_diagnostic_and_allows_next_run() 
     )
 
 
-def test_unlocated_main_failure_keeps_current_cell_origin_and_platform_cause() -> None:
+def test_unlocated_main_failure_keeps_current_cell_origin_without_platform_cause() -> None:
     runtime = runtime_module()
     raw = (
         "Ошибка при вызове метода контекста (Записать)\n"
@@ -625,7 +625,7 @@ def test_unlocated_main_failure_keeps_current_cell_origin_and_platform_cause() -
         reply, NotebookDisplayConfig.presentation(),
         visible_source=source, source_unit=unit,
     )
-    assert "Не заполнено обязательное поле Наименование" in displayed.text
+    assert "Не заполнено обязательное поле Наименование" not in displayed.text
     assert "строка" not in displayed.text
 
 

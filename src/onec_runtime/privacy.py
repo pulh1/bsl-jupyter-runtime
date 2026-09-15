@@ -44,7 +44,7 @@ def diagnostic_to_public_wire(value: NormalizedDiagnostic) -> dict[str, object]:
 
 
 def diagnostic_to_expert_wire(value: NormalizedDiagnostic) -> dict[str, object]:
-    """Render the bounded expert allowlist without source or runtime identity."""
+    """Render bounded verbatim expert evidence without source objects or paths."""
     try:
         safe = sanitize_normalized_diagnostic(value)
         public = diagnostic_to_public_wire(value)
