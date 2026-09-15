@@ -402,6 +402,7 @@ class PrototypeRuntimeController:
         self.last_debug_stop: DebugStop | None = None
         self.pending_capture_evaluation: _PendingCaptureEvaluation | None = None
         self._capture_evaluation_coordinator: CaptureEvaluationCoordinator | None = None
+        self._capture_shutdown_transport_invalidated = False
         self._capture_owned_submission: _CaptureOwnedSubmission | None = None
         self._capture_helper_handoffs = local()
         self.breakpoint_workspaces: list[BreakpointWorkspaceEvent] = []
@@ -458,6 +459,7 @@ class PrototypeRuntimeController:
             poll_interval_s=min(0.1, self.command_timeout_s),
             journal=self.journal,
         )
+        self._capture_shutdown_transport_invalidated = False
 
     def _capture_evaluation_owner(self) -> CaptureEvaluationCoordinator:
         owner = self._capture_evaluation_coordinator
@@ -700,6 +702,25 @@ class PrototypeRuntimeController:
     def invalidate_capture_inspection(self) -> None:
         """Revoke captured-frame handles without resuming the suspended target."""
         self._clear_capture_inspection()
+
+    def shutdown_capture_evaluation(self) -> bool:
+        """Stop and classify the CAPTURE owner within the command deadline."""
+        owner = self._capture_evaluation_coordinator
+        if owner is None:
+            return True
+        owner.begin_close()
+        invalidation_error: BaseException | None = None
+        if not self._capture_shutdown_transport_invalidated:
+            self._capture_shutdown_transport_invalidated = True
+            try:
+                self.session.invalidate()
+            except BaseException as error:
+                invalidation_error = error
+        stopped = owner.join(min(1.0, self.command_timeout_s))
+        owner.finish_close(stopped)
+        if invalidation_error is not None:
+            raise invalidation_error
+        return stopped
 
     def _capture_command_deadline(self, timeout_s: float | None) -> float:
         selected = self.command_timeout_s if timeout_s is None else timeout_s

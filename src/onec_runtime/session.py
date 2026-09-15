@@ -2103,18 +2103,29 @@ class RuntimeSession:
             if current_thread() is not self._heartbeat_thread:
                 self._heartbeat_thread.join(timeout=2.0)
             errors: list[BaseException] = []
-            with self._operation_lock:
-                if not shutdown and not self._runtime_api_closed:
-                    close_runtime_api = getattr(self.runtime_api, "close", None)
-                    if not callable(close_runtime_api):
-                        self._runtime_api_closed = True
+            if shutdown:
+                close_capture = getattr(
+                    self.runtime_api,
+                    "_close_capture_control_plane",
+                    None,
+                )
+                if callable(close_capture):
+                    try:
+                        close_capture()
+                    except BaseException as error:
+                        errors.append(error)
+            elif not self._runtime_api_closed:
+                close_runtime_api = getattr(self.runtime_api, "close", None)
+                if not callable(close_runtime_api):
+                    self._runtime_api_closed = True
+                else:
+                    try:
+                        close_runtime_api()
+                    except BaseException as error:
+                        errors.append(error)
                     else:
-                        try:
-                            close_runtime_api()
-                        except BaseException as error:
-                            errors.append(error)
-                        else:
-                            self._runtime_api_closed = True
+                        self._runtime_api_closed = True
+            with self._operation_lock:
                 if self.config.runtime.is_server_infobase:
                     if not self._server_session_terminated:
                         try:

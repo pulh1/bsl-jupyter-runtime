@@ -569,6 +569,14 @@ class _RemoteStepFailure(Exception):
         self.uncertain = uncertain
 
 
+class _ShutdownStepSettled(Exception):
+    """A remote step settled after close began; teardown owns disposition."""
+
+    def __init__(self, disposition: str):
+        super().__init__(disposition)
+        self.disposition = disposition
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class CaptureStepContext:
     _coordinator: CaptureEvaluationCoordinator
@@ -757,6 +765,7 @@ class CaptureEvaluationCoordinator:
         self._poll_interval_s = poll_interval_s
         self._journal = journal if journal is not None else RecoveryJournal()
         self._condition = Condition(Lock())
+        self._disposition_lock = Lock()
         self._phase = CapturePhase.PAUSED
         self._failure: CaptureFailureDiagnostic | None = None
         self._active: _CaptureEvaluationRecord | None = None
@@ -769,6 +778,10 @@ class CaptureEvaluationCoordinator:
         self._last_order = 0
         self._quarantined: _CaptureEvaluationRecord | None = None
         self._closing = False
+        self._shutdown_record: _CaptureEvaluationRecord | None = None
+        self._shutdown_disposition: str | None = None
+        self._shutdown_finalized = False
+        self._shutdown_abandoned = False
         self._events: deque[tuple[str, dict[str, object]]] = deque()
         self._worker = Thread(target=self._run, name="capture-evaluation-owner", daemon=True)
         self._worker.start()
@@ -884,6 +897,67 @@ class CaptureEvaluationCoordinator:
         self._worker.join(timeout_s)
         return not self._worker.is_alive()
 
+    def finish_close(self, termination_proven: bool) -> None:
+        """Dispose shutdown ownership once, after termination has been classified."""
+        if type(termination_proven) is not bool:
+            raise TypeError("termination_proven must be a Boolean")
+        if termination_proven:
+            with self._disposition_lock:
+                self._finish_close_exclusive(True)
+        else:
+            # An unresponsive worker may own the disposition lock. Recording
+            # supervised retention must remain bounded and never wait for it.
+            self._finish_close_exclusive(False)
+
+    def _finish_close_exclusive(self, termination_proven: bool) -> None:
+        with self._condition:
+            if self._shutdown_finalized:
+                return
+            if termination_proven and self._worker.is_alive():
+                raise ProtocolError(
+                    "CAPTURE shutdown termination has not been proven"
+                )
+            record = self._shutdown_record or self._active
+            if record is None:
+                self._shutdown_finalized = True
+                return
+            elapsed_ms = self._offset(record)
+            cleanup_count = len(record.request.cleanup_leases)
+            if not termination_proven:
+                self._shutdown_finalized = True
+                self._shutdown_abandoned = True
+                event = "capture_evaluation_shutdown_abandoned"
+                disposition = "retained"
+            else:
+                disposition = self._shutdown_disposition
+                if disposition not in {"release", "quarantine"}:
+                    raise ProtocolError(
+                        "CAPTURE shutdown record has no terminal disposition"
+                    )
+                self._shutdown_finalized = True
+                self._shutdown_record = None
+                if disposition == "quarantine":
+                    self._quarantined = record
+                event = "capture_evaluation_shutdown_disposed"
+
+        if termination_proven:
+            record.request.pin_lease(disposition)
+            for cleanup in record.request.cleanup_leases:
+                dispose = getattr(cleanup, "dispose_shutdown", None)
+                if callable(dispose):
+                    dispose(disposition)
+        self._journal.record(
+            "capture-evaluation.jsonl",
+            event,
+            evaluation_id=record.evaluation_id,
+            evaluation_kind=record.request.evaluation_kind.value,
+            termination_proven=termination_proven,
+            elapsed_ms=elapsed_ms,
+            pin_disposition=disposition,
+            cleanup_disposition=disposition,
+            cleanup_lease_count=cleanup_count,
+        )
+
     def _require_fence_locked(self, fence: CaptureFence) -> None:
         if fence != self._fence or self._closing or self._phase is CapturePhase.STALE:
             raise StaleCaptureError()
@@ -965,8 +1039,7 @@ class CaptureEvaluationCoordinator:
         with self._condition:
             closing = self._closing
         if closing:
-            self._finish(record, CapturePhase.STALE, CaptureEvaluationState.FAILED,
-                         diagnostic=_diagnostic("coordinator_closed"))
+            self._defer_shutdown(record, "release")
             return
 
         context = CaptureStepContext(self, record)
@@ -974,8 +1047,17 @@ class CaptureEvaluationCoordinator:
             event = context.execute_inline(CaptureRemoteStep(
                 request.dispatch, request.poll, request.restore,
             ))
+        except _ShutdownStepSettled as settled:
+            self._defer_shutdown(record, settled.disposition)
+            return
         except _RemoteStepFailure as error:
             self._finish_remote_failure(record, error)
+            return
+
+        with self._condition:
+            closing = self._closing
+        if closing:
+            self._defer_shutdown(record, "release")
             return
 
         value = None
@@ -1024,6 +1106,11 @@ class CaptureEvaluationCoordinator:
             value = None
             private_result = None
 
+        with self._condition:
+            closing = self._closing
+        if closing:
+            self._defer_shutdown(record, "release")
+            return
         try:
             for cleanup in request.cleanup_leases:
                 if isinstance(cleanup, CaptureCleanupLease):
@@ -1033,6 +1120,9 @@ class CaptureEvaluationCoordinator:
                 else:
                     cleanup()
             record.cleanup_status = "completed"
+        except _ShutdownStepSettled as settled:
+            self._defer_shutdown(record, settled.disposition)
+            return
         except _RemoteStepFailure as error:
             record.cleanup_status = "unknown" if error.uncertain else "failed"
             self._finish(record,
@@ -1082,7 +1172,7 @@ class CaptureEvaluationCoordinator:
         entered = False
         with self._condition:
             if self._closing:
-                raise _RemoteStepFailure(CapturePhase.STALE, "coordinator_closed", uncertain=True)
+                raise _ShutdownStepSettled("release")
             step_index = record.remote_step_count + 1
 
         def dispatch_entered() -> None:
@@ -1127,7 +1217,7 @@ class CaptureEvaluationCoordinator:
         while True:
             with self._condition:
                 if self._closing:
-                    raise _RemoteStepFailure(CapturePhase.STALE, "coordinator_closed", uncertain=True)
+                    raise _ShutdownStepSettled("quarantine")
             try:
                 event = step.poll(capability, self._poll_interval_s)
             except CommandTimeout:
@@ -1148,7 +1238,10 @@ class CaptureEvaluationCoordinator:
             with self._condition:
                 record.capability = None
                 self._evidence_locked(record, "result_received", step_index=step_index)
+                closing = self._closing
             self._flush_evidence()
+            if closing:
+                raise _ShutdownStepSettled("release")
             break
         try:
             step.restore()
@@ -1186,6 +1279,39 @@ class CaptureEvaluationCoordinator:
         candidate: CaptureEvaluationOutcome | None = None,
         messages: tuple[str, ...] = (),
     ) -> None:
+        with self._disposition_lock:
+            self._finish_exclusive(
+                record,
+                phase,
+                state,
+                diagnostic=diagnostic,
+                quarantine=quarantine,
+                private_result=private_result,
+                candidate=candidate,
+                messages=messages,
+            )
+        self._flush_evidence()
+
+    def _finish_exclusive(
+        self,
+        record: _CaptureEvaluationRecord,
+        phase: CapturePhase,
+        state: CaptureEvaluationState,
+        *,
+        diagnostic: CaptureFailureDiagnostic | None = None,
+        quarantine: bool = False,
+        private_result: object = None,
+        candidate: CaptureEvaluationOutcome | None = None,
+        messages: tuple[str, ...] = (),
+    ) -> None:
+        with self._condition:
+            closing = self._closing
+        if closing:
+            self._defer_shutdown(
+                record,
+                "quarantine" if quarantine else "release",
+            )
+            return
         # All leases are disposed outside the condition, before outcome visibility.
         if record.request.completion is not None:
             provisional = candidate or CaptureEvaluationOutcome(
@@ -1247,10 +1373,29 @@ class CaptureEvaluationCoordinator:
             } else None
             self._active = None
             self._condition.notify_all()
-        # Evidence was queued in the same critical section, in transition
-        # order. Only the worker drains it, before it can become idle or exit.
-        # Journal latency never leaves a pending snapshot with final timing.
-        self._flush_evidence()
+        # Evidence was queued in the same critical section as publication.
+        # The wrapper drains it after releasing disposition admission, so
+        # begin_close never waits behind journal I/O.
+
+    def _defer_shutdown(
+        self,
+        record: _CaptureEvaluationRecord,
+        disposition: str,
+    ) -> None:
+        if disposition not in {"release", "quarantine"}:
+            raise ValueError("invalid CAPTURE shutdown disposition")
+        with self._condition:
+            if self._active is not record:
+                return
+            record.initiator_attached = False
+            self._shutdown_record = record
+            self._shutdown_disposition = disposition
+            if self._shutdown_abandoned:
+                self._quarantined = record
+            self._phase = CapturePhase.STALE
+            self._failure = None
+            self._active = None
+            self._condition.notify_all()
 
     @staticmethod
     def _initiator_failure(

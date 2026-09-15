@@ -8,7 +8,7 @@ from hashlib import sha256
 from inspect import Parameter, signature
 from math import isfinite
 from pathlib import Path
-from threading import Lock, get_ident, local
+from threading import Lock, RLock, get_ident, local
 from time import monotonic
 from types import MappingProxyType
 from typing import Callable, Iterator, Protocol
@@ -866,10 +866,13 @@ class PrototypeRuntimeApi:
         self._capture_inspection_quarantined = False
         self._user_breakpoints = tuple(user_breakpoints)
         self._lock = Lock()
+        self._close_lock = RLock()
         self._writer_owner: int | None = None
         self._worker_exports: tuple[WorkerExport, ...] = ()
         self._poisoned_error: ProtocolError | None = None
         self._closed = False
+        self._capture_shutdown_finished = False
+        self._capture_shutdown_termination_proven = True
         self._context_generation = context_generation
         self._pending_dirty_roots: dict[str, str] = {}
         self._active_command_deadline: float | None = None
@@ -4507,50 +4510,92 @@ class PrototypeRuntimeApi:
             )
             raise self._poisoned_error from error
 
+    def _close_capture_control_plane(self) -> bool:
+        """Stop CAPTURE polling without entering the data-plane writer."""
+        with self._close_lock:
+            return self._close_capture_control_plane_locked()
+
+    def _close_capture_control_plane_locked(self) -> bool:
+        if self._capture_shutdown_finished:
+            return self._capture_shutdown_termination_proven
+        owner = self._capture_control_owner()
+        if owner is None:
+            self._capture_shutdown_finished = True
+            self._capture_shutdown_termination_proven = True
+            return True
+        shutdown = getattr(self._controller, "shutdown_capture_evaluation", None)
+        if callable(shutdown):
+            stopped = shutdown()
+        else:
+            owner.begin_close()
+            session = getattr(self._controller, "session", None)
+            invalidate = getattr(session, "invalidate", None)
+            if callable(invalidate):
+                invalidate()
+            timeout_s = getattr(self._controller, "command_timeout_s", 1.0)
+            if (
+                isinstance(timeout_s, bool)
+                or not isinstance(timeout_s, (int, float))
+                or not isfinite(float(timeout_s))
+                or float(timeout_s) <= 0
+            ):
+                timeout_s = 1.0
+            stopped = owner.join(min(1.0, float(timeout_s)))
+            owner.finish_close(stopped)
+        self._capture_shutdown_finished = True
+        self._capture_shutdown_termination_proven = bool(stopped)
+        return self._capture_shutdown_termination_proven
+
     def close(self) -> None:
         """Release all generation roots, pins and target registrations once."""
-        with self._single_writer():
+        with self._close_lock:
             if self._closed:
                 return
-            if (
-                self._controller.state is OperationState.CAPTURED
-                and self._operation_generation_pin is not None
-            ):
-                self._clear_capture_worker_generation_pin_locked()
-            try:
-                if self._controller.state is OperationState.RECOVERING:
-                    self._worker_universe_target.abandon_target()
-                else:
-                    self._worker_universe_target.teardown()
-            except WorkerPromotionOutcomeUnknown:
-                raise
-            except BaseException as error:
-                self._poisoned_error = PoisonedRuntimeError(
-                    "Runtime API cleanup could not release Worker generations"
-                )
-                raise self._poisoned_error from error
-            self._operation_generation_pin = None
-            self._preparing_generation_pin = None
-            self._evaluation_generation_pin = None
-            self._worker_generation_handle = None
-            self._api_owned_worker_generation_handle = None
-            prune_binary_cache = getattr(
-                self._worker_module_builder,
-                "_prune_cache",
-                None,
+            if not self._close_capture_control_plane_locked():
+                # The event consumer still owns its pending record and leases.
+                # Process/session teardown is now the only safe cleanup owner.
+                self._closed = True
+                return
+            with self._single_writer():
+                self._close_data_plane_locked()
+
+    def _close_data_plane_locked(self) -> None:
+        if self._closed:
+            return
+        try:
+            if self._controller.state is OperationState.RECOVERING:
+                self._worker_universe_target.abandon_target()
+            else:
+                self._worker_universe_target.teardown()
+        except WorkerPromotionOutcomeUnknown:
+            raise
+        except BaseException as error:
+            self._poisoned_error = PoisonedRuntimeError(
+                "Runtime API cleanup could not release Worker generations"
             )
-            if callable(prune_binary_cache):
-                prune_binary_cache(frozenset())
-            self._worker_module_artifacts.clear()
-            self._worker_generation_diagnostics.clear()
-            self._worker_syntax_generations.clear()
-            self._module_syntax_registry = ModuleSyntaxRegistry()
-            self._worker_active_modules.clear()
-            self._notebook_method_set = None
-            self._notebook_worker_descriptor = None
-            self._worker_exports = ()
-            self._prepared_source_units.clear()
-            self._closed = True
+            raise self._poisoned_error from error
+        self._operation_generation_pin = None
+        self._preparing_generation_pin = None
+        self._evaluation_generation_pin = None
+        self._worker_generation_handle = None
+        self._api_owned_worker_generation_handle = None
+        prune_binary_cache = getattr(
+            self._worker_module_builder,
+            "_prune_cache",
+            None,
+        )
+        if callable(prune_binary_cache):
+            prune_binary_cache(frozenset())
+        self._worker_module_artifacts.clear()
+        self._worker_generation_diagnostics.clear()
+        self._worker_syntax_generations.clear()
+        self._module_syntax_registry = ModuleSyntaxRegistry()
+        self._worker_active_modules.clear()
+        self._notebook_method_set = None
+        self._notebook_worker_descriptor = None
+        self._worker_exports = ()
+        self._prepared_source_units.clear()
+        self._closed = True
 
     def _notebook_publication_artifacts(
         self, artifact: WorkerArtifact,

@@ -534,6 +534,8 @@ def test_shutdown_rejects_submission_wakes_waiters_and_does_not_release_live_pin
     finally:
         release_poll.set()
     assert coordinator.join(1)
+    assert driver.dispositions == []
+    coordinator.finish_close(True)
     assert driver.dispositions == ["quarantine"]
 
 
@@ -607,6 +609,8 @@ def test_close_before_transport_marker_prevents_dispatch(environment):
         release_prepare.set()
     assert coordinator.join(1)
     assert driver.dispatch_count == 0
+    assert driver.dispositions == []
+    coordinator.finish_close(True)
     assert driver.dispositions == ["release"]
 
 
@@ -930,6 +934,8 @@ def test_close_drains_queued_evidence_in_order_after_publication_barrier(environ
         journal.release.set()
     assert coordinator.join(1)
     assert queued.dispatch_count == 0
+    assert queued.dispositions == []
+    coordinator.finish_close(True)
     assert queued.dispositions == ["release"]
     events = journal.events
     first_published = next(index for index, event in enumerate(events) if (
@@ -940,8 +946,9 @@ def test_close_drains_queued_evidence_in_order_after_publication_barrier(environ
     ))
     assert first_published < queued_created
     assert events[-1].fields["evaluation_id"] == queued_ticket.evaluation_id
-    assert events[-1].event == "capture_evaluation_outcome_published"
-    assert events[-1].fields["state"] == "failed"
+    assert events[-1].event == "capture_evaluation_shutdown_disposed"
+    assert events[-1].fields["termination_proven"] is True
+    assert events[-1].fields["pin_disposition"] == "release"
     with coordinator._condition:
         assert not coordinator._events
 
