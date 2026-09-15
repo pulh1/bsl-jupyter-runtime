@@ -365,3 +365,73 @@ full unit suite: 4265 passed, 57 skipped, 1 known Windows Proactor/pyzmq warning
 `git diff --check` passed. `ruff` is not installed in the project environment,
 so no Ruff result is claimed. No live 1C qualification was run; all evidence
 is unit/scripted transport coverage.
+
+## RuntimeApi terminal-axis remediation
+
+The final Sol xhigh review found that `PrototypeRuntimeApi._closed` represented
+two incompatible facts. A normal close could set it after capture admission had
+closed but before the unproven capture shutdown had been published or the real
+Worker data plane had been finalized. `RuntimeSession` then inferred both
+remaining shutdown axes from that one flag, reached a false terminal state
+after local teardown, and made the post-target RuntimeApi finalizer unreachable.
+
+The correction is split into:
+
+- `e404a77` — `test: finalize unproven capture worker ownership`
+- `2a74d51` — `fix: separate capture shutdown terminal axes`
+- `2ddf449` — `test: use RuntimeApi admission closure state`
+
+`PrototypeRuntimeApi` now keeps three independent monotonic facts:
+
+- `_admission_closed` fences new public data-plane requests;
+- `_capture_shutdown_finished` means capture publication is finalized; and
+- `_data_plane_finalized` means API-owned data-plane resources have been
+  finalized after target termination.
+
+Admission closure never claims data-plane finalization. A normal unproven
+close remains retryable through the existing post-target finalizer. That
+finalizer can enter the single-writer boundary after admission has closed,
+abandon the terminated Worker target without remote cleanup, release the
+detached pin lease and module registrations, and clear API generation/cache
+ownership exactly once.
+
+`RuntimeSession` now uses the exact composite terminal predicate: local
+resources terminal, capture publication finalized, and RuntimeApi data plane
+finalized. It no longer derives either API completion axis from `_closed`.
+Normal and kernel retry entries therefore finish any reachable axis after the
+target has terminated; Interactive wrapper, guardian, and hook cleanup remain
+pending until that composite state is terminal. The existing completion test
+now explicitly models admission closure rather than mutating the obsolete
+terminal sentinel.
+
+The RED uses real `WorkerUniverseRegistry` and
+`ServerWorkerUniverseRegistry` ownership with two Worker registrations and a
+detached capture pin lease. Its four rows cover normal-first and kernel-first
+shutdown, each followed by normal or kernel retry. Before the fix, both
+normal-first rows left the Worker host `READY`. After finalization, every row
+requires a closed host, no host leases, zero registration refcounts, an empty
+broken server registry, cleared API generation/pin/module-cache ownership, no
+target cleanup instruction or disconnect, one private bounded abandoned
+journal event, one guardian stop, removed hooks only after convergence, and
+idempotent later closes.
+
+RuntimeApi terminal-axis verification:
+
+```text
+RED real-worker matrix: 2 failed (normal-first host remained READY), 2 passed
+GREEN real-worker matrix: 4 passed in 2.29s
+GREEN matrix plus late-worker retry: 8 passed in 2.79s
+GREEN matrix repeated: 10/10 invocations passed (four rows each)
+RuntimeApi recovery contract: 1 passed in 1.60s
+completion/admission and real-worker rows: 16 passed in 2.28s
+shutdown/control-plane/RuntimeApi focused: 384 passed, 1 known Windows Proactor/pyzmq warning in 40.25s
+worker/server/prototype/guardian nearby: 376 passed in 8.98s
+kernel process: 5 passed, 1 known Windows Proactor/pyzmq warning in 11.58s
+full unit suite: 4269 passed, 57 skipped, 1 known Windows Proactor/pyzmq warning in 241.21s
+```
+
+The kernel and full-suite commands used `uv run python -m pytest` from the
+worktree root so the checked-in root `integration` package is importable.
+`python -m compileall -q src/onec_runtime` and `git diff --check` passed.
+No live 1C qualification was run; all evidence is unit/scripted transport
+coverage.
