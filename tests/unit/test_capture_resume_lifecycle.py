@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from pathlib import Path
+import sys
 from threading import Event, RLock, Thread, current_thread, get_ident
 from types import SimpleNamespace
 from time import monotonic, sleep
@@ -120,6 +121,36 @@ def eventually(predicate) -> None:  # type: ignore[no-untyped-def]
     while not predicate():
         assert monotonic() < deadline, "controller-owned resume did not settle"
         sleep(0.002)
+
+
+@contextmanager
+def interrupt_controller_admit_return(error_factory):  # type: ignore[no-untyped-def]
+    """Raise after the real controller commits RESUMING but before it returns."""
+
+    previous = sys.gettrace()
+    injected = False
+
+    def trace(frame, event, argument):  # type: ignore[no-untyped-def]
+        nonlocal injected
+        del argument
+        if (
+            not injected
+            and event == "return"
+            and frame.f_code.co_name == "admit"
+            and frame.f_code.co_filename.replace("\\", "/").endswith(
+                "/prototype_runtime.py"
+            )
+        ):
+            injected = True
+            raise error_factory()
+        return trace
+
+    sys.settrace(trace)
+    try:
+        yield
+    finally:
+        sys.settrace(previous)
+    assert injected, "resume admission did not reach the real controller commit"
 
 
 @pytest.mark.parametrize(
@@ -440,6 +471,85 @@ def test_submission_adoption_receipt_detaches_session_waiter_before_ticket_retur
         eventually(lambda: runtime._active_capture_ticket is None)
         assert terminal_fences and len(terminal_fences) == 1
         assert rdbg.continue_count == 2
+    finally:
+        rdbg.release_root_export.set()
+        rdbg.release_next_stop.set()
+        controller.shutdown_capture_evaluation()
+
+
+@pytest.mark.parametrize(
+    ("error_factory", "expected_error"),
+    (
+        (lambda: KeyboardInterrupt(), KeyboardInterrupt),
+        (lambda: TimeoutError("admit return timed out"), TimeoutError),
+    ),
+    ids=("keyboard-interrupt", "timeout"),
+)
+@pytest.mark.parametrize("entry", ("runtime-api", "session"))
+def test_interrupt_inside_admit_keeps_one_detached_resume_owner(
+    error_factory,
+    expected_error: type[BaseException],
+    entry: str,
+) -> None:  # type: ignore[no-untyped-def]
+    """The controller commit cannot become visible without its owner receipt."""
+
+    rdbg = ResumeBarrierSession((CAPTURE_A, SERVICE, SERVICE))
+    controller = captured_controller(rdbg, command_timeout_s=1)
+    api = PrototypeRuntimeApi(controller)
+    old_view = api.current_capture()
+    runtime: RuntimeSession | None = None
+    active: object | None = None
+    delivered: list[object] = []
+    if entry == "session":
+        runtime = object.__new__(RuntimeSession)
+        runtime._operation_lock = RLock()
+        runtime._capture_resume_listeners = []
+        active = SimpleNamespace(
+            ticket_id="capture-ticket",
+            capture_intent_id="intent",
+            operation_id="operation",
+            capture_generation=1,
+            source_revision=1,
+            source_sha256="a" * 64,
+            stop_sequence=1,
+        )
+        runtime._active_capture_ticket = active
+        runtime.runtime_api = api
+        runtime.add_capture_resume_listener(delivered.append)
+
+    try:
+        with interrupt_controller_admit_return(error_factory):
+            with pytest.raises(expected_error):
+                if runtime is None:
+                    api.resume_capture(dirty_roots=("Скаляр",))
+                else:
+                    runtime.resume_capture(dirty_roots=("Скаляр",))
+
+        owner = controller._capture_evaluation_coordinator
+        assert owner is not None
+        assert controller.state is OperationState.RESUMING
+        assert owner.status(owner._fence).phase is CapturePhase.RESUMING
+        assert owner._active_resume is not None
+        assert owner._active_resume.initiator_attached is False
+        assert rdbg.root_export_entered.wait(1)
+        with pytest.raises(CaptureBusyError):
+            api.resume_capture()
+        if runtime is not None:
+            assert runtime._active_capture_ticket is active
+            assert delivered == []
+
+        rdbg.release_root_export.set()
+        assert rdbg.next_stop_wait_entered.wait(1)
+        assert old_view.status().phase is CapturePhase.STALE
+        rdbg.release_next_stop.set()
+        eventually(lambda: controller.state is OperationState.COMPLETED)
+        assert rdbg.continue_count == 2
+        if runtime is not None:
+            eventually(lambda: runtime._active_capture_ticket is None)
+            assert len(delivered) == 1
+
+        next_main = api.execute_bsl("СледующаяКоманда = 1;")
+        assert next_main.kind is RuntimeReplyKind.MAIN_COMPLETED
     finally:
         rdbg.release_root_export.set()
         rdbg.release_next_stop.set()
