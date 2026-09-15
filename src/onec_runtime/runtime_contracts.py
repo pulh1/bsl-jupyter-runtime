@@ -16,6 +16,7 @@ from onec_runtime.bsl import (
     VisibleSourceLocation,
 )
 from onec_runtime.bsl.diagnostics import (
+    DiagnosticCategoryBlock,
     DiagnosticCoordinateSpace,
     DiagnosticTextSpan,
     ErrorTraceCause,
@@ -42,7 +43,14 @@ _WORKER_REGISTRATION_RE = re.compile(
     r"OnecRuntime_[0-9a-f]{8}_[0-9a-f]{16}\Z",
     re.IGNORECASE,
 )
-_UNKNOWN_MODULES = frozenset({"<Неизвестный модуль>", "Неизвестный модуль"})
+_UNKNOWN_MODULES = frozenset(
+    {
+        "<Неизвестный модуль>",
+        "Неизвестный модуль",
+        "<Unknown module>",
+        "Unknown module",
+    }
+)
 _DIAGNOSTIC_SUMMARIES = {
     DiagnosticStage.PARSING: "BSL parsing failed",
     DiagnosticStage.LOWERING: "BSL lowering failed",
@@ -184,13 +192,30 @@ def _bounded_diagnostic_span(value: object, text_length: int) -> bool:
     )
 
 
+def _bounded_diagnostic_category(
+    value: object,
+    text_length: int,
+    cause_span: DiagnosticTextSpan,
+) -> bool:
+    return (
+        isinstance(value, DiagnosticCategoryBlock)
+        and _bounded_diagnostic_span(value.span, text_length)
+        and cause_span.start <= value.span.start <= value.span.end <= cause_span.end
+        and type(value.names) is tuple
+        and 0 < len(value.names) <= 16
+        and all(
+            type(item) is str
+            and len(item) <= MAX_DIAGNOSTIC_LABEL_LENGTH
+            and _MODULE_COMPONENT_RE.fullmatch(item) is not None
+            for item in value.names
+        )
+    )
+
+
 def _bounded_platform_location(value: object) -> bool:
     if (
         not isinstance(value, PlatformDiagnosticLocation)
-        or type(value.module_name) is not str
-        or not 0 < len(value.module_name) <= 512
         or type(value.module_components) is not tuple
-        or not 0 < len(value.module_components) <= 32
         or type(value.line) is not int
         or not 0 <= value.line <= MAX_DIAGNOSTIC_COORDINATE
         or (value.column is None and value.line == 0)
@@ -202,6 +227,27 @@ def _bounded_platform_location(value: object) -> bool:
             )
         )
         or type(value.coordinate_space) is not DiagnosticCoordinateSpace
+        or (
+            value.extension_name is not None
+            and (
+                type(value.extension_name) is not str
+                or len(value.extension_name) > 512
+                or _MODULE_COMPONENT_RE.fullmatch(value.extension_name) is None
+            )
+        )
+    ):
+        return False
+    if value.module_name is None:
+        return (
+            value.module_components == ()
+            and value.worker_artifact_location is None
+            and value.coordinate_space is DiagnosticCoordinateSpace.UNKNOWN
+            and value.extension_name is None
+        )
+    if (
+        type(value.module_name) is not str
+        or not 0 < len(value.module_name) <= 512
+        or not 0 < len(value.module_components) <= 32
     ):
         return False
     if value.module_name in _UNKNOWN_MODULES:
@@ -209,6 +255,7 @@ def _bounded_platform_location(value: object) -> bool:
             value.module_components == (value.module_name,)
             and value.worker_artifact_location is None
             and value.coordinate_space is DiagnosticCoordinateSpace.EXECUTED_BSL
+            and value.extension_name is None
         )
     if (
         value.coordinate_space is not DiagnosticCoordinateSpace.HOST_MODULE
@@ -225,7 +272,7 @@ def _bounded_platform_location(value: object) -> bool:
         and _WORKER_REGISTRATION_RE.fullmatch(value.module_components[1]) is not None
         and value.module_components[2].casefold() == "модульобъекта"
     )
-    if not canonical_worker:
+    if not canonical_worker or value.extension_name is not None:
         return value.worker_artifact_location is None
     return (
         isinstance(value.worker_artifact_location, WorkerArtifactPlatformLocation)
@@ -246,12 +293,17 @@ def _bounded_trace_origin(frame: ErrorTraceFrame) -> bool:
     location = frame.platform_location
     unknown = _is_unknown_platform_location(location)
     worker = _is_worker_platform_location(location)
+    anonymous_main = (
+        location.module_name is None
+        and location.column is None
+        and frame.cause_ordinal == 0
+    )
     if frame.origin is ErrorTraceFrameOrigin.EXECUTED_ARTIFACT:
-        return unknown and not worker
+        return (unknown or anonymous_main) and not worker
     if frame.origin is ErrorTraceFrameOrigin.WORKER_ARTIFACT:
         return worker
     if frame.origin is ErrorTraceFrameOrigin.NATIVE_MODULE:
-        return not unknown and not worker
+        return location.module_name is not None and not unknown and not worker
     return frame.origin is ErrorTraceFrameOrigin.UNKNOWN
 
 
@@ -630,6 +682,17 @@ def _bounded_trace(
             or any(type(item) is not int for item in cause.frame_ordinals)
             or tuple(sorted(set(cause.frame_ordinals))) != cause.frame_ordinals
             or any(not 0 <= item < len(value.frames) for item in cause.frame_ordinals)
+            or (
+                cause.category is not None
+                and (
+                    not _bounded_diagnostic_category(
+                        cause.category,
+                        text_length,
+                        cause.block_span,
+                    )
+                    or cause.summary_span.end > cause.category.span.start
+                )
+            )
         ):
             return False
         if index and value.causes[index - 1].block_span.end > cause.block_span.start:
@@ -683,6 +746,13 @@ def _bounded_trace(
     for cause in value.causes:
         if cause.frame_ordinals != tuple(
             frame.ordinal
+            for frame in value.frames
+            if frame.cause_ordinal == cause.ordinal
+        ):
+            return False
+        if cause.category is not None and any(
+            frame.block_span.start < cause.category.span.end
+            and cause.category.span.start < frame.block_span.end
             for frame in value.frames
             if frame.cause_ordinal == cause.ordinal
         ):

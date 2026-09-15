@@ -22,13 +22,19 @@ from onec_runtime.bsl.source_maps import (
 _PLATFORM_DIAGNOSTIC_LIMIT_BYTES = 64 * 1024
 _PLATFORM_FRAME_LIMIT = 128
 _PLATFORM_CAUSE_LIMIT = 32
+_PLATFORM_CATEGORY_NAME_LIMIT = 16
+_PLATFORM_CATEGORY_LABEL_LIMIT = 128
 _PLATFORM_COORDINATE_LIMIT = 10_000_000
 _MODULE_LOCATOR_LIMIT = 512
 _MODULE_COMPONENT_LIMIT = 32
 _MODULE_IDENTIFIER = r"[A-Za-zА-Яа-яЁё_][0-9A-Za-zА-Яа-яЁё_]*"
+_UNKNOWN_MODULE_PATTERN = (
+    r"<Неизвестный модуль>|Неизвестный модуль|<Unknown module>|Unknown module"
+)
 _LOCATION_RE = re.compile(
-    rf"^\{{(?P<module><Неизвестный модуль>|Неизвестный модуль|"
-    rf"{_MODULE_IDENTIFIER}(?:\.{_MODULE_IDENTIFIER})*)"
+    rf"^\{{(?:(?P<unknown>{_UNKNOWN_MODULE_PATTERN})|"
+    rf"(?:(?P<extension>{_MODULE_IDENTIFIER})[ \t]+)?"
+    rf"(?P<module>{_MODULE_IDENTIFIER}(?:\.{_MODULE_IDENTIFIER})*))?"
     r"\((?P<line>[0-9]{1,10})"
     r"(?:\s*,\s*(?P<column>[0-9]{1,10}))?\)\}",
     re.MULTILINE,
@@ -43,15 +49,27 @@ _COMPILATION_MARKER_RE = re.compile(
     r"[ \t]*(?:\r?\n)?\Z",
 )
 _NESTED_COMPILE_CAUSE_PREFIX_RE = re.compile(
-    r"(?:^|\r?\n)[ \t]*по причине:[ \t]*\r?\n\Z",
+    r"(?:^|\r?\n)[ \t]*(?:по причине:|Reason:)[ \t]*\r?\n\Z",
     re.IGNORECASE,
 )
 _CAUSE_BOUNDARY_RE = re.compile(
-    r"^[ \t]*по причине:[ \t]*(?:\r?\n|\Z)",
+    r"^[ \t]*(?:по причине:|Reason:)[ \t]*(?:\r?\n|\Z)",
     re.IGNORECASE | re.MULTILINE,
 )
+_CATEGORY_BLOCK_RE = re.compile(
+    rf"^[ \t]*\[(?P<names>{_MODULE_IDENTIFIER}"
+    rf"(?:[ \t]*,[ \t]*{_MODULE_IDENTIFIER})*)\][ \t]*(?:\r?\n|\Z)",
+    re.MULTILINE,
+)
 _DIAGNOSTIC_BLOCK_START_RE = re.compile(r"^\{", re.MULTILINE)
-_UNKNOWN_MODULES = frozenset({"<Неизвестный модуль>", "Неизвестный модуль"})
+_UNKNOWN_MODULES = frozenset(
+    {
+        "<Неизвестный модуль>",
+        "Неизвестный модуль",
+        "<Unknown module>",
+        "Unknown module",
+    }
+)
 
 
 class DiagnosticStage(StrEnum):
@@ -110,11 +128,18 @@ class DiagnosticTextSpan:
 
 
 @dataclass(frozen=True, slots=True)
+class DiagnosticCategoryBlock:
+    span: DiagnosticTextSpan
+    names: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ParsedDiagnosticCause:
     ordinal: int
     summary_span: DiagnosticTextSpan
     block_span: DiagnosticTextSpan
     frame_ordinals: tuple[int, ...]
+    category: DiagnosticCategoryBlock | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,12 +241,13 @@ class WorkerArtifactPlatformLocation:
 
 @dataclass(frozen=True, slots=True)
 class PlatformDiagnosticLocation:
-    module_name: str
+    module_name: str | None
     module_components: tuple[str, ...]
     worker_artifact_location: WorkerArtifactPlatformLocation | None
     line: int
     column: int | None
     coordinate_space: DiagnosticCoordinateSpace
+    extension_name: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -312,6 +338,7 @@ class ErrorTraceCause:
     summary_span: DiagnosticTextSpan
     block_span: DiagnosticTextSpan
     frame_ordinals: tuple[int, ...]
+    category: DiagnosticCategoryBlock | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -401,19 +428,32 @@ def _bound_platform_diagnostic(message: str) -> tuple[str, bool]:
 def _accepted_platform_locations(text: str) -> tuple[_AcceptedPlatformLocation, ...]:
     accepted: list[_AcceptedPlatformLocation] = []
     for match in _LOCATION_RE.finditer(text):
-        module = match.group("module")
+        unknown = match.group("unknown")
+        module = unknown or match.group("module")
+        extension_name = match.group("extension")
         components = (
-            (module,) if module in _UNKNOWN_MODULES else tuple(module.split("."))
+            ()
+            if module is None
+            else ((module,) if module in _UNKNOWN_MODULES else tuple(module.split(".")))
         )
         line = int(match.group("line"))
         column_text = match.group("column")
         column = None if column_text is None else int(column_text)
         if (
-            len(module) > _MODULE_LOCATOR_LIMIT
+            (module is not None and len(module) > _MODULE_LOCATOR_LIMIT)
+            or (
+                extension_name is not None
+                and len(extension_name) > _MODULE_LOCATOR_LIMIT
+            )
             or len(components) > _MODULE_COMPONENT_LIMIT
             or (column is None and line <= 0)
         ):
             continue
+        worker_location = (
+            None
+            if extension_name is not None
+            else _parse_worker_artifact_location(components)
+        )
         accepted.append(
             _AcceptedPlatformLocation(
                 match.start(),
@@ -421,14 +461,19 @@ def _accepted_platform_locations(text: str) -> tuple[_AcceptedPlatformLocation, 
                 PlatformDiagnosticLocation(
                     module,
                     components,
-                    _parse_worker_artifact_location(components),
+                    worker_location,
                     line,
                     column,
                     (
                         DiagnosticCoordinateSpace.EXECUTED_BSL
                         if module in _UNKNOWN_MODULES
-                        else DiagnosticCoordinateSpace.HOST_MODULE
+                        else (
+                            DiagnosticCoordinateSpace.UNKNOWN
+                            if module is None
+                            else DiagnosticCoordinateSpace.HOST_MODULE
+                        )
                     ),
+                    extension_name,
                 ),
             )
         )
@@ -502,6 +547,7 @@ def _parse_diagnostic_structure(
     bool,
 ]:
     markers = tuple(_CAUSE_BOUNDARY_RE.finditer(text))
+    category_matches = tuple(_CATEGORY_BLOCK_RE.finditer(text))
     if not text:
         cause_blocks: tuple[DiagnosticTextSpan, ...] = ()
     else:
@@ -517,7 +563,12 @@ def _parse_diagnostic_structure(
     )
     retained_candidates = candidates[:_PLATFORM_FRAME_LIMIT]
     diagnostic_block_starts = tuple(
-        match.start() for match in _DIAGNOSTIC_BLOCK_START_RE.finditer(text)
+        sorted(
+            (
+                *(match.start() for match in _DIAGNOSTIC_BLOCK_START_RE.finditer(text)),
+                *(match.start() for match in category_matches),
+            )
+        )
     )
     frames: list[ParsedDiagnosticFrame] = []
     for ordinal, item in enumerate(retained_candidates):
@@ -555,20 +606,49 @@ def _parse_diagnostic_structure(
             (item.start for item in accepted if block.start <= item.start < block.end),
             block.end,
         )
+        cause_category_matches = tuple(
+            match
+            for match in category_matches
+            if block.start <= match.start() < block.end
+        )
+        category = None
+        if len(cause_category_matches) == 1:
+            category_match = cause_category_matches[0]
+            category_names = tuple(
+                item.strip() for item in category_match.group("names").split(",")
+            )
+            if (
+                len(category_names) <= _PLATFORM_CATEGORY_NAME_LIMIT
+                and all(
+                    len(item) <= _PLATFORM_CATEGORY_LABEL_LIMIT
+                    for item in category_names
+                )
+            ):
+                category = DiagnosticCategoryBlock(
+                    DiagnosticTextSpan(category_match.start(), category_match.end()),
+                    category_names,
+                )
+        summary_boundaries = (
+            first_locator,
+            *(match.start() for match in cause_category_matches),
+        )
+        summary_end = min(summary_boundaries)
         causes.append(
             ParsedDiagnosticCause(
                 ordinal,
-                _trim_diagnostic_span(text, block.start, first_locator),
+                _trim_diagnostic_span(text, block.start, summary_end),
                 block,
                 tuple(
                     frame.ordinal for frame in frames if frame.cause_ordinal == ordinal
                 ),
+                category,
             )
         )
     consumed = (
         *(DiagnosticTextSpan(match.start(), match.end()) for match in markers),
         *(cause.summary_span for cause in causes),
         *(frame.block_span for frame in frames),
+        *(cause.category.span for cause in causes if cause.category is not None),
     )
     return (
         tuple(causes),
@@ -738,8 +818,9 @@ def _remap_worker_runtime_primary(
     for location in parsed.locations:
         worker_location = location.worker_artifact_location
         if worker_location is None:
-            if location.module_name in _UNKNOWN_MODULES:
-                frames.append(_unknown_worker_projection(location.module_name))
+            module_name = location.module_name
+            if module_name is not None and module_name in _UNKNOWN_MODULES:
+                frames.append(_unknown_worker_projection(module_name))
             continue
         artifact = _pinned_worker_artifact(
             worker_location.registration_name,
@@ -1011,6 +1092,18 @@ def _pinned_worker_artifact(
     return matches[0] if len(matches) == 1 else None
 
 
+def _is_main_trace_frame(frame: ParsedDiagnosticFrame) -> bool:
+    location = frame.location
+    if location.module_name in _UNKNOWN_MODULES:
+        return True
+    return (
+        location.module_name is None
+        and location.extension_name is None
+        and location.column is None
+        and frame.cause_ordinal == 0
+    )
+
+
 def _worker_trace_frame(
     frame: ParsedDiagnosticFrame,
     artifact: WorkerDiagnosticArtifact,
@@ -1072,6 +1165,7 @@ def _normalize_trace_frames(
     include_worker_projection = pinned_manifest_sha256 is not None
     for item in parsed.frames:
         worker_location = item.location.worker_artifact_location
+        module_name = item.location.module_name
         observed_registration = (
             None if worker_location is None else worker_location.registration_name
         )
@@ -1107,18 +1201,24 @@ def _normalize_trace_frames(
                     )
                 )
                 continue
-            if item.location.module_name in _UNKNOWN_MODULES:
+            if _is_main_trace_frame(item):
                 frames.append(
                     _main_trace_frame(item, executed, visible_source_context)
                     if executed is not None
                     else _unknown_trace_frame(item)
                 )
-                if include_worker_projection:
-                    worker_frames.append(
-                        _unknown_worker_projection(item.location.module_name)
-                    )
+                if (
+                    include_worker_projection
+                    and module_name is not None
+                    and module_name in _UNKNOWN_MODULES
+                ):
+                    worker_frames.append(_unknown_worker_projection(module_name))
                 continue
-            frames.append(_native_trace_frame(item))
+            frames.append(
+                _unknown_trace_frame(item)
+                if module_name is None
+                else _native_trace_frame(item)
+            )
         except BaseException:
             frames.append(
                 _unknown_trace_frame(
@@ -1128,12 +1228,13 @@ def _normalize_trace_frames(
             )
             if include_worker_projection and (
                 worker_location is not None
-                or item.location.module_name in _UNKNOWN_MODULES
+                or (module_name is not None and module_name in _UNKNOWN_MODULES)
             ):
+                projection_name = observed_registration or module_name
+                if projection_name is None:
+                    continue
                 worker_frames.append(
-                    _unknown_worker_projection(
-                        observed_registration or item.location.module_name
-                    )
+                    _unknown_worker_projection(projection_name)
                 )
     return tuple(frames), tuple(worker_frames)
 
@@ -1223,6 +1324,7 @@ def normalize_platform_diagnostic_trace(
             item.summary_span,
             item.block_span,
             item.frame_ordinals,
+            item.category,
         )
         for item in parsed.causes
     )

@@ -74,7 +74,9 @@ The existing `_PrivatePlatformEvidence` remains the only owner of retained platf
 - `ordinal`: zero-based outer-to-inner order;
 - `summary_span`: the cause prose excluding recognized frame locators and structural separators;
 - `block_span`: the complete retained cause block;
-- `frame_ordinals`: ordered references to retained parsed frames.
+- `frame_ordinals`: ordered references to retained parsed frames;
+- an optional `DiagnosticCategoryBlock` containing the bounded category names and
+  their span in the retained platform text.
 
 `ParsedDiagnosticFrame` contains:
 
@@ -83,6 +85,11 @@ The existing `_PrivatePlatformEvidence` remains the only owner of retained platf
 - `location`: the existing `PlatformDiagnosticLocation`;
 - `block_span`: locator plus its associated platform text up to the next locator or cause boundary;
 - `detail_span`: platform-provided text following the locator, if present.
+
+`PlatformDiagnosticLocation` keeps the canonical module path separate from an
+optional configuration-extension name. Anonymous locators have no module name or
+components and remain in the unknown coordinate space until trace context proves
+their owner.
 
 `ParsedPlatformDiagnostic` gains:
 
@@ -113,7 +120,8 @@ The existing `locations`, `line`, `column`, `module_name`, `additional_locations
 - optional dependency and method anchors for existing Worker dependency diagnostics;
 - optional `visible_line_span`, identifying the exact hash-fenced original-source line that a local adapter may slice later.
 
-`ErrorTraceCause` contains its ordinal, summary/block spans, and retained normalized frame ordinals.
+`ErrorTraceCause` contains its ordinal, summary/block spans, retained normalized
+frame ordinals, and the optional category block.
 
 `NormalizedDiagnostic` gains:
 
@@ -133,12 +141,23 @@ Parsing is conservative and operates only on bounded private text.
 3. Recognize module locators only at line starts and only in canonical forms:
    - `{Module.Path(line,column)}`;
    - `{Module.Path(line)}`;
-   - both current spellings of the unknown module.
+   - `{ExtensionName Module.Path(line,column)}` and its line-only form;
+   - anonymous `{(line,column)}` and `{(line)}` forms;
+   - Russian and English spellings of the unknown module, with or without angle
+     brackets.
 4. Apply existing module length, component count, numeric-width, and Worker-registration allowlists. Runtime-contract validation still rejects non-positive or out-of-range normalized coordinates. General line-only locations are parsed, but generated-code remapping remains exact-or-unknown under the rules below.
-5. Recognize a cause boundary only when `по причине:` occupies its structural line, ignoring surrounding horizontal whitespace and case. The text before the first boundary is the outer cause; subsequent blocks are ordered inner causes.
-6. Associate a locator's detail with that frame until the next canonical locator or cause boundary. Preserve line breaks and platform wording through spans; do not rewrite the text.
-7. Preserve all unclassified ranges as opaque spans. Raw retained text is authoritative when a future platform version produces an unfamiliar layout.
-8. Preserve the existing strict terminal compilation-marker rule so arbitrary prose cannot reclassify the diagnostic stage.
+5. Recognize a cause boundary only when Russian `по причине:` or English
+   `Reason:` occupies its structural line, ignoring surrounding horizontal
+   whitespace and case. The text before the first boundary is the outer cause;
+   subsequent blocks are ordered inner causes.
+6. Recognize a canonical bracketed category line separately from the cause summary
+   and frame detail. Retain at most 16 identifier-shaped category names of at most
+   128 characters each; an excessive or unfamiliar bracket block remains opaque.
+7. Associate a locator's detail with that frame until the next canonical locator,
+   category block, or cause boundary. Preserve line breaks and platform wording
+   through spans; do not rewrite the text.
+8. Preserve all unclassified ranges as opaque spans. Raw retained text is authoritative when a future platform version produces an unfamiliar layout.
+9. Preserve the existing strict terminal compilation-marker rule so arbitrary prose cannot reclassify the diagnostic stage.
 
 Limits are independent:
 
@@ -156,9 +175,13 @@ Mapping is performed independently for each retained frame. One failure must not
 
 ### Generated main-cell frames
 
-An unknown-module locator can be classified as `EXECUTED_ARTIFACT` only when the caller supplies the exact `MappedSource` admitted for that failed operation. Its one-based line and column are converted against the executed artifact, then mapped with the existing exact/derived/synthetic rules.
+An unknown-module locator can be classified as `EXECUTED_ARTIFACT` only when the caller supplies the exact `MappedSource` admitted for that failed operation. Its one-based line and column are converted against the executed artifact, then mapped with the existing exact/derived/synthetic rules. A line-only anonymous locator in the outer cause is also an executed main-cell frame under the same evidence requirement.
 
 If a column is absent, the same conservative single-exact-segment rule currently used for line-only Worker frames applies. Blank, ambiguous, synthetic, zero, and out-of-range lines remain unmapped.
+
+Anonymous locators with columns, and anonymous locators in nested causes, remain
+`UNKNOWN`. This preserves sublanguage coordinates such as query text locations
+without incorrectly applying the BSL source map.
 
 ### Worker frames
 
@@ -168,7 +191,11 @@ Unknown or stale Worker registrations remain present in the trace with `UNKNOWN`
 
 ### Native configuration frames
 
-Any other accepted module locator is `NATIVE_MODULE`. Its module, line, and optional column are already the correct platform coordinates because the module source is executed 1:1. The frame is considered a valid direct location even though `mapping_confidence` is `UNKNOWN`, because that enum continues to describe source-map confidence only.
+Any other accepted module locator is `NATIVE_MODULE`. Its canonical module path,
+optional extension name, line, and optional column are already the correct
+platform coordinates because the module source is executed 1:1. The frame is
+considered a valid direct location even though `mapping_confidence` is `UNKNOWN`,
+because that enum continues to describe source-map confidence only.
 
 When a future `source_root` is configured, the configuration-source resolver may attach a file/link and provide hash-fenced source for excerpts. It must not change the platform location or become the source of diagnostic prose. Without `source_root`, the platform's own detail fragment remains available through `detail_span`.
 
@@ -294,6 +321,9 @@ Core work follows test-driven development with focused tests first.
 
 - multiple outer-to-inner causes and multiple frames per cause;
 - mixed `{module(line,column)}` and `{module(line)}` frames;
+- extension-prefixed, anonymous, and Russian/English unknown-module locators;
+- English and Russian cause markers;
+- category extraction and opaque fallback for malformed or excessive blocks;
 - platform detail/block span boundaries and opaque ranges;
 - Russian case/whitespace variants only at structural cause lines;
 - unknown layouts preserved without invented causes;
@@ -308,6 +338,7 @@ Core work follows test-driven development with focused tests first.
 - every pinned Worker frame maps through its own artifact;
 - mixed native, main, known Worker, stale Worker, and unknown frames remain ordered;
 - line-only exact mapping and all ambiguity fallbacks;
+- outer anonymous main-cell mapping without mapping nested query coordinates;
 - one malformed or unmappable frame does not affect the others;
 - native module coordinates remain direct without a source map;
 - visible line spans appear only under an exact source hash fence;

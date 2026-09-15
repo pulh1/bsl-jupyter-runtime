@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import hashlib
 import json
 
@@ -8,6 +8,7 @@ import pytest
 import onec_runtime.privacy as privacy
 
 from onec_runtime.bsl.diagnostics import (
+    DiagnosticCategoryBlock,
     DiagnosticTextSpan,
     DiagnosticCoordinateSpace,
     DiagnosticStage,
@@ -164,6 +165,204 @@ def test_parses_ordered_causes_frames_and_platform_fragments() -> None:
         "вызывающий кадр",
     ]
     assert [item.location.column for item in parsed.frames] == [2, 5, None]
+
+
+def test_live_extension_stack_preserves_canonical_modules_and_categories() -> None:
+    """Break caught: extension prefixes must not hide native stack frames."""
+    from onec_runtime.runtime_contracts import sanitize_normalized_diagnostic
+
+    raw = (
+        "Division by zero\n"
+        "{FixtureExtension ОбщийМодуль.CalleeServer.Модуль(41)}:Возврат 1 / Ноль;\n"
+        "{(1)}:Результат = CallerServer.Вызвать();\n"
+        "{RuntimeExtension ОбщийМодуль.RuntimeKernelServer.Модуль(122)}:Выполнить();\n"
+        "\n"
+        "[ОшибкаВоВремяВыполненияВстроенногоЯзыка, ОшибкаИспользованияВстроенногоЯзыка]"
+    )
+
+    parsed = parse_platform_diagnostic(raw)
+    diagnostic = normalize_platform_diagnostic_trace(
+        parsed,
+        stage=DiagnosticStage.EXECUTION,
+        executed=_wrapped("Результат = CallerServer.Вызвать();"),
+        visible_source_context=_visible_context(
+            "Результат = CallerServer.Вызвать();"
+        ),
+    )
+
+    assert [
+        (item.extension_name, item.module_name, item.line, item.column)
+        for item in parsed.locations
+    ] == [
+        (
+            "FixtureExtension",
+            "ОбщийМодуль.CalleeServer.Модуль",
+            41,
+            None,
+        ),
+        (None, None, 1, None),
+        (
+            "RuntimeExtension",
+            "ОбщийМодуль.RuntimeKernelServer.Модуль",
+            122,
+            None,
+        ),
+    ]
+    assert parsed.causes[0].category is not None
+    assert parsed.causes[0].category.names == (
+        "ОшибкаВоВремяВыполненияВстроенногоЯзыка",
+        "ОшибкаИспользованияВстроенногоЯзыка",
+    )
+    assert [_diagnostic_text(raw, item.detail_span) for item in parsed.frames] == [
+        "Возврат 1 / Ноль;",
+        "Результат = CallerServer.Вызвать();",
+        "Выполнить();",
+    ]
+    assert [item.origin for item in diagnostic.frames] == [
+        ErrorTraceFrameOrigin.NATIVE_MODULE,
+        ErrorTraceFrameOrigin.EXECUTED_ARTIFACT,
+        ErrorTraceFrameOrigin.NATIVE_MODULE,
+    ]
+    assert diagnostic.frames[1].mapping_confidence is MappingConfidence.EXACT
+    assert diagnostic.causes[0].category == parsed.causes[0].category
+    assert sanitize_normalized_diagnostic(diagnostic) == diagnostic
+
+
+def test_english_compile_reason_and_unknown_module_form_a_nested_cause() -> None:
+    """Break caught: English 1C markers must retain the inner compile cause."""
+    raw = (
+        "Error compiling or calculating expression or executing fragment of code\n"
+        "{RuntimeExtension ОбщийМодуль.RuntimeKernelServer.Модуль(122)}:Выполнить();\n"
+        "\n"
+        "[ОшибкаВоВремяВыполненияВстроенногоЯзыка]\n"
+        "Reason:\n"
+        "{<Unknown module>(1,13)}: Procedure or function is not defined\n"
+        "Результат = <<?>>MissingFunction();\n"
+        "[ОшибкаКомпиляцииВстроенногоЯзыка]"
+    )
+
+    parsed = parse_platform_diagnostic(raw)
+
+    assert parsed.has_compilation_marker is True
+    assert [_diagnostic_text(raw, item.summary_span) for item in parsed.causes] == [
+        "Error compiling or calculating expression or executing fragment of code",
+        "",
+    ]
+    assert [item.frame_ordinals for item in parsed.causes] == [(0,), (1,)]
+    assert parsed.causes[0].category is not None
+    assert parsed.causes[0].category.names == (
+        "ОшибкаВоВремяВыполненияВстроенногоЯзыка",
+    )
+    assert parsed.causes[1].category is not None
+    assert parsed.causes[1].category.names == (
+        "ОшибкаКомпиляцииВстроенногоЯзыка",
+    )
+    assert [_diagnostic_text(raw, item.detail_span) for item in parsed.frames] == [
+        "Выполнить();",
+        "Procedure or function is not defined\n"
+        "Результат = <<?>>MissingFunction();",
+    ]
+    assert parsed.frames[1].location.module_name == "<Unknown module>"
+    assert (
+        parsed.frames[1].location.coordinate_space
+        is DiagnosticCoordinateSpace.EXECUTED_BSL
+    )
+
+
+def test_query_coordinates_are_retained_but_not_mapped_as_bsl() -> None:
+    """Break caught: an inner query coordinate must not use the cell source map."""
+    source = "Контекст = Подготовить();\nРезультат = Контекст.Запрос.Выполнить();"
+    raw = (
+        "Error calling context method (Выполнить)\n"
+        "{(2)}:Результат = Контекст.Запрос.Выполнить();\n"
+        "{RuntimeExtension ОбщийМодуль.RuntimeKernelServer.Модуль(122)}:Выполнить();\n"
+        "\n"
+        "[ОшибкаВоВремяВыполненияВстроенногоЯзыка]\n"
+        "Reason:\n"
+        "{(1, 14)}: Table not found \"MissingTable\"\n"
+        "ВЫБРАТЬ * ИЗ <<?>>MissingTable"
+    )
+
+    diagnostic = normalize_platform_diagnostic_trace(
+        parse_platform_diagnostic(raw),
+        stage=DiagnosticStage.EXECUTION,
+        executed=_wrapped(source),
+        visible_source_context=_visible_context(source),
+    )
+
+    assert [item.origin for item in diagnostic.frames] == [
+        ErrorTraceFrameOrigin.EXECUTED_ARTIFACT,
+        ErrorTraceFrameOrigin.NATIVE_MODULE,
+        ErrorTraceFrameOrigin.UNKNOWN,
+    ]
+    outer, _, query = diagnostic.frames
+    assert outer.visible_location is not None
+    assert outer.visible_location.line == 2
+    assert outer.mapping_confidence is MappingConfidence.EXACT
+    assert query.platform_location.module_name is None
+    assert (query.platform_location.line, query.platform_location.column) == (1, 14)
+    assert query.mapping_confidence is MappingConfidence.UNKNOWN
+    assert query.lowered_location is None
+
+
+def test_oversized_category_stays_opaque_without_invalidating_trace() -> None:
+    """Break caught: excessive category metadata must not drop the BSL failure."""
+    from onec_runtime.runtime_contracts import sanitize_normalized_diagnostic
+
+    category_text = "[" + ", ".join(f"Ошибка{index}" for index in range(17)) + "]"
+    raw = "Failure\n{ОбщийМодуль.Service.Модуль(2)}:Вызов();\n" + category_text
+
+    parsed = parse_platform_diagnostic(raw)
+    diagnostic = normalize_platform_diagnostic_trace(
+        parsed,
+        stage=DiagnosticStage.EXECUTION,
+    )
+
+    assert parsed.causes[0].category is None
+    assert category_text in "".join(
+        raw[span.start : span.end] for span in parsed.opaque_spans
+    )
+    assert sanitize_normalized_diagnostic(diagnostic) == diagnostic
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("outside_span", "empty_names", "invalid_name", "too_many_names"),
+)
+def test_sanitizer_rejects_malformed_platform_category(mutation: str) -> None:
+    """Break caught: malformed category metadata must fail closed."""
+    from onec_runtime.runtime_contracts import sanitize_normalized_diagnostic
+
+    raw = (
+        "Failure\n"
+        "{ОбщийМодуль.Service.Модуль(2)}:Вызов();\n"
+        "[ОшибкаВоВремяВыполненияВстроенногоЯзыка]"
+    )
+    diagnostic = normalize_platform_diagnostic_trace(
+        parse_platform_diagnostic(raw),
+        stage=DiagnosticStage.EXECUTION,
+    )
+    cause = diagnostic.causes[0]
+    assert cause.category is not None
+    category = cause.category
+    if mutation == "outside_span":
+        malformed = DiagnosticCategoryBlock(
+            DiagnosticTextSpan(category.span.start, len(raw) + 1),
+            category.names,
+        )
+    elif mutation == "empty_names":
+        malformed = replace(category, names=())
+    elif mutation == "invalid_name":
+        malformed = replace(category, names=("not a category",))
+    else:
+        malformed = replace(category, names=("Ошибка",) * 17)
+    mutated = replace(
+        diagnostic,
+        causes=(replace(cause, category=malformed),),
+    )
+
+    assert sanitize_normalized_diagnostic(diagnostic) == diagnostic
+    assert sanitize_normalized_diagnostic(mutated) is None
 
 
 def test_nonstructural_cause_text_does_not_split_chain() -> None:
