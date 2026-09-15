@@ -255,7 +255,8 @@ class SessionCommonModuleCatalog:
 
     def _enumerate_path_index(self) -> dict[str, Path]:
         index: dict[str, Path] = {}
-        paths = self._layout.metadata_candidates("CommonModules")
+        selected = tuple(self._layout.metadata_candidates("CommonModules"))
+        paths = (*selected, *self._layout.legacy_metadata_alternates("CommonModules"))
         for path in sorted(paths, key=lambda item: item.name.casefold()):
             if not _is_bsl_identifier(path.stem):
                 raise ProtocolError("common-module metadata identity is invalid")
@@ -263,7 +264,9 @@ class SessionCommonModuleCatalog:
             if normalized in index:
                 raise ProtocolError("duplicate common module identity")
             index[normalized] = path
-        return index
+        # Legacy opposite-format names participate only in collision detection.
+        # Neither native nor legacy roots admit a path outside the chosen layout.
+        return {path.stem.casefold(): path for path in selected}
 
     def _read_descriptor(self, metadata_path: Path) -> CommonModuleDescriptor | None:
         return self._read_metadata(metadata_path)[1]

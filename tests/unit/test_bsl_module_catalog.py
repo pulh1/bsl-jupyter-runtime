@@ -425,3 +425,42 @@ def test_catalog_admission_uses_only_selected_layout(tmp_path, layout, same_name
     assert capture.resolve_modules((location(object_id),))[0].reason == 'source_unavailable'
     with pytest.raises(ProtocolError):
         catalog._safe_metadata_path(opposite)
+
+
+@pytest.mark.parametrize('first_format', ['designer', 'edt'])
+@pytest.mark.parametrize('duplicate_name', ['ZDuplicate', 'ZDUPLICATE'])
+@pytest.mark.parametrize('admission', ['ensure_modules', 'resolve_candidates'])
+def test_legacy_collision_scan_covers_later_modules_in_both_discovery_orders(
+    tmp_path, monkeypatch, first_format, duplicate_name, admission,
+):
+    import os
+    from contextlib import contextmanager
+    if first_format == 'designer':
+        add_metadata(tmp_path, 'AFirst', server=True, client=False, global_module=False)
+    else:
+        add_edt_metadata(tmp_path, 'AFirst')
+    add_metadata(tmp_path, 'ZDuplicate', server=True, client=False, global_module=False)
+    add_edt_metadata(tmp_path, duplicate_name)
+    original_scan = os.scandir
+    yielded = []
+
+    @contextmanager
+    def ordered_scan(path):
+        with original_scan(path) as entries:
+            ordered = sorted(entries, key=lambda entry: entry.name.casefold())
+        def counted():
+            for entry in ordered:
+                yielded.append(entry.name)
+                yield entry
+        yield counted()
+
+    def forbidden_read(path):
+        raise AssertionError('collision discovery must not open metadata payloads')
+
+    monkeypatch.setattr(os, 'scandir', ordered_scan)
+    monkeypatch.setattr(Path, 'read_bytes', forbidden_read)
+    catalog = SessionCommonModuleCatalog(tmp_path, profile='server')
+    assert catalog._layout.layout.value == first_format
+    assert len(yielded) == 1  # Only layout discovery, not a startup metadata index.
+    with pytest.raises(ProtocolError, match='duplicate common module identity'):
+        getattr(catalog, admission)(('ZDuplicate',))

@@ -76,6 +76,7 @@ class ConfigurationSourceLayout:
         root = self.normalized_root
         designer = (root / "Configuration.xml").is_file()
         edt = (root / "Configuration" / "Configuration.mdo").is_file()
+        self._has_native_metadata = designer or edt
         if designer and edt:
             raise ProtocolError("configuration source root is ambiguous")
         # Metadata-only legacy exports lack Configuration metadata. Detect their
@@ -89,18 +90,11 @@ class ConfigurationSourceLayout:
                 with os.scandir(folder) as entries:
                     for entry in entries:
                         if entry.name.endswith(".xml"):
-                            name = Path(entry.name).stem
-                            if (folder / name / f"{name}.mdo").is_file():
-                                raise ProtocolError("duplicate common module identity")
                             designer = True
                             break
                         if entry.is_dir(follow_symlinks=False):
                             name = entry.name
                             if (folder / name / f"{name}.mdo").is_file():
-                                if (folder / f"{name}.xml").is_file():
-                                    raise ProtocolError(
-                                        "duplicate common module identity"
-                                    )
                                 edt = True
                                 break
                             if next((folder / name).glob("*.mdo"), None) is not None:
@@ -204,6 +198,27 @@ class ConfigurationSourceLayout:
         *,
         streaming: bool = False,
     ) -> Iterator[Path]:
+        yield from self._metadata_candidates(
+            directory, self.layout, streaming=streaming
+        )
+
+    def legacy_metadata_alternates(self, directory: str) -> Iterator[Path]:
+        """Additional names for legacy collision checks, never for admission."""
+        if not self._has_native_metadata:
+            alternate = (
+                SourceTreeLayout.EDT
+                if self.layout == SourceTreeLayout.DESIGNER
+                else SourceTreeLayout.DESIGNER
+            )
+            yield from self._metadata_candidates(directory, alternate)
+
+    def _metadata_candidates(
+        self,
+        directory: str,
+        tree_layout: SourceTreeLayout,
+        *,
+        streaming: bool = False,
+    ) -> Iterator[Path]:
         """Enumerate selected-format names without opening metadata payloads.
 
         Callers must validate a yielded path before reading it. In particular,
@@ -212,12 +227,12 @@ class ConfigurationSourceLayout:
         if directory not in METADATA_DIRECTORIES:
             raise ProtocolError("configuration metadata kind is unsupported")
         folder = self.normalized_root / directory
-        if self.layout == SourceTreeLayout.DESIGNER and not streaming:
+        if tree_layout == SourceTreeLayout.DESIGNER and not streaming:
             yield from folder.glob("*.xml")
             return
         with os.scandir(folder) as entries:
             for entry in entries:
-                if self.layout == SourceTreeLayout.DESIGNER:
+                if tree_layout == SourceTreeLayout.DESIGNER:
                     if Path(entry.name).match("*.xml"):
                         yield folder / entry.name
                     continue
