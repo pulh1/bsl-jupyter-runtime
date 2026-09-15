@@ -2562,9 +2562,17 @@ class PrototypeRuntimeController:
         self._require_state(OperationState.CAPTURED)
         owner = self._capture_evaluation_owner()
 
+        def preflight() -> None:
+            # The RuntimeApi single writer is held before the coordinator
+            # condition is acquired. This check has no stateful side effect;
+            # a rejected admission therefore leaves no owner record or ticket.
+            self._preflight_capture_resume_admission()
+
         def admit() -> None:
-            self._require_state(OperationState.CAPTURED)
-            self.state = OperationState.RESUMING
+            # The coordinator has already adopted the record and receipt.
+            # Keep this commit local and hook-free so an interrupt after this
+            # assignment still leaves a detached owner able to settle it.
+            self._commit_capture_resume_admission()
 
         def execute(step_context: CaptureStepContext) -> object:
             if before_resume is not None:
@@ -2609,12 +2617,23 @@ class PrototypeRuntimeController:
 
         return owner.submit_resume(CaptureResumeRequest(
             owner._fence,
+            preflight,
             admit,
             execute,
             completion,
             detached_completion,
             settlement,
         ))
+
+    def _preflight_capture_resume_admission(self) -> None:
+        """Validate the paused controller state without changing it."""
+
+        self._require_state(OperationState.CAPTURED)
+
+    def _commit_capture_resume_admission(self) -> None:
+        """Commit a coordinator-owned resume after its receipt exists."""
+
+        self.state = OperationState.RESUMING
 
     def _resume_owned(
         self,

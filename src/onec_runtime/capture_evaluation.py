@@ -915,10 +915,14 @@ class CaptureResumeRequest:
 
     A resume is deliberately not an evaluation: it owns a compound mutation
     and the next debugger stop, so it has no evaluation kind or public result
-    record.  The coordinator invokes every callback on its single worker.
+    record. ``preflight`` is side-effect-free validation. ``admit`` is the
+    controller's local commit and runs only after owner adoption; it must not
+    dispatch remote work or invoke caller-provided hooks. The coordinator
+    invokes every execution callback on its single worker.
     """
 
     fence: CaptureFence = field(repr=False)
+    preflight: Callable[[], None] = field(repr=False)
     admit: Callable[[], None] = field(repr=False)
     execute: Callable[[CaptureStepContext], object] = field(repr=False)
     completion: Callable[[object | None, BaseException | None], object] | None = (
@@ -935,7 +939,11 @@ class CaptureResumeRequest:
     def __post_init__(self) -> None:
         if not isinstance(self.fence, CaptureFence):
             raise ValueError("capture fence is required")
-        if not callable(self.admit) or not callable(self.execute):
+        if (
+            not callable(self.preflight)
+            or not callable(self.admit)
+            or not callable(self.execute)
+        ):
             raise ValueError("resume callbacks must be callable")
         if self.completion is not None and not callable(self.completion):
             raise ValueError("resume completion callback must be callable")
@@ -1174,16 +1182,26 @@ class CaptureEvaluationCoordinator:
                 )
             if self._phase is not CapturePhase.PAUSED:
                 raise StaleCaptureError()
+            # Validation is deliberately side-effect-free. The lock order is
+            # RuntimeApi's single writer, then this coordinator condition,
+            # then the controller's local state commit. This condition
+            # serializes the owner record. The admission commit below is only
+            # the controller's local state assignment.
+            # There is therefore no user or remote callback between that
+            # externally visible state transition and receipt publication.
+            request.preflight()
             record = _CaptureResumeRecord(request)
             ticket = CaptureResumeTicket(record.resume_id, self, record)
             submission = _capture_resume_submission.get()
             if submission is not None and submission.ticket is not None:
                 raise ProtocolError("CAPTURE resume handoff was already claimed")
-            # The callback changes controller state while the phase reservation
-            # remains private. Once observers can see ``resuming``, no root
-            # export or inspection can fit before it.
+            # Owner-first admission: the record, receipt, and coordinator
+            # phase exist before the controller can expose ``resuming``. If
+            # any BaseException interrupts the tiny commit callback, the
+            # accepted record stays detached and the worker settles it; do not
+            # roll a potentially visible controller transition back through a
+            # second interruptible callback.
             try:
-                request.admit()
                 self._active_resume = record
                 if submission is not None:
                     # Receipt publication is part of the adoption boundary.
@@ -1191,6 +1209,7 @@ class CaptureEvaluationCoordinator:
                     # handler below repairs it before releasing this mutex.
                     submission.ticket = ticket
                 self._phase = CapturePhase.RESUMING
+                request.admit()
                 self._condition.notify_all()
                 return ticket
             except BaseException:
