@@ -2258,6 +2258,17 @@ class RuntimeSession:
                 else:
                     self._processes_closed = True
             state = self._refresh_shutdown_state()
+            if state.local_resources_terminal is _ShutdownAxis.COMPLETE:
+                mark_target_terminated = getattr(
+                    self.runtime_api,
+                    "_mark_target_terminated",
+                    None,
+                )
+                if callable(mark_target_terminated):
+                    try:
+                        mark_target_terminated()
+                    except BaseException as error:
+                        errors.append(error)
             if (
                 state.local_resources_terminal is _ShutdownAxis.COMPLETE
                 and state.capture_publication_finalized is _ShutdownAxis.COMPLETE

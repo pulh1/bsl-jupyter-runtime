@@ -879,6 +879,7 @@ class PrototypeRuntimeApi:
         self._closed = False
         self._capture_shutdown_finished = False
         self._capture_shutdown_termination_proven = True
+        self._target_terminated = False
         self._context_generation = context_generation
         self._pending_dirty_roots: dict[str, str] = {}
         self._active_command_deadline: float | None = None
@@ -4555,17 +4556,31 @@ class PrototypeRuntimeApi:
             self._admission_closed = True
             if self._data_plane_finalized:
                 return
-            if not self._close_capture_control_plane_locked():
+            capture_termination_proven = self._close_capture_control_plane_locked()
+            if self._target_terminated:
+                # Session has already destroyed the target.  Capture worker
+                # termination and publication are separate facts, so a cached
+                # unproven join result must not strand local Worker ownership.
+                with self._single_writer():
+                    self._close_data_plane_locked(target_terminated=True)
+                return
+            if not capture_termination_proven:
                 # The event consumer still owns its pending record and leases.
                 # Process/session teardown is now the only safe cleanup owner.
                 return
             with self._single_writer():
                 self._close_data_plane_locked()
 
+    def _mark_target_terminated(self) -> None:
+        """Publish Session's irreversible target-death fact to RuntimeApi."""
+        with self._close_lock:
+            self._target_terminated = True
+
     def _close_after_target_termination(self) -> None:
         """Finish local API teardown after RuntimeSession killed the target."""
         with self._close_lock:
             self._admission_closed = True
+            self._target_terminated = True
             if self._data_plane_finalized:
                 return
             if not self._capture_shutdown_finished:
