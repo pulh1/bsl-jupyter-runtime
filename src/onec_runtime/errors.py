@@ -79,6 +79,17 @@ class CaptureEvaluationPendingError(ProtocolError):
         )
 
 
+class CaptureInspectionTimeout(ProtocolError):
+    """A bounded CAPTURE inspection read exhausted its local deadline."""
+
+    __slots__ = ()
+
+    def __init__(self, message: str = "CAPTURE inspection timed out") -> None:
+        super().__init__(
+            _safe_error_text(message, default="CAPTURE inspection timed out")
+        )
+
+
 class CaptureBusyError(ProtocolError):
     """The current capture is owned by another acknowledged evaluation."""
 
@@ -355,6 +366,10 @@ class TargetLost(RuntimeProbeError):
 
 class RdbgTransportError(ProtocolError):
     """The HTTP/RDBG transport failed before a protocol outcome was proven."""
+
+
+class RdbgTransportTimeout(RdbgTransportError, CommandTimeout):
+    """The HTTP/RDBG transport exceeded a caller-supplied finite deadline."""
 
 
 class TransportRecoveryError(RuntimeProbeError):

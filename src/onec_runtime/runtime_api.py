@@ -102,10 +102,12 @@ from onec_runtime.compact_table_backend import (
 from onec_runtime.errors import (
     BslExecutionError,
     CaptureBusyError,
+    CaptureInspectionTimeout,
     CaptureOutcomeUnknownError,
     CaptureRecoveryRequiredError,
     CaptureValueAccessDeniedError,
     CaptureValueCheckError,
+    CommandTimeout,
     NoActiveCaptureError,
     PoisonedRuntimeError,
     ProtocolError,
@@ -1183,11 +1185,21 @@ class PrototypeRuntimeApi:
             if not callable(read):
                 raise ProtocolError("Runtime controller cannot read a fresh capture stack")
             inventory_failed = False
+            inventory_timed_out = False
             try:
                 with self._remaining_command_timeout() as remaining:
                     frames = read(timeout_s=remaining)
+            except CommandTimeout:
+                inventory_timed_out = True
             except Exception:
                 inventory_failed = True
+            if inventory_timed_out:
+                # Let a concurrent lifecycle transition take precedence, then
+                # discard the private transport exception outside its handler.
+                self._require_capture_stack_fence(fence)
+                raise CaptureInspectionTimeout(
+                    "capture stack inventory timed out"
+                )
             if inventory_failed:
                 # Recheck lifecycle outside the exception handler so a concurrent
                 # stale/busy transition wins and no transport exception remains as
@@ -3899,6 +3911,7 @@ class PrototypeRuntimeApi:
         sources: Mapping[tuple[str, SourceUnitRef], _WorkerStackSource],
         *,
         generation: int,
+        required_keys: frozenset[tuple[str, SourceUnitRef]],
     ) -> Mapping[tuple[str, SourceUnitRef], _WorkerStackSource]:
         return MappingProxyType({
             key: _WorkerStackSource(
@@ -3915,6 +3928,7 @@ class PrototypeRuntimeApi:
                 ),
             )
             for key, source in sources.items()
+            if key in required_keys
         })
 
     def _notebook_source_snapshot(
@@ -4272,6 +4286,9 @@ class PrototypeRuntimeApi:
         )
         try:
             candidate_diagnostics = self._worker_candidate_diagnostics(candidate)
+            candidate_source_keys = self._worker_universe._candidate_source_keys(
+                candidate
+            )
         except BaseException:
             self._worker_universe.discard(candidate)
             raise
@@ -4410,6 +4427,7 @@ class PrototypeRuntimeApi:
         self._worker_source_generations[handle] = self._repin_worker_source_snapshot(
             inherited_sources,
             generation=handle.generation,
+            required_keys=candidate_source_keys,
         )
         self._worker_generation_diagnostics[handle.manifest_sha256] = (
             candidate_diagnostics
@@ -4747,6 +4765,11 @@ class PrototypeRuntimeApi:
             manifest_sha256: diagnostics
             for manifest_sha256, diagnostics in self._worker_generation_diagnostics.items()
             if manifest_sha256 in inventory.manifest_sha256s
+        }
+        self._worker_source_generations = {
+            handle: sources
+            for handle, sources in self._worker_source_generations.items()
+            if handle in inventory.generation_handles
         }
 
     @contextmanager

@@ -1357,6 +1357,7 @@ GenerationFence = int | Callable[[], int]
 
 @dataclass(frozen=True, slots=True)
 class _WorkerUniverseLiveInventory:
+    generation_handles: frozenset[WorkerGenerationHandle]
     manifest_sha256s: frozenset[str]
     artifact_identities: frozenset[tuple[str, int, str]]
     descriptor_cache_identities: frozenset[tuple[str, str, int, str, str]]
@@ -1460,6 +1461,15 @@ class WorkerUniverseRegistry:
                 )
             )
             return _WorkerUniverseLiveInventory(
+                frozenset(
+                    record.handle
+                    for record in self._generations.values()
+                    if (
+                        record.active
+                        or record.explicitly_retained
+                        or record.operation_pins > 0
+                    )
+                ),
                 frozenset(manifest.sha256 for manifest in manifests),
                 frozenset(
                     (
@@ -1994,6 +2004,22 @@ class WorkerUniverseRegistry:
             if view is None:
                 raise ProtocolError("Worker candidate debug view is unavailable")
             return view
+
+    def _candidate_source_keys(
+        self,
+        candidate: WorkerUniverseCandidate,
+    ) -> frozenset[tuple[str, SourceUnitRef]]:
+        """Return exact physical source owners from one sealed candidate."""
+
+        with self._lock:
+            activation = self._require_sealed_activation(candidate)
+            return frozenset(
+                (artifact.descriptor.logical_name.casefold(), source_unit)
+                for artifact in activation.artifact_views
+                for source_unit in _worker_debug_source_units(
+                    artifact.snapshot.mapped_source
+                )
+            )
 
     def _operation_debug_view(
         self,

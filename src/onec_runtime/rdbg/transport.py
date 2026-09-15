@@ -10,6 +10,7 @@ from onec_runtime.errors import (
     ProtocolError,
     RdbgDebugUiNotRegistered,
     RdbgTransportError,
+    RdbgTransportTimeout,
 )
 
 
@@ -86,7 +87,7 @@ class RdbgTransport:
             error_text = str(error)
             if command == "pingDebugUIParams":
                 return b""
-            raise RdbgTransportError(
+            raise RdbgTransportTimeout(
                 f"RDBG {command} transport failure: {error}"
             ) from error
         except httpx.HTTPError as error:
