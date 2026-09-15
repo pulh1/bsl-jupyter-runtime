@@ -807,7 +807,7 @@ def test_session_current_capture_binds_sources_methods_and_frame_value_scope() -
 
     values = LocalCaptureValueAdapter(
         ValueBackend(), object(),
-        policy=CaptureValuePolicy(lambda fence, handle: False),
+        policy=CaptureValuePolicy(),
         resolve_parameters=lambda root: ("Arg",),
     )
     core = object.__new__(RuntimeSession)
