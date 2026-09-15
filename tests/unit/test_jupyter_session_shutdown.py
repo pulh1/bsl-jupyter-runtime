@@ -5,6 +5,8 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from threading import Event, RLock, Thread
+from types import SimpleNamespace
 
 from IPython.core.interactiveshell import InteractiveShell
 from jupyter_client import KernelManager
@@ -12,8 +14,17 @@ from traitlets.config import Config
 import pytest
 
 from onec_runtime.runtime_api import RuntimeNamespaceSnapshot
+from onec_runtime.recovery_journal import RecoveryJournal
+from onec_runtime.runtime_api import PrototypeRuntimeApi
 from onec_runtime_jupyter import InteractiveRuntimeSession, install_runtime
 from onec_runtime_jupyter import session as session_module
+
+from test_capture_control_plane import (
+    ShutdownBlockingCaptureSession,
+    observe_shutdown_join,
+    start_shutdown_evaluation,
+)
+from test_prototype_runtime import captured_controller
 
 
 class RuntimeResource:
@@ -33,6 +44,84 @@ class RuntimeResource:
         self.closes += 1
         if self.fail:
             raise RuntimeError("secret token=private-connection")
+
+
+class _ShutdownHeartbeat:
+    def join(self, timeout: float) -> None:
+        assert timeout == 2.0
+
+
+class _ShutdownProcesses:
+    def __init__(self, timeline: list[str]) -> None:
+        self.timeline = timeline
+
+    def close(self, **_options: object) -> None:
+        self.timeline.append("processes_closed")
+
+
+class _ShutdownTransport:
+    def __init__(self, rdbg: ShutdownBlockingCaptureSession) -> None:
+        self.rdbg = rdbg
+
+    def close(self) -> None:
+        self.rdbg.invalidate()
+        self.rdbg.shutdown_timeline.append("transport_closed")
+
+
+class _ServerShutdownCaptureSession(ShutdownBlockingCaptureSession):
+    def terminate_bound_server_session(self) -> bool:
+        self.shutdown_timeline.append("server_termination_requested")
+        return True
+
+    def detach(self) -> None:
+        self.shutdown_timeline.append("debug_ui_detached")
+
+
+def _shutdown_runtime_session(
+    rdbg: ShutdownBlockingCaptureSession,
+    api: PrototypeRuntimeApi,
+    *,
+    server: bool,
+):  # type: ignore[no-untyped-def]
+    runtime = object.__new__(session_module.RuntimeSession)
+    runtime.config = SimpleNamespace(
+        chunk_size=128,
+        runtime=SimpleNamespace(is_server_infobase=server),
+    )
+    runtime.runtime_api = api
+    runtime._operation_lock = RLock()
+    runtime._close_lock = RLock()
+    runtime._closed = False
+    runtime._runtime_api_closed = False
+    runtime._transport_closed = False
+    runtime._processes_closed = False
+    runtime._server_session_terminated = not server
+    runtime._debug_ui_detached = not server
+    runtime._native_client_termination_requested = False
+    runtime._rdbg = rdbg
+    runtime._transport = _ShutdownTransport(rdbg)
+    runtime._processes = _ShutdownProcesses(rdbg.shutdown_timeline)
+    runtime._heartbeat_stop = Event()
+    runtime._heartbeat_thread = _ShutdownHeartbeat()
+    return runtime
+
+
+def _start_shutdown_thread(invoke, timeline: list[str]):  # type: ignore[no-untyped-def]
+    finished = Event()
+    errors: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            invoke()
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            timeline.append("session_close_returned")
+            finished.set()
+
+    thread = Thread(target=run, name="jupyter-runtime-shutdown-caller")
+    thread.start()
+    return thread, finished, errors
 
 
 def start_owned(monkeypatch, shell, runtime):
@@ -232,6 +321,99 @@ def test_guardian_start_failure_closes_new_runtime(monkeypatch):
     with pytest.raises(RuntimeError, match="guardian unavailable"):
         InteractiveRuntimeSession.start(object(), shell=shell)
     assert runtime.closes == 1
+
+
+def test_runtime_session_close_joins_pending_capture_consumer_before_return() -> None:
+    rdbg = ShutdownBlockingCaptureSession(wake_on_invalidate=True)
+    journal = RecoveryJournal()
+    controller = captured_controller(
+        rdbg,
+        command_timeout_s=0.05,
+        journal=journal,
+    )
+    api = PrototypeRuntimeApi(controller, journal=journal)
+    owner, _ticket = start_shutdown_evaluation(controller, rdbg)
+    join_timeouts = observe_shutdown_join(owner, rdbg.shutdown_timeline)
+    runtime = _shutdown_runtime_session(rdbg, api, server=False)
+    closer, finished, errors = _start_shutdown_thread(
+        runtime.close,
+        rdbg.shutdown_timeline,
+    )
+    try:
+        finished_in_deadline = finished.wait(0.6)
+        close_join_timeouts = tuple(join_timeouts)
+        joined_before_rescue = owner.join(0.05)
+    finally:
+        rdbg.shutdown_poll_release.set()
+        owner.begin_close()
+        assert owner.join(2)
+        closer.join(2)
+
+    assert finished_in_deadline, "RuntimeSession.close exceeded the configured deadline"
+    assert not errors
+    assert close_join_timeouts
+    assert all(0 <= timeout <= 0.05 for timeout in close_join_timeouts)
+    assert joined_before_rescue, "RuntimeSession.close left the capture consumer alive"
+    assert rdbg.shutdown_timeline.index("transport_invalidated") < (
+        rdbg.shutdown_timeline.index("poll_returned")
+    )
+    assert rdbg.shutdown_timeline.index("poll_returned") < (
+        rdbg.shutdown_timeline.index("event_consumer_joined")
+    )
+    assert rdbg.shutdown_timeline.index("event_consumer_joined") < (
+        rdbg.shutdown_timeline.index("pin_quarantine")
+    )
+    assert rdbg.shutdown_timeline.index("pin_quarantine") < (
+        rdbg.shutdown_timeline.index("session_close_returned")
+    )
+    assert not closer.is_alive()
+
+
+def test_jupyter_shutdown_from_another_thread_joins_pending_capture_consumer() -> None:
+    rdbg = _ServerShutdownCaptureSession(wake_on_invalidate=True)
+    journal = RecoveryJournal()
+    controller = captured_controller(
+        rdbg,
+        command_timeout_s=0.05,
+        journal=journal,
+    )
+    api = PrototypeRuntimeApi(controller, journal=journal)
+    owner, _ticket = start_shutdown_evaluation(controller, rdbg)
+    join_timeouts = observe_shutdown_join(owner, rdbg.shutdown_timeline)
+    runtime = _shutdown_runtime_session(rdbg, api, server=True)
+    interactive = InteractiveRuntimeSession(runtime)
+    closer, finished, errors = _start_shutdown_thread(
+        interactive._close_at_shutdown,
+        rdbg.shutdown_timeline,
+    )
+    try:
+        finished_in_deadline = finished.wait(0.6)
+        close_join_timeouts = tuple(join_timeouts)
+        joined_before_rescue = owner.join(0.05)
+    finally:
+        rdbg.shutdown_poll_release.set()
+        owner.begin_close()
+        assert owner.join(2)
+        closer.join(2)
+
+    assert finished_in_deadline, "Jupyter shutdown exceeded the configured deadline"
+    assert not errors
+    assert close_join_timeouts
+    assert all(0 <= timeout <= 0.05 for timeout in close_join_timeouts)
+    assert joined_before_rescue, "kernel shutdown left the capture consumer alive"
+    assert rdbg.shutdown_timeline.index("transport_invalidated") < (
+        rdbg.shutdown_timeline.index("poll_returned")
+    )
+    assert rdbg.shutdown_timeline.index("poll_returned") < (
+        rdbg.shutdown_timeline.index("event_consumer_joined")
+    )
+    assert rdbg.shutdown_timeline.index("event_consumer_joined") < (
+        rdbg.shutdown_timeline.index("pin_quarantine")
+    )
+    assert rdbg.shutdown_timeline.index("pin_quarantine") < (
+        rdbg.shutdown_timeline.index("session_close_returned")
+    )
+    assert not closer.is_alive()
 
 
 def test_failed_prior_guard_is_retried_before_starting_next_runtime(monkeypatch):
