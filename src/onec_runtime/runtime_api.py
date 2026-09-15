@@ -207,6 +207,13 @@ class _ActiveWorkerModule:
     artifact: WorkerModuleArtifact
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class _WorkerStackSource:
+    source: str
+    identity: ModuleIdentity
+    version: SourceVersionRef
+
+
 class RuntimeReplyKind(Enum):
     SOURCE_FAILED = "source_failed"
     MAIN_COMPLETED = "main_completed"
@@ -953,7 +960,7 @@ class PrototypeRuntimeApi:
         ] = {}
         self._worker_source_generations: dict[
             WorkerGenerationHandle,
-            Mapping[str, tuple[WorkerModuleUnit, SourceVersionRef]],
+            Mapping[SourceUnitRef, _WorkerStackSource],
         ] = {}
         self._worker_catalog_snapshot: CommonModuleCatalogSnapshot | None = None
         self._notebook_worker_revision = 0
@@ -1217,20 +1224,32 @@ class PrototypeRuntimeApi:
             mapped = map_generated_line(module, frame.location.line)
             if mapped is None:
                 continue
-            source_entry = worker_sources.get(mapped.canonical_module)
-            if source_entry is None or source_entry[0].mapped_source.artifact.source_sha256 != mapped.source_unit.source_sha256:
+            source_entry = worker_sources.get(mapped.source_unit)
+            if (
+                source_entry is None
+                or source_entry.version.source_sha256
+                != mapped.source_unit.source_sha256
+            ):
                 continue
-            unit, version = source_entry
             resolved[index] = ResolvedFrameSource(
-                unit.logical_name,
+                source_entry.source,
                 mapped.line,
-                self._worker_module_identity(unit),
-                version,
+                source_entry.identity,
+                source_entry.version,
             )
         if configuration_resolver is not None and configuration_indexes:
             configuration_frames = tuple(frames[index] for index in configuration_indexes)
-            configuration_sources = configuration_resolver(configuration_frames)
-            if type(configuration_sources) is not tuple or len(configuration_sources) != len(configuration_frames):
+            try:
+                configuration_sources = configuration_resolver(configuration_frames)
+            except Exception:
+                # Configuration sources are optional inspection metadata.  Resolver
+                # failures can contain local paths in OSError fields and exception
+                # chains, so they degrade to the ordinary unavailable status here.
+                configuration_sources = (None,) * len(configuration_frames)
+            if (
+                type(configuration_sources) is not tuple
+                or len(configuration_sources) != len(configuration_frames)
+            ):
                 raise ProtocolError("configuration stack source mapping is invalid")
             for index, source in zip(
                 configuration_indexes, configuration_sources, strict=True,
@@ -3821,32 +3840,96 @@ class PrototypeRuntimeApi:
                 module_syntax={name: models[name].syntax_index for name in ordered_names},
             )
             self._worker_active_modules = staged_active
-            self._worker_source_generations[handle] = self._worker_source_snapshot(
-                staged_active,
-                generation=handle.generation,
-            )
+            sources = dict(self._worker_source_generations.get(handle, {}))
+            sources.update(self._worker_source_snapshot(
+                staged_active, generation=handle.generation,
+            ))
+            self._worker_source_generations[handle] = MappingProxyType(sources)
             self._worker_module_artifacts.update(cache_additions)
             self._worker_catalog_snapshot = catalog
             self._prune_worker_caches_locked()
             return handle
 
-    @staticmethod
     def _worker_source_snapshot(
+        self,
         modules: Mapping[str, _ActiveWorkerModule],
         *,
         generation: int,
-    ) -> Mapping[str, tuple[WorkerModuleUnit, SourceVersionRef]]:
+    ) -> Mapping[SourceUnitRef, _WorkerStackSource]:
+        result: dict[SourceUnitRef, _WorkerStackSource] = {}
+        for active in modules.values():
+            unit = active.unit
+            version = SourceVersionRef.worker(
+                artifact_id=unit.mapped_source.artifact.source_sha256,
+                generation=generation,
+                source_text=unit.mapped_source.text,
+            )
+            references = {
+                reference
+                for segment in unit.mapped_source.source_map.segments
+                for reference in (segment.origin_ref, segment.anchor_ref)
+                if isinstance(reference, SourceUnitRef)
+                and reference.source_sha256 == version.source_sha256
+            }
+            for reference in references:
+                result[reference] = _WorkerStackSource(
+                    unit.logical_name,
+                    self._worker_module_identity(unit),
+                    version,
+                )
+        return MappingProxyType(result)
+
+    @staticmethod
+    def _repin_worker_source_snapshot(
+        sources: Mapping[SourceUnitRef, _WorkerStackSource],
+        *,
+        generation: int,
+    ) -> Mapping[SourceUnitRef, _WorkerStackSource]:
         return MappingProxyType({
-            name: (
-                active.unit,
+            unit: _WorkerStackSource(
+                source.source,
+                source.identity,
                 SourceVersionRef.worker(
-                    artifact_id=active.unit.mapped_source.artifact.source_sha256,
+                    artifact_id=(
+                        source.version.artifact_id
+                        or source.version.source_sha256
+                        or unit.source_sha256
+                    ),
                     generation=generation,
-                    source_text=active.unit.mapped_source.text,
+                    source_text=source.version.read_text(),
                 ),
             )
-            for name, active in modules.items()
+            for unit, source in sources.items()
         })
+
+    def _notebook_source_snapshot(
+        self,
+        method_set: NotebookMethodSet,
+        *,
+        generation: int,
+    ) -> Mapping[SourceUnitRef, _WorkerStackSource]:
+        result: dict[SourceUnitRef, _WorkerStackSource] = {}
+        for visible in method_set._visible_sources:
+            mapped = visible.source_map.map_offset(0)
+            unit = mapped.unit
+            if unit is None or unit.source_sha256 != source_sha256(visible.text):
+                raise ProtocolError("Notebook source snapshot is invalid")
+            result[unit] = _WorkerStackSource(
+                "ЯчейкаНоутбука",
+                ModuleIdentity(
+                    self._anonymous_notebook_id,
+                    "worker",
+                    unit.kind.value,
+                    source_sha256(unit.unit_id),
+                    "Module",
+                ),
+                SourceVersionRef.worker(
+                    artifact_id=unit.source_sha256,
+                    generation=generation,
+                    source_text=visible.text,
+                ),
+            )
+        return MappingProxyType(result)
 
     def confirmed_worker_module_units(
         self, handle: WorkerGenerationHandle,
@@ -4309,7 +4392,10 @@ class PrototypeRuntimeApi:
         )
         self._worker_generation_handle = handle
         self._worker_syntax_generations[handle] = candidate_syntax
-        self._worker_source_generations[handle] = inherited_sources
+        self._worker_source_generations[handle] = self._repin_worker_source_snapshot(
+            inherited_sources,
+            generation=handle.generation,
+        )
         self._worker_generation_diagnostics[handle.manifest_sha256] = (
             candidate_diagnostics
         )
@@ -4918,6 +5004,13 @@ class PrototypeRuntimeApi:
             before_promote=record_upload_planned,
             on_prepared_generation=on_prepared_generation,
         )
+        if method_set_candidate is not None:
+            sources = dict(self._worker_source_generations.get(generation, {}))
+            sources.update(self._notebook_source_snapshot(
+                method_set_candidate,
+                generation=generation.generation,
+            ))
+            self._worker_source_generations[generation] = MappingProxyType(sources)
         self._notebook_worker_descriptor = descriptor
         self._notebook_worker_revision = revision
         try:
