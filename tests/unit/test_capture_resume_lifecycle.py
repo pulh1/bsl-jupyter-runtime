@@ -249,6 +249,75 @@ def test_interrupt_after_resume_submission_detaches_the_initiator(
         controller.shutdown_capture_evaluation()
 
 
+@pytest.mark.parametrize(
+    ("handoff_error", "expected_error"),
+    (
+        (lambda: KeyboardInterrupt(), KeyboardInterrupt),
+        (lambda: TimeoutError("resume handoff timed out"), TimeoutError),
+    ),
+    ids=("keyboard-interrupt", "timeout"),
+)
+def test_submission_adoption_receipt_detaches_session_waiter_before_ticket_return(
+    monkeypatch: pytest.MonkeyPatch,
+    handoff_error,
+    expected_error: type[BaseException],
+) -> None:  # type: ignore[no-untyped-def]
+    """A post-adoption exception cannot strand the Session/MCP completion fence."""
+    rdbg = ResumeBarrierSession((CAPTURE_A, SERVICE))
+    controller = captured_controller(rdbg, command_timeout_s=1)
+    api = PrototypeRuntimeApi(controller)
+    runtime = object.__new__(RuntimeSession)
+    runtime._operation_lock = RLock()
+    runtime._capture_resume_listeners = []
+    active = SimpleNamespace(
+        ticket_id="capture-ticket",
+        capture_intent_id="intent",
+        operation_id="operation",
+        capture_generation=1,
+        source_revision=1,
+        source_sha256="a" * 64,
+        stop_sequence=1,
+    )
+    runtime._active_capture_ticket = active
+    runtime.runtime_api = api
+    terminal_fences: list[object] = []
+    runtime.add_capture_resume_listener(terminal_fences.append)
+    original_submit_resume = controller.submit_resume
+    adopted = Event()
+
+    def interrupt_after_adoption(**kwargs: object) -> CaptureResumeTicket:
+        ticket = original_submit_resume(**kwargs)
+        adopted.set()
+        raise handoff_error()
+
+    monkeypatch.setattr(controller, "submit_resume", interrupt_after_adoption)
+    try:
+        with pytest.raises(expected_error):
+            runtime.resume_capture(dirty_roots=("Скаляр",))
+
+        assert adopted.is_set()
+        assert rdbg.root_export_entered.wait(1)
+        owner = controller._capture_evaluation_coordinator
+        assert owner is not None
+        assert owner._active_resume is not None
+        # The only proof available to RuntimeApi is the submission receipt:
+        # Python never assigned the returned ticket to its local variable.
+        assert owner._active_resume.initiator_attached is False
+        with pytest.raises(CaptureBusyError):
+            api.resume_capture()
+
+        rdbg.release_root_export.set()
+        assert rdbg.next_stop_wait_entered.wait(1)
+        rdbg.release_next_stop.set()
+        eventually(lambda: runtime._active_capture_ticket is None)
+        assert terminal_fences and len(terminal_fences) == 1
+        assert rdbg.continue_count == 2
+    finally:
+        rdbg.release_root_export.set()
+        rdbg.release_next_stop.set()
+        controller.shutdown_capture_evaluation()
+
+
 @pytest.mark.parametrize("stage", ("root", "modify", "cleanup", "continue", "wait"))
 def test_interrupt_at_every_resume_boundary_keeps_the_same_worker_plan(
     stage: str,
