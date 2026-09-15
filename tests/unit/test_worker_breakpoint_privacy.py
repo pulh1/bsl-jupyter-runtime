@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID
 
 from onec_runtime.privacy import public_artifact_value
@@ -97,3 +98,54 @@ def test_capture_value_snapshots_expose_only_normalized_public_fields() -> None:
     }
     assert "object at" not in serialized
     assert "_owner" not in serialized and "_lineage" not in serialized
+
+
+def test_attached_frame_and_live_descriptors_never_publish_inspection_capabilities() -> None:
+    from onec_runtime.capture_inspection import DebugFrame, StackPage
+    from onec_runtime.capture_values import (
+        CaptureValuePolicy, LocalCaptureValueAdapter, SafeValuePath, ValueNode,
+        ValueRoot, ValueRootKind, ValueShape,
+    )
+
+    secret_fence = object()
+    secret_callback = lambda *args: False
+    secret_backend = SimpleNamespace(private="PRIVATE_BACKEND_CAPABILITY")
+    adapter = LocalCaptureValueAdapter(
+        secret_backend, secret_fence,
+        policy=CaptureValuePolicy(secret_callback),
+        resolve_parameters=secret_callback,
+    )
+    original = DebugFrame(
+        native_level=4, source="Common.Safe", line=12,
+        _resolved=SimpleNamespace(private="PRIVATE_SOURCE_PIN"),
+        _enricher=secret_callback,
+    )
+    frame = adapter.bind_frame(original)
+    stack = StackPage((frame,), 1, None, _enricher=secret_callback)
+    node = ValueNode(
+        "Запись", "Структура", "1 elements", 1, True, ValueShape.STRUCTURE,
+        SafeValuePath(ValueRoot(ValueRootKind.CONTEXT)), _owner=adapter,
+    )
+
+    converted = tuple(public_artifact_value(value) for value in (
+        frame, stack, adapter.context, adapter.context.variables, node.fields,
+    ))
+
+    def assert_public(value):
+        assert value is not adapter
+        assert value is not secret_backend
+        assert value is not secret_fence
+        assert value is not secret_callback
+        if isinstance(value, dict):
+            for key, child in value.items():
+                assert not key.startswith("_")
+                assert_public(child)
+        elif isinstance(value, (tuple, list)):
+            for child in value:
+                assert_public(child)
+        else:
+            assert value is None or isinstance(value, (str, int, bool, float))
+
+    assert_public(converted)
+    serialized = json.dumps(converted, ensure_ascii=False, default=str)
+    assert "PRIVATE_" not in serialized and "object at" not in serialized

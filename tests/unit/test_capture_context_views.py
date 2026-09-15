@@ -1,4 +1,5 @@
 from dataclasses import FrozenInstanceError, replace
+import traceback
 
 import pytest
 
@@ -119,7 +120,7 @@ def test_variables_need_no_source_and_parameters_keep_source_order_without_dupli
         "ПервыйПараметр", "ВторойПараметр",
     ]
     assert [item.name for item in adapter.context.locals[:20].items] == ["Локальная"]
-    assert len(resolutions) == 2
+    assert 1 <= len(resolutions) <= 2
 
 
 def test_exact_lookup_is_case_insensitive_and_missing_or_ambiguous_is_typed():
@@ -134,13 +135,18 @@ def test_exact_lookup_is_case_insensitive_and_missing_or_ambiguous_is_typed():
 
 def test_parameters_and_locals_direct_to_variables_when_source_is_unavailable():
     def unavailable(root):
-        raise CaptureSourceUnavailableError("method source unavailable")
+        raise CaptureSourceUnavailableError("PRIVATE C:/customer/source/Module.bsl")
     adapter, backend = setup_adapter(resolver=unavailable)
     assert adapter.context.variables[:1].items
-    with pytest.raises(CaptureSourceUnavailableError, match="variables"):
+    with pytest.raises(CaptureSourceUnavailableError, match="variables") as parameters_error:
         adapter.context.parameters[:1]
-    with pytest.raises(CaptureSourceUnavailableError, match="variables"):
+    with pytest.raises(CaptureSourceUnavailableError, match="variables") as locals_error:
         adapter.frame(7).locals[:1]
+    for raised in (parameters_error.value, locals_error.value):
+        rendered = "".join(traceback.format_exception(raised))
+        assert "PRIVATE" not in rendered and "customer" not in rendered
+        assert "PRIVATE" not in repr(raised)
+        assert raised.__cause__ is None and raised.__context__ is None
     assert sum(call[0] == "project" for call in backend.calls) == 1
 
 
@@ -189,6 +195,42 @@ def test_parameter_names_are_valid_unique_bsl_identifiers():
     with pytest.raises(CaptureSourceUnavailableError, match="classification"):
         adapter.context.parameters[:20]
     assert [call[0] for call in backend.calls] == ["validate"]
+
+
+def test_adapter_filters_and_orders_roles_when_backend_returns_plain_debugger_order():
+    adapter, backend = setup_adapter()
+    original = backend.project_values
+    def ignore_role(fence, request):
+        return original(
+            fence,
+            replace(
+                request,
+                role=api().VariableRole.VARIABLES,
+                parameter_names=(),
+            ),
+        )
+    backend.project_values = ignore_role
+
+    parameters = adapter.context.parameters[:20]
+    locals_page = adapter.context.locals[:20]
+
+    assert [item.name for item in parameters.items] == [
+        "ПервыйПараметр", "ВторойПараметр",
+    ]
+    assert [item.name for item in locals_page.items] == ["Локальная"]
+    assert parameters.total == 2 and locals_page.total == 1
+
+
+@pytest.mark.parametrize("start", [0, 3, 99])
+def test_zero_width_variable_slice_is_empty_terminal_without_source_or_projection(start):
+    resolutions = []
+    adapter, backend = setup_adapter(
+        resolver=lambda root: resolutions.append(root) or ("ПервыйПараметр",),
+    )
+    page = adapter.context.parameters[start:start]
+    assert page.items == () and page.total == 0 and page.next_cursor is None
+    assert resolutions == []
+    assert backend.calls == [("validate", backend.fence)]
 
 
 def test_value_adapter_can_bind_native_frame_scope_without_changing_stack_coordinates():

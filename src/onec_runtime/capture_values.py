@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
+import json
 import re
 from typing import TYPE_CHECKING, Protocol, cast, overload
 
@@ -29,6 +30,7 @@ from onec_runtime.errors import (
     NoActiveCaptureError,
     StaleCaptureError,
 )
+from onec_runtime.privacy import public_artifact_value
 
 if TYPE_CHECKING:
     from onec_runtime.capture_inspection import DebugFrame
@@ -241,6 +243,9 @@ class CaptureValueBackend(Protocol):
     privacy or source work.  Each later call must validate the same fence again
     while it runs.  Projection and guard calls are coordinator-owned inspection
     operations; temporary-handle cleanup is a materialization-helper step.
+    Variable projections apply the requested role before paging.  The adapter
+    defensively filters and orders every returned page and rejects a role leak
+    that would make a nonterminal cursor ambiguous.
     """
 
     def validate_inspection(self, fence: object) -> None: ...
@@ -272,6 +277,7 @@ class CaptureValuePolicy:
             raise ValueError("capture value byte budget is invalid")
 
     def is_private(self, fence: object, handle: object) -> bool:
+        check_failed = False
         try:
             result = self.private_guard(fence, handle)
         except (
@@ -285,8 +291,11 @@ class CaptureValuePolicy:
             StaleCaptureError,
         ):
             raise
-        except Exception as error:
-            raise CaptureValueCheckError("capture public-value check failed") from error
+        except Exception:
+            check_failed = True
+            result = None
+        if check_failed:
+            raise CaptureValueCheckError("capture public-value check failed") from None
         if type(result) is not bool:
             raise CaptureValueCheckError("public-value guard returned an invalid result")
         return result
@@ -480,12 +489,17 @@ class LocalCaptureValueAdapter:
             start, stop = self._page_bounds(key)
         else:
             raise TypeError("variables require an identifier, index or bounded slice")
+        if isinstance(key, slice) and start == stop:
+            return self._empty_page(
+                SafeValuePath(root), role.value, start=start, stop=stop,
+            )
         parameters = self._parameters(root) if role is not VariableRole.VARIABLES else ()
         request = ValueInspectionRequest(
             SafeValuePath(root), ValueViewKind.VARIABLES, start, stop,
             role, parameters, exact,
         )
         projection = self._project(request)
+        projection = self._classify_role_projection(projection, request)
         page = self._normalize_page(
             projection, request, exact_access=not isinstance(key, slice),
         )
@@ -493,13 +507,58 @@ class LocalCaptureValueAdapter:
             return page
         return self._one(page, exact=exact)
 
+    @staticmethod
+    def _classify_role_projection(
+        projection: PrivateValueProjection,
+        request: ValueInspectionRequest,
+    ) -> PrivateValueProjection:
+        if request.role is VariableRole.VARIABLES:
+            return projection
+        parameter_order = {
+            name.casefold(): index for index, name in enumerate(request.parameter_names)
+        }
+        original = projection.entries
+        if request.role is VariableRole.PARAMETERS:
+            entries = tuple(
+                entry for entry in original
+                if isinstance(entry.name, str) and entry.name.casefold() in parameter_order
+            )
+            folded = tuple(cast(str, entry.name).casefold() for entry in entries)
+            if len(set(folded)) != len(folded):
+                raise CaptureValueCheckError("parameter projection is ambiguous")
+            entries = tuple(sorted(
+                entries,
+                key=lambda entry: parameter_order[cast(str, entry.name).casefold()],
+            ))
+        else:
+            entries = tuple(
+                entry for entry in original
+                if not isinstance(entry.name, str)
+                or entry.name.casefold() not in parameter_order
+            )
+        changed = entries != original
+        if changed and projection.next_cursor is not None:
+            raise CaptureValueCheckError(
+                "backend must apply variable roles before nonterminal paging"
+            )
+        total = (
+            request.start + len(entries)
+            if changed and projection.next_cursor is None
+            else projection.total
+        )
+        return PrivateValueProjection(entries, total, projection.next_cursor)
+
     def _parameters(self, root: ValueRoot) -> tuple[str, ...]:
+        source_unavailable = False
         try:
             names = self._resolve_parameters(root)
-        except CaptureSourceUnavailableError as error:
+        except CaptureSourceUnavailableError:
+            source_unavailable = True
+            names = ()
+        if source_unavailable:
             raise CaptureSourceUnavailableError(
                 "method source unavailable; use variables for unclassified values"
-            ) from error
+            ) from None
         if type(names) is not tuple:
             raise CaptureSourceUnavailableError(
                 "method parameter classification unavailable; use variables"
@@ -544,6 +603,8 @@ class LocalCaptureValueAdapter:
             start, stop = self._page_bounds(key)
         else:
             raise TypeError("children require a safe name, index or bounded slice")
+        if isinstance(key, slice) and start == stop:
+            return self._empty_page(node.path, view.value, start=start, stop=stop)
 
         root_record = self._backend.resolve_value(self._fence, node.path)
         if self._policy.is_private(self._fence, root_record.handle):
@@ -551,18 +612,19 @@ class LocalCaptureValueAdapter:
         root_metadata = self._describe(root_record)
         if not isinstance(root_metadata, ValueMetadata) or root_metadata.shape is not node.shape:
             raise CaptureValueCheckError("capture value shape changed during inspection")
-        if view in {ValueViewKind.TABLE_ROWS, ValueViewKind.TABLE_COLUMNS}:
-            columns = self._backend.discover_table_columns(
-                self._fence, node.path, MAX_PAGE_ITEMS + 1,
-            )
-            if type(columns) is not tuple or any(not isinstance(name, str) for name in columns):
-                raise CaptureValueCheckError("value-table schema is invalid")
-            if len(columns) > MAX_PAGE_ITEMS:
-                raise CaptureShapeUnsupportedError("value table exceeds 100 columns")
-            for name in columns:
-                _identifier(name, what="value-table column")
+        schema = None
+        if view in {
+            ValueViewKind.TABLE_ROWS,
+            ValueViewKind.TABLE_COLUMNS,
+            ValueViewKind.ROW_FIELDS,
+        }:
+            schema = self._discover_schema(node.path)
         request = ValueInspectionRequest(node.path, view, start, stop, exact=exact)
         projection = self._project(request)
+        if schema is not None and view in {
+            ValueViewKind.TABLE_COLUMNS, ValueViewKind.ROW_FIELDS,
+        }:
+            self._validate_schema_projection(projection, request, schema)
         page = self._normalize_page(
             projection, request, exact_access=exact is not None,
             segment_kind=segment_kind,
@@ -570,6 +632,39 @@ class LocalCaptureValueAdapter:
         if isinstance(key, slice):
             return page
         return self._one(page, exact=exact)
+
+    def _discover_schema(self, path: SafeValuePath) -> tuple[str, ...]:
+        columns = self._backend.discover_table_columns(
+            self._fence, path, MAX_PAGE_ITEMS + 1,
+        )
+        if type(columns) is not tuple or any(not isinstance(name, str) for name in columns):
+            raise CaptureValueCheckError("value-table schema is invalid")
+        if len(columns) > MAX_PAGE_ITEMS:
+            raise CaptureShapeUnsupportedError("value table exceeds 100 columns")
+        checked = tuple(_identifier(name, what="value-table column") for name in columns)
+        if len({name.casefold() for name in checked}) != len(checked):
+            raise CaptureShapeUnsupportedError("value-table column names must be unique")
+        return checked
+
+    @staticmethod
+    def _validate_schema_projection(
+        projection: PrivateValueProjection,
+        request: ValueInspectionRequest,
+        schema: tuple[str, ...],
+    ) -> None:
+        actual = tuple(entry.name for entry in projection.entries)
+        if any(not isinstance(name, str) for name in actual):
+            raise CaptureValueCheckError("value projection does not match its schema")
+        if isinstance(request.exact, str):
+            expected = tuple(
+                name for name in schema if name.casefold() == request.exact.casefold()
+            )
+        else:
+            expected = schema[request.start:request.stop]
+            if projection.total != len(schema):
+                raise CaptureValueCheckError("value projection schema count does not match")
+        if actual != expected:
+            raise CaptureValueCheckError("value projection does not match its schema")
 
     def _view_for(
         self, shape: ValueShape | None, alias: str | None,
@@ -633,7 +728,6 @@ class LocalCaptureValueAdapter:
         segment_kind: ValuePathSegmentKind = ValuePathSegmentKind.VARIABLE,
     ) -> ValuePage:
         nodes: list[ValueNode] = []
-        used_bytes = 0
         for entry in projection.entries:
             name = entry.name
             if segment_kind in {
@@ -675,13 +769,8 @@ class LocalCaptureValueAdapter:
                     expandable, metadata.shape, path, cycle=cycle,
                     _owner=self,
                 )
-            used_bytes += len(str(checked_name).encode("utf-8"))
-            used_bytes += len((node.type_name or "").encode("utf-8"))
-            used_bytes += len(node.preview.encode("utf-8"))
-            if used_bytes > self._policy.max_bytes:
-                raise CaptureValueCheckError("capture value page byte budget exceeded")
             nodes.append(node)
-        return ValuePage(
+        page = ValuePage(
             tuple(nodes), projection.total, projection.next_cursor,
             request.path,
             request.role.value
@@ -689,6 +778,28 @@ class LocalCaptureValueAdapter:
             else request.view.value,
             request.start, request.stop,
         )
+        return self._bounded_page(page)
+
+    def _empty_page(
+        self,
+        path: SafeValuePath,
+        view: str,
+        *,
+        start: int,
+        stop: int,
+    ) -> ValuePage:
+        return self._bounded_page(ValuePage((), 0, None, path, view, start, stop))
+
+    def _bounded_page(self, page: ValuePage) -> ValuePage:
+        public_bytes = json.dumps(
+            public_artifact_value(page),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        if len(public_bytes) > self._policy.max_bytes:
+            raise CaptureValueCheckError("capture value page byte budget exceeded")
+        return page
 
     @staticmethod
     def _preview(metadata: ValueMetadata) -> str:
@@ -701,6 +812,7 @@ class LocalCaptureValueAdapter:
 
     @staticmethod
     def _describe(entry: PrivateProjectedValue) -> ValueMetadata:
+        check_failed = False
         try:
             metadata = entry.describe()
         except (
@@ -714,8 +826,11 @@ class LocalCaptureValueAdapter:
             StaleCaptureError,
         ):
             raise
-        except Exception as error:
-            raise CaptureValueCheckError("capture value metadata check failed") from error
+        except Exception:
+            check_failed = True
+            metadata = None
+        if check_failed:
+            raise CaptureValueCheckError("capture value metadata check failed") from None
         if not isinstance(metadata, ValueMetadata):
             raise CaptureValueCheckError("capture value metadata is invalid")
         return metadata

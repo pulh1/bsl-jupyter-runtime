@@ -1,5 +1,7 @@
 from dataclasses import FrozenInstanceError
 import gc
+import json
+import traceback
 import weakref
 
 import pytest
@@ -11,6 +13,7 @@ from onec_runtime.errors import (
     CaptureValueAccessDeniedError,
     CaptureValueCheckError,
 )
+from onec_runtime.privacy import public_artifact_value
 
 
 def api():
@@ -45,6 +48,7 @@ class Backend:
         self.private = set()
         self.calls = []
         self.row_reads = 0
+        self.field_reads = 0
 
     def validate_inspection(self, fence):
         self.calls.append(("validate", fence))
@@ -68,6 +72,8 @@ class Backend:
             values = list(self.roots.items())
         if request.view.value == "table_rows":
             self.row_reads += 1
+        if request.view.value == "row_fields":
+            self.field_reads += 1
         entries = [
             self._entry(
                 name, value,
@@ -88,8 +94,12 @@ class Backend:
 
     def discover_table_columns(self, fence, path, limit):
         self.calls.append(("schema", fence, path, limit))
-        table = self._resolve(path)
-        names = tuple(name for name, _ in table.children[0][1].children) if table.children else ()
+        value = self._resolve(path)
+        if value.shape == "value_table":
+            fields = value.children[0][1].children if value.children else ()
+        else:
+            fields = value.children
+        names = tuple(name for name, _ in fields)
         return names[:limit]
 
     def is_private_value(self, fence, handle):
@@ -277,7 +287,10 @@ def test_unexpected_guard_failure_is_a_bounded_check_error_without_metadata_acce
     )
     with pytest.raises(CaptureValueCheckError) as raised:
         adapter.context.variables[:1]
-    assert "PRIVATE BACKEND DETAIL" not in str(raised.value)
+    rendered = "".join(traceback.format_exception(raised.value))
+    assert "PRIVATE BACKEND DETAIL" not in rendered
+    assert "PRIVATE BACKEND DETAIL" not in repr(raised.value)
+    assert raised.value.__cause__ is None and raised.value.__context__ is None
     assert roots["Секрет"].describe_calls == 0
 
 
@@ -385,7 +398,10 @@ def test_backend_metadata_failure_is_bounded_after_the_public_guard():
     backend.project_values = lambda fence, request: api().PrivateValueProjection((entry,), 1, None)
     with pytest.raises(CaptureValueCheckError) as raised:
         adapter.context.variables[:1]
-    assert "PRIVATE METADATA DETAIL" not in str(raised.value)
+    rendered = "".join(traceback.format_exception(raised.value))
+    assert "PRIVATE METADATA DETAIL" not in rendered
+    assert "PRIVATE METADATA DETAIL" not in repr(raised.value)
+    assert raised.value.__cause__ is None and raised.value.__context__ is None
     assert [call[0] for call in backend.calls[-2:]] == ["validate", "guard"]
 
 
@@ -405,3 +421,101 @@ def test_normalized_node_does_not_retain_the_temporary_guard_handle():
     gc.collect()
     assert page.items[0].preview == "1"
     assert retained[0]() is None
+
+
+@pytest.mark.parametrize("letter", ["A", "Я"])
+def test_byte_budget_counts_the_complete_recursive_public_page(letter):
+    child_names = tuple(f"{letter * 180}{index}" for index in range(5))
+    leaf = Value(
+        "Структура", "ignored", "structure",
+        [(name, scalar(str(index))) for index, name in enumerate(child_names)],
+    )
+    chain = []
+    nested = leaf
+    for index in range(5):
+        name = f"{letter * 180}{index + 10}"
+        chain.append(name)
+        nested = Value("Структура", "ignored", "structure", [(name, nested)])
+    chain.reverse()
+    roots = {"Корень": nested}
+
+    def final_page(limit):
+        adapter, _ = setup_values(
+            roots=roots, max_depth=8, max_items=100, max_bytes=limit,
+        )
+        node = adapter.context.variables["Корень"]
+        for name in chain:
+            node = node.fields[name]
+        return node.fields[:5]
+
+    page = final_page(10_000_000)
+    public_bytes = len(json.dumps(
+        public_artifact_value(page), ensure_ascii=False,
+        separators=(",", ":"), sort_keys=True,
+    ).encode("utf-8"))
+    assert len(final_page(public_bytes).items) == 5
+    with pytest.raises(CaptureValueCheckError, match="byte budget"):
+        final_page(public_bytes - 1)
+
+
+def test_direct_row_rejects_more_than_100_columns_before_field_projection():
+    row = Value(
+        "СтрокаТаблицыЗначений", "ignored", "value_table_row",
+        [(f"Поле{i}", scalar()) for i in range(101)],
+    )
+    adapter, backend = setup_values(roots={"Строка": row})
+    node = adapter.context.variables["Строка"]
+    with pytest.raises(CaptureShapeUnsupportedError, match="100 columns"):
+        node.fields[:100]
+    assert backend.field_reads == 0
+    assert backend.calls[-1][0] == "schema"
+
+
+def test_table_derived_row_revalidates_unique_casefold_schema_before_fields():
+    row = Value(
+        "СтрокаТаблицыЗначений", "ignored", "value_table_row",
+        [("Код", scalar("1")), ("Имя", scalar("one"))],
+    )
+    table = Value("ТаблицаЗначений", "ignored", "value_table", [(0, row)])
+    adapter, backend = setup_values(roots={"Таблица": table})
+    saved_row = adapter.context.variables["Таблица"].rows[0]
+    row.children[1] = ("КОД", scalar("duplicate"))
+    prior = backend.field_reads
+    with pytest.raises(CaptureShapeUnsupportedError, match="unique"):
+        saved_row.fields[:2]
+    assert backend.field_reads == prior
+
+
+def test_table_columns_must_match_discovered_schema_order_and_count():
+    adapter, backend = setup_values()
+    table = adapter.context.variables["Таблица"]
+    original = backend.project_values
+    def reverse_columns(fence, request):
+        result = original(fence, request)
+        if request.view is api().ValueViewKind.TABLE_COLUMNS:
+            return api().PrivateValueProjection(
+                tuple(reversed(result.entries)), result.total, result.next_cursor,
+            )
+        return result
+    backend.project_values = reverse_columns
+    with pytest.raises(CaptureValueCheckError, match="schema"):
+        table.columns[:2]
+
+    backend.project_values = original
+    original_schema = backend.discover_table_columns
+    backend.discover_table_columns = (
+        lambda fence, path, limit:
+        original_schema(fence, path, limit) + ("Лишняя",)
+    )
+    with pytest.raises(CaptureValueCheckError, match="schema"):
+        table.columns[:2]
+
+
+@pytest.mark.parametrize("start", [0, 2, 99])
+def test_zero_width_child_slice_is_empty_terminal_without_resolve_or_projection(start):
+    adapter, backend = setup_values()
+    node = adapter.context.variables["Структура"]
+    prior = len(backend.calls)
+    page = node.fields[start:start]
+    assert page.items == () and page.total == 0 and page.next_cursor is None
+    assert [call[0] for call in backend.calls[prior:]] == ["validate"]
