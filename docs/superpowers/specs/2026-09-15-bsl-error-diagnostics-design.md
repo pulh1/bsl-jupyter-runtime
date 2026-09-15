@@ -258,7 +258,7 @@ The change is additive at the dataclass boundary:
 - existing `locations` and `worker_frames` order and meaning stay stable;
 - deterministic parser/lowering diagnostics receive empty traces;
 - public/expert serializers emit their current keys only;
-- Compact/public Jupyter and MCP behavior is unchanged until their integration tranches. Existing expert/private paths may carry the expanded verbatim diagnostic without a schema change.
+- Compact/public Jupyter and MCP paths omit platform diagnostic text. Existing diagnostic/expert/private paths may carry the expanded verbatim diagnostic without a schema change.
 
 If changing the retained-text bound changes the digest-independent `platform_diagnostic` value for long inputs, that is intentional. The SHA-256 continues to identify the complete original input.
 

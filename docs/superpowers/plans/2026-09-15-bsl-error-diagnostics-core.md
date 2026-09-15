@@ -19,6 +19,7 @@
 - Preserve existing diagnostic IDs, entrypoint-specific primary selection, `locations`, `worker_frames`, and public/expert wire key sets for existing inputs.
 - Native 1C configuration locations are direct coordinates and require neither a source map nor `source_root`.
 - Source excerpts are represented only by hash-fenced source spans; no BSL source string or path enters a public artifact.
+- Compact/public Jupyter and MCP paths never emit platform diagnostic prose; diagnostic/expert/private paths preserve it verbatim within the shared 64 KiB UTF-8 bound.
 - Each generated frame maps only through the exact `MappedSource` or immutable Worker manifest/artifact evidence supplied by the caller.
 - A malformed/unmappable frame degrades independently and cannot remove other frames.
 - This tranche adds no runtime wiring, so successful and failed execution behavior remains unchanged.
