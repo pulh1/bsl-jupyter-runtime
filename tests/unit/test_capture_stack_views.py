@@ -1,6 +1,6 @@
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -12,15 +12,27 @@ from onec_runtime.bsl.module_syntax import ModuleIdentity, ModuleSyntaxRegistry
 from onec_runtime.capture_source import SourceVersionRef
 from onec_runtime.errors import (
     CaptureBusyError,
-    CaptureSourceUnavailableError,
     CommandTimeout,
     ProtocolError,
     StaleCaptureError,
 )
-from onec_runtime.rdbg.models import ModuleLocation, StackFrame, StopEvent, TargetId
+from onec_runtime.rdbg.models import (
+    FrameVariable,
+    LocalVariablesResult,
+    ModuleLocation,
+    StackFrame,
+    StopEvent,
+    TargetId,
+)
 from onec_runtime.runtime_api import PrototypeRuntimeApi
 
-from test_prototype_runtime import CAPTURE_A, SERVICE, ScriptedSession, captured_controller
+from test_prototype_runtime import (
+    CAPTURE_A,
+    SERVICE,
+    ScriptedSession,
+    captured_controller,
+    evaluation,
+)
 
 
 SOURCE = "Procedure RunFixture(Arg)\nX = 1;\nEndProcedure"
@@ -840,6 +852,92 @@ def test_runtime_native_frame_projection_keeps_its_physical_level_in_one_plan() 
         assert owner.join(2)
 
 
+def test_runtime_native_frame_uses_the_production_envelope_without_inventory_metadata():
+    """A physical frame reaches the same coordinator-owned closed protocol."""
+    from base64 import b64encode
+    from hashlib import sha256
+    import json
+
+    class EnvelopeNativeSession(FreshStackSession):
+        def __init__(self) -> None:
+            super().__init__()
+            self.projection_sources: list[str] = []
+            self.payload_reads = 0
+            self.cleanups = 0
+            document = {
+                "v": 1,
+                "action": "project",
+                "entries": [{
+                    "name": "Оклад",
+                    "denied": False,
+                    "type_name": "Число",
+                    "preview": "55000",
+                    "size": None,
+                    "shape": "scalar",
+                    "cycle": False,
+                }],
+                "total": 1,
+                "next": None,
+            }
+            payload = json.dumps(
+                document, ensure_ascii=False, separators=(",", ":"),
+            ).encode("utf-8")
+            self.payload = b64encode(payload).decode("ascii")
+            self.admission = "R|1|1|{}|{}|{}".format(
+                len(payload), sha256(payload).hexdigest(), len(self.payload),
+            )
+
+        def local_variables(self, stack_level: int = 0) -> LocalVariablesResult:
+            if stack_level == 1:
+                self.calls.append(("local_variables", stack_level))
+                return LocalVariablesResult(uuid4(), (
+                    FrameVariable(
+                        "Оклад", "PRIVATE_NATIVE_TYPE", "PRIVATE_NATIVE_PRESENTATION",
+                    ),
+                ))
+            return super().local_variables(stack_level)
+
+        def evaluate(self, expression: str, **kwargs: object):  # type: ignore[no-untyped-def]
+            stack_level = kwargs.get("stack_level", 0)
+            call_value: object = (
+                expression if stack_level == 0 else (expression, stack_level)
+            )
+            self.calls.append(("evaluate", call_value))
+            if "СпроецироватьЗначенияИнспекции" in expression:
+                self.projection_sources.append(expression)
+                return evaluation("Строка", f'"{self.admission}"')
+            if "ЗабратьКомпактнуюМатериализациюИзКонтекста" in expression:
+                self.payload_reads += 1
+                return evaluation("Строка", f'"{self.payload}"')
+            if "УдалитьМатериализациюИзКонтекста" in expression:
+                self.cleanups += 1
+                return evaluation("Булево", "Истина")
+            return super().evaluate(expression, **kwargs)
+
+    session = EnvelopeNativeSession()
+    controller = captured_controller(session)
+    runtime = PrototypeRuntimeApi(controller)
+    owner = controller._capture_evaluation_coordinator
+    assert owner is not None
+    try:
+        page = runtime.current_capture().stack.native[1].variables[:1]
+
+        assert [item.name for item in page.items] == ["Оклад"]
+        assert session.payload_reads == session.cleanups == 1
+        assert len(session.projection_sources) == 1
+        source = session.projection_sources[0]
+        assert "PRIVATE_NATIVE_TYPE" not in source
+        assert "PRIVATE_NATIVE_PRESENTATION" not in source
+        assert "RuntimeContextStoreServer.ПолучитьКонтекст()" in source
+        assert any(
+            name == "local_variables" and level == 1
+            for name, level in session.calls
+        )
+    finally:
+        owner.begin_close()
+        assert owner.join(2)
+
+
 def test_session_current_capture_binds_sources_methods_and_frame_value_scope() -> None:
     from onec_runtime.capture_inspection import ResolvedFrameSource
     from onec_runtime.capture_values import (
@@ -885,10 +983,9 @@ def test_session_current_capture_binds_sources_methods_and_frame_value_scope() -
     assert frame.variables._root.native_level == 1
     assert frame.parameters._root.native_level == 1
     assert frame.locals._root.native_level == 1
-    # A session-provided local scope may enrich the saved frame, but it cannot
-    # replace RuntimeApi's fence-owned target admission backend.
-    with pytest.raises(CaptureSourceUnavailableError, match="not qualified"):
-        frame.variables[:1]
+    # The session binder enriches source metadata only.  The live descriptor
+    # remains the RuntimeApi-owned backend; its target protocol is covered by
+    # the envelope fake-transport tests rather than this source-only fixture.
 
 
 def test_stack_views_keep_target_urls_and_physical_ids_out_of_ordinary_repr() -> None:

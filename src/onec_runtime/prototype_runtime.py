@@ -41,6 +41,7 @@ from onec_runtime.capture import (
     build_temporary_storage_value_expression,
 )
 from onec_runtime.capture_evaluation import (
+    CaptureCleanupLease,
     CaptureEvaluationCoordinator,
     CaptureEvaluationKind,
     CaptureEvaluationRequest,
@@ -49,6 +50,10 @@ from onec_runtime.capture_evaluation import (
     CapturePhase,
     CaptureRemoteStep,
     CaptureStepContext,
+)
+from onec_runtime.capture_value_protocol import (
+    CaptureValueInspectionEnvelope,
+    build_capture_value_inspection_envelope,
 )
 from onec_runtime.capture_values import (
     CaptureValuePolicy,
@@ -135,6 +140,9 @@ class CaptureValueInspectionPlan:
     decode: Callable[[EvaluationResult], object] = field(
         repr=False, compare=False,
     )
+    envelope: CaptureValueInspectionEnvelope | None = field(
+        default=None, repr=False, compare=False,
+    )
 
     def __post_init__(self) -> None:
         if (
@@ -148,6 +156,11 @@ class CaptureValueInspectionPlan:
             raise ValueError("capture value inspection source is invalid")
         if not callable(self.decode):
             raise TypeError("capture value inspection decoder must be callable")
+        if self.envelope is not None:
+            if not isinstance(self.envelope, CaptureValueInspectionEnvelope):
+                raise TypeError("capture value inspection envelope is invalid")
+            if self.envelope.source != self.source:
+                raise ValueError("capture value inspection plan source disagrees with envelope")
 
 
 CaptureValueInspectionBuilder = Callable[..., CaptureValueInspectionPlan]
@@ -1883,15 +1896,15 @@ class PrototypeRuntimeController:
         request: ValueInspectionRequest | None,
         limit: int | None,
         worker_type_registrations: tuple[str, ...],
+        context_generation: int = 1,
         timeout_s: float | None = None,
     ) -> object:
         """Submit one qualified capture-value projection through the coordinator.
 
-        A value descriptor carries only a frozen symbolic path.  The optional
-        protocol builder turns that already-validated path into one closed
-        target expression when, and only when, the descriptor is consumed.
-        There is intentionally no fallback to ``local_variables`` metadata:
-        RDBG inventory details are candidates, never public value metadata.
+        A value descriptor carries only a frozen symbolic path.  The normal
+        path builds a protocol-2 envelope backed by the checked-in extension
+        helper.  Test-only injected builders remain a narrow decoder seam;
+        there is no inventory-to-public-value fallback.
         """
         deadline = self._capture_command_deadline(timeout_s)
         # This deliberately precedes request/path validation.  A busy, stale
@@ -1918,6 +1931,8 @@ class PrototypeRuntimeController:
                 raise CaptureValueCheckError(
                     "capture value Worker registrations are invalid"
                 )
+            if type(context_generation) is not int or context_generation < 1:
+                raise CaptureValueCheckError("capture value context generation is invalid")
         except (
             CaptureBusyError,
             CaptureEvaluationPendingError,
@@ -1934,24 +1949,40 @@ class PrototypeRuntimeController:
                 "capture value inspection request is invalid"
             ) from None
 
-        builder = self._capture_value_inspection_builder
-        if builder is None:
-            raise CaptureSourceUnavailableError(
-                "capture value target projection is not qualified"
-            )
         try:
-            plan = builder(
-                action=action,
-                path=selected_path,
-                request=request,
-                limit=limit,
-                worker_type_registrations=worker_type_registrations,
-            )
+            builder = self._capture_value_inspection_builder
+            if builder is None:
+                plan = self._build_capture_value_inspection_plan(
+                    action=action,
+                    path=selected_path,
+                    request=request,
+                    limit=limit,
+                    worker_type_registrations=worker_type_registrations,
+                    context_generation=context_generation,
+                    deadline=deadline,
+                )
+            else:
+                plan = builder(
+                    action=action,
+                    path=selected_path,
+                    request=request,
+                    limit=limit,
+                    worker_type_registrations=worker_type_registrations,
+                )
         except (
             CaptureBusyError,
             CaptureEvaluationPendingError,
             CaptureOutcomeUnknownError,
             CaptureRecoveryRequiredError,
+        ):
+            # A builder runs before it has submitted a coordinator record.
+            # Its fabricated lifecycle result cannot identify a public pending
+            # evaluation, so never leak it to descriptor callers.
+            self._require_capture_value_stop_fence()
+            raise CaptureValueCheckError(
+                "capture value target projection is unavailable"
+            ) from None
+        except (
             CaptureSourceUnavailableError,
             CaptureValueAccessDeniedError,
             CaptureValueCheckError,
@@ -1964,14 +1995,12 @@ class PrototypeRuntimeController:
             ) from None
         if not isinstance(plan, CaptureValueInspectionPlan):
             raise CaptureValueCheckError("capture value target plan is invalid")
+        # A builder may have needed a native candidate-name read.  Do not send
+        # its source after that pre-submit work has lost this saved stop.
+        self._require_capture_value_stop_fence()
 
-        def decode(result: EvaluationResult) -> object:
-            if result.error_occurred:
-                raise CaptureValueCheckError(
-                    "capture value target projection failed"
-                )
+        def decode_value(value: object) -> object:
             try:
-                value = plan.decode(result)
                 # A target response can race a new stop.  Detect that fence
                 # change before touching even the private lazy metadata
                 # readers returned by the trusted decoder.
@@ -2009,14 +2038,29 @@ class PrototypeRuntimeController:
                 raise CaptureValueCheckError("capture value target schema is invalid")
             return value
 
+        def decode(result: EvaluationResult) -> object:
+            if result.error_occurred:
+                raise CaptureValueCheckError(
+                    "capture value target projection failed"
+                )
+            return decode_value(plan.decode(result))
+
         try:
-            result = self._evaluate_capture_helper(
-                plan.source,
-                evaluation_kind=CaptureEvaluationKind.INSPECTION,
-                stack_level=stack_level,
-                result_policy=decode,
-                timeout_s=self._capture_remaining_timeout(deadline),
-            )
+            if plan.envelope is None:
+                result = self._evaluate_capture_helper(
+                    plan.source,
+                    evaluation_kind=CaptureEvaluationKind.INSPECTION,
+                    stack_level=stack_level,
+                    result_policy=decode,
+                    timeout_s=self._capture_remaining_timeout(deadline),
+                )
+            else:
+                result = self._evaluate_capture_value_envelope(
+                    plan.envelope,
+                    stack_level=stack_level,
+                    result_decoder=decode_value,
+                    timeout_s=self._capture_remaining_timeout(deadline),
+                )
             self._capture_remaining_timeout(deadline)
             return result
         except (
@@ -2038,6 +2082,187 @@ class PrototypeRuntimeController:
             raise CaptureValueCheckError(
                 "capture value target projection failed"
             ) from None
+
+    def _build_capture_value_inspection_plan(
+        self,
+        *,
+        action: str,
+        path: SafeValuePath,
+        request: ValueInspectionRequest | None,
+        limit: int | None,
+        worker_type_registrations: tuple[str, ...],
+        context_generation: int,
+        deadline: float,
+    ) -> CaptureValueInspectionPlan:
+        """Create the only production target plan after complete local grammar."""
+        native_candidates = (
+            ()
+            if path.root.kind is ValueRootKind.CONTEXT
+            else self._capture_value_native_candidates(path, deadline=deadline)
+        )
+        envelope = build_capture_value_inspection_envelope(
+            action=action,
+            path=path,
+            request=request,
+            limit=limit,
+            runtime_generation=self.runtime_generation,
+            context_generation=context_generation,
+            worker_type_registrations=worker_type_registrations,
+            native_candidates=native_candidates,
+            policy=CaptureValuePolicy(),
+        )
+        return CaptureValueInspectionPlan(envelope.source, lambda _result: None, envelope)
+
+    def _capture_value_native_candidates(
+        self,
+        path: SafeValuePath,
+        *,
+        deadline: float,
+    ) -> tuple[str, ...]:
+        """Keep native RDBG candidates private; only their safe names form BSL."""
+        root = path.root
+        if root.kind is not ValueRootKind.FRAME or type(root.native_level) is not int:
+            raise CaptureValueCheckError("capture native frame candidates are invalid")
+        if root.native_level == self.capture_frame_stack_level:
+            variables = self._capture_frame_variables
+        else:
+            result = self.session.local_variables(stack_level=root.native_level)
+            if result.error_occurred:
+                raise CaptureSourceUnavailableError(
+                    "native frame value candidates are unavailable"
+                )
+            variables = result.variables
+        self._capture_remaining_timeout(deadline)
+        try:
+            names = tuple(
+                SafePathSegment(ValuePathSegmentKind.VARIABLE, item.name).key
+                for item in variables
+            )
+        except Exception:
+            raise CaptureSourceUnavailableError(
+                "native frame value candidates are unavailable"
+            ) from None
+        if len({name.casefold() for name in names}) != len(names):
+            raise CaptureSourceUnavailableError(
+                "native frame value candidates are unavailable"
+            )
+        return names
+
+    def _evaluate_capture_value_envelope(
+        self,
+        envelope: CaptureValueInspectionEnvelope,
+        *,
+        stack_level: int,
+        result_decoder: Callable[[object], object],
+        timeout_s: float,
+    ) -> object:
+        """Run admission, private read and cleanup in one INSPECTION record."""
+        self._require_capture_evaluation_admission()
+        owner = self._capture_evaluation_owner()
+        policy_failure: BaseException | None = None
+
+        def note_policy_failure(error: BaseException) -> None:
+            nonlocal policy_failure
+            if isinstance(
+                error,
+                (
+                    BslExecutionError,
+                    ProtocolError,
+                    CaptureSourceUnavailableError,
+                    CaptureValueAccessDeniedError,
+                    CaptureValueCheckError,
+                    StaleCaptureError,
+                ),
+            ):
+                policy_failure = error
+
+        def parse_initial(result: EvaluationResult) -> AdmissionEnvelopeV1:
+            if result.error_occurred:
+                error = CaptureValueCheckError(
+                    "capture value target projection failed"
+                )
+                note_policy_failure(error)
+                raise error
+            try:
+                return envelope.parse_metadata(evaluation_to_python(result))
+            except BaseException as error:
+                note_policy_failure(error)
+                raise
+
+        def read_payload(context: CaptureStepContext) -> str:
+            source = (
+                "RuntimeKernelServer.ЗабратьКомпактнуюМатериализациюИзКонтекста("
+                "RuntimeContextStoreServer.ПолучитьКонтекст(), "
+                + bsl_string_literal(envelope.private_key)
+                + ")"
+            )
+            response = context.execute_inline(self._capture_remote_step(
+                source,
+                stack_level=stack_level,
+                max_text_size=envelope.max_text_size,
+                timeout_s=timeout_s,
+            ))
+            if response.error_occurred:
+                raise CaptureValueCheckError("capture value payload is unavailable")
+            try:
+                content = evaluation_to_python(response)
+            except Exception:
+                raise CaptureValueCheckError("capture value payload is invalid") from None
+            if not isinstance(content, str) or len(content) > envelope.max_text_size:
+                raise CaptureValueCheckError("capture value payload is invalid")
+            return content
+
+        def continue_envelope(
+            context: CaptureStepContext,
+            metadata: AdmissionEnvelopeV1,
+        ) -> object:
+            try:
+                value = envelope.decode(metadata, read_payload(context))
+                self._require_capture_value_stop_fence()
+                return result_decoder(value)
+            except BaseException as error:
+                note_policy_failure(error)
+                raise
+
+        first = self._capture_remote_step(
+            envelope.source,
+            stack_level=stack_level,
+            max_text_size=4096,
+            timeout_s=timeout_s,
+        )
+        cleanup = CaptureCleanupLease(
+            envelope.private_key,
+            self._capture_remote_step(
+                envelope.cleanup_source,
+                stack_level=stack_level,
+                max_text_size=4096,
+                timeout_s=timeout_s,
+            ),
+        )
+        request = CaptureEvaluationRequest(
+            owner._fence,
+            CaptureEvaluationKind.INSPECTION,
+            first.dispatch,
+            first.poll,
+            parse_initial,
+            restore=first.restore,
+            cleanup_leases=(cleanup,),
+            step_continuation=continue_envelope,
+            completion=self._complete_capture_lifecycle,
+        )
+        try:
+            return self._submit_capture_request(
+                request,
+                timeout_s=timeout_s,
+                helper_handoff=True,
+            )
+        except (BslExecutionError, CaptureEvaluationDeliveryError):
+            if policy_failure is not None:
+                # A policy failure is private coordinator work.  Before it
+                # becomes a descriptor error, let a changed stop fence win.
+                self._require_capture_value_stop_fence()
+                raise policy_failure from None
+            raise
 
     def _require_capture_value_stop_fence(self) -> None:
         """Validate the controller-side portion of the saved CAPTURE fence.
@@ -2082,22 +2307,14 @@ class PrototypeRuntimeController:
                 or type(request.stop) is not int
                 or request.start < 0
                 or request.stop < request.start
+                or request.start > MAX_CAPTURE_PROJECTION_POSITION
+                or request.stop > MAX_CAPTURE_PROJECTION_POSITION
                 or request.stop - request.start > 100
                 or type(request.parameter_names) is not tuple
                 or any(not isinstance(name, str) for name in request.parameter_names)
             ):
                 raise CaptureValueCheckError("capture value projection request is invalid")
-            exact = request.exact
-            if exact is not None:
-                if type(exact) is int:
-                    if exact < 0:
-                        raise CaptureValueCheckError("capture value projection request is invalid")
-                elif isinstance(exact, str):
-                    SafePathSegment(ValuePathSegmentKind.VARIABLE, exact)
-                else:
-                    raise CaptureValueCheckError("capture value projection request is invalid")
-            for name in request.parameter_names:
-                SafePathSegment(ValuePathSegmentKind.VARIABLE, name)
+            self._validate_capture_value_projection_grammar(request)
         elif action == "resolve":
             if (
                 request is not None
@@ -2149,8 +2366,107 @@ class PrototypeRuntimeController:
         if (
             len(segments) > MAX_CAPTURE_VALUE_PATH_SEGMENTS
             or segments[0].kind is not ValuePathSegmentKind.VARIABLE
+            or any(
+                segment.kind in {
+                    ValuePathSegmentKind.VARIABLE,
+                    ValuePathSegmentKind.COLUMN,
+                }
+                for segment in segments[1:]
+            )
         ):
             raise CaptureValueCheckError("capture value path is invalid")
+        previous = segments[0]
+        for segment in segments[1:]:
+            # A public row descriptor may expose only named fields.  Column
+            # nodes are metadata leaves and cannot form a target value path.
+            if (
+                previous.kind is ValuePathSegmentKind.ROW
+                and segment.kind is not ValuePathSegmentKind.FIELD
+            ):
+                raise CaptureValueCheckError("capture value path is invalid")
+            previous = segment
+
+    @classmethod
+    def _validate_capture_value_projection_grammar(
+        cls,
+        request: ValueInspectionRequest,
+    ) -> None:
+        """Validate every locally constructible project route before planning.
+
+        ``SafeValuePath`` proves that individual components are expression
+        safe.  It intentionally permits more combinations than public value
+        descriptors can create, so this gate also closes root/view/role/exact
+        combinations for direct controller users.
+        """
+        path = request.path
+        if not isinstance(path, SafeValuePath):
+            raise CaptureValueCheckError("capture value projection path is invalid")
+        if not isinstance(request.view, ValueViewKind) or not isinstance(
+            request.role, VariableRole,
+        ):
+            raise CaptureValueCheckError("capture value projection request is invalid")
+        if type(request.parameter_names) is not tuple:
+            raise CaptureValueCheckError("capture value projection request is invalid")
+        try:
+            parameters = tuple(
+                SafePathSegment(ValuePathSegmentKind.VARIABLE, name).key
+                for name in request.parameter_names
+            )
+        except Exception:
+            raise CaptureValueCheckError("capture value projection request is invalid") from None
+        if len({name.casefold() for name in parameters}) != len(parameters):
+            raise CaptureValueCheckError("capture value parameter names are ambiguous")
+
+        if not path.segments:
+            if request.view is not ValueViewKind.VARIABLES:
+                raise CaptureValueCheckError("capture value root view is invalid")
+            if request.exact is not None:
+                try:
+                    SafePathSegment(ValuePathSegmentKind.VARIABLE, request.exact)
+                except Exception:
+                    raise CaptureValueCheckError(
+                        "capture value root exact selector is invalid"
+                    ) from None
+            if request.role is VariableRole.VARIABLES and parameters:
+                raise CaptureValueCheckError(
+                    "capture value variable role cannot have parameter names"
+                )
+            return
+
+        if (
+            request.view is ValueViewKind.VARIABLES
+            or request.role is not VariableRole.VARIABLES
+            or parameters
+        ):
+            raise CaptureValueCheckError("capture value descendant view is invalid")
+        named_view = request.view in {
+            ValueViewKind.STRUCTURE_FIELDS,
+            ValueViewKind.TABLE_COLUMNS,
+            ValueViewKind.ROW_FIELDS,
+        }
+        indexed_view = request.view in {
+            ValueViewKind.ARRAY_ITEMS,
+            ValueViewKind.TABLE_ROWS,
+        }
+        if not (named_view or indexed_view):
+            raise CaptureValueCheckError("capture value descendant view is invalid")
+        terminal = path.segments[-1]
+        if terminal.kind is ValuePathSegmentKind.ROW:
+            if request.view is not ValueViewKind.ROW_FIELDS:
+                raise CaptureValueCheckError("capture value terminal view is invalid")
+        elif request.view is ValueViewKind.ROW_FIELDS:
+            raise CaptureValueCheckError("capture value terminal view is invalid")
+        if request.exact is None:
+            return
+        try:
+            if named_view:
+                SafePathSegment(ValuePathSegmentKind.FIELD, request.exact)
+            elif type(request.exact) is not int or request.exact < 0:
+                raise ValueError("indexed selector is invalid")
+        except Exception:
+            raise CaptureValueCheckError(
+                "capture value descendant exact selector is invalid"
+            ) from None
 
     def resolve_capture_manager_origin(
         self, root: str, fields: tuple[str, ...], *,

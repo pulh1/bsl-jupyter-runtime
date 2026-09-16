@@ -727,6 +727,7 @@ class RuntimeController(Protocol):
         request: ValueInspectionRequest | None,
         limit: int | None,
         worker_type_registrations: tuple[str, ...],
+        context_generation: int = 1,
         timeout_s: float | None = None,
     ) -> object: ...
 
@@ -1377,6 +1378,7 @@ class PrototypeRuntimeApi:
                             request=request,
                             limit=limit,
                             worker_type_registrations=registrations,
+                            context_generation=self._context_generation,
                             timeout_s=remaining,
                         )
             except (

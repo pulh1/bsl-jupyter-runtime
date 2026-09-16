@@ -376,19 +376,20 @@ def test_runtime_context_projection_is_lazy_and_uses_one_controller_inspection_p
         assert owner.join(2)
 
 
-def test_runtime_context_projection_fails_closed_without_a_qualified_target_plan():
-    """RDBG inventory metadata is never a fallback public value descriptor."""
+def test_runtime_context_projection_uses_the_checked_in_target_plan_without_injection():
+    """The ordinary runtime submits the checked-in plan, never an inventory fallback."""
     from test_capture_control_plane import _capture_runtime, close_owner
 
-    runtime, controller, transport = _capture_runtime()
+    runtime, controller, transport = _capture_runtime(timeout_s=0.02)
     try:
         capture = runtime.current_capture()
-        before = len(transport.calls)
 
-        with pytest.raises(CaptureSourceUnavailableError, match="not qualified"):
+        with pytest.raises(CaptureEvaluationPendingError):
             capture.context.variables[:1]
 
-        assert len(transport.calls) == before
+        starts = [call for call in transport.calls if call[0] == "start_evaluation"]
+        assert len(starts) == 1
+        assert "СпроецироватьЗначенияИнспекции" in starts[0][1][0]
     finally:
         close_owner(controller, transport)
 
@@ -622,10 +623,104 @@ def test_runtime_value_binding_uses_the_checked_in_envelope_without_an_injected_
         assert [item.name for item in page.items] == ["Оклад"]
         assert page.items[0].preview == "55000"
         assert session.projections == session.payload_reads == session.cleanups == 1
-        assert owner.status(owner._fence).last_evaluation_kind.value == "inspection"
+        assert owner.status(owner._fence).can_inspect
     finally:
         owner.begin_close()
         assert owner.join(2)
+
+
+@pytest.mark.parametrize(
+    ("admission", "error_type"),
+    (
+        pytest.param("D|worker_generation_value", CaptureValueAccessDeniedError, id="denied"),
+        pytest.param("E|value_admission_failed", CaptureValueCheckError, id="invalid"),
+    ),
+)
+def test_runtime_value_envelope_cleans_private_context_after_denial_or_invalid_metadata(
+    admission, error_type,
+):
+    """Cleanup is registered before the first helper dispatch in all outcomes."""
+    from onec_runtime.runtime_api import PrototypeRuntimeApi
+    from test_prototype_runtime import CAPTURE_A, ScriptedSession, captured_controller, evaluation
+
+    class RejectedEnvelopeSession(ScriptedSession):
+        def __init__(self) -> None:
+            super().__init__((CAPTURE_A,))
+            self.projections = 0
+            self.payload_reads = 0
+            self.cleanups = 0
+
+        def evaluate(self, expression, **kwargs):  # type: ignore[no-untyped-def]
+            if "СпроецироватьЗначенияИнспекции" in expression:
+                self.projections += 1
+                return evaluation("Строка", f'"{admission}"')
+            if "ЗабратьКомпактнуюМатериализациюИзКонтекста" in expression:
+                self.payload_reads += 1
+                raise AssertionError("a rejected envelope cannot fetch its payload")
+            if "УдалитьМатериализациюИзКонтекста" in expression:
+                self.cleanups += 1
+                return evaluation("Булево", "Истина")
+            return super().evaluate(expression, **kwargs)
+
+    session = RejectedEnvelopeSession()
+    controller = captured_controller(session)
+    runtime = PrototypeRuntimeApi(controller)
+    owner = controller._capture_evaluation_coordinator
+    assert owner is not None
+    try:
+        with pytest.raises(error_type):
+            runtime.current_capture().context.variables[:1]
+
+        assert session.projections == session.cleanups == 1
+        assert session.payload_reads == 0
+    finally:
+        owner.begin_close()
+        assert owner.join(2)
+
+
+def test_runtime_value_envelope_cleans_private_context_after_a_detached_late_result():
+    """An acknowledged waiter may detach; its INSPECTION record still cleans up."""
+    from base64 import b64encode
+    from hashlib import sha256
+    import json
+
+    from onec_runtime.runtime_api import PrototypeRuntimeApi
+    from test_capture_evaluation_lifecycle import ControlledCaptureSession, close_owner, eventually
+    from test_prototype_runtime import captured_controller
+
+    document = {
+        "v": 1,
+        "action": "project",
+        "entries": [],
+        "total": 0,
+        "next": None,
+    }
+    payload = json.dumps(document, separators=(",", ":")).encode("utf-8")
+    encoded = b64encode(payload).decode("ascii")
+    admission = "R|1|1|{}|{}|{}".format(
+        len(payload), sha256(payload).hexdigest(), len(encoded),
+    )
+    transport = ControlledCaptureSession()
+    controller = captured_controller(transport, command_timeout_s=0.02)
+    runtime = PrototypeRuntimeApi(controller)
+    try:
+        capture = runtime.current_capture()
+        with pytest.raises(CaptureEvaluationPendingError):
+            capture.context.variables[:1]
+
+        transport.complete(f'"{admission}"', type_name="Строка")
+        eventually(lambda: sum(
+            call[0] == "start_evaluation" for call in transport.calls
+        ) == 2)
+        transport.complete("Истина", type_name="Булево")
+        eventually(lambda: capture.status().phase.value == "paused")
+
+        steps = [call[1][0] for call in transport.calls if call[0] == "start_evaluation"]
+        assert len(steps) == 2  # creating projection + mandatory cleanup
+        assert not any("ЗабратьКомпактнуюМатериализациюИзКонтекста" in step for step in steps)
+        assert any("УдалитьМатериализациюИзКонтекста" in step for step in steps)
+    finally:
+        close_owner(controller, transport)
 
 
 def test_runtime_value_binding_validates_the_complete_path_and_view_grammar_before_builder():
@@ -636,6 +731,7 @@ def test_runtime_value_binding_validates_the_complete_path_and_view_grammar_befo
         ValueRoot,
         ValueRootKind,
         ValueViewKind,
+        VariableRole,
     )
     from test_prototype_runtime import CAPTURE_A, ScriptedSession, captured_controller
 
@@ -669,6 +765,49 @@ def test_runtime_value_binding_validates_the_complete_path_and_view_grammar_befo
             0,
             1,
         ),
+        ValueInspectionRequest(
+            root.child(ValuePathSegmentKind.VARIABLE, "X"),
+            ValueViewKind.VARIABLES,
+            0,
+            1,
+        ),
+        ValueInspectionRequest(
+            root.child(ValuePathSegmentKind.VARIABLE, "X"),
+            ValueViewKind.ARRAY_ITEMS,
+            0,
+            1,
+            exact="not_an_index",
+        ),
+        ValueInspectionRequest(
+            root.child(ValuePathSegmentKind.VARIABLE, "X"),
+            ValueViewKind.STRUCTURE_FIELDS,
+            0,
+            1,
+            role=VariableRole.PARAMETERS,
+            parameter_names=("Arg",),
+        ),
+        ValueInspectionRequest(
+            root.child(ValuePathSegmentKind.VARIABLE, "X").child(
+                ValuePathSegmentKind.ROW, 0,
+            ).child(ValuePathSegmentKind.INDEX, 0),
+            ValueViewKind.ARRAY_ITEMS,
+            0,
+            1,
+        ),
+        ValueInspectionRequest(
+            root.child(ValuePathSegmentKind.VARIABLE, "X").child(
+                ValuePathSegmentKind.ROW, 0,
+            ),
+            ValueViewKind.TABLE_ROWS,
+            0,
+            1,
+        ),
+        ValueInspectionRequest(
+            root,
+            ValueViewKind.VARIABLES,
+            10_000_001,
+            10_000_002,
+        ),
     )
     session = ScriptedSession((CAPTURE_A,))
     controller = captured_controller(session, capture_value_inspection_builder=build)
@@ -679,6 +818,26 @@ def test_runtime_value_binding_validates_the_complete_path_and_view_grammar_befo
             with pytest.raises(CaptureValueCheckError):
                 controller.capture_value_inspection(
                     "project", path=None, request=request, limit=None,
+                    worker_type_registrations=(),
+                )
+
+        for action, invalid_path, limit in (
+            ("resolve", root, None),
+            ("columns", root, 1),
+            (
+                "resolve",
+                root.child(ValuePathSegmentKind.VARIABLE, "X").child(
+                    ValuePathSegmentKind.COLUMN, "Column",
+                ),
+                None,
+            ),
+        ):
+            with pytest.raises(CaptureValueCheckError):
+                controller.capture_value_inspection(
+                    action,
+                    path=invalid_path,
+                    request=None,
+                    limit=limit,
                     worker_type_registrations=(),
                 )
 
