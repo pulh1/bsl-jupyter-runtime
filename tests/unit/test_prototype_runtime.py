@@ -826,22 +826,6 @@ def test_failed_capture_retains_dirty_root_for_reply_and_resume_writeback() -> N
     assert "e1cib/tempstorage/root" in scalar_writes[0][1]
 
 
-def test_completion_fields_use_bounded_schema_helper_in_capture_kernel_frame() -> None:
-    session = ScriptedSession((), messages=("value",))
-    controller = runtime_module().PrototypeRuntimeController(session, SERVICE)
-    controller.state = runtime_module().OperationState.CAPTURED
-    controller.capture_kernel_stack_level = 2
-
-    controller.inspect_completion_fields(
-        "Контекст.Данные", table_row=True, worker_type_registrations=(),
-    )
-
-    assert ("evaluate_collection", (
-        "RuntimeValueTransferServer.ПолучитьДопущенныеИменаСвойствДляПодсказки(Контекст.Данные, Истина, \"\")",
-        0, 129, 2,
-    )) in session.calls
-
-
 def _completion_lifecycle_snapshot(
     controller, session: ScriptedSession,  # type: ignore[no-untyped-def]
 ) -> tuple[object, ...]:

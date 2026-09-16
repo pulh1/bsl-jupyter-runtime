@@ -1304,6 +1304,11 @@ class CaptureEvaluationCoordinator:
                 failure=self._failure,
             )
 
+    def owns_debug_ui_stream(self) -> bool:
+        """Whether this owner can still issue RDBG evaluation-stream traffic."""
+        with self._condition:
+            return self._active is not None or self._active_resume is not None
+
     def capture_view_is_current(self, fence: CaptureFence) -> bool:
         """Keep the view fence distinct from the controller's active MAIN."""
         with self._condition:

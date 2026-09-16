@@ -589,6 +589,16 @@ class PrototypeRuntimeController:
         """Expose only the bounded-close owner, never a public capture view."""
         return self._ready_inspection_evaluation_coordinator
 
+    def owns_debug_ui_stream(self) -> bool:
+        """Report a live controller-owned evaluation without consuming its stream."""
+        return any(
+            owner is not None and owner.owns_debug_ui_stream()
+            for owner in (
+                self._capture_evaluation_coordinator,
+                self._ready_inspection_evaluation_coordinator,
+            )
+        )
+
     def _ready_inspection_evaluation_owner(self) -> CaptureEvaluationCoordinator:
         owner = self._ready_inspection_evaluation_coordinator
         if owner is not None:
@@ -4170,44 +4180,3 @@ class PrototypeRuntimeController:
             timeout_s=self.command_timeout_s,
             stack_level=0,
         ))
-
-    def inspect_completion_fields(
-        self,
-        handle: str,
-        *,
-        table_row: bool,
-        worker_type_registrations: tuple[str, ...],
-    ) -> EvaluationResult:
-        """Admit and inspect bounded field names in one target operation."""
-        if (not isinstance(handle, str) or len(handle) > 512
-                or not re.fullmatch(r"Контекст\.[^\W\d]\w*(?:\.[^\W\d]\w*){0,7}", handle)
-                or type(table_row) is not bool):
-            raise ProtocolError("Completion requires a direct or dotted Context path")
-        if (
-            type(worker_type_registrations) is not tuple
-            or any(
-                not isinstance(registration, str)
-                or not registration
-                or "\n" in registration
-                or "\r" in registration
-                for registration in worker_type_registrations
-            )
-        ):
-            raise ProtocolError("Completion Worker type registrations are invalid")
-        stack_level = (
-            self._required_capture_kernel_stack_level()
-            if self.state is OperationState.CAPTURED else 0
-        )
-        result = self.session.evaluate_collection(
-            "RuntimeValueTransferServer.ПолучитьДопущенныеИменаСвойствДляПодсказки("
-            + handle
-            + (", Истина, " if table_row else ", Ложь, ")
-            + bsl_string_literal("\n".join(worker_type_registrations))
-            + ")",
-            # One admission-marker row plus the helper's bounded 128 names.
-            start_index=0, page_size=129, max_text_size=512,
-            timeout_s=self.command_timeout_s, stack_level=stack_level,
-        )
-        if result.error_occurred:
-            raise BslExecutionError(result.error_text)
-        return result

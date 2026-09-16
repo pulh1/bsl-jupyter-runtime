@@ -644,12 +644,17 @@ class RuntimeSession:
 
     def _heartbeat_loop(self) -> None:
         while not self._heartbeat_stop.wait(self._heartbeat_interval_s):
-            if not self._operation_lock.acquire(blocking=False):
-                continue
-            lost_debug_ui = False
-            lost_owned_process = False
-            try:
-                if not self._closed:
+            self._heartbeat_tick()
+
+    def _heartbeat_tick(self) -> None:
+        """Run one best-effort keepalive without entering an owned RDBG stream."""
+        if not self._operation_lock.acquire(blocking=False):
+            return
+        lost_debug_ui = False
+        lost_owned_process = False
+        try:
+            if not self._closed:
+                if not self.runtime_api.owns_debug_ui_stream():
                     try:
                         self._rdbg.heartbeat()
                     except RdbgDebugUiNotRegistered:
@@ -659,30 +664,29 @@ class RuntimeSession:
                         # disable later keepalives. The next notebook command
                         # remains the authoritative place to surface it.
                         pass
-                    ensure_running = getattr(self._processes, "ensure_running", None)
-                    if callable(ensure_running):
-                        try:
-                            ensure_running()
-                        except TargetLost:
-                            lost_owned_process = True
-                        except Exception:
-                            # Process inspection can fail transiently too.
-                            pass
-            finally:
-                self._operation_lock.release()
-            if lost_debug_ui or lost_owned_process:
-                try:
-                    self.close()
-                except BaseException:
-                    # The owner retains incomplete cleanup for an explicit retry.
-                    warnings.warn(
-                        "1C runtime lost its debug UI or owned process; "
-                        "cleanup is incomplete; "
-                        "retry runtime.close()",
-                        RuntimeWarning,
-                        stacklevel=2,
-                    )
-                return
+                ensure_running = getattr(self._processes, "ensure_running", None)
+                if callable(ensure_running):
+                    try:
+                        ensure_running()
+                    except TargetLost:
+                        lost_owned_process = True
+                    except Exception:
+                        # Process inspection can fail transiently too.
+                        pass
+        finally:
+            self._operation_lock.release()
+        if lost_debug_ui or lost_owned_process:
+            try:
+                self.close()
+            except BaseException:
+                # The owner retains incomplete cleanup for an explicit retry.
+                warnings.warn(
+                    "1C runtime lost its debug UI or owned process; "
+                    "cleanup is incomplete; "
+                    "retry runtime.close()",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
     @classmethod
     def start(

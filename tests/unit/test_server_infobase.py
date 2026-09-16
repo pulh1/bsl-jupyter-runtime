@@ -166,7 +166,10 @@ def test_server_session_cleanup_detaches_shared_debugger_after_closing_owned_cli
         SimpleNamespace(close=lambda: events.append("transport-close")),
         SimpleNamespace(detach=lambda: events.append("debugger-detach"),
                         terminate_bound_server_session=lambda: events.append("server-terminate")),
-        SimpleNamespace(close=lambda: events.append("api-close")),
+        SimpleNamespace(
+            close=lambda: events.append("api-close"),
+            owns_debug_ui_stream=lambda: False,
+        ),
         ArtifactWriter(tmp_path / "evidence", "test"),
         heartbeat_interval_s=3600,
     )
@@ -192,7 +195,10 @@ def test_kernel_shutdown_terminates_server_before_worker_cleanup(tmp_path: Path)
             terminate_bound_server_session=lambda: events.append("server-terminate") or True,
             detach=lambda: events.append("debugger-detach"),
         ),
-        SimpleNamespace(close=lambda: events.append("api-close")),
+        SimpleNamespace(
+            close=lambda: events.append("api-close"),
+            owns_debug_ui_stream=lambda: False,
+        ),
         ArtifactWriter(tmp_path / "evidence", "test"),
         heartbeat_interval_s=3600,
     )
@@ -219,7 +225,10 @@ def test_kernel_shutdown_retries_native_termination_before_closing_client(tmp_pa
         SimpleNamespace(close=lambda: events.append("transport-close")),
         SimpleNamespace(terminate_bound_server_session=terminate,
                         detach=lambda: events.append("debugger-detach")),
-        SimpleNamespace(close=lambda: events.append("api-close")),
+        SimpleNamespace(
+            close=lambda: events.append("api-close"),
+            owns_debug_ui_stream=lambda: False,
+        ),
         ArtifactWriter(tmp_path / "evidence", "test"),
         heartbeat_interval_s=3600,
     )
@@ -263,7 +272,10 @@ def test_server_session_cleanup_retries_failed_debug_ui_deregistration(
         processes,
         SimpleNamespace(close=lambda: events.append("transport-close")),
         rdbg,
-        SimpleNamespace(close=lambda: events.append("api-close")),
+        SimpleNamespace(
+            close=lambda: events.append("api-close"),
+            owns_debug_ui_stream=lambda: False,
+        ),
         ArtifactWriter(tmp_path / "evidence", "test"),
         heartbeat_interval_s=3600,
     )
@@ -355,7 +367,10 @@ def test_heartbeat_lost_debug_ui_releases_owned_runtime(tmp_path: Path) -> None:
             terminate_bound_server_session=terminate,
             detach=lambda: events.append("detach"),
         ),
-        SimpleNamespace(close=lambda: events.append("api-close")),
+        SimpleNamespace(
+            close=lambda: events.append("api-close"),
+            owns_debug_ui_stream=lambda: False,
+        ),
         ArtifactWriter(tmp_path / "evidence", "test"),
         heartbeat_interval_s=0.01,
     )
@@ -390,7 +405,10 @@ def test_heartbeat_closes_when_owned_client_has_exited(tmp_path: Path) -> None:
             terminate_bound_server_session=lambda: events.append("native-terminate") or False,
             detach=lambda: events.append("detach"),
         ),
-        SimpleNamespace(close=lambda: events.append("api-close")),
+        SimpleNamespace(
+            close=lambda: events.append("api-close"),
+            owns_debug_ui_stream=lambda: False,
+        ),
         ArtifactWriter(tmp_path / "evidence", "test"),
         heartbeat_interval_s=0.01,
     )

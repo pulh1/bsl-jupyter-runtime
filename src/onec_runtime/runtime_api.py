@@ -655,6 +655,8 @@ class RuntimeController(Protocol):
 
     def execute_system_inspection(self, expression: str) -> object: ...
 
+    def owns_debug_ui_stream(self) -> bool: ...
+
     def ready_inspection_evaluation_owner(
         self,
     ) -> CaptureEvaluationCoordinator | None: ...
@@ -1553,6 +1555,10 @@ class PrototypeRuntimeApi:
     def _ready_inspection_control_owner(self) -> CaptureEvaluationCoordinator | None:
         owner = self._controller.ready_inspection_evaluation_owner()
         return owner if isinstance(owner, CaptureEvaluationCoordinator) else None
+
+    def owns_debug_ui_stream(self) -> bool:
+        """Expose controller stream ownership to RuntimeSession's heartbeat."""
+        return self._controller.owns_debug_ui_stream()
 
     def _require_capture_data_plane_admission(self) -> None:
         owner = self._capture_control_owner()

@@ -123,6 +123,7 @@ _LOCAL_READ_ONLY_ROUTES = frozenset(
         "last_worker_breakpoint_reload_report",
         "list_worker_breakpoints",
         "namespace_snapshot",
+        "owns_debug_ui_stream",
         "prepared_capture_hypothesis_provenance",
         "prepared_main_execution_provenance",
         "prepared_main_worker_generation",

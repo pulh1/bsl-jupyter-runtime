@@ -17,6 +17,7 @@ from onec_runtime.errors import (
     CaptureValueAccessDeniedError,
     CaptureValueCheckError,
     ProtocolError,
+    TargetLost,
 )
 from onec_runtime.prototype_runtime import OperationState
 from onec_runtime.runtime_api import PrototypeRuntimeApi
@@ -473,8 +474,12 @@ def test_completion_handoff_defers_heartbeat_while_controller_owns_debug_stream(
         runtime._closed = False
 
     heartbeats: list[str] = []
-    runtime._rdbg = SimpleNamespace(heartbeat=lambda: heartbeats.append("called"))
-    runtime._processes = SimpleNamespace()
+    process_checks: list[str] = []
+    session.heartbeat = lambda: heartbeats.append("called")  # type: ignore[attr-defined]
+    runtime._rdbg = session
+    runtime._processes = SimpleNamespace(
+        ensure_running=lambda: process_checks.append("called")
+    )
     fields: list[tuple[str, ...]] = []
     errors: list[BaseException] = []
 
@@ -495,6 +500,7 @@ def test_completion_handoff_defers_heartbeat_while_controller_owns_debug_stream(
         runtime._heartbeat_tick()
 
         assert heartbeats == []
+        assert process_checks == ["called"]
         session.complete(_completion_wire(), type_name="Строка")
         caller.join(1)
         assert not caller.is_alive()
@@ -504,6 +510,55 @@ def test_completion_handoff_defers_heartbeat_while_controller_owns_debug_stream(
         if session.capture_pending is not None:
             session.complete(_completion_wire(), type_name="Строка")
         caller.join(1)
+        close_owner(controller, session)
+
+
+def test_heartbeat_defers_debug_stream_for_a_detached_controller_owned_resume() -> None:
+    """A pending resume has the same exclusive RDBG-stream ownership as evaluation."""
+    class PendingResumeSession(ControlledCaptureSession):
+        def __init__(self) -> None:
+            super().__init__(auto_helpers=True)
+            self.initial_capture = True
+            self.resume_waiting = Event()
+            self.release_resume = Event()
+
+        def wait_for_any_stop(self, *, timeout_s: float):
+            if self.initial_capture:
+                self.initial_capture = False
+                return super().wait_for_any_stop(timeout_s=timeout_s)
+            self.resume_waiting.set()
+            assert self.release_resume.wait(timeout_s)
+            raise TargetLost("synthetic resume completion")
+
+    session = PendingResumeSession()
+    runtime, _api, controller = _captured_completion_runtime(session)
+    heartbeats: list[str] = []
+    process_checks: list[str] = []
+    session.heartbeat = lambda: heartbeats.append("called")  # type: ignore[attr-defined]
+    runtime._rdbg = session
+    runtime._processes = SimpleNamespace(
+        ensure_running=lambda: process_checks.append("called")
+    )
+    owner = controller._capture_evaluation_owner()
+    try:
+        ticket = controller.submit_resume()
+        assert session.resume_waiting.wait(1), "resume owner did not enter stop wait"
+        ticket.detach_initiator()
+        assert ticket.initiator_detached
+        assert owner.owns_debug_ui_stream()
+
+        runtime._heartbeat_tick()
+
+        assert heartbeats == []
+        assert process_checks == ["called"]
+        assert owner.owns_debug_ui_stream()
+        session.release_resume.set()
+        deadline = monotonic() + 1.0
+        while owner.owns_debug_ui_stream() and monotonic() < deadline:
+            sleep(0.005)
+        assert not owner.owns_debug_ui_stream()
+    finally:
+        session.release_resume.set()
         close_owner(controller, session)
 
 

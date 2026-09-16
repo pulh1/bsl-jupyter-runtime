@@ -442,3 +442,61 @@ correction. The checked-in Designer-built bundle remains the matching
 protocol-`2` / artifact-`0.1.3` bundle with the existing four-source
 fingerprint; this is a core Python lifecycle change, not live 1C
 qualification.
+
+## Final Debug UI stream ownership correction
+
+`RuntimeSession` deliberately releases its operation lock only after a
+coordinator ticket has been adopted, so status and other control-plane callers
+remain reachable while the initiating waiter blocks. That release previously
+allowed the periodic heartbeat to enter `RdbgSession.heartbeat()` and issue
+`pingDebugUIParams` concurrently with the coordinator worker's RDBG polling.
+
+`CaptureEvaluationCoordinator.owns_debug_ui_stream()` now reads its condition-
+protected active evaluation/resume record. `PrototypeRuntimeController`
+combines the CAPTURE and private ready-inspection owners, and
+`PrototypeRuntimeApi` exposes the resulting read-only signal to
+`RuntimeSession._heartbeat_tick()`. The tick keeps its nonblocking operation-
+lock discipline but skips `RdbgSession.heartbeat()` whenever either controller
+owner has a live record. It still calls `FileModeProcesses.ensure_running()`:
+process liveness does not consume the Debug UI event stream and must remain
+observable during a long pending evaluation.
+
+The deterministic Session regressions create acknowledged, withheld completion
+requests through the real CAPTURE and ready-inspection paths. They prove that
+the operation lock is available after handoff, the coordinator is polling, an
+explicit heartbeat tick emits no RDBG heartbeat, and the process monitor still
+runs. A third regression drives a real controller-owned resume ticket to a
+detached pending `_active_resume`; stream ownership remains true before and
+after the heartbeat tick, then clears only once that resume terminates.
+
+The obsolete `PrototypeRuntimeController.inspect_completion_fields()` direct
+`session.evaluate_collection()` entrypoint has been removed. Completion remains
+the RuntimeApi-generated bounded scalar `INSPECTION` request, and the direct-
+session inventory now permits no CAPTURE completion collection bypass. The
+public RuntimeApi route inventory classifies the new ownership signal as local
+read-only. Test runtime-api doubles explicitly implement that signal; no
+production fallback or compatibility shim was added.
+
+RED `51c6097` contains the handoff and no-direct-entrypoint regressions.
+GREEN is the following commit on `fix/capture-final-ownership`. The worktree is
+`C:\repo\bsl-jupyter-runtime\.worktrees\capture-final-ownership`, created from
+combined head `d17a742` and isolated from the reviewer worktree.
+
+Validation:
+
+- exact RED before implementation: `3 failed` (missing heartbeat tick and the
+  direct completion entrypoint);
+- heartbeat/process/captured/ready/resume plus server-heartbeat suite:
+  `44 passed`;
+- expanded coordinator, lifecycle, control-plane, completion, prototype,
+  RuntimeApi, extension-session, heartbeat and server suite: `663 passed, 1
+  skipped`;
+- `uv run python -m pytest tests/unit -q`: `4664 passed, 58 skipped` in
+  251.57 seconds, with only the existing Windows ZMQ Proactor warning;
+- `uv run python -m compileall -q src/onec_runtime packages/jupyter/src
+  packages/mcp/src` and `git diff --check` pass.
+
+Only Python runtime/tests changed. No BSL source, extension CFE, manifest,
+protocol, artifact version, or four-source fingerprint input changed; no
+Designer rebuild was required and none was represented as live 1C
+qualification.

@@ -314,6 +314,9 @@ class _SessionModuleRuntimeApi:
     def release_worker_generation(self, handle: object) -> None:
         self.released.append(handle)
 
+    def owns_debug_ui_stream(self) -> bool:
+        return False
+
 
 class _IdleRdbg:
     def heartbeat(self) -> dict[str, object]:

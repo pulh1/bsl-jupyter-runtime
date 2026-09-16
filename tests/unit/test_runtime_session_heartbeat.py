@@ -38,6 +38,9 @@ class ModuleApi:
         assert handle is self.handle and self.active_units
         return tuple(self.active_units[name] for name in sorted(self.active_units))
 
+    def owns_debug_ui_stream(self) -> bool:
+        return False
+
 
 def runtime_session(tmp_path: Path, http, *, breakpoints=()):
     transport = RdbgTransport(

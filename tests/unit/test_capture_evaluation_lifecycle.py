@@ -1789,15 +1789,14 @@ def test_controller_has_no_legacy_capture_evaluation_or_resume_entrypoints() -> 
     from onec_runtime.runtime_api import PrototypeRuntimeApi
 
     # Initial CAPTURE transition, MAIN completion/message collection and the
-    # explicitly non-CAPTURE branches remain synchronous. Task 8 owns removal
-    # of inspect_completion_fields and adds execute_system_inspection.
+    # explicitly non-CAPTURE branches remain synchronous. Completion reaches
+    # CAPTURE through RuntimeApi's coordinator-owned INSPECTION request.
     assert _direct_session_evaluation_methods() == {
         "_begin_capture",
         "_complete_main",
         "_take_context_cell_messages",
         "take_context_string",
         "drop_context_value",
-        "inspect_completion_fields",
     }
     assert "resume" not in PrototypeRuntimeController.__dict__
     assert "inspect_table_sample" not in PrototypeRuntimeController.__dict__
