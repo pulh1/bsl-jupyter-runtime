@@ -70,6 +70,27 @@ def test_live_capture_contract_enumerates_every_advertised_v1_shape() -> None:
     }
 
 
+def test_mutable_and_fixed_shapes_require_exact_scalar_children() -> None:
+    by_name = {item.name: item for item in live.ADVERTISED_SHAPES}
+
+    assert by_name["QualificationStructure"].children == (
+        ("Code", "Число", "7"),
+        ("Name", "Строка", "row"),
+    )
+    assert by_name["QualificationFixedStructure"].children == (
+        ("Code", "Число", "7"),
+        ("Name", "Строка", "row"),
+    )
+    assert by_name["QualificationArray"].children == (
+        (0, "Число", "7"),
+        (1, "Строка", "row"),
+    )
+    assert by_name["QualificationFixedArray"].children == (
+        (0, "Число", "7"),
+        (1, "Строка", "row"),
+    )
+
+
 def test_live_shape_setup_is_valid_capture_code_for_every_named_root() -> None:
     parser = PythonParserTarget.from_generated()
     lowered = SemanticNotebookLowerer(parser).lower(

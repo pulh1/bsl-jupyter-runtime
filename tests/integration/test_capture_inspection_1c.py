@@ -24,26 +24,37 @@ class LiveShapeExpectation:
     type_name: str
     shape: ValueShape
     alias: str
+    children: tuple[tuple[str | int, str, str], ...] = ()
 
 
 ADVERTISED_SHAPES = (
     LiveShapeExpectation(
-        "QualificationStructure", "Структура", ValueShape.STRUCTURE, "fields"
+        "QualificationStructure",
+        "Структура",
+        ValueShape.STRUCTURE,
+        "fields",
+        (("Code", "Число", "7"), ("Name", "Строка", "row")),
     ),
     LiveShapeExpectation(
         "QualificationFixedStructure",
         "ФиксированнаяСтруктура",
         ValueShape.FIXED_STRUCTURE,
         "fields",
+        (("Code", "Число", "7"), ("Name", "Строка", "row")),
     ),
     LiveShapeExpectation(
-        "QualificationArray", "Массив", ValueShape.ARRAY, "items"
+        "QualificationArray",
+        "Массив",
+        ValueShape.ARRAY,
+        "items",
+        ((0, "Число", "7"), (1, "Строка", "row")),
     ),
     LiveShapeExpectation(
         "QualificationFixedArray",
         "ФиксированныйМассив",
         ValueShape.FIXED_ARRAY,
         "items",
+        ((0, "Число", "7"), (1, "Строка", "row")),
     ),
     LiveShapeExpectation(
         "QualificationTable",
@@ -113,10 +124,26 @@ def test_typed_capture_inspection_live(tmp_path: Path) -> None:
             assert node.expandable is True
             children = node.children[:2]
             aliased = getattr(node, expected.alias)[:2]
-            assert tuple(item.name for item in children.items) == tuple(
-                item.name for item in aliased.items
-            )
-            assert len(children.items) <= 2
+            if expected.children:
+                assert children.total == len(expected.children)
+                assert children.next_cursor is None
+                assert aliased.total == len(expected.children)
+                assert aliased.next_cursor is None
+                assert all(isinstance(item, ValueNode) for item in children.items)
+                assert all(isinstance(item, ValueNode) for item in aliased.items)
+                assert tuple(
+                    (item.name, item.type_name, item.preview)
+                    for item in children.items
+                ) == expected.children
+                assert tuple(
+                    (item.name, item.type_name, item.preview)
+                    for item in aliased.items
+                ) == expected.children
+            else:
+                assert tuple(item.name for item in children.items) == tuple(
+                    item.name for item in aliased.items
+                )
+                assert len(children.items) <= 2
 
         table = capture.context.variables["QualificationTable"]
         columns = table.columns[:2]
