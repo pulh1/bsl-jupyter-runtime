@@ -1994,7 +1994,13 @@ def test_stale_phase_two_validation_before_controller_call_quarantines_generatio
                 True,
             )
 
-        def execute_system_capture(self, source: str) -> CaptureCellResult:
+        def execute_system_capture(
+            self,
+            source: str,
+            *,
+            evaluation_kind: object,
+        ) -> CaptureCellResult:
+            del evaluation_kind
             return CaptureCellResult(
                 self.operation_id,
                 source,

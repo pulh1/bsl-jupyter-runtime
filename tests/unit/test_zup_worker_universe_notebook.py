@@ -1838,7 +1838,13 @@ def test_incremental_object_probe_uses_trusted_capture_execution_boundary() -> N
     calls: list[str] = []
 
     class Controller:
-        def execute_system_capture(self, source: str) -> CaptureCellResult:
+        def execute_system_capture(
+            self,
+            source: str,
+            *,
+            evaluation_kind: object,
+        ) -> CaptureCellResult:
+            del evaluation_kind
             calls.append(source)
             return CaptureCellResult(1, source, source, observation)
 

@@ -1190,7 +1190,10 @@ def inspect_temporary_table(controller):  # type: ignore[no-untyped-def]
     ("invoke", "expected_kind", "late_type", "late_value", "changes_workspace"),
     [
         (
-            lambda controller: controller.execute_system_capture("Результат = 1;"),
+            lambda controller: controller.execute_system_capture(
+                "Результат = 1;",
+                evaluation_kind=CaptureEvaluationKind.MATERIALIZATION_HELPER,
+            ),
             CaptureEvaluationKind.MATERIALIZATION_HELPER,
             "Число",
             "1",

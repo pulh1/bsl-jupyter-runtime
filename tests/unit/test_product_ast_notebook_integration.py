@@ -182,7 +182,13 @@ class FakeController:
             True,
         )
 
-    def execute_system_capture(self, source: str) -> CaptureCellResult:
+    def execute_system_capture(
+        self,
+        source: str,
+        *,
+        evaluation_kind: object,
+    ) -> CaptureCellResult:
+        del evaluation_kind
         self.capture_sources.append(source)
         return CaptureCellResult(self.operation_id, source, source, self.worker_results.popleft())
 

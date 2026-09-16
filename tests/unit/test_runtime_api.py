@@ -957,9 +957,13 @@ def test_mixed_capture_activation_fails_closed_when_capture_fence_changes(
     system_calls = 0
     original = controller.execute_system_capture
 
-    def drift_after_activation(source: str) -> CaptureCellResult:
+    def drift_after_activation(
+        source: str,
+        *,
+        evaluation_kind: object,
+    ) -> CaptureCellResult:
         nonlocal system_calls
-        result = original(source)
+        result = original(source, evaluation_kind=evaluation_kind)
         system_calls += 1
         if system_calls == 1:
             setattr(controller, fence_field, getattr(controller, fence_field) + 1)
@@ -1635,7 +1639,13 @@ class FakeController:
             result = self.worker_results.popleft()
         return MainCompletion(operation, result, "", True)
 
-    def execute_system_capture(self, source: str) -> CaptureCellResult:
+    def execute_system_capture(
+        self,
+        source: str,
+        *,
+        evaluation_kind: object,
+    ) -> CaptureCellResult:
+        del evaluation_kind
         self.capture_sources.append(source)
         result = self._worker_universe_result(source)
         if result is _NO_UNIVERSE_RESULT:
@@ -4135,9 +4145,14 @@ class _DeadlineAwarePreviewController(FakeController):
         self.command_timeout_s = 30.0
         self.preview_command_timeouts: list[float] = []
 
-    def execute_system_capture(self, source: str) -> CaptureCellResult:
+    def execute_system_capture(
+        self,
+        source: str,
+        *,
+        evaluation_kind: object,
+    ) -> CaptureCellResult:
         self.preview_command_timeouts.append(self.command_timeout_s)
-        return super().execute_system_capture(source)
+        return super().execute_system_capture(source, evaluation_kind=evaluation_kind)
 
     def inspect_declared_table_schema(self, handle: str) -> EvaluationResult:
         self.preview_command_timeouts.append(self.command_timeout_s)

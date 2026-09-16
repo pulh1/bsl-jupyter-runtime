@@ -19,6 +19,7 @@ import pytest
 import nbformat
 
 from onec_runtime.artifacts import ArtifactWriter
+from onec_runtime.capture_evaluation import CaptureEvaluationKind
 from onec_runtime_mcp.agent.capture_contracts import (
     CaptureFence,
     CapturePointRequest,
@@ -1697,8 +1698,19 @@ def test_unselected_preview_uses_one_native_selection_and_one_transfer_through_f
     # The controller owns both metadata and selected handles and rejects the
     # metadata handle from materialization, so this cannot pass via a fake-only
     # full-table resolver.
-    payload = json.dumps(
-        {"version": 1, "root": {"t": "null"}}, separators=(",", ":")
+    payload = (
+        json.dumps(
+            {
+                "version": 1,
+                "columns": ["Сумма"],
+                "kinds": ["integer"],
+                "reference_modes": {},
+            },
+            separators=(",", ":"),
+        )
+        + "\n"
+        + json.dumps([3], separators=(",", ":"))
+        + "\n"
     ).encode("utf-8")
     encoded = b64encode(payload).decode("ascii")
     metadata = (
@@ -1711,8 +1723,11 @@ def test_unselected_preview_uses_one_native_selection_and_one_transfer_through_f
                 (CAPTURE_A, SERVICE),
                 capture_evaluations=(
                     evaluation("Число", "3"),
-                    evaluation("Строка", '"value"'),
+                    evaluation("Строка", '"table"'),
                     evaluation("Строка", '"' + metadata + '"'),
+                    # The coordinator now owns the context payload read as the
+                    # final step of the one materialization request.
+                    evaluation("Строка", '"' + encoded + '"'),
                 ),
                 compact_payload=encoded,
             )
@@ -1890,7 +1905,7 @@ def test_unselected_preview_uses_one_native_selection_and_one_transfer_through_f
         transfers = [
             value
             for name, value in rdbg.calls
-            if name == "evaluate" and "СериализоватьЗначение" in str(value)
+            if name == "evaluate" and "СериализоватьКомпактнуюТаблицу" in str(value)
         ]
         assert len(native_selections) == 1
         assert len(transfers) == 1
@@ -1986,7 +2001,10 @@ def test_system_capture_sends_verbatim_bsl_without_notebook_lowering() -> None:
     context_names_before = controller.lowerer.context_names
     source = "Результат = Контекст.RuntimeWorker.Версия();"
 
-    cell = controller.execute_system_capture(source)
+    cell = controller.execute_system_capture(
+        source,
+        evaluation_kind=CaptureEvaluationKind.MATERIALIZATION_HELPER,
+    )
 
     capture_call = next(
         value
@@ -2009,7 +2027,10 @@ def test_system_capture_is_rejected_without_active_capture() -> None:
     controller = runtime.PrototypeRuntimeController(session, SERVICE)
 
     with pytest.raises(ProtocolError, match="idle"):
-        controller.execute_system_capture("Результат = 1;")
+        controller.execute_system_capture(
+            "Результат = 1;",
+            evaluation_kind=CaptureEvaluationKind.MATERIALIZATION_HELPER,
+        )
 
 
 def test_rejected_notebook_main_does_not_mutate_later_capture_lowering() -> None:

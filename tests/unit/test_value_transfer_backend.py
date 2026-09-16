@@ -24,7 +24,10 @@ KEY = VALUE_CONTEXT_KEY_PREFIX + "0123456789abcdef0123456789abcdef"
 
 
 def test_capture_transfer_registers_key_before_dispatch_and_owns_cleanup():
-    from onec_runtime.capture_evaluation import CaptureEvaluationCoordinator
+    from onec_runtime.capture_evaluation import (
+        CaptureEvaluationCoordinator,
+        CaptureEvaluationKind,
+    )
     from test_capture_evaluation_coordinator import Driver, FENCE
 
     payload = _payload()
@@ -32,7 +35,8 @@ def test_capture_transfer_registers_key_before_dispatch_and_owns_cleanup():
     drivers = [Driver(), Driver(), Driver()]
     coordinator = CaptureEvaluationCoordinator(FENCE, poll_interval_s=0.01)
     caller_cleanups = []
-    def execute_plan(plan):
+    def execute_plan(plan, evaluation_kind):
+        assert evaluation_kind is CaptureEvaluationKind.MATERIALIZATION_HELPER
         assert plan.private_key == KEY
         def step(source):
             from onec_runtime.capture_evaluation import CaptureRemoteStep
@@ -44,7 +48,12 @@ def test_capture_transfer_registers_key_before_dispatch_and_owns_cleanup():
             from onec_runtime.capture_evaluation import CaptureRemoteStep
             assert key == KEY and maximum == 5464
             return context.execute_inline(CaptureRemoteStep(drivers[1].dispatch, drivers[1].poll)).presentation
-        request = plan.capture_request(FENCE, step_factory=step, read=read)
+        request = plan.capture_request(
+            FENCE,
+            step_factory=step,
+            read=read,
+            evaluation_kind=CaptureEvaluationKind.MATERIALIZATION_HELPER,
+        )
         assert request.cleanup_leases[0].private_key == KEY
         ticket = coordinator.submit_evaluation(request)
         for driver, value in zip(drivers, [f"R|3|5|{len(payload)}|{sha256(payload).hexdigest()}|{len(encoded)}", encoded, ""]):

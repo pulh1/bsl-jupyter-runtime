@@ -31,7 +31,10 @@ def test_capture_compact_plan_exists_before_creation_and_caller_does_not_clean()
     seen = []
     expected = payload()
     encoded = b64encode(expected).decode("ascii")
-    def execute_plan(plan):
+    def execute_plan(plan, evaluation_kind):
+        from onec_runtime.capture_evaluation import CaptureEvaluationKind
+
+        assert evaluation_kind is CaptureEvaluationKind.MATERIALIZATION_HELPER
         seen.append(plan)
         assert plan.private_key == KEY
         assert KEY in plan.cleanup_instruction
