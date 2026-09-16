@@ -1265,6 +1265,22 @@ class PrototypeRuntimeApi:
         return callable(classifier) and classifier(frame.location) is True
 
     def _require_capture_stack_fence(self, fence: CaptureFence) -> None:
+        self._require_capture_fence_identity(fence)
+        owner = self._capture_control_owner()
+        assert owner is not None
+        status = owner.status(fence)
+        if not status.can_inspect:
+            self._require_capture_data_plane_admission()
+            raise StaleCaptureError("CAPTURE inspection is unavailable")
+
+    def _require_capture_fence_identity(self, fence: CaptureFence) -> None:
+        """Validate identity without treating an active helper as stale.
+
+        An initiating helper waiter may time out after RDBG acknowledgement.
+        In that case ``CaptureEvaluationPendingError`` is still the useful
+        result while the coordinator status is evaluating, provided this is
+        still the saved operation/generation/stop fence.
+        """
         owner = self._capture_control_owner()
         if (
             owner is None
@@ -1274,10 +1290,6 @@ class PrototypeRuntimeApi:
             or getattr(self._controller, "stop_sequence", None) != fence.stop_sequence
         ):
             raise StaleCaptureError()
-        status = owner.status(fence)
-        if not status.can_inspect:
-            self._require_capture_data_plane_admission()
-            raise StaleCaptureError("CAPTURE inspection is unavailable")
 
     def _validate_capture_value_inspection(self, fence: object) -> None:
         """Check lifecycle before local path validation or target admission."""
@@ -1348,6 +1360,7 @@ class PrototypeRuntimeApi:
                 raise CaptureSourceUnavailableError(
                     "capture value target projection is not attached"
                 )
+            expected_error: BaseException | None = None
             failed = False
             try:
                 registrations = self._worker_type_registrations()
@@ -1375,14 +1388,23 @@ class PrototypeRuntimeApi:
                 CaptureValueAccessDeniedError,
                 CaptureValueCheckError,
                 StaleCaptureError,
-            ):
-                raise
+            ) as error:
+                expected_error = error
             except Exception:
                 failed = True
                 result = None
             # A lifecycle transition races ahead of a private denial or
             # malformed target reply.  Recheck it before assigning any public
             # value error so stale/busy semantics always win.
+            self._require_capture_fence_identity(fence)
+            if expected_error is not None:
+                # The coordinator remains actively evaluating after an
+                # acknowledged initiating timeout.  Preserve its typed pending
+                # guidance while still rejecting an old fence above.
+                if isinstance(expected_error, CaptureEvaluationPendingError):
+                    raise expected_error
+                self._require_capture_stack_fence(fence)
+                raise expected_error
             self._require_capture_stack_fence(fence)
             if failed:
                 raise CaptureValueCheckError(

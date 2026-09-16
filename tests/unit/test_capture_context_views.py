@@ -9,6 +9,7 @@ from onec_runtime.errors import (
     CaptureLookupError,
     CapturePathError,
     CaptureSourceUnavailableError,
+    CaptureValueAccessDeniedError,
     CaptureValueCheckError,
     StaleCaptureError,
 )
@@ -452,6 +453,39 @@ def test_runtime_value_binding_rechecks_the_fence_after_private_target_result():
             capture.context.variables[:1]
 
         assert metadata_calls == []
+    finally:
+        owner.begin_close()
+        assert owner.join(2)
+
+
+def test_runtime_value_binding_prioritizes_stale_over_private_target_error():
+    from onec_runtime.prototype_runtime import CaptureValueInspectionPlan
+    from onec_runtime.runtime_api import PrototypeRuntimeApi
+    from test_prototype_runtime import CAPTURE_A, ScriptedSession, captured_controller
+
+    controller_ref = []
+
+    def build(**_kwargs):
+        def decode(_result):
+            controller_ref[0].stop_sequence += 1
+            raise CaptureValueAccessDeniedError("capture value is private")
+
+        return CaptureValueInspectionPlan(
+            'RuntimeKernelServer.ВыполнитьКодВКонтекстеОтладки(Контекст, "")',
+            decode,
+        )
+
+    session = ScriptedSession((CAPTURE_A,))
+    controller = captured_controller(
+        session, capture_value_inspection_builder=build,
+    )
+    controller_ref.append(controller)
+    runtime = PrototypeRuntimeApi(controller)
+    owner = controller._capture_evaluation_coordinator
+    assert owner is not None
+    try:
+        with pytest.raises(StaleCaptureError):
+            runtime.current_capture().context.variables[:1]
     finally:
         owner.begin_close()
         assert owner.join(2)
