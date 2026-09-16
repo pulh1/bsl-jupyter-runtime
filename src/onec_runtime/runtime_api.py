@@ -54,6 +54,7 @@ from onec_runtime.capture_source import SourceVersionRef
 from onec_runtime.bsl import (
     DiagnosticStage,
     LoweringMode,
+    MappingConfidence,
     NormalizedDiagnostic,
     ParsedModuleModel,
     ResolvedModulePlan,
@@ -72,7 +73,9 @@ from onec_runtime.bsl.full_ast_worker_projection import (
     parse_full_ast_module,
 )
 from onec_runtime.bsl.diagnostics import (
+    ErrorTraceFrameOrigin,
     WorkerDiagnosticArtifact,
+    normalize_platform_diagnostic_trace,
     remap_worker_runtime_diagnostic,
 )
 from onec_runtime.bsl.lexer import BslLexError
@@ -3039,6 +3042,7 @@ class PrototypeRuntimeApi:
                 primary_execution, normalize_capture_error = (
                     self._capture_execution_callbacks_locked(
                         lowering.dirty_roots,
+                        visible_source_context=visible_source_context,
                     )
                 )
 
@@ -3103,6 +3107,8 @@ class PrototypeRuntimeApi:
                         else self._worker_runtime_diagnostic(
                             str(error),
                             error.diagnostic,
+                            executed=error.executed_source,
+                            visible_source_context=visible_source_context,
                         )
                     )
                     reply = RuntimeReply(
@@ -3257,6 +3263,8 @@ class PrototypeRuntimeApi:
     def _capture_execution_callbacks_locked(
         self,
         dirty_roots: tuple[str, ...],
+        *,
+        visible_source_context: VisibleSourceContext,
     ) -> tuple[
         Callable[[], None],
         Callable[[BslExecutionError], BslExecutionError],
@@ -3293,6 +3301,8 @@ class PrototypeRuntimeApi:
                 error.diagnostic,
                 manifest_sha256=manifest_sha256,
                 artifacts=artifacts,
+                executed=error.executed_source,
+                visible_source_context=visible_source_context,
             )
             if diagnostic is error.diagnostic:
                 return error
@@ -3863,6 +3873,7 @@ class PrototypeRuntimeApi:
                         primary_execution, normalize_capture_error = (
                             self._capture_execution_callbacks_locked(
                                 dirty_roots,
+                                visible_source_context=visible_source_context,
                             )
                         )
 
@@ -3935,6 +3946,8 @@ class PrototypeRuntimeApi:
                         else self._worker_runtime_diagnostic(
                             str(error),
                             error.diagnostic,
+                            executed=error.executed_source,
+                            visible_source_context=visible_source_context,
                         )
                     )
                     reply = RuntimeReply(
@@ -6976,6 +6989,9 @@ class PrototypeRuntimeApi:
         self,
         message: str,
         current: NormalizedDiagnostic | None,
+        *,
+        executed: MappedSource | None = None,
+        visible_source_context: VisibleSourceContext | None = None,
     ) -> NormalizedDiagnostic | None:
         if not message:
             return current
@@ -6993,6 +7009,8 @@ class PrototypeRuntimeApi:
             current,
             manifest_sha256=pin.handle.manifest_sha256,
             artifacts=artifacts,
+            executed=executed,
+            visible_source_context=visible_source_context,
         )
 
     @staticmethod
@@ -7002,6 +7020,8 @@ class PrototypeRuntimeApi:
         *,
         manifest_sha256: str,
         artifacts: tuple[WorkerDiagnosticArtifact, ...],
+        executed: MappedSource | None = None,
+        visible_source_context: VisibleSourceContext | None = None,
     ) -> NormalizedDiagnostic | None:
         try:
             parsed = parse_platform_diagnostic(message)
@@ -7010,12 +7030,34 @@ class PrototypeRuntimeApi:
                 for location in parsed.locations
             ):
                 return current
+            if (
+                executed is not None
+                and current is not None
+                and current.platform_diagnostic_sha256
+                == parsed.platform_diagnostic_sha256
+                and current.execution_artifact_sha256
+                == executed.artifact.source_sha256
+                and current.source_map_sha256 == executed.source_map_sha256
+                and any(
+                    frame.origin is ErrorTraceFrameOrigin.EXECUTED_ARTIFACT
+                    and frame.mapping_confidence is not MappingConfidence.UNKNOWN
+                    for frame in current.frames
+                )
+            ):
+                return normalize_platform_diagnostic_trace(
+                    parsed,
+                    stage=current.stage,
+                    executed=executed,
+                    visible_source_context=visible_source_context,
+                    pinned_manifest_sha256=manifest_sha256,
+                    pinned_artifacts=artifacts,
+                )
             return remap_worker_runtime_diagnostic(
                 parsed,
                 pinned_manifest_sha256=manifest_sha256,
                 pinned_artifacts=artifacts,
             )
-        except (TypeError, ValueError):
+        except BaseException:
             return current
 
     @staticmethod
@@ -7055,9 +7097,15 @@ class PrototypeRuntimeApi:
         ):
             raise ProtocolError("Worker generation objects are not public values")
         if isinstance(result, MainCompletion):
-            diagnostic = self._worker_runtime_diagnostic(
-                result.error,
-                result.diagnostic,
+            diagnostic = (
+                self._worker_runtime_diagnostic(
+                    result.error,
+                    result.diagnostic,
+                    executed=result.operation.executed_source,
+                    visible_source_context=result.operation.visible_source_context,
+                )
+                if not result.succeeded and result.error
+                else result.diagnostic
             )
             return RuntimeReply(
                 RuntimeReplyKind.MAIN_COMPLETED,

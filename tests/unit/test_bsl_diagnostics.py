@@ -1697,6 +1697,9 @@ def test_mixed_trace_maps_worker_main_and_native_frames_in_order() -> None:
         pinned_artifacts=(worker,),
     )
 
+    assert diagnostic.mapping_confidence is MappingConfidence.EXACT
+    assert diagnostic.source_unit is not None
+    assert diagnostic.source_unit.revision == 18
     assert [frame.origin for frame in diagnostic.frames] == [
         ErrorTraceFrameOrigin.WORKER_ARTIFACT,
         ErrorTraceFrameOrigin.NATIVE_MODULE,
@@ -1707,6 +1710,43 @@ def test_mixed_trace_maps_worker_main_and_native_frames_in_order() -> None:
     assert diagnostic.frames[1].mapping_confidence is MappingConfidence.UNKNOWN
     assert diagnostic.frames[2].mapping_confidence is MappingConfidence.EXACT
     assert sanitize_normalized_diagnostic(diagnostic) is not None
+
+
+def test_main_first_mixed_trace_keeps_main_primary_and_worker_frame() -> None:
+    """Worker enrichment must preserve a MAIN-first exact primary location."""
+    manifest = "c" * 64
+    worker = _worker_diagnostic_artifact(
+        "МодульБ",
+        18,
+        "OnecRuntime_bbbbbbbb_bbbbbbbbbbbbbbbb",
+        "b" * 64,
+        manifest,
+    )
+    source = "Результат = 1;"
+    raw = (
+        "{<Неизвестный модуль>(1,1)}: main\n"
+        f"{{ВнешняяОбработка.{worker.registration_name}.МодульОбъекта(2,1)}}: worker"
+    )
+
+    diagnostic = normalize_platform_diagnostic_trace(
+        parse_platform_diagnostic(raw),
+        stage=DiagnosticStage.EXECUTION,
+        executed=_wrapped(source),
+        visible_source_context=_visible_context(source),
+        pinned_manifest_sha256=manifest,
+        pinned_artifacts=(worker,),
+    )
+
+    assert diagnostic.mapping_confidence is MappingConfidence.EXACT
+    assert diagnostic.source_unit == _visible(source).source_map.segments[0].origin_ref
+    assert [frame.origin for frame in diagnostic.frames] == [
+        ErrorTraceFrameOrigin.EXECUTED_ARTIFACT,
+        ErrorTraceFrameOrigin.WORKER_ARTIFACT,
+    ]
+    assert [frame.mapping_confidence for frame in diagnostic.frames] == [
+        MappingConfidence.EXACT,
+        MappingConfidence.EXACT,
+    ]
 
 
 def test_stale_worker_frame_degrades_without_hiding_other_frames() -> None:

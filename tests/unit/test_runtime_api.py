@@ -57,6 +57,7 @@ from onec_runtime.runtime_api import (
     PrototypeRuntimeApi,
     RuntimeReplyKind,
 )
+from onec_runtime.runtime_contracts import sanitize_normalized_diagnostic
 from onec_runtime.value_transfer_backend import validate_value_handle
 from onec_runtime.bsl import (
     CommonModuleCatalogSnapshot,
@@ -64,6 +65,7 @@ from onec_runtime.bsl import (
     CommonModuleScope,
     DiagnosticStage,
     LineIndex,
+    LoweringMode,
     MappingConfidence,
     VisibleSourceContext,
     WorkerExport,
@@ -76,12 +78,24 @@ from onec_runtime.session import RuntimeSession
 from onec_runtime.bsl.lexer import BslLexError
 from onec_runtime.bsl.notebook_cells import split_notebook_cell
 from onec_runtime.bsl.parser_target import BslParseError, PythonParserTarget
-from onec_runtime.bsl.source_maps import SourceUnitKind, SourceUnitRef, source_sha256
+from onec_runtime.bsl.source_maps import (
+    MappedSource,
+    SourceArtifactKind,
+    SourceSpan,
+    SourceTransformBuilder,
+    SourceUnitKind,
+    SourceUnitRef,
+    source_sha256,
+)
 from onec_runtime.bsl.source_maps import mapped_visible_source
 from onec_runtime.bsl.module_universe import (
     WorkerModuleUnit,
 )
 from onec_runtime.bsl.diagnostics import remap_worker_stage_diagnostic
+from onec_runtime.bsl.diagnostics import (
+    ErrorTraceFrameOrigin,
+    WorkerDiagnosticArtifact,
+)
 from onec_runtime.config import RuntimeConfig
 from onec_runtime.server_worker import (
     NotebookWorkerArtifactBuilder,
@@ -510,6 +524,252 @@ def _mixed_capture_source(statement: str) -> str:
         "    Состояние.Результат = Значение * 2;\n"
         "КонецПроцедуры;\n"
         f"{statement}"
+    )
+
+
+def _mixed_error_evidence() -> tuple[
+    str, MappedSource, VisibleSourceContext, WorkerDiagnosticArtifact, str
+]:
+    source = "Результат = МодульА.Вызвать();"
+    unit = SourceUnitRef(
+        SourceUnitKind.NOTEBOOK_CELL, "mixed-error", 1, source_sha256(source)
+    )
+    executed_builder = SourceTransformBuilder(mapped_visible_source(source, unit))
+    executed_builder.copy(SourceSpan(0, len(source)))
+    executed = executed_builder.build(SourceArtifactKind.EXECUTED_BSL)
+    context = VisibleSourceContext({unit: source})
+    worker_source = "Функция Вызвать() Экспорт\nВозврат 1;\nКонецФункции"
+    worker_unit = SourceUnitRef(
+        SourceUnitKind.MODULE, "МодульА", 3, source_sha256(worker_source)
+    )
+    worker_builder = SourceTransformBuilder(
+        mapped_visible_source(worker_source, worker_unit)
+    )
+    worker_builder.copy(SourceSpan(0, len(worker_source)))
+    worker_map = worker_builder.build(SourceArtifactKind.WORKER_PROJECTION)
+    manifest = "c" * 64
+    artifact = WorkerDiagnosticArtifact(
+        logical_name="МодульА",
+        revision=3,
+        artifact_sha256="a" * 64,
+        registration_name="OnecRuntime_aaaaaaaa_aaaaaaaaaaaaaaaa",
+        manifest_sha256=manifest,
+        source_map_sha256=worker_map.source_map_sha256,
+        mapped_source=worker_map,
+        visible_source_context=VisibleSourceContext({worker_unit: worker_source}),
+    )
+    message = (
+        "{ВнешняяОбработка."
+        f"{artifact.registration_name}.МодульОбъекта(2,1)}}: worker\n"
+        "{ОбщийМодуль.Сервис.Модуль(7,3)}: native\n"
+        "{<Неизвестный модуль>(1,1)}: main"
+    )
+    return source, executed, context, artifact, message
+
+
+def test_main_reply_keeps_main_worker_and_native_error_frames_mapped() -> None:
+    """Break caught: Worker enrichment must not discard the MAIN source map."""
+    source, executed, context, artifact, message = _mixed_error_evidence()
+    api = PrototypeRuntimeApi(FakeController())
+    api._operation_generation_pin = SimpleNamespace(
+        handle=SimpleNamespace(manifest_sha256=artifact.manifest_sha256)
+    )
+    api._worker_generation_diagnostics[artifact.manifest_sha256] = (artifact,)
+    current = remap_platform_diagnostic(
+        parse_platform_diagnostic(message),
+        executed,
+        stage=DiagnosticStage.EXECUTION,
+        visible_source_context=context,
+    )
+    operation = OperationHandle(
+        7, source, executed.text,
+        executed_source=executed,
+        visible_source_context=context,
+    )
+
+    reply = api._reply(
+        MainCompletion(operation, None, message, False, diagnostic=current)
+    )
+
+    assert reply.succeeded is False
+    assert reply.error == "BSL execution failed"
+    assert reply.diagnostic is not None
+    assert reply.diagnostic.mapping_confidence is MappingConfidence.EXACT
+    assert reply.diagnostic.source_unit is not None
+    assert reply.diagnostic.source_unit.revision == 3
+    assert [frame.origin for frame in reply.diagnostic.frames] == [
+        ErrorTraceFrameOrigin.WORKER_ARTIFACT,
+        ErrorTraceFrameOrigin.NATIVE_MODULE,
+        ErrorTraceFrameOrigin.EXECUTED_ARTIFACT,
+    ]
+    assert reply.diagnostic.frames[0].mapping_confidence is MappingConfidence.EXACT
+    assert reply.diagnostic.frames[1].platform_location.module_name == (
+        "ОбщийМодуль.Сервис.Модуль"
+    )
+    assert reply.diagnostic.frames[2].mapping_confidence is MappingConfidence.EXACT
+    assert reply.diagnostic.frames[2].source_unit is not None
+    assert reply.diagnostic.frames[2].source_unit.source_sha256 == source_sha256(source)
+    assert sanitize_normalized_diagnostic(reply.diagnostic) is not None
+
+
+def test_main_first_reply_keeps_main_primary_when_worker_follows() -> None:
+    source, executed, context, artifact, _message = _mixed_error_evidence()
+    message = (
+        "{<Неизвестный модуль>(1,1)}: main\n"
+        "{ВнешняяОбработка."
+        f"{artifact.registration_name}.МодульОбъекта(2,1)}}: worker"
+    )
+    api = PrototypeRuntimeApi(FakeController())
+    api._operation_generation_pin = SimpleNamespace(
+        handle=SimpleNamespace(manifest_sha256=artifact.manifest_sha256)
+    )
+    api._worker_generation_diagnostics[artifact.manifest_sha256] = (artifact,)
+    current = remap_platform_diagnostic(
+        parse_platform_diagnostic(message),
+        executed,
+        stage=DiagnosticStage.EXECUTION,
+        visible_source_context=context,
+    )
+    operation = OperationHandle(
+        10, source, executed.text,
+        executed_source=executed,
+        visible_source_context=context,
+    )
+
+    reply = api._reply(
+        MainCompletion(operation, None, message, False, diagnostic=current)
+    )
+
+    assert reply.diagnostic is not None
+    assert reply.diagnostic.mapping_confidence is MappingConfidence.EXACT
+    assert reply.diagnostic.source_unit is not None
+    assert reply.diagnostic.source_unit.source_sha256 == source_sha256(source)
+    assert [frame.origin for frame in reply.diagnostic.frames] == [
+        ErrorTraceFrameOrigin.EXECUTED_ARTIFACT,
+        ErrorTraceFrameOrigin.WORKER_ARTIFACT,
+    ]
+    assert reply.diagnostic.frames[1].mapping_confidence is MappingConfidence.EXACT
+
+
+def test_successful_main_reply_never_calls_diagnostic_enrichment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: successful cells must not enter diagnostic collaborators."""
+    api = PrototypeRuntimeApi(FakeController())
+    monkeypatch.setattr(
+        api,
+        "_worker_runtime_diagnostic",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("diagnostic enrichment called on success")
+        ),
+    )
+
+    reply = api._reply(
+        MainCompletion(
+            OperationHandle(8, "Результат = 1;", "Результат = 1;"),
+            1,
+            "",
+            True,
+        )
+    )
+
+    assert reply.succeeded is True
+    assert reply.diagnostic is None
+
+
+@pytest.mark.parametrize(
+    "collaborator",
+    ("parse_platform_diagnostic", "normalize_platform_diagnostic_trace"),
+)
+def test_worker_enrichment_failure_preserves_original_main_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+    collaborator: str,
+) -> None:
+    """Break caught: a parser failure cannot replace a failed BSL result."""
+    import onec_runtime.runtime_api as runtime_api_module
+
+    source, executed, context, artifact, message = _mixed_error_evidence()
+    api = PrototypeRuntimeApi(FakeController())
+    api._operation_generation_pin = SimpleNamespace(
+        handle=SimpleNamespace(manifest_sha256=artifact.manifest_sha256)
+    )
+    api._worker_generation_diagnostics[artifact.manifest_sha256] = (artifact,)
+    current = remap_platform_diagnostic(
+        parse_platform_diagnostic(message),
+        executed,
+        stage=DiagnosticStage.EXECUTION,
+        visible_source_context=context,
+    )
+
+    class DiagnosticProbeFailure(BaseException):
+        pass
+
+    monkeypatch.setattr(
+        runtime_api_module,
+        collaborator,
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(DiagnosticProbeFailure()),
+    )
+    operation = OperationHandle(
+        9, source, executed.text,
+        executed_source=executed,
+        visible_source_context=context,
+    )
+
+    reply = api._reply(
+        MainCompletion(operation, None, message, False, diagnostic=current)
+    )
+
+    assert reply.succeeded is False
+    assert reply.error == "BSL execution failed"
+    assert reply.diagnostic is current
+
+
+def test_late_capture_failure_uses_pinned_worker_and_capture_source_maps() -> None:
+    """Break caught: detached completion must retain both source identities."""
+    source, executed, context, artifact, message = _mixed_error_evidence()
+    api = PrototypeRuntimeApi(FakeController())
+    api._evaluation_generation_pin = SimpleNamespace(
+        handle=SimpleNamespace(manifest_sha256=artifact.manifest_sha256)
+    )
+    api._worker_generation_diagnostics[artifact.manifest_sha256] = (artifact,)
+    with api._single_writer():
+        _primary, normalize_error = api._capture_execution_callbacks_locked(
+            (), visible_source_context=context
+        )
+    api._evaluation_generation_pin = None
+    api._worker_generation_diagnostics.clear()
+    final_executed = PrototypeRuntimeController._as_executed_source(
+        executed, mode=LoweringMode.CAPTURE
+    )
+    assert final_executed.source_map_sha256 != executed.source_map_sha256
+    current = remap_platform_diagnostic(
+        parse_platform_diagnostic(message),
+        final_executed,
+        stage=DiagnosticStage.EXECUTION,
+        visible_source_context=context,
+    )
+
+    normalized = normalize_error(
+        BslExecutionError(
+            message,
+            diagnostic=current,
+            executed_source=final_executed,
+        )
+    )
+
+    assert normalized.executed_source is None
+    assert normalized.diagnostic is not None
+    assert [frame.origin for frame in normalized.diagnostic.frames] == [
+        ErrorTraceFrameOrigin.WORKER_ARTIFACT,
+        ErrorTraceFrameOrigin.NATIVE_MODULE,
+        ErrorTraceFrameOrigin.EXECUTED_ARTIFACT,
+    ]
+    assert normalized.diagnostic.frames[0].source_unit is not None
+    assert normalized.diagnostic.frames[0].source_unit.revision == 3
+    assert normalized.diagnostic.frames[2].source_unit is not None
+    assert (
+        normalized.diagnostic.frames[2].source_unit.source_sha256
+        == source_sha256(source)
     )
 
 

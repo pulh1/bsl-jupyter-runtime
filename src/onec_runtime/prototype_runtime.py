@@ -233,7 +233,7 @@ def _safe_platform_diagnostic(
             stage=DiagnosticStage.EXECUTION,
             visible_source_context=visible_source_context,
         )
-    except Exception:
+    except BaseException:
         return None
 
 
@@ -3449,6 +3449,7 @@ class PrototypeRuntimeController:
                 platform_error = BslExecutionError(
                     event.error_text,
                     messages=sealed_messages,
+                    executed_source=executed_source,
                     diagnostic=_safe_platform_diagnostic(
                         event.error_text,
                         executed_source,

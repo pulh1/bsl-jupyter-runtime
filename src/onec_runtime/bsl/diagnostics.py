@@ -1302,19 +1302,25 @@ def normalize_platform_diagnostic_trace(
             pinned_manifest_sha256,
             pinned_artifacts,
         )
-    if executed is not None:
-        base = _remap_platform_primary(
-            parsed,
-            executed,
-            stage=stage,
-            visible_source_context=visible_source_context,
+    if pinned_manifest_sha256 is not None and (
+        executed is None
+        or (
+            bool(parsed.locations)
+            and parsed.locations[0].worker_artifact_location is not None
         )
-    elif pinned_manifest_sha256 is not None:
+    ):
         base = _remap_worker_runtime_primary(
             parsed,
             stage=stage,
             pinned_manifest_sha256=pinned_manifest_sha256,
             pinned_artifacts=pinned_artifacts,
+        )
+    elif executed is not None:
+        base = _remap_platform_primary(
+            parsed,
+            executed,
+            stage=stage,
+            visible_source_context=visible_source_context,
         )
     else:
         base = _generic_trace_base(parsed, stage)

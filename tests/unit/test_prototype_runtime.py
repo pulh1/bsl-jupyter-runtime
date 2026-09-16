@@ -50,6 +50,7 @@ from onec_runtime.bsl import (
     MappingRelation,
     SourceUnitKind,
     SourceUnitRef,
+    VisibleSourceContext,
     WorkerExport,
     mapped_visible_source,
     source_sha256,
@@ -677,8 +678,10 @@ def test_unlocated_main_failure_keeps_current_cell_origin_without_platform_cause
     assert "строка" not in displayed.text
 
 
+@pytest.mark.parametrize("failure_type", (RuntimeError, BaseException))
 def test_normalizer_failure_keeps_main_failure_safe_and_allows_next_run(
     monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[BaseException],
 ) -> None:
     """Break caught: diagnostic normalization must not replace a MAIN failure."""
     runtime = runtime_module()
@@ -692,7 +695,7 @@ def test_normalizer_failure_keeps_main_failure_safe_and_allows_next_run(
     api = PrototypeRuntimeApi(controller)
 
     def fail_normalization(*_args: object, **_kwargs: object) -> object:
-        raise RuntimeError("forced normalizer failure")
+        raise failure_type("forced normalizer failure")
 
     monkeypatch.setattr(runtime, "remap_platform_diagnostic", fail_normalization)
 
@@ -748,8 +751,42 @@ def test_capture_platform_failure_keeps_paused_state_and_sends_no_continue() -> 
     ]
 
 
+def test_capture_error_carries_final_executed_source_map() -> None:
+    """Break caught: CAPTURE must attach its post-wrapper artifact, not input map."""
+    raw = "{<Неизвестный модуль>(1,1)}: Деление на 0"
+    session = ScriptedSession(
+        (CAPTURE_A,),
+        capture_evaluations=(evaluation("Ошибка", "boom", error=raw),),
+    )
+    controller = captured_controller(session)
+    source = "РезультатИнструкции = 1 / 0;"
+    unit = SourceUnitRef(
+        SourceUnitKind.NOTEBOOK_CELL, "capture-final-error", 1, source_sha256(source)
+    )
+    supplied = mapped_visible_source(source, unit)
+
+    with pytest.raises(BslExecutionError) as caught:
+        controller.execute_mapped_capture(
+            source,
+            supplied,
+            visible_source_context=VisibleSourceContext({unit: source}),
+        )
+
+    error = caught.value
+    assert error.executed_source is not None
+    assert error.executed_source.source_map_sha256 != supplied.source_map_sha256
+    assert error.diagnostic is not None
+    assert (
+        error.diagnostic.execution_artifact_sha256
+        == error.executed_source.artifact.source_sha256
+    )
+    assert error.diagnostic.source_map_sha256 == error.executed_source.source_map_sha256
+
+
+@pytest.mark.parametrize("failure_type", (RuntimeError, BaseException))
 def test_normalizer_failure_keeps_capture_failure_private_and_paused(
     monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[BaseException],
 ) -> None:
     """Break caught: missing diagnostics must not leak raw CAPTURE prose."""
     runtime = runtime_module()
@@ -765,7 +802,7 @@ def test_normalizer_failure_keeps_capture_failure_private_and_paused(
     before = session.continue_count
 
     def fail_normalization(*_args: object, **_kwargs: object) -> object:
-        raise RuntimeError("forced normalizer failure")
+        raise failure_type("forced normalizer failure")
 
     monkeypatch.setattr(runtime, "remap_platform_diagnostic", fail_normalization)
 

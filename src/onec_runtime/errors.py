@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from onec_runtime.bsl.diagnostics import NormalizedDiagnostic
+from onec_runtime.bsl.source_maps import MappedSource
 
 if TYPE_CHECKING:
     from onec_runtime.capture_evaluation import (
@@ -349,7 +350,7 @@ class CommandTimeout(RuntimeProbeError):
 class BslExecutionError(RuntimeProbeError):
     """The kernel captured a BSL execution exception."""
 
-    __slots__ = ("_diagnostic", "_messages")
+    __slots__ = ("_diagnostic", "_executed_source", "_messages")
 
     def __init__(
         self,
@@ -357,10 +358,12 @@ class BslExecutionError(RuntimeProbeError):
         *,
         messages: tuple[str, ...] = (),
         diagnostic: NormalizedDiagnostic | None = None,
+        executed_source: MappedSource | None = None,
     ) -> None:
         super().__init__(message)
         self._messages = tuple(messages)
         self._diagnostic = diagnostic
+        self._executed_source = executed_source
 
     @property
     def messages(self) -> tuple[str, ...]:
@@ -369,6 +372,11 @@ class BslExecutionError(RuntimeProbeError):
     @property
     def diagnostic(self) -> NormalizedDiagnostic | None:
         return self._diagnostic
+
+    @property
+    def executed_source(self) -> MappedSource | None:
+        """Exact failed artifact, retained privately for postmortem remapping."""
+        return self._executed_source
 
 
 class TargetLost(RuntimeProbeError):
