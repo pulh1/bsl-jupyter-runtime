@@ -2,14 +2,14 @@
 <ConfigDumpInfo xmlns="http://v8.1c.ru/8.3/xcf/dumpinfo" xmlns:xen="http://v8.1c.ru/8.3/xcf/enums" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" format="Hierarchical" version="2.20">
 	<ConfigVersions>
 		<Metadata name="CommonModule.RuntimeContextStoreServer" id="c8a390d7-e463-4413-ae75-2bb83ce8c299" configVersion="bca15396eaa8d3f268a94cacb6f57b024e119e47"/>
-		<Metadata name="CommonModule.RuntimeContextStoreServer.Module" id="c8a390d7-e463-4413-ae75-2bb83ce8c299.0" configVersion="2520e72283f2d4f9c1dd237e2bf66ea43617c45d"/>
+		<Metadata name="CommonModule.RuntimeContextStoreServer.Module" id="c8a390d7-e463-4413-ae75-2bb83ce8c299.0" configVersion="cf6f49b4557f283968a4a98c0efd3874376ede45"/>
 		<Metadata name="CommonModule.RuntimeKernelServer" id="4a0aa21a-4046-47f7-8421-5eeb79d0e9f0" configVersion="d2e2673b2b831cf71d7b1d2ba8644840a4921eed"/>
-		<Metadata name="CommonModule.RuntimeKernelServer.Module" id="4a0aa21a-4046-47f7-8421-5eeb79d0e9f0.0" configVersion="57ab60a367b3d828e12c1e49c2da2b20d1ab9f79"/>
+		<Metadata name="CommonModule.RuntimeKernelServer.Module" id="4a0aa21a-4046-47f7-8421-5eeb79d0e9f0.0" configVersion="cfc711807d248ccc43c637aaf9ad1619e6d8ac26"/>
 		<Metadata name="CommonModule.RuntimeTableTransferServer" id="33445a61-8047-40aa-8144-690175755340" configVersion="89ca73991174a3f21649ea1e216cc157fbff1214"/>
-		<Metadata name="CommonModule.RuntimeTableTransferServer.Module" id="33445a61-8047-40aa-8144-690175755340.0" configVersion="f0dc68722cf1ffae9d811cff0e05604d527cb5e0"/>
+		<Metadata name="CommonModule.RuntimeTableTransferServer.Module" id="33445a61-8047-40aa-8144-690175755340.0" configVersion="034e30c8b0d08e45a334c856f40fd41ecb7d72d4"/>
 		<Metadata name="CommonModule.RuntimeValueTransferServer" id="403bd06b-17d6-4171-94d6-e38fc5f8a585" configVersion="59845c0287ed89074f5fe4448ad6b7b8d3cabf1c"/>
-		<Metadata name="CommonModule.RuntimeValueTransferServer.Module" id="403bd06b-17d6-4171-94d6-e38fc5f8a585.0" configVersion="2c703a4e84fa4e20af1e6bb2fe5449822076f0c3"/>
-		<Metadata name="Configuration.OnecInteractiveRuntime" id="fcac7610-e58e-4c3b-b637-9d809453a8a2" configVersion="794eb29a0df63c1fed790fbeda0cd6dcfb507271"/>
-		<Metadata name="Configuration.OnecInteractiveRuntime.ManagedApplicationModule" id="96ff5058-0bc6-4207-935b-3cb72a166691.6" configVersion="618a7b144945167e458b66b66cac64f81deea138"/>
+		<Metadata name="CommonModule.RuntimeValueTransferServer.Module" id="403bd06b-17d6-4171-94d6-e38fc5f8a585.0" configVersion="d6dbb62bef77ef4352b729f784fa141a3735250c"/>
+		<Metadata name="Configuration.OnecInteractiveRuntime" id="fcac7610-e58e-4c3b-b637-9d809453a8a2" configVersion="863a96b0e05162356ba5b0c516c91ce83ab14771"/>
+		<Metadata name="Configuration.OnecInteractiveRuntime.ManagedApplicationModule" id="96ff5058-0bc6-4207-935b-3cb72a166691.6" configVersion="2a0c45223802ec7c6116abec6a491616c01d5c40"/>
 	</ConfigVersions>
 </ConfigDumpInfo>

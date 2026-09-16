@@ -1,6 +1,6 @@
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -17,10 +17,23 @@ from onec_runtime.errors import (
     ProtocolError,
     StaleCaptureError,
 )
-from onec_runtime.rdbg.models import ModuleLocation, StackFrame, StopEvent, TargetId
+from onec_runtime.rdbg.models import (
+    FrameVariable,
+    LocalVariablesResult,
+    ModuleLocation,
+    StackFrame,
+    StopEvent,
+    TargetId,
+)
 from onec_runtime.runtime_api import PrototypeRuntimeApi
 
-from test_prototype_runtime import CAPTURE_A, SERVICE, ScriptedSession, captured_controller
+from test_prototype_runtime import (
+    CAPTURE_A,
+    SERVICE,
+    ScriptedSession,
+    captured_controller,
+    evaluation,
+)
 
 
 SOURCE = "Procedure RunFixture(Arg)\nX = 1;\nEndProcedure"
@@ -532,9 +545,14 @@ class FreshStackSession(ScriptedSession):
         )
 
 
-def captured_stack_api() -> tuple[PrototypeRuntimeApi, object, FreshStackSession]:
+def captured_stack_api(
+    *, capture_value_inspection_builder=None,
+) -> tuple[PrototypeRuntimeApi, object, FreshStackSession]:
     session = FreshStackSession()
-    controller = captured_controller(session)
+    controller = captured_controller(
+        session,
+        capture_value_inspection_builder=capture_value_inspection_builder,
+    )
     return PrototypeRuntimeApi(controller), controller, session
 
 
@@ -773,13 +791,334 @@ def test_runtime_native_stack_bypasses_config_source_resolution_and_ast() -> Non
     assert source_calls == []
 
 
-def test_runtime_frame_scope_is_explicitly_deferred_to_value_binding() -> None:
-    runtime, _, _ = captured_stack_api()
+def test_runtime_frame_scope_is_bound_without_target_value_io() -> None:
+    from onec_runtime.capture_values import VariableDescriptor
+
+    runtime, _, session = captured_stack_api()
+    prior_local_reads = sum(name == "local_variables" for name, _ in session.calls)
     frame = runtime.current_capture().stack[0]
 
     for attribute in ("variables", "parameters", "locals"):
-        with pytest.raises(CaptureSourceUnavailableError, match="not attached"):
-            getattr(frame, attribute)
+        scope = getattr(frame, attribute)
+        assert isinstance(scope, VariableDescriptor)
+        assert scope._root.native_level == 1
+    assert session.stack_reads == 1
+    assert sum(name == "local_variables" for name, _ in session.calls) == prior_local_reads
+
+
+def test_runtime_native_frame_projection_keeps_its_physical_level_in_one_plan() -> None:
+    from onec_runtime.capture_values import (
+        PrivateProjectedValue, PrivateValueProjection, ValueMetadata, ValueShape,
+    )
+    from onec_runtime.prototype_runtime import CaptureValueInspectionPlan
+
+    plans = []
+
+    def build(**kwargs):
+        plans.append(kwargs)
+        return CaptureValueInspectionPlan(
+            'RuntimeKernelServer.ВыполнитьКодВКонтекстеОтладки(Контекст, "")',
+            lambda _result: PrivateValueProjection((
+                PrivateProjectedValue(
+                    "Локальная",
+                    lambda: ValueMetadata(
+                        "Число", "40", None, ValueShape.SCALAR,
+                    ),
+                ),
+            ), 1, None),
+        )
+
+    runtime, controller, session = captured_stack_api(
+        capture_value_inspection_builder=build,
+    )
+    owner = controller._capture_evaluation_coordinator
+    assert owner is not None
+    try:
+        frame = runtime.current_capture().stack.native[1]
+        before = len(session.calls)
+
+        page = frame.variables[:1]
+
+        assert [item.name for item in page.items] == ["Локальная"]
+        assert len(plans) == 1
+        assert plans[0]["path"].root.kind.value == "frame"
+        assert plans[0]["path"].root.native_level == 1
+        assert plans[0]["request"].start == 0
+        assert plans[0]["request"].stop == 1
+        evaluations = [call for call in session.calls[before:] if call[0] == "evaluate"]
+        assert len(evaluations) == 1
+        assert evaluations[0][1][1] == 1
+    finally:
+        owner.begin_close()
+        assert owner.join(2)
+
+
+def test_runtime_native_frame_uses_the_production_envelope_without_inventory_metadata():
+    """A physical frame reaches the same coordinator-owned closed protocol."""
+    from base64 import b64encode
+    from hashlib import sha256
+    import json
+
+    class EnvelopeNativeSession(FreshStackSession):
+        def __init__(self) -> None:
+            super().__init__()
+            self.projection_sources: list[str] = []
+            self.payload_reads = 0
+            self.cleanups = 0
+            document = {
+                "v": 1,
+                "action": "project",
+                "entries": [{
+                    "name": "Оклад",
+                    "denied": False,
+                    "type_name": "Число",
+                    "preview": "55000",
+                    "size": None,
+                    "shape": "scalar",
+                    "cycle": False,
+                }],
+                "total": 1,
+                "next": None,
+            }
+            payload = json.dumps(
+                document, ensure_ascii=False, separators=(",", ":"),
+            ).encode("utf-8")
+            self.payload = b64encode(payload).decode("ascii")
+            self.admission = "R|1|1|{}|{}|{}".format(
+                len(payload), sha256(payload).hexdigest(), len(self.payload),
+            )
+
+        def local_variables(self, stack_level: int = 0) -> LocalVariablesResult:
+            if stack_level == 1:
+                self.calls.append(("local_variables", stack_level))
+                return LocalVariablesResult(uuid4(), (
+                    FrameVariable(
+                        "Оклад", "PRIVATE_NATIVE_TYPE", "PRIVATE_NATIVE_PRESENTATION",
+                    ),
+                ))
+            return super().local_variables(stack_level)
+
+        def evaluate(self, expression: str, **kwargs: object):  # type: ignore[no-untyped-def]
+            stack_level = kwargs.get("stack_level", 0)
+            call_value: object = (
+                expression if stack_level == 0 else (expression, stack_level)
+            )
+            self.calls.append(("evaluate", call_value))
+            if "СпроецироватьЗначенияИнспекции" in expression:
+                self.projection_sources.append(expression)
+                return evaluation("Строка", f'"{self.admission}"')
+            if "ЗабратьКомпактнуюМатериализациюИзКонтекста" in expression:
+                self.payload_reads += 1
+                return evaluation("Строка", f'"{self.payload}"')
+            if "УдалитьМатериализациюИзКонтекста" in expression:
+                self.cleanups += 1
+                return evaluation("Булево", "Истина")
+            return super().evaluate(expression, **kwargs)
+
+    session = EnvelopeNativeSession()
+    controller = captured_controller(session)
+    runtime = PrototypeRuntimeApi(controller)
+    owner = controller._capture_evaluation_coordinator
+    assert owner is not None
+    try:
+        page = runtime.current_capture().stack.native[1].variables[:1]
+
+        assert [item.name for item in page.items] == ["Оклад"]
+        assert session.payload_reads == session.cleanups == 1
+        assert len(session.projection_sources) == 1
+        source = session.projection_sources[0]
+        assert "PRIVATE_NATIVE_TYPE" not in source
+        assert "PRIVATE_NATIVE_PRESENTATION" not in source
+        assert "RuntimeContextStoreServer.ПолучитьКонтекст()" in source
+        assert any(
+            name == "local_variables" and level == 1
+            for name, level in session.calls
+        )
+    finally:
+        owner.begin_close()
+        assert owner.join(2)
+
+
+def test_runtime_native_frame_pages_wide_private_inventory_before_envelope_projection():
+    """Only the requested native roots may cross into one inspection source."""
+    from base64 import b64encode
+    from hashlib import sha256
+    import json
+    import re
+
+    from onec_runtime.capture_inspection import ResolvedFrameSource
+
+    names = [f"V{index}" for index in range(101)]
+    names[2] = "ParamB"
+    names[99] = "ParamA"
+    local_names = tuple(name for name in names if name not in {"ParamA", "ParamB"})
+
+    class WideEnvelopeNativeSession(FreshStackSession):
+        def __init__(self) -> None:
+            super().__init__()
+            self.private_inventory_reads = 0
+            self.projection_sources: list[str] = []
+            self.projection_roots: list[tuple[str, ...]] = []
+            self.payload_reads = 0
+            self.cleanups = 0
+            self.payload = ""
+            self.admission = ""
+
+        def local_variables(self, stack_level: int = 0) -> LocalVariablesResult:
+            if stack_level == 1:
+                self.calls.append(("local_variables", stack_level))
+                self.private_inventory_reads += 1
+                return LocalVariablesResult(uuid4(), tuple(
+                    FrameVariable(
+                        name, "PRIVATE_NATIVE_TYPE", "PRIVATE_NATIVE_PRESENTATION",
+                    )
+                    for name in names
+                ))
+            return super().local_variables(stack_level)
+
+        def evaluate(self, expression: str, **kwargs: object):  # type: ignore[no-untyped-def]
+            stack_level = kwargs.get("stack_level", 0)
+            call_value: object = (
+                expression if stack_level == 0 else (expression, stack_level)
+            )
+            self.calls.append(("evaluate", call_value))
+            if "СпроецироватьЗначенияИнспекции" in expression:
+                roots = tuple(name for name, value in re.findall(
+                    r'\.Вставить\("([^"\\]+)", '
+                    r'([A-Za-zА-Яа-яЁё_][0-9A-Za-zА-Яа-яЁё_]*)\);',
+                    expression,
+                ) if name == value)
+                self.projection_sources.append(expression)
+                self.projection_roots.append(roots)
+                document = {
+                    "v": 1,
+                    "action": "project",
+                    "entries": [{
+                        "name": name,
+                        "denied": False,
+                        "type_name": "Число",
+                        "preview": "1",
+                        "size": None,
+                        "shape": "scalar",
+                        "cycle": False,
+                    } for name in roots],
+                    "total": len(roots),
+                    "next": None,
+                }
+                payload = json.dumps(
+                    document, ensure_ascii=False, separators=(",", ":"),
+                ).encode("utf-8")
+                self.payload = b64encode(payload).decode("ascii")
+                self.admission = "R|1|1|{}|{}|{}".format(
+                    len(payload), sha256(payload).hexdigest(), len(self.payload),
+                )
+                return evaluation("Строка", f'"{self.admission}"')
+            if "ЗабратьКомпактнуюМатериализациюИзКонтекста" in expression:
+                self.payload_reads += 1
+                return evaluation("Строка", f'"{self.payload}"')
+            if "УдалитьМатериализациюИзКонтекста" in expression:
+                self.cleanups += 1
+                return evaluation("Булево", "Истина")
+            return super().evaluate(expression, **kwargs)
+
+    session = WideEnvelopeNativeSession()
+    controller = captured_controller(session)
+    runtime = PrototypeRuntimeApi(controller)
+    owner = controller._capture_evaluation_coordinator
+    assert owner is not None
+    source = "Procedure RunFixture(ParamA, ParamB)\nX = 1;\nEndProcedure"
+    pin = SourceVersionRef.worker(
+        artifact_id="wide-native-frame", generation=1, source_text=source,
+    )
+    resolved = ResolvedFrameSource("Common.RunFixture", 2, IDENTITY, pin)
+    source_resolutions: list[tuple[int, ...]] = []
+
+    def resolve_sources(frames):  # type: ignore[no-untyped-def]
+        source_resolutions.append(tuple(frame.level for frame in frames))
+        return tuple(resolved if frame.level == 1 else None for frame in frames)
+
+    try:
+        capture = runtime._current_capture(resolve_sources=resolve_sources)
+        frame = capture.stack.native[1]
+        assert source_resolutions == []
+
+        first = frame.variables[50:51]
+        second = frame.variables[51:52]
+        first_name = frame.variables[:1]
+        exact = frame.variables["v50"]
+        parameters = frame.parameters[:1]
+        locals_page = frame.locals[50:51]
+
+        assert [item.name for item in first.items] == ["V50"]
+        assert first.total == 101 and first.next_cursor == 51
+        assert [item.name for item in second.items] == ["V51"]
+        assert second.total == 101 and second.next_cursor == 52
+        assert [item.name for item in first_name.items] == ["V0"]
+        assert first_name.total == 101 and first_name.next_cursor == 1
+        assert exact.name == "V50"
+        assert [item.name for item in parameters.items] == ["ParamA"]
+        assert parameters.total == 2 and parameters.next_cursor == 1
+        assert [item.name for item in locals_page.items] == [local_names[50]]
+        assert locals_page.total == len(local_names) and locals_page.next_cursor == 51
+
+        assert session.private_inventory_reads == 6
+        assert source_resolutions == [(1,), (1,)]
+        assert session.projection_roots == [
+            ("V50",), ("V51",), ("V0",), ("V50",),
+            ("ParamA",), (local_names[50],),
+        ]
+        assert session.payload_reads == session.cleanups == 6
+        first_page_source = session.projection_sources[2]
+        assert 'Вставить("V0", V0);' in first_page_source
+        assert 'Вставить("V1", V1);' not in first_page_source
+        assert 'Вставить("ParamB", ParamB);' not in first_page_source
+        assert 'PRIVATE_NATIVE_TYPE' not in first_page_source
+        assert 'PRIVATE_NATIVE_PRESENTATION' not in first_page_source
+    finally:
+        owner.begin_close()
+        assert owner.join(2)
+
+
+def test_runtime_native_frame_bounds_private_inventory_before_source_generation():
+    """A malformed wide RDBG inventory remains private and submits no source."""
+    from onec_runtime.prototype_runtime import MAX_CAPTURE_VALUE_NATIVE_INVENTORY
+
+    class OverboundNativeSession(FreshStackSession):
+        def __init__(self) -> None:
+            super().__init__()
+            self.projection_attempts = 0
+
+        def local_variables(self, stack_level: int = 0) -> LocalVariablesResult:
+            if stack_level == 1:
+                self.calls.append(("local_variables", stack_level))
+                return LocalVariablesResult(uuid4(), tuple(
+                    FrameVariable(
+                        f"V{index}", "PRIVATE_NATIVE_TYPE", "PRIVATE_NATIVE_PRESENTATION",
+                    )
+                    for index in range(MAX_CAPTURE_VALUE_NATIVE_INVENTORY + 1)
+                ))
+            return super().local_variables(stack_level)
+
+        def evaluate(self, expression: str, **kwargs: object):  # type: ignore[no-untyped-def]
+            if "СпроецироватьЗначенияИнспекции" in expression:
+                self.projection_attempts += 1
+            return super().evaluate(expression, **kwargs)
+
+    session = OverboundNativeSession()
+    controller = captured_controller(session)
+    runtime = PrototypeRuntimeApi(controller)
+    owner = controller._capture_evaluation_coordinator
+    assert owner is not None
+    try:
+        with pytest.raises(CaptureSourceUnavailableError) as rejected:
+            runtime.current_capture().stack.native[1].variables[:1]
+
+        assert "PRIVATE_NATIVE" not in str(rejected.value)
+        assert rejected.value.__cause__ is None and rejected.value.__context__ is None
+        assert session.projection_attempts == 0
+    finally:
+        owner.begin_close()
+        assert owner.join(2)
 
 
 def test_session_current_capture_binds_sources_methods_and_frame_value_scope() -> None:
@@ -827,6 +1166,9 @@ def test_session_current_capture_binds_sources_methods_and_frame_value_scope() -
     assert frame.variables._root.native_level == 1
     assert frame.parameters._root.native_level == 1
     assert frame.locals._root.native_level == 1
+    # The session binder enriches source metadata only.  The live descriptor
+    # remains the RuntimeApi-owned backend; its target protocol is covered by
+    # the envelope fake-transport tests rather than this source-only fixture.
 
 
 def test_stack_views_keep_target_urls_and_physical_ids_out_of_ordinary_repr() -> None:

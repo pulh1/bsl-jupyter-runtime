@@ -55,6 +55,9 @@ class CaptureView:
         [float | None, str | None], CaptureEvaluationOutcome
     ] = field(repr=False, compare=False)
     __stack: StackDescriptor | None = field(default=None, repr=False, compare=False)
+    __context: CaptureContextView | None = field(
+        default=None, repr=False, compare=False,
+    )
 
     def __post_init__(self) -> None:
         for name in ("operation_id", "capture_generation", "stop_sequence"):
@@ -72,6 +75,11 @@ class CaptureView:
             raise TypeError("capture view readers must be callable")
         if self.__stack is not None and not isinstance(self.__stack, StackDescriptor):
             raise TypeError("capture stack descriptor is invalid")
+        if self.__context is not None:
+            from onec_runtime.capture_values import CaptureContextView
+
+            if not isinstance(self.__context, CaptureContextView):
+                raise TypeError("capture context descriptor is invalid")
 
     def __repr__(self) -> str:
         return (
@@ -105,6 +113,15 @@ class CaptureView:
         if self.__stack is None:
             raise CaptureSourceUnavailableError("capture stack inspection is not attached")
         return self.__stack
+
+    @property
+    def context(self) -> CaptureContextView:
+        """Live, fenced values from the staged CAPTURE context namespace."""
+        if self.__context is None:
+            raise CaptureSourceUnavailableError(
+                "capture context value inspection is not attached"
+            )
+        return self.__context
 
 
 
@@ -340,6 +357,41 @@ class LocalStackAdapter:
     def stack(self) -> StackDescriptor:
         return StackDescriptor(self)
 
+    def native_frame_with_method(
+        self,
+        native_level: int,
+        work_budget_s: float | None = None,
+    ) -> DebugFrame:
+        """Enrich one physical frame only for a requested value role.
+
+        ``stack.native`` remains a fast line-only inventory.  Parameter and
+        local classification is the explicit slow path that needs the method
+        declaration, so it resolves and parses just the requested frame.
+        """
+        if type(native_level) is not int or native_level < 0:
+            raise ValueError("native frame level must be nonnegative")
+        frames = self._backend.read_stack(self._fence)
+        frame = next((item for item in frames if item.level == native_level), None)
+        if frame is None:
+            raise IndexError("stack frame is outside the inventory")
+        runtime = self._is_runtime(frame)
+        source = None
+        if not runtime:
+            sources = self._resolve_sources((frame,))
+            if type(sources) is not tuple or len(sources) != 1:
+                raise ProtocolError("stack source mapping is invalid")
+            source = sources[0]
+        mapped = self._mapped_frame(
+            frame,
+            source,
+            visible_index=None,
+            runtime=runtime,
+        )
+        enriched = self._enricher.enrich((mapped,), work_budget_s)[0]
+        if not isinstance(enriched, DebugFrame):
+            raise ProtocolError("stack method enrichment is invalid")
+        return enriched
+
     def _read(self, start: int, stop: int, *, native: bool) -> StackPage:
         frames = self._backend.read_stack(self._fence)
         runtime = tuple(self._is_runtime(frame) for frame in frames)
@@ -380,18 +432,11 @@ class LocalStackAdapter:
                 continue
             hidden = self._is_runtime(entry)
             source = mapped[entry.level]
-            mapped_frame = DebugFrame(
-                native_level=entry.level,
-                source=source.source if source else "Модуль конфигурации",
-                line=None if hidden else source.line if source else entry.location.line,
+            mapped_frame = self._mapped_frame(
+                entry,
+                source,
                 visible_index=None if native else visible_index,
-                source_status=source.version.source_status if source else "unavailable",
-                runtime_kernel=hidden,
-                physical=None if hidden else PhysicalFrameIdentity(
-                    entry.location.object_id, entry.location.property_id,
-                    entry.location.module_type[:256], entry.location.extension_name[:256],
-                ),
-                _resolved=source, _enricher=self._enricher,
+                runtime=hidden,
             )
             result.append(
                 self._bind_frame(mapped_frame)
@@ -401,6 +446,29 @@ class LocalStackAdapter:
             visible_index += 1
         return StackPage(tuple(result), total, stop if start < stop < total else None,
                          native=native, _enricher=self._enricher)
+
+    def _mapped_frame(
+        self,
+        frame: StackFrame,
+        source: ResolvedFrameSource | None,
+        *,
+        visible_index: int | None,
+        runtime: bool,
+    ) -> DebugFrame:
+        return DebugFrame(
+            native_level=frame.level,
+            source=source.source if source else "Модуль конфигурации",
+            line=None if runtime else source.line if source else frame.location.line,
+            visible_index=visible_index,
+            source_status=source.version.source_status if source else "unavailable",
+            runtime_kernel=runtime,
+            physical=None if runtime else PhysicalFrameIdentity(
+                frame.location.object_id, frame.location.property_id,
+                frame.location.module_type[:256], frame.location.extension_name[:256],
+            ),
+            _resolved=source,
+            _enricher=self._enricher,
+        )
 
 
 class _MethodEnricher:
