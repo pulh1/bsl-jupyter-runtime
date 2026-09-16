@@ -51,6 +51,7 @@ from onec_runtime.capture_evaluation import (
     CaptureStepContext,
 )
 from onec_runtime.capture_values import (
+    CaptureValuePolicy,
     PrivateProjectedValue,
     PrivateValueProjection,
     SafePathSegment,
@@ -117,6 +118,7 @@ from onec_runtime.table_value import evaluation_to_python
 MAX_CAPTURE_PROJECTION_POSITION = 10_000_000
 MAX_CAPTURE_SCHEMA_COLUMNS = 100
 MAX_CAPTURE_VALUE_INSPECTION_SOURCE_BYTES = 64 * 1024
+MAX_CAPTURE_VALUE_PATH_SEGMENTS = CaptureValuePolicy().max_depth + 1
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -2113,6 +2115,7 @@ class PrototypeRuntimeController:
 
         if not isinstance(selected_path, SafeValuePath):
             raise CaptureValueCheckError("capture value path is invalid")
+        self._validate_capture_value_path(action, selected_path)
         root = selected_path.root
         if root.kind is ValueRootKind.CONTEXT:
             return selected_path, self._required_capture_kernel_stack_level()
@@ -2125,6 +2128,29 @@ class PrototypeRuntimeController:
                 "native frame value inspection is unavailable"
             )
         return selected_path, root.native_level
+
+    @staticmethod
+    def _validate_capture_value_path(
+        action: str,
+        path: SafeValuePath,
+    ) -> None:
+        """Reject paths that no public value descriptor can construct.
+
+        The frozen path types prevent expression injection.  This second gate
+        prevents a direct controller caller from using their general-purpose
+        constructors to skip the root variable or the public depth budget
+        before a qualified target builder sees the request.
+        """
+        segments = path.segments
+        if not segments:
+            if action != "project":
+                raise CaptureValueCheckError("capture value root request is invalid")
+            return
+        if (
+            len(segments) > MAX_CAPTURE_VALUE_PATH_SEGMENTS
+            or segments[0].kind is not ValuePathSegmentKind.VARIABLE
+        ):
+            raise CaptureValueCheckError("capture value path is invalid")
 
     def resolve_capture_manager_origin(
         self, root: str, fields: tuple[str, ...], *,

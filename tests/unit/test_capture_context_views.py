@@ -410,6 +410,41 @@ def test_runtime_value_binding_checks_the_fence_before_path_validation_or_planni
         close_owner(controller, transport)
 
 
+def test_runtime_value_binding_rejects_fabricated_root_path_before_planning():
+    from onec_runtime.capture_values import SafeValuePath, ValueRoot, ValueRootKind
+    from onec_runtime.prototype_runtime import CaptureValueInspectionPlan
+    from test_prototype_runtime import CAPTURE_A, ScriptedSession, captured_controller
+
+    planned = []
+
+    def build(**_kwargs):
+        planned.append(True)
+        return CaptureValueInspectionPlan("Результат = Неопределено;", lambda _result: ())
+
+    session = ScriptedSession((CAPTURE_A,))
+    controller = captured_controller(
+        session, capture_value_inspection_builder=build,
+    )
+    owner = controller._capture_evaluation_coordinator
+    assert owner is not None
+    try:
+        before = len(session.calls)
+        with pytest.raises(CaptureValueCheckError, match="root request"):
+            controller.capture_value_inspection(
+                "resolve",
+                path=SafeValuePath(ValueRoot(ValueRootKind.CONTEXT)),
+                request=None,
+                limit=None,
+                worker_type_registrations=(),
+            )
+
+        assert planned == []
+        assert not any(call[0] == "evaluate" for call in session.calls[before:])
+    finally:
+        owner.begin_close()
+        assert owner.join(2)
+
+
 def test_runtime_value_binding_rechecks_the_fence_after_private_target_result():
     from onec_runtime.capture_values import (
         PrivateProjectedValue, PrivateValueProjection, ValueMetadata, ValueShape,
