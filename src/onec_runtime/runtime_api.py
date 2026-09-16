@@ -23,6 +23,7 @@ import pandas as pd
 from onec_runtime.capture_evaluation import (
     AdmissionEnvelopeV1,
     CaptureEvaluationCoordinator,
+    CaptureEvaluationKind,
     CaptureFence,
     CaptureEvaluationTicket,
     CapturePhase,
@@ -651,7 +652,10 @@ class RuntimeController(Protocol):
     def execute_system_main(self, source: str) -> MainCompletion: ...
 
     def execute_system_capture(
-        self, source: str
+        self,
+        source: str,
+        *,
+        evaluation_kind: CaptureEvaluationKind,
     ) -> CaptureCellResult | DebugStop: ...
 
     def install_capture_worker_generation_pin(
@@ -1005,7 +1009,7 @@ class PrototypeRuntimeApi:
         self._evaluation_pin_lock = self._generation_lock
         self._session_waiter_handoffs = local()
         self._worker_instruction_executor = (
-            worker_instruction_executor or self._execute_worker_instruction
+            worker_instruction_executor or self._materialization_instruction_executor
         )
         self._worker_journal = journal or RecoveryJournal()
         self._worker_universe = WorkerUniverseRegistry(
@@ -5302,7 +5306,7 @@ class PrototypeRuntimeApi:
                 max_bytes=max_bytes,
             )
             transfer = RuntimeValueTransfer(
-                self._execute_worker_instruction,
+                self._materialization_instruction_executor,
                 self._take_context_string,
                 context_cleaner=self._drop_context_value,
                 runtime_generation=lambda: self._controller.runtime_generation,
@@ -5335,7 +5339,7 @@ class PrototypeRuntimeApi:
             self._require_available()
             safe_handle = self._resolve_value_handle_locked(handle)
             transfer = RuntimeValueTransfer(
-                self._execute_worker_instruction,
+                self._materialization_instruction_executor,
                 self._take_context_string,
                 context_cleaner=self._drop_context_value,
                 runtime_generation=lambda: self._controller.runtime_generation,
@@ -5365,7 +5369,7 @@ class PrototypeRuntimeApi:
             self._require_available()
             safe_handle = self._resolve_value_handle_locked(handle)
             transfer = CompactRuntimeTableTransfer(
-                self._execute_worker_instruction,
+                self._materialization_instruction_executor,
                 self._take_context_string,
                 runtime_generation=lambda: self._controller.runtime_generation,
                 context_generation=self._context_generation,
@@ -5497,18 +5501,89 @@ class PrototypeRuntimeApi:
             context_generation=self._context_generation,
             worker_type_registrations=self._worker_type_registrations(),
         )
+        capture_transfer = self._capture_transfer_executor_or_none() is not None
         try:
-            metadata = self._execute_worker_instruction(instruction)
-            payload = self._consume_projection_payload_locked(
-                metadata,
-                context_key=context_key,
-                max_bytes=max_bytes,
-            )
+            if capture_transfer:
+                payload = self._execute_capture_transfer(
+                    self._projection_transfer_plan(
+                        instruction,
+                        context_key=context_key,
+                        max_bytes=max_bytes,
+                    ),
+                    evaluation_kind=CaptureEvaluationKind.INSPECTION,
+                )
+            else:
+                metadata = self._execute_worker_instruction(
+                    instruction,
+                    evaluation_kind=CaptureEvaluationKind.INSPECTION,
+                )
+                payload = self._consume_projection_payload_locked(
+                    metadata,
+                    context_key=context_key,
+                    max_bytes=max_bytes,
+                )
             if kind == "table_rows":
                 return "compact_table", payload
             return "value", payload
         finally:
-            self._drop_context_value(context_key)
+            if not capture_transfer:
+                self._drop_context_value(context_key)
+
+    def _projection_transfer_plan(
+        self,
+        instruction: str,
+        *,
+        context_key: str,
+        max_bytes: int,
+    ) -> CaptureTransferPlan:
+        max_base64_chars = ((max_bytes + 2) // 3) * 4
+
+        def admit(metadata: object) -> object:
+            envelope = AdmissionEnvelopeV1.parse(
+                metadata,
+                max_payload_bytes=max_bytes,
+                max_base64_chars=max_base64_chars,
+            )
+            if (
+                envelope.runtime_generation != self._controller.runtime_generation
+                or envelope.context_generation != self._context_generation
+            ):
+                raise CaptureValueCheckError("CAPTURE value admission result is invalid")
+            return metadata
+
+        def decode(metadata: object, content: str) -> bytes:
+            envelope = AdmissionEnvelopeV1.parse(
+                metadata,
+                max_payload_bytes=max_bytes,
+                max_base64_chars=max_base64_chars,
+            )
+            if (
+                envelope.runtime_generation != self._controller.runtime_generation
+                or envelope.context_generation != self._context_generation
+                or len(content) != envelope.base64_chars
+            ):
+                raise CaptureValueCheckError("CAPTURE value admission result is invalid")
+            try:
+                payload = b64decode("".join(content.split()), validate=True)
+            except (ValueError, binascii.Error) as error:
+                raise ProtocolError("projection Base64 payload is invalid") from error
+            if (
+                len(payload) != envelope.payload_bytes
+                or sha256(payload).hexdigest() != envelope.payload_sha256
+            ):
+                raise CaptureValueCheckError(
+                    "CAPTURE value payload integrity check failed"
+                )
+            return payload
+
+        return CaptureTransferPlan(
+            instruction,
+            context_key,
+            f"Контекст.Удалить({bsl_string_literal(context_key)});\nРезультат = Истина;",
+            max_base64_chars,
+            decode,
+            admit,
+        )
 
     def _consume_projection_payload_locked(
         self,
@@ -5809,7 +5884,10 @@ class PrototypeRuntimeApi:
             '    Результат = "E|value_admission_failed";',
             "КонецПопытки;",
         ))
-        route = self._execute_worker_instruction("\n".join(lines))
+        route = self._execute_worker_instruction(
+            "\n".join(lines),
+            evaluation_kind=CaptureEvaluationKind.INSPECTION,
+        )
         if route == AdmissionEnvelopeV1.denied():
             raise CaptureValueAccessDeniedError(
                 "Worker generation objects are not public values"
@@ -5880,7 +5958,7 @@ class PrototypeRuntimeApi:
         profiler: PhaseRecorder | None = None,
     ) -> pd.DataFrame:
         transfer = CompactRuntimeTableTransfer(
-            self._execute_worker_instruction,
+            self._materialization_instruction_executor,
             self._take_context_string,
             runtime_generation=lambda: self._controller.runtime_generation,
             context_generation=self._context_generation,
@@ -5923,12 +6001,18 @@ class PrototypeRuntimeApi:
         with self._capture_helper_writer_handoff():
             self._controller.drop_context_value(key)
 
-    def _execute_worker_instruction(self, source: str) -> object:
+    def _execute_worker_instruction(
+        self,
+        source: str,
+        *,
+        evaluation_kind: CaptureEvaluationKind,
+    ) -> object:
         with self._remaining_command_timeout():
             if self._controller.state is OperationState.CAPTURED:
                 with self._capture_helper_writer_handoff():
                     cell = self._controller.execute_system_capture(
-                        source + "\nРезультатИнструкции = Результат;"
+                        source + "\nРезультатИнструкции = Результат;",
+                        evaluation_kind=evaluation_kind,
                     )
                 return cell.result
             completion = self._controller.execute_system_main(source)
@@ -5940,23 +6024,44 @@ class PrototypeRuntimeApi:
                 )
             return completion.result
 
+    def _materialization_instruction_executor(self, source: str) -> object:
+        return self._execute_worker_instruction(
+            source,
+            evaluation_kind=CaptureEvaluationKind.MATERIALIZATION_HELPER,
+        )
+
     def _capture_transfer_executor_or_none(
         self,
-    ) -> Callable[[CaptureTransferPlan], bytes] | None:
+    ) -> Callable[[CaptureTransferPlan, CaptureEvaluationKind], bytes] | None:
         return (
-            self._execute_capture_transfer
+            self._dispatch_capture_transfer
             if self._capture_control_owner() is not None
             and self._controller.state is OperationState.CAPTURED
             else None
         )
 
-    def _execute_capture_transfer(self, plan: CaptureTransferPlan) -> bytes:
+    def _dispatch_capture_transfer(
+        self,
+        plan: CaptureTransferPlan,
+        evaluation_kind: CaptureEvaluationKind,
+    ) -> bytes:
+        return self._execute_capture_transfer(
+            plan,
+            evaluation_kind=evaluation_kind,
+        )
+
+    def _execute_capture_transfer(
+        self,
+        plan: CaptureTransferPlan,
+        *,
+        evaluation_kind: CaptureEvaluationKind,
+    ) -> bytes:
         with self._remaining_command_timeout():
             executor = getattr(self._controller, "_execute_capture_transfer", None)
             if not callable(executor):
                 raise ProtocolError("Runtime controller cannot execute CAPTURE transfer")
             with self._capture_helper_writer_handoff():
-                result = executor(plan)
+                result = executor(plan, evaluation_kind=evaluation_kind)
             if not isinstance(result, bytes):
                 raise ProtocolError("CAPTURE transfer returned an invalid payload")
             return result

@@ -2203,17 +2203,27 @@ class PrototypeRuntimeController:
             f"__onec_cell_messages_{self.runtime_generation}_{operation_id}_{cell_sequence}"
         )
 
-    def execute_system_capture(self, source: str) -> CaptureCellResult | DebugStop:
+    def execute_system_capture(
+        self,
+        source: str,
+        *,
+        evaluation_kind: CaptureEvaluationKind,
+    ) -> CaptureCellResult | DebugStop:
         """Execute trusted runtime BSL verbatim in the current capture frame."""
         mapped = self._compatibility_mapped_source(source, "system-capture")
         return self._execute_capture(
             source,
             mapped,
             visible_source_context=self._visible_context(mapped, source),
-            evaluation_kind=CaptureEvaluationKind.MATERIALIZATION_HELPER,
+            evaluation_kind=evaluation_kind,
         )
 
-    def _execute_capture_transfer(self, plan: CaptureTransferPlan) -> bytes:
+    def _execute_capture_transfer(
+        self,
+        plan: CaptureTransferPlan,
+        *,
+        evaluation_kind: CaptureEvaluationKind,
+    ) -> bytes:
         """Run the full private transfer as one coordinator-owned CAPTURE record."""
         if not isinstance(plan, CaptureTransferPlan):
             raise TypeError("CAPTURE transfer plan is required")
@@ -2223,7 +2233,7 @@ class PrototypeRuntimeController:
 
         def step_factory(source: str) -> CaptureRemoteStep:
             return self._capture_remote_step(
-                source,
+                build_live_current_capture_call(source),
                 stack_level=stack_level,
                 max_text_size=plan.max_text_size,
             )
@@ -2255,6 +2265,7 @@ class PrototypeRuntimeController:
             owner._fence,
             step_factory=step_factory,
             read=read,
+            evaluation_kind=evaluation_kind,
             completion=self._complete_capture_lifecycle,
         )
         return self._submit_capture_request(

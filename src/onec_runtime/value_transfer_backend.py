@@ -7,7 +7,11 @@ from hashlib import sha256
 import re
 from uuid import uuid4
 
-from onec_runtime.capture_evaluation import AdmissionEnvelopeV1, CaptureTransferPlan
+from onec_runtime.capture_evaluation import (
+    AdmissionEnvelopeV1,
+    CaptureEvaluationKind,
+    CaptureTransferPlan,
+)
 from onec_runtime.errors import CaptureValueCheckError, ProtocolError
 from onec_runtime.experiment import bsl_string_literal
 from onec_runtime.performance_profile import PhaseRecorder
@@ -98,7 +102,7 @@ class RuntimeValueTransfer:
         context_generation: int,
         key_factory: Callable[[], str] | None = None,
         profiler: PhaseRecorder | None = None,
-        capture_executor: Callable[[CaptureTransferPlan], bytes] | None = None,
+        capture_executor: Callable[[CaptureTransferPlan, CaptureEvaluationKind], bytes] | None = None,
         worker_type_registrations: Callable[[], tuple[str, ...]] | None = None,
     ) -> None:
         self._capture_execute = capture_executor
@@ -168,15 +172,31 @@ class RuntimeValueTransfer:
                 raise CaptureValueCheckError("CAPTURE value payload integrity check failed")
             return payload
 
+        def admit(metadata: object) -> object:
+            observed = AdmissionEnvelopeV1.parse(
+                metadata,
+                max_payload_bytes=maximum_transfer_bytes,
+                max_base64_chars=maximum_text_size,
+            )
+            if (
+                observed.runtime_generation != generation
+                or observed.context_generation != self._context_generation
+            ):
+                raise CaptureValueCheckError("CAPTURE value admission result is invalid")
+            return metadata
+
         return CaptureTransferPlan(
             source, key, f"Контекст.Удалить({bsl_string_literal(key)});\nРезультат = Истина;",
-            maximum_text_size, decode,
+            maximum_text_size, decode, admit,
         )
 
     def payload(self, handle: str, options: MaterializationOptions) -> bytes:
         plan = self.prepare_payload(handle, options)
         if self._capture_execute is not None:
-            return self._capture_execute(plan)
+            return self._capture_execute(
+                plan,
+                CaptureEvaluationKind.MATERIALIZATION_HELPER,
+            )
         consumed = False
         primary_error: BaseException | None = None
         try:

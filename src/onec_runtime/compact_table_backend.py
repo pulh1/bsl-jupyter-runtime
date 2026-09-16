@@ -11,7 +11,11 @@ from uuid import uuid4
 import pandas as pd
 
 from onec_runtime.compact_table import decode_compact_table_payload
-from onec_runtime.capture_evaluation import AdmissionEnvelopeV1, CaptureTransferPlan
+from onec_runtime.capture_evaluation import (
+    AdmissionEnvelopeV1,
+    CaptureEvaluationKind,
+    CaptureTransferPlan,
+)
 from onec_runtime.errors import CaptureValueCheckError, ProtocolError
 from onec_runtime.experiment import bsl_string_literal
 from onec_runtime.performance_profile import PhaseRecorder
@@ -214,7 +218,7 @@ class CompactRuntimeTableTransfer:
         key_factory: Callable[[], str] | None = None,
         profiler: PhaseRecorder | None = None,
         worker_type_registrations: Callable[[], tuple[str, ...]] | None = None,
-        capture_executor: Callable[[CaptureTransferPlan], bytes] | None = None,
+        capture_executor: Callable[[CaptureTransferPlan, CaptureEvaluationKind], bytes] | None = None,
     ) -> None:
         self._capture_execute = capture_executor
         self._execute = instruction_executor
@@ -285,9 +289,13 @@ class CompactRuntimeTableTransfer:
                 raise CaptureValueCheckError("CAPTURE value payload integrity check failed")
             return payload
 
+        def admit(metadata: object) -> object:
+            self._validate_metadata(metadata, generation)
+            return metadata
+
         return CaptureTransferPlan(
             source, key, f"Контекст.Удалить({bsl_string_literal(key)});\nРезультат = Истина;",
-            self._max_text_size, decode,
+            self._max_text_size, decode, admit,
         )
 
     def _validate_metadata(self, metadata: object, generation: int) -> tuple[int, int, str]:
@@ -306,7 +314,10 @@ class CompactRuntimeTableTransfer:
     def payload(self, handle: str, policy: ReferencePolicy) -> bytes:
         plan = self.prepare_payload(handle, policy)
         if self._capture_execute is not None:
-            return self._capture_execute(plan)
+            return self._capture_execute(
+                plan,
+                CaptureEvaluationKind.MATERIALIZATION_HELPER,
+            )
         metadata = self._profile(
             "table.prepare_jsonl", lambda: self._execute(plan.instruction),
             input_bytes=len(plan.instruction.encode("utf-8")),

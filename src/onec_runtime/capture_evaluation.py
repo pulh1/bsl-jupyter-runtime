@@ -38,6 +38,7 @@ from onec_runtime.errors import (
 )
 from onec_runtime.rdbg.models import EvaluationResult, PendingEvaluation, StopEvent
 from onec_runtime.recovery_journal import RecoveryJournal
+from onec_runtime.table_value import evaluation_to_python
 
 
 # These limits are part of the public safety boundary.  Timing is intentionally
@@ -600,6 +601,10 @@ def _no_messages() -> tuple[str, ...]:
     return ()
 
 
+def _admit_transfer_metadata(metadata: object) -> object:
+    return metadata
+
+
 def _no_pin(disposition: str) -> None:
     pass
 
@@ -716,25 +721,46 @@ class CaptureTransferPlan:
     cleanup_instruction: str = field(repr=False)
     max_text_size: int
     decode: Callable[[object, str], bytes] = field(repr=False)
+    admit_metadata: Callable[[object], object] = field(
+        default=_admit_transfer_metadata,
+        repr=False,
+    )
 
     def capture_request(
         self, fence: CaptureFence, *,
         step_factory: Callable[[str], CaptureRemoteStep],
         read: Callable[[CaptureStepContext, str, int], str],
+        evaluation_kind: CaptureEvaluationKind,
         pin_lease: Callable[[str], None] = _no_pin,
         completion: Callable[[object, BaseException | None], object] | None = None,
     ) -> CaptureEvaluationRequest:
         first = step_factory(self.instruction)
         cleanup = CaptureCleanupLease(self.private_key, step_factory(self.cleanup_instruction))
 
+        policy_error: BaseException | None = None
+
+        def admit(result: EvaluationResult) -> object:
+            nonlocal policy_error
+            try:
+                if result.error_occurred:
+                    raise CaptureValueCheckError("CAPTURE value admission failed")
+                return self.admit_metadata(evaluation_to_python(result))
+            except (CaptureValueAccessDeniedError, CaptureValueCheckError) as error:
+                policy_error = error
+                raise
+
         def continuation(context: CaptureStepContext, metadata: object) -> bytes:
             return self.decode(metadata, read(context, self.private_key, self.max_text_size))
 
+        def restore_policy(error: BaseException) -> BaseException:
+            return error if policy_error is None else policy_error
+
         return CaptureEvaluationRequest(
-            fence, CaptureEvaluationKind.MATERIALIZATION_HELPER,
-            first.dispatch, first.poll, lambda result: result.presentation,
+            fence, evaluation_kind,
+            first.dispatch, first.poll, admit,
             restore=first.restore, pin_lease=pin_lease, cleanup_leases=(cleanup,),
             step_continuation=continuation, completion=completion,
+            initiator_error_policy=restore_policy,
         )
 
 

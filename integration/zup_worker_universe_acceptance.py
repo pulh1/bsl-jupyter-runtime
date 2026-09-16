@@ -2757,7 +2757,12 @@ def _execute_trusted_incremental_object_probe(api: object, source: str) -> objec
     execute = getattr(controller, "execute_system_capture", None)
     if not callable(execute):
         raise ProtocolError("ZUP trusted incremental capture is unavailable")
-    probe = execute(source)
+    from onec_runtime.capture_evaluation import CaptureEvaluationKind
+
+    probe = execute(
+        source,
+        evaluation_kind=CaptureEvaluationKind.MATERIALIZATION_HELPER,
+    )
     if not isinstance(probe, CaptureCellResult):
         raise ProtocolError("ZUP trusted incremental capture result is invalid")
     return probe.result
