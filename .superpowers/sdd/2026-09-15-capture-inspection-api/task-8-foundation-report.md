@@ -335,3 +335,51 @@ skipped` in 258.08 seconds, with only the existing Windows ZMQ Proactor
 warning. `uv run python -m compileall -q src/onec_runtime packages/jupyter/src
 packages/mcp/src`, `git diff --check`, and the no-`inspect_completion_fields`
 source check pass.
+
+## Ready-state completion lifecycle correction
+
+A non-CAPTURE `completion_fields()` call previously reached
+`_execute_worker_instruction()` and therefore `execute_system_main()`. That
+created a new MAIN operation for a read-only schema request, changing the
+operation id, state, active operation, registry, histories, workspace,
+journal, and continue count.
+
+The controller now owns `execute_system_inspection()`: it accepts only the
+trusted bounded completion scalar expression, evaluates it directly through
+RDBG, and returns only scalar text. It does not allocate an operation, change
+the registry or workspace, write the recovery journal, or continue the target.
+A confirmed target failure remains `BslExecutionError`; an unexpected RDBG stop
+propagates without partially changing the prior ready lifecycle. CAPTURE keeps
+the coordinator-owned `INSPECTION` ticket path unchanged.
+
+Both branches execute the same server expression,
+`RuntimeValueTransferServer.СериализоватьДопущенныеИменаСвойствДляПодсказки`.
+The new bounded server serializer calls the existing root-admitting schema
+helper before iterating names and emits the checked scalar `C<TAB>count`
+format. The direct scalar evaluation allows 75,000 bytes, covering the marker
+and 128 maximum-length Unicode identifiers. No collection API or standalone
+completion guard was restored.
+
+The real `PrototypeRuntimeController` regressions establish a completed MAIN
+before inspection, then prove a successful scalar read leaves operation id,
+state, active operation, registry identity, histories, workspace, journal, and
+continue count unchanged. A synthetic `UnexpectedStop` and a confirmed BSL
+error each preserve the same snapshot. The generated expression is parsed by
+the pinned BSL parser and the server source test proves admission occurs before
+field enumeration.
+
+RED `187c688` demonstrates the second-MAIN mutation. GREEN `7f8c2fd` adds the
+immediate controller route, scalar extension function, fixture updates, and a
+Designer-rebuilt bundle. The checked-in CFE was rebuilt with Designer 8.3.27.2170:
+21,951 bytes, SHA-256
+`0b0a871ba44dc0250abe2d5bafc62b38060ef9a61cace94a1330d9dbe20ce924`.
+The regenerated manifest matches the canonical four-source fingerprint and
+retains sole protocol `2` and artifact `0.1.3`; `ConfigDumpInfo` did not change.
+
+The final focused completion/controller/extension suite passed `82 passed` in
+2.66 seconds. The expanded completion/coordinator/runtime/Jupyter/MCP/bundle
+suite passed `657 passed` in 46.61 seconds. The final full unit suite passed
+`4579 passed, 58 skipped` in 251.16 seconds, with only the existing Windows ZMQ
+Proactor warning. `uv run python -m compileall -q src/onec_runtime
+packages/jupyter/src packages/mcp/src`, `git diff --check`, and the manifest
+fingerprint/protocol/artifact verification pass.
