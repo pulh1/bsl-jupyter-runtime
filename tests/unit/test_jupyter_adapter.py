@@ -423,7 +423,7 @@ def test_bsl_magic_renders_acknowledged_user_evaluation_pending_as_safe_mime_bun
     shell = FakeShell()
     runtime = FakeRuntime()
     runtime._poisoned_error = None  # type: ignore[attr-defined]
-    evaluation_id = "eval-<safe>"
+    evaluation_id = "a4f1d86e1e1d4d45b0948e021f669d1f"
     guidance = "runtime.current_capture().wait(timeout_s=10)"
     source = (
         "СекретныйИсточник = worker://private-handle; "
@@ -453,12 +453,12 @@ def test_bsl_magic_renders_acknowledged_user_evaluation_pending_as_safe_mime_bun
     assert displayed is not None
     bundle = displayed._repr_mimebundle_()
     assert bundle["text/plain"] == (
-        "evaluation_id=eval-<safe>\n"
+        f"evaluation_id={evaluation_id}\n"
         "evaluation_kind=user_bsl\n"
         + guidance
     )
     assert bundle["text/html"] == (
-        "<pre>evaluation_id=eval-&lt;safe&gt;\n"
+        f"<pre>evaluation_id={evaluation_id}\n"
         "evaluation_kind=user_bsl\n"
         + guidance
         + "</pre>"
@@ -479,6 +479,142 @@ def test_bsl_magic_renders_acknowledged_user_evaluation_pending_as_safe_mime_bun
         assert secret not in rendered
     assert dispatches == 1
     assert runtime._poisoned_error is None  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    (
+        "untrusted_evaluation_id",
+        "untrusted_evaluation_kind",
+        "expected_evaluation_id",
+        "expected_evaluation_kind",
+        "secret",
+    ),
+    (
+        (
+            "malformed-private-receipt",
+            CaptureEvaluationKind.USER_BSL,
+            "<unavailable>",
+            "user_bsl",
+            "malformed-private-receipt",
+        ),
+        (
+            "https://private.invalid/evaluation",
+            CaptureEvaluationKind.USER_BSL,
+            "<unavailable>",
+            "user_bsl",
+            "private.invalid",
+        ),
+        (
+            "worker://private-handle",
+            CaptureEvaluationKind.USER_BSL,
+            "<unavailable>",
+            "user_bsl",
+            "private-handle",
+        ),
+        (
+            "generation=987-private",
+            CaptureEvaluationKind.USER_BSL,
+            "<unavailable>",
+            "user_bsl",
+            "987-private",
+        ),
+        (
+            "result_id=private-result",
+            CaptureEvaluationKind.USER_BSL,
+            "<unavailable>",
+            "user_bsl",
+            "private-result",
+        ),
+        (
+            "\x1b[31mprivate-control",
+            CaptureEvaluationKind.USER_BSL,
+            "<unavailable>",
+            "user_bsl",
+            "private-control",
+        ),
+        (
+            "overlong-private-" + "a" * 300,
+            CaptureEvaluationKind.USER_BSL,
+            "<unavailable>",
+            "user_bsl",
+            "overlong-private",
+        ),
+        (
+            "a4f1d86e-1e1d-4d45-b094-8e021f669d1f",
+            "worker://private-kind",
+            "a4f1d86e1e1d4d45b0948e021f669d1f",
+            "unknown",
+            "private-kind",
+        ),
+    ),
+    ids=(
+        "malformed-id",
+        "url-id",
+        "handle-id",
+        "generation-id",
+        "result-id",
+        "control-id",
+        "overlong-id",
+        "untrusted-kind",
+    ),
+)
+def test_bsl_magic_pending_receipt_redacts_untrusted_exception_fields(
+    untrusted_evaluation_id: str,
+    untrusted_evaluation_kind: object,
+    expected_evaluation_id: str,
+    expected_evaluation_kind: str,
+    secret: str,
+) -> None:
+    """The Jupyter and VS Code MIME bundle never reflects exception fields."""
+
+    shell = FakeShell()
+    runtime = FakeRuntime()
+    receipt = CaptureEvaluationPendingError(
+        untrusted_evaluation_id,
+        CaptureEvaluationKind.USER_BSL,
+    )
+    receipt.evaluation_kind = untrusted_evaluation_kind  # type: ignore[assignment]
+
+    def pending(
+        _source: str,
+        *,
+        source_unit: SourceUnitRef,
+    ) -> RuntimeReply:
+        del source_unit
+        raise receipt
+
+    runtime.execute_bsl = pending  # type: ignore[method-assign]
+    install_runtime(shell, runtime)
+
+    displayed = OnecRuntimeMagics(shell).bsl(  # type: ignore[arg-type]
+        "", "РезультатИнструкции = 904;"
+    )
+
+    assert displayed is not None
+    bundle = displayed._repr_mimebundle_()
+    guidance = "runtime.current_capture().wait(timeout_s=10)"
+    expected_text = (
+        f"evaluation_id={expected_evaluation_id}\n"
+        f"evaluation_kind={expected_evaluation_kind}\n"
+        + guidance
+    )
+    assert bundle["text/plain"] == expected_text
+    assert bundle["text/html"] == (
+        "<pre>"
+        + expected_text.replace("<", "&lt;").replace(">", "&gt;")
+        + "</pre>"
+    )
+    assert bundle[MACHINE_MIME_TYPE] == {
+        "evaluation_id": expected_evaluation_id,
+        "evaluation_kind": expected_evaluation_kind,
+        "guidance": guidance,
+    }
+    for rendered in (
+        bundle["text/plain"],
+        bundle["text/html"],
+        json.dumps(bundle[MACHINE_MIME_TYPE], ensure_ascii=False),
+    ):
+        assert secret not in rendered
 
 
 def test_presentation_mode_prints_bsl_messages_without_visible_json(

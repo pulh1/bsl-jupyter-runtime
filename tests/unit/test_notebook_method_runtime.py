@@ -4,7 +4,7 @@ Only the external debugger session and target artifact transport are scripted.
 """
 from pathlib import Path
 import re
-from threading import Event, RLock, Thread, current_thread
+from threading import Barrier, Event, RLock, Thread, current_thread
 
 import pytest
 
@@ -98,11 +98,16 @@ def _session_backed_notebook_runtime(
 
 
 def test_jupyter_magic_pending_user_bsl_detaches_core_ticket_and_keeps_controls_available(
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """The notebook waiter must not retain either Session/API writer lock."""
 
-    from onec_runtime.capture_evaluation import CaptureEvaluationState, CapturePhase
+    from onec_runtime.capture_evaluation import (
+        CaptureEvaluationState,
+        CaptureEvaluationTicket,
+        CapturePhase,
+    )
     from onec_runtime_jupyter.extension import (
         MACHINE_MIME_TYPE,
         OnecRuntimeMagics,
@@ -110,7 +115,7 @@ def test_jupyter_magic_pending_user_bsl_detaches_core_ticket_and_keeps_controls_
     )
 
     session = ControlledCaptureSession()
-    controller = captured_controller(session, command_timeout_s=0.2)
+    controller = captured_controller(session, command_timeout_s=30)
     api = PrototypeRuntimeApi(
         controller,
         notebook_worker_builder=_notebook_worker_builder(tmp_path),
@@ -122,6 +127,20 @@ def test_jupyter_magic_pending_user_bsl_detaches_core_ticket_and_keeps_controls_
     result: list[object] = []
     errors: list[BaseException] = []
     finished = Event()
+    wait_handoff = Barrier(2)
+    release_initiator = Event()
+    original_wait = CaptureEvaluationTicket.wait_initiator
+
+    def held_wait(
+        ticket: CaptureEvaluationTicket,
+        timeout_s: float | None = None,
+    ) -> object:
+        assert timeout_s == 30
+        wait_handoff.wait(timeout=1)
+        assert release_initiator.wait(1)
+        return original_wait(ticket, timeout_s=0)
+
+    monkeypatch.setattr(CaptureEvaluationTicket, "wait_initiator", held_wait)
 
     def execute() -> None:
         try:
@@ -147,6 +166,7 @@ def test_jupyter_magic_pending_user_bsl_detaches_core_ticket_and_keeps_controls_
     try:
         initiator.start()
         assert session.accepted.wait(1), "user BSL evaluation was not acknowledged"
+        wait_handoff.wait(timeout=1)
         capture = runtime.current_capture()
         status = capture.status()
         assert status.phase is CapturePhase.EVALUATING
@@ -154,13 +174,12 @@ def test_jupyter_magic_pending_user_bsl_detaches_core_ticket_and_keeps_controls_
         assert capture.wait(timeout_s=0).state is CaptureEvaluationState.PENDING
 
         contender.start()
-        assert contender_done.wait(0.1), (
-            "Session/API writer lock stayed with waiter"
-        )
+        assert contender_done.wait(1), "Session/API writer lock stayed with waiter"
         assert len(contender_errors) == 1
         assert isinstance(contender_errors[0], CaptureBusyError)
         assert session.capture_start_count == 1
 
+        release_initiator.set()
         assert finished.wait(1), "notebook command deadline did not detach waiter"
         assert errors == []
         assert len(result) == 1 and result[0] is not None
@@ -184,6 +203,7 @@ def test_jupyter_magic_pending_user_bsl_detaches_core_ticket_and_keeps_controls_
         assert outcome.evaluation_id == status.pending_evaluation_id
         assert session.capture_start_count == 1
     finally:
+        release_initiator.set()
         if session.capture_pending is not None:
             session.complete()
         initiator.join(1)
