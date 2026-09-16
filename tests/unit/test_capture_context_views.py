@@ -5,10 +5,12 @@ import pytest
 
 from onec_runtime.errors import (
     CaptureBusyError,
+    CaptureEvaluationPendingError,
     CaptureLookupError,
     CapturePathError,
     CaptureSourceUnavailableError,
     CaptureValueCheckError,
+    StaleCaptureError,
 )
 
 
@@ -309,5 +311,183 @@ def test_current_capture_exposes_a_typed_live_context_view() -> None:
 
         assert isinstance(capture.context, CaptureContextView)
         assert capture.context is capture.context
+    finally:
+        close_owner(controller, transport)
+
+
+def test_runtime_context_projection_is_lazy_and_uses_one_controller_inspection_plan():
+    """Public descriptors are inert; consuming a page owns one coordinator plan."""
+    from onec_runtime.capture_values import (
+        PrivateProjectedValue, PrivateValueProjection, ValueMetadata, ValueShape,
+    )
+    from onec_runtime.prototype_runtime import CaptureValueInspectionPlan
+    from onec_runtime.runtime_api import PrototypeRuntimeApi
+    from test_prototype_runtime import CAPTURE_A, ScriptedSession, captured_controller
+
+    plans = []
+    metadata_calls = []
+
+    def build(**kwargs):
+        plans.append(kwargs)
+        return CaptureValueInspectionPlan(
+            'RuntimeKernelServer.ВыполнитьКодВКонтекстеОтладки(Контекст, "")',
+            lambda _result: PrivateValueProjection((
+                PrivateProjectedValue(
+                    "Оклад",
+                    lambda: metadata_calls.append("describe") or ValueMetadata(
+                        "Число", "55000", None, ValueShape.SCALAR,
+                    ),
+                ),
+            ), 1, None),
+        )
+
+    session = ScriptedSession((CAPTURE_A,))
+    controller = captured_controller(
+        session, capture_value_inspection_builder=build,
+    )
+    runtime = PrototypeRuntimeApi(controller)
+    owner = controller._capture_evaluation_coordinator
+    assert owner is not None
+    try:
+        capture = runtime.current_capture()
+        descriptor = capture.context.variables
+        before = len(session.calls)
+
+        assert plans == []
+        page = descriptor[:1]
+
+        assert [item.name for item in page.items] == ["Оклад"]
+        assert metadata_calls == ["describe"]
+        assert repr(page.items[0])
+        assert metadata_calls == ["describe"]
+        assert len(plans) == 1
+        planned = plans[0]
+        assert planned["action"] == "project"
+        assert planned["path"].root.kind.value == "context"
+        assert planned["request"].start == 0 and planned["request"].stop == 1
+        assert planned["limit"] is None
+        starts = [call for call in session.calls[before:] if call[0] == "evaluate"]
+        assert len(starts) == 1
+        assert starts[0][1][1] == controller.capture_kernel_stack_level
+        assert owner.status(owner._fence).can_inspect
+    finally:
+        owner.begin_close()
+        assert owner.join(2)
+
+
+def test_runtime_context_projection_fails_closed_without_a_qualified_target_plan():
+    """RDBG inventory metadata is never a fallback public value descriptor."""
+    from test_capture_control_plane import _capture_runtime, close_owner
+
+    runtime, controller, transport = _capture_runtime()
+    try:
+        capture = runtime.current_capture()
+        before = len(transport.calls)
+
+        with pytest.raises(CaptureSourceUnavailableError, match="not qualified"):
+            capture.context.variables[:1]
+
+        assert len(transport.calls) == before
+    finally:
+        close_owner(controller, transport)
+
+
+def test_runtime_value_binding_checks_the_fence_before_path_validation_or_planning():
+    from test_capture_control_plane import _capture_runtime, close_owner
+
+    runtime, controller, transport = _capture_runtime()
+    try:
+        capture = runtime.current_capture()
+        controller.stop_sequence += 1
+        before = len(transport.calls)
+
+        with pytest.raises(StaleCaptureError):
+            capture.context.variables["X); ВыполнитьОпасное(); //"]
+
+        assert len(transport.calls) == before
+    finally:
+        close_owner(controller, transport)
+
+
+def test_runtime_value_binding_rechecks_the_fence_after_private_target_result():
+    from onec_runtime.capture_values import (
+        PrivateProjectedValue, PrivateValueProjection, ValueMetadata, ValueShape,
+    )
+    from onec_runtime.prototype_runtime import CaptureValueInspectionPlan
+    from onec_runtime.runtime_api import PrototypeRuntimeApi
+    from test_prototype_runtime import CAPTURE_A, ScriptedSession, captured_controller
+
+    metadata_calls = []
+    controller_ref = []
+
+    def build(**_kwargs):
+        def decode(_result):
+            controller_ref[0].stop_sequence += 1
+            return PrivateValueProjection((
+                PrivateProjectedValue(
+                    "Секрет",
+                    lambda: metadata_calls.append("describe") or ValueMetadata(
+                        "Строка", "private", None, ValueShape.SCALAR,
+                    ),
+                ),
+            ), 1, None)
+
+        return CaptureValueInspectionPlan(
+            'RuntimeKernelServer.ВыполнитьКодВКонтекстеОтладки(Контекст, "")',
+            decode,
+        )
+
+    session = ScriptedSession((CAPTURE_A,))
+    controller = captured_controller(
+        session, capture_value_inspection_builder=build,
+    )
+    controller_ref.append(controller)
+    runtime = PrototypeRuntimeApi(controller)
+    owner = controller._capture_evaluation_coordinator
+    assert owner is not None
+    try:
+        capture = runtime.current_capture()
+
+        with pytest.raises(StaleCaptureError):
+            capture.context.variables[:1]
+
+        assert metadata_calls == []
+    finally:
+        owner.begin_close()
+        assert owner.join(2)
+
+
+def test_runtime_value_binding_preserves_a_pending_coordinator_outcome():
+    from onec_runtime.prototype_runtime import CaptureValueInspectionPlan
+    from onec_runtime.runtime_api import PrototypeRuntimeApi
+    from test_capture_evaluation_lifecycle import ControlledCaptureSession, close_owner
+    from test_prototype_runtime import captured_controller
+
+    def decode_pending(_result):
+        raise AssertionError("pending plan must not decode")
+
+    def build(**_kwargs):
+        return CaptureValueInspectionPlan(
+            'RuntimeKernelServer.ВыполнитьКодВКонтекстеОтладки(Контекст, "")',
+            decode_pending,
+        )
+
+    transport = ControlledCaptureSession()
+    controller = captured_controller(
+        transport,
+        command_timeout_s=0.02,
+        capture_value_inspection_builder=build,
+    )
+    runtime = PrototypeRuntimeApi(controller)
+    try:
+        capture = runtime.current_capture()
+
+        with pytest.raises(CaptureEvaluationPendingError):
+            capture.context.variables[:1]
+
+        status = capture.status()
+        assert status.pending_evaluation_id is not None
+        assert status.evaluation_kind is not None
+        assert status.evaluation_kind.value == "inspection"
     finally:
         close_owner(controller, transport)

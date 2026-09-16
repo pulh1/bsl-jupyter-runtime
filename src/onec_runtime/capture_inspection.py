@@ -55,6 +55,9 @@ class CaptureView:
         [float | None, str | None], CaptureEvaluationOutcome
     ] = field(repr=False, compare=False)
     __stack: StackDescriptor | None = field(default=None, repr=False, compare=False)
+    __context: CaptureContextView | None = field(
+        default=None, repr=False, compare=False,
+    )
 
     def __post_init__(self) -> None:
         for name in ("operation_id", "capture_generation", "stop_sequence"):
@@ -72,6 +75,11 @@ class CaptureView:
             raise TypeError("capture view readers must be callable")
         if self.__stack is not None and not isinstance(self.__stack, StackDescriptor):
             raise TypeError("capture stack descriptor is invalid")
+        if self.__context is not None:
+            from onec_runtime.capture_values import CaptureContextView
+
+            if not isinstance(self.__context, CaptureContextView):
+                raise TypeError("capture context descriptor is invalid")
 
     def __repr__(self) -> str:
         return (
@@ -105,6 +113,15 @@ class CaptureView:
         if self.__stack is None:
             raise CaptureSourceUnavailableError("capture stack inspection is not attached")
         return self.__stack
+
+    @property
+    def context(self) -> CaptureContextView:
+        """Live, fenced values from the staged CAPTURE context namespace."""
+        if self.__context is None:
+            raise CaptureSourceUnavailableError(
+                "capture context value inspection is not attached"
+            )
+        return self.__context
 
 
 

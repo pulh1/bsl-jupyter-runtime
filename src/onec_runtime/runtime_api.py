@@ -35,6 +35,15 @@ from onec_runtime.capture_inspection import (
     LocalStackAdapter,
     ResolvedFrameSource,
 )
+from onec_runtime.capture_values import (
+    CaptureValueBackend,
+    CaptureValuePolicy,
+    LocalCaptureValueAdapter,
+    PrivateProjectedValue,
+    PrivateValueProjection,
+    SafeValuePath,
+    ValueInspectionRequest,
+)
 from onec_runtime.capture_source import SourceVersionRef
 
 from onec_runtime.bsl import (
@@ -102,9 +111,11 @@ from onec_runtime.compact_table_backend import (
 from onec_runtime.errors import (
     BslExecutionError,
     CaptureBusyError,
+    CaptureEvaluationPendingError,
     CaptureInspectionTimeout,
     CaptureOutcomeUnknownError,
     CaptureRecoveryRequiredError,
+    CaptureSourceUnavailableError,
     CaptureValueAccessDeniedError,
     CaptureValueCheckError,
     CommandTimeout,
@@ -708,6 +719,17 @@ class RuntimeController(Protocol):
         name: str | None = None, timeout_s: float | None = None,
     ) -> Mapping[str, object]: ...
 
+    def capture_value_inspection(
+        self,
+        action: str,
+        *,
+        path: SafeValuePath | None,
+        request: ValueInspectionRequest | None,
+        limit: int | None,
+        worker_type_registrations: tuple[str, ...],
+        timeout_s: float | None = None,
+    ) -> object: ...
+
     def resolve_capture_manager_origin(
         self, root: str, fields: tuple[str, ...], *,
         timeout_s: float | None = None,
@@ -882,6 +904,39 @@ class _RuntimeStackInventoryBackend:
         if not isinstance(fence, CaptureFence):
             raise StaleCaptureError()
         return self._runtime._read_capture_stack_inventory(fence)
+
+
+class _RuntimeCaptureValueBackend(CaptureValueBackend):
+    """Fence-owning bridge from saved value descriptors to RuntimeApi.
+
+    Constructing a descriptor deliberately does no target work.  Each adapter
+    call re-enters the RuntimeApi data plane, validates the exact stop fence,
+    and delegates the actual target-side projection to the controller's
+    coordinator-owned inspection seam.
+    """
+
+    __slots__ = ("_runtime",)
+
+    def __init__(self, runtime: PrototypeRuntimeApi) -> None:
+        self._runtime = runtime
+
+    def validate_inspection(self, fence: object) -> None:
+        self._runtime._validate_capture_value_inspection(fence)
+
+    def resolve_value(
+        self, fence: object, path: SafeValuePath,
+    ) -> PrivateProjectedValue:
+        return self._runtime._capture_value_resolve(fence, path)
+
+    def project_values(
+        self, fence: object, request: ValueInspectionRequest,
+    ) -> PrivateValueProjection:
+        return self._runtime._capture_value_project(fence, request)
+
+    def discover_table_columns(
+        self, fence: object, path: SafeValuePath, limit: int,
+    ) -> tuple[str, ...]:
+        return self._runtime._capture_value_columns(fence, path, limit)
 
 
 class PrototypeRuntimeApi:
@@ -1134,14 +1189,51 @@ class PrototypeRuntimeApi:
                 return resolved
 
         command_timeout_s = getattr(self._controller, "command_timeout_s", 30.0)
-        adapter = LocalStackAdapter(
+        context_native_level = getattr(
+            self._controller, "capture_frame_stack_level", 0,
+        )
+        if type(context_native_level) is not int or context_native_level < 0:
+            context_native_level = 0
+        value_adapter = LocalCaptureValueAdapter(
+            _RuntimeCaptureValueBackend(self),
+            fence,
+            policy=CaptureValuePolicy(),
+            resolve_parameters=lambda root: resolve_value_parameters(
+                root.native_level
+                if root.native_level is not None
+                else context_native_level
+            ),
+        )
+
+        stack_adapter: LocalStackAdapter
+
+        def resolve_value_parameters(native_level: int) -> tuple[str, ...]:
+            frame = stack_adapter.stack.native[native_level].with_method()
+            method = frame.method
+            if method is None:
+                raise CaptureSourceUnavailableError(
+                    "method source unavailable; use variables for unclassified values"
+                )
+            return method.parameters
+
+        def bind_value_frame(frame: DebugFrame) -> DebugFrame:
+            bound = frame if effective_binder is None else effective_binder(frame)
+            if not isinstance(bound, DebugFrame):
+                raise ProtocolError("capture stack frame binder is invalid")
+            # Source/session binding may annotate a saved frame, but its value
+            # scope must never replace this stop's canonical fence-owned
+            # adapter.  In particular, a preattached local fake cannot bypass
+            # the controller's inline admission path.
+            return value_adapter.bind_frame(bound)
+
+        stack_adapter = LocalStackAdapter(
             _RuntimeStackInventoryBackend(self),
             fence,
             resolve_sources=resolve_stack_sources,
             is_runtime_frame=self._capture_stack_runtime_frame,
             registry=self._module_syntax_registry,
             command_timeout_s=float(command_timeout_s),
-            bind_frame=effective_binder,
+            bind_frame=bind_value_frame,
         )
 
         def is_current() -> bool:
@@ -1164,7 +1256,8 @@ class PrototypeRuntimeApi:
                 evaluation_id,
                 timeout_s,
             ),
-            adapter.stack,
+            stack_adapter.stack,
+            value_adapter.context,
         )
 
     def _capture_stack_runtime_frame(self, frame: StackFrame) -> bool:
@@ -1185,6 +1278,117 @@ class PrototypeRuntimeApi:
         if not status.can_inspect:
             self._require_capture_data_plane_admission()
             raise StaleCaptureError("CAPTURE inspection is unavailable")
+
+    def _validate_capture_value_inspection(self, fence: object) -> None:
+        """Check lifecycle before local path validation or target admission."""
+        if not isinstance(fence, CaptureFence):
+            raise StaleCaptureError()
+        with self._capture_data_plane_writer():
+            self._require_available()
+            self._require_capture_inspection_available()
+            self._require_capture_stack_fence(fence)
+
+    def _capture_value_resolve(
+        self, fence: object, path: SafeValuePath,
+    ) -> PrivateProjectedValue:
+        result = self._capture_value_operation(
+            fence, action="resolve", path=path,
+        )
+        if not isinstance(result, PrivateProjectedValue):
+            raise CaptureValueCheckError("capture value root projection is invalid")
+        return result
+
+    def _capture_value_project(
+        self, fence: object, request: ValueInspectionRequest,
+    ) -> PrivateValueProjection:
+        result = self._capture_value_operation(
+            fence, action="project", request=request,
+        )
+        if not isinstance(result, PrivateValueProjection):
+            raise CaptureValueCheckError("capture value page projection is invalid")
+        return result
+
+    def _capture_value_columns(
+        self, fence: object, path: SafeValuePath, limit: int,
+    ) -> tuple[str, ...]:
+        result = self._capture_value_operation(
+            fence, action="columns", path=path, limit=limit,
+        )
+        if type(result) is not tuple or any(not isinstance(name, str) for name in result):
+            raise CaptureValueCheckError("capture value schema projection is invalid")
+        return result
+
+    def _capture_value_operation(
+        self,
+        fence: object,
+        *,
+        action: str,
+        path: SafeValuePath | None = None,
+        request: ValueInspectionRequest | None = None,
+        limit: int | None = None,
+    ) -> object:
+        """Run one controller-owned, coordinator-backed value operation.
+
+        The controller seam receives frozen paths and a bounded request only.
+        It is responsible for the inline admission of the root and every
+        selected descendant before it constructs ``PrivateProjectedValue``
+        records.  The RuntimeApi deliberately has no direct RDBG fallback:
+        inventory metadata is not public projection data.
+        """
+        if not isinstance(fence, CaptureFence):
+            raise StaleCaptureError()
+        if action not in {"resolve", "project", "columns"}:
+            raise CaptureValueCheckError("capture value operation is invalid")
+        with self._capture_data_plane_writer():
+            self._require_available()
+            self._require_capture_inspection_available()
+            self._require_capture_stack_fence(fence)
+            inspect = getattr(self._controller, "capture_value_inspection", None)
+            if not callable(inspect):
+                raise CaptureSourceUnavailableError(
+                    "capture value target projection is not attached"
+                )
+            failed = False
+            try:
+                registrations = self._worker_type_registrations()
+                with self._remaining_command_timeout() as remaining:
+                    # The controller submits the qualified target plan to its
+                    # coordinator.  This handoff releases the API writer while
+                    # that coordinator owns dispatch, polling and any required
+                    # cleanup; it must wrap the whole initiating wait rather
+                    # than only a later payload read.
+                    with self._capture_helper_writer_handoff():
+                        result = inspect(
+                            action,
+                            path=path,
+                            request=request,
+                            limit=limit,
+                            worker_type_registrations=registrations,
+                            timeout_s=remaining,
+                        )
+            except (
+                CaptureBusyError,
+                CaptureEvaluationPendingError,
+                CaptureOutcomeUnknownError,
+                CaptureRecoveryRequiredError,
+                CaptureSourceUnavailableError,
+                CaptureValueAccessDeniedError,
+                CaptureValueCheckError,
+                StaleCaptureError,
+            ):
+                raise
+            except Exception:
+                failed = True
+                result = None
+            # A lifecycle transition races ahead of a private denial or
+            # malformed target reply.  Recheck it before assigning any public
+            # value error so stale/busy semantics always win.
+            self._require_capture_stack_fence(fence)
+            if failed:
+                raise CaptureValueCheckError(
+                    "capture value target projection is unavailable"
+                ) from None
+            return result
 
     def _read_capture_stack_inventory(
         self, fence: CaptureFence,

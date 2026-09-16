@@ -532,9 +532,14 @@ class FreshStackSession(ScriptedSession):
         )
 
 
-def captured_stack_api() -> tuple[PrototypeRuntimeApi, object, FreshStackSession]:
+def captured_stack_api(
+    *, capture_value_inspection_builder=None,
+) -> tuple[PrototypeRuntimeApi, object, FreshStackSession]:
     session = FreshStackSession()
-    controller = captured_controller(session)
+    controller = captured_controller(
+        session,
+        capture_value_inspection_builder=capture_value_inspection_builder,
+    )
     return PrototypeRuntimeApi(controller), controller, session
 
 
@@ -773,13 +778,66 @@ def test_runtime_native_stack_bypasses_config_source_resolution_and_ast() -> Non
     assert source_calls == []
 
 
-def test_runtime_frame_scope_is_explicitly_deferred_to_value_binding() -> None:
-    runtime, _, _ = captured_stack_api()
+def test_runtime_frame_scope_is_bound_without_target_value_io() -> None:
+    from onec_runtime.capture_values import VariableDescriptor
+
+    runtime, _, session = captured_stack_api()
+    prior_local_reads = sum(name == "local_variables" for name, _ in session.calls)
     frame = runtime.current_capture().stack[0]
 
     for attribute in ("variables", "parameters", "locals"):
-        with pytest.raises(CaptureSourceUnavailableError, match="not attached"):
-            getattr(frame, attribute)
+        scope = getattr(frame, attribute)
+        assert isinstance(scope, VariableDescriptor)
+        assert scope._root.native_level == 1
+    assert session.stack_reads == 1
+    assert sum(name == "local_variables" for name, _ in session.calls) == prior_local_reads
+
+
+def test_runtime_native_frame_projection_keeps_its_physical_level_in_one_plan() -> None:
+    from onec_runtime.capture_values import (
+        PrivateProjectedValue, PrivateValueProjection, ValueMetadata, ValueShape,
+    )
+    from onec_runtime.prototype_runtime import CaptureValueInspectionPlan
+
+    plans = []
+
+    def build(**kwargs):
+        plans.append(kwargs)
+        return CaptureValueInspectionPlan(
+            'RuntimeKernelServer.ВыполнитьКодВКонтекстеОтладки(Контекст, "")',
+            lambda _result: PrivateValueProjection((
+                PrivateProjectedValue(
+                    "Локальная",
+                    lambda: ValueMetadata(
+                        "Число", "40", None, ValueShape.SCALAR,
+                    ),
+                ),
+            ), 1, None),
+        )
+
+    runtime, controller, session = captured_stack_api(
+        capture_value_inspection_builder=build,
+    )
+    owner = controller._capture_evaluation_coordinator
+    assert owner is not None
+    try:
+        frame = runtime.current_capture().stack.native[1]
+        before = len(session.calls)
+
+        page = frame.variables[:1]
+
+        assert [item.name for item in page.items] == ["Локальная"]
+        assert len(plans) == 1
+        assert plans[0]["path"].root.kind.value == "frame"
+        assert plans[0]["path"].root.native_level == 1
+        assert plans[0]["request"].start == 0
+        assert plans[0]["request"].stop == 1
+        evaluations = [call for call in session.calls[before:] if call[0] == "evaluate"]
+        assert len(evaluations) == 1
+        assert evaluations[0][1][1] == 1
+    finally:
+        owner.begin_close()
+        assert owner.join(2)
 
 
 def test_session_current_capture_binds_sources_methods_and_frame_value_scope() -> None:
@@ -827,6 +885,10 @@ def test_session_current_capture_binds_sources_methods_and_frame_value_scope() -
     assert frame.variables._root.native_level == 1
     assert frame.parameters._root.native_level == 1
     assert frame.locals._root.native_level == 1
+    # A session-provided local scope may enrich the saved frame, but it cannot
+    # replace RuntimeApi's fence-owned target admission backend.
+    with pytest.raises(CaptureSourceUnavailableError, match="not qualified"):
+        frame.variables[:1]
 
 
 def test_stack_views_keep_target_urls_and_physical_ids_out_of_ordinary_repr() -> None:
