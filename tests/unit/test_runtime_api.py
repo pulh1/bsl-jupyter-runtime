@@ -52,10 +52,12 @@ from onec_runtime.rdbg.models import (
 )
 from onec_runtime.recovery import RecoveryPhase
 from onec_runtime.runtime_api import (
+    MAX_PROJECTION_POSITION,
     OperationSourceMapBundle,
     PrototypeRuntimeApi,
     RuntimeReplyKind,
 )
+from onec_runtime.value_transfer_backend import validate_value_handle
 from onec_runtime.bsl import (
     CommonModuleCatalogSnapshot,
     CommonModuleDescriptor,
@@ -3890,6 +3892,100 @@ def test_api_materializes_table_without_active_worker() -> None:
     ]
 
 
+def _capture_table_descriptor(
+    *,
+    fields: tuple[str, ...] = ("Manager",),
+    columns: tuple[str, ...] = ("Amount",),
+    table: str = "Totals",
+    offset: int = 0,
+    limit: int = 10,
+) -> str:
+    manager = ".".join(("Context", "DebugContext", "Result", *fields))
+    selected = (
+        "New Array"
+        if not columns
+        else 'StrSplit("' + ",".join(columns) + '", ",")'
+    )
+    # Production descriptors use Russian BSL identifiers. Keep the helper
+    # readable in these tests and translate only the fixed grammar tokens.
+    return (
+        "RuntimeKernelServer.GetDebugTemporaryTable("
+        f'{manager}, "{table}", {offset}, {limit}, {selected})'
+    ).replace("GetDebugTemporaryTable", "ПолучитьВременнуюТаблицуОтладки").replace(
+        "Context.DebugContext.Result",
+        "Контекст.КонтекстОтладки.Результат",
+    ).replace("New Array", "Новый Массив").replace("StrSplit", "СтрРазделить")
+
+
+class _DeferredCaptureTableController(FakeController):
+    def __init__(self, descriptor: str) -> None:
+        super().__init__()
+        self.state = OperationState.CAPTURED
+        self.descriptor = descriptor
+
+    def capture_value_handle(self, handle: str) -> str:
+        assert handle == "capture_table_deferred"
+        return self.descriptor
+
+
+def _deferred_capture_table_runtime() -> tuple[
+    PrototypeRuntimeApi,
+    _DeferredCaptureTableController,
+    bytes,
+]:
+    controller = _DeferredCaptureTableController(_capture_table_descriptor())
+    api = PrototypeRuntimeApi(controller)
+    content = (
+        json.dumps(
+            {
+                "version": 1,
+                "columns": ["Amount"],
+                "kinds": ["integer"],
+                "reference_modes": {},
+            },
+            separators=(",", ":"),
+        )
+        + "\n"
+        + json.dumps([3], separators=(",", ":"))
+        + "\n"
+    ).encode()
+    encoded = b64encode(content).decode()
+    controller.context_value = encoded
+    controller.worker_results.clear()
+    controller.worker_results.append(
+        f"R|1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}"
+    )
+    return api, controller, content
+
+
+def test_api_materializes_deferred_capture_table_through_trusted_internal_route() -> None:
+    api, controller, _content = _deferred_capture_table_runtime()
+
+    frame = api.materialize_table("capture_table_deferred")
+
+    assert frame.to_dict(orient="records") == [{"Amount": 3}]
+    assert len(controller.capture_sources) == 1
+    assert controller.descriptor in controller.capture_sources[0]
+    with pytest.raises(ProtocolError, match="persistent Context path"):
+        validate_value_handle(controller.descriptor)
+
+
+def test_api_materializes_deferred_capture_table_payload_through_trusted_internal_route() -> None:
+    api, controller, content = _deferred_capture_table_runtime()
+
+    payload = api.materialize_table_payload(
+        "capture_table_deferred",
+        max_rows=10,
+        max_bytes=4096,
+    )
+
+    assert payload == content
+    assert len(controller.capture_sources) == 1
+    assert controller.descriptor in controller.capture_sources[0]
+    with pytest.raises(ProtocolError, match="persistent Context path"):
+        validate_value_handle(controller.descriptor)
+
+
 def test_api_enforces_table_payload_row_budget_before_transport() -> None:
     controller = FakeController()
     api = PrototypeRuntimeApi(controller)
@@ -5824,6 +5920,29 @@ def test_capture_projection_descriptor_accepts_only_bounded_generated_grammar() 
         "Контекст.КонтекстОтладки.Значение.Менеджер, \"Итоги\", 2, 3, "
         "СтрРазделить(\"Сумма,Количество\", \",\"))"
     )
+    assert PrototypeRuntimeApi._capture_projection_expression(descriptor) == descriptor
+
+
+def test_capture_projection_descriptor_accepts_deep_manager_origin() -> None:
+    descriptor = _capture_table_descriptor(
+        fields=tuple(f"Field{index}" for index in range(8)),
+    )
+    assert PrototypeRuntimeApi._capture_projection_expression(descriptor) == descriptor
+
+
+def test_capture_projection_descriptor_accepts_maximum_bounded_selection() -> None:
+    def maximum_identifier(prefix: str, index: int) -> str:
+        start = f"{prefix}{index}_"
+        return start + "x" * (256 - len(start))
+
+    descriptor = _capture_table_descriptor(
+        fields=tuple(maximum_identifier("Field", index) for index in range(100)),
+        columns=tuple(maximum_identifier("Column", index) for index in range(100)),
+        table="T" + "x" * 255,
+        offset=MAX_PROJECTION_POSITION - 100,
+        limit=100,
+    )
+    assert len(descriptor) > 4096
     assert PrototypeRuntimeApi._capture_projection_expression(descriptor) == descriptor
 
 
