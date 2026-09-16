@@ -221,3 +221,38 @@ in 10.94 seconds. Jupyter/value routes passed `51 passed` in 25.61 seconds;
 the MCP minimum passed `23 passed` in 2.94 seconds. The final full unit suite
 passed `4554 passed, 58 skipped` in 249.59 seconds (one existing Windows ZMQ
 Proactor warning).
+
+## Final Task 8 Session wait-handoff correction
+
+- `RuntimeSession` now binds every public materialization route to
+  `capture_session_caller_handoff` while it owns `_operation_lock`: `to_df`,
+  `project_to_df`, `materialize`/`materialize_value`, `project_value`,
+  `materialization_kind`, and the table/value/projection payload routes.
+  There is no compatibility adapter; the test Runtime API exposes the same
+  required method and enters the supplied factory.
+- The helper callback composes the existing API writer handoff around the
+  Session release.  It drops API writer ownership first and the Session lock
+  second; on result, timeout, or `KeyboardInterrupt`, it reacquires the
+  Session lock before the API writer.  The binding remains thread-local and
+  is removed on every public-call exit.
+- A production-path regression creates `OnecValueProxy(RuntimeSession)`, has
+  RDBG acknowledge its table materialization and withhold the result, then
+  starts a second Session call.  The second call receives `CaptureBusyError`
+  before 100 ms, the first waiter remains pending until its deadline, one
+  dispatch was sent, and `status`/`wait(0)` remain available.  A companion
+  regression proves a `KeyboardInterrupt` returns with the Session operation
+  lock reacquired.  A parameterized surface test exercises every listed
+  Session materialization/payload route and verifies the required handoff
+  binding and lock restoration.
+
+RED `a6a83e1` reproduces the real Session/proxy deadline blockage. GREEN
+`224d345` supplies the composed handoff and the route, timeout, and interrupt
+regressions. No BSL module changed, so the matching protocol-2/artifact-0.1.3
+CFE and four-source manifest remain unchanged.
+
+The exact Session regression suite passed `17 passed` in 3.03 seconds. The
+expanded RuntimeSession/coordinator/Jupyter/MCP suite passed `673 passed` in
+45.33 seconds. `python -m compileall -q src/onec_runtime
+packages/jupyter/src packages/mcp/src` and `git diff --check` pass.
+The final unit suite passed `4565 passed, 58 skipped` in 252.29 seconds, with
+only the existing Windows ZMQ Proactor warning.
