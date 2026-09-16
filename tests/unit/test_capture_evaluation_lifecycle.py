@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import ast
+import inspect
+import textwrap
 from queue import Empty, Queue
 from threading import Event, Thread, current_thread
 from time import monotonic, sleep
@@ -28,6 +31,8 @@ from onec_runtime.errors import (
     TargetLost,
 )
 from onec_runtime.rdbg.models import (
+    CollectionCell,
+    CollectionRow,
     DebugTarget,
     EvaluationResult,
     PendingEvaluation,
@@ -89,6 +94,8 @@ class ControlledCaptureSession(ScriptedSession):
         self.poll_threads: list[int] = []
         self.workspace_threads: list[int] = []
         self.polled_capabilities: list[PendingEvaluation] = []
+        self.collection_starts: list[tuple[str, int, int, int, int]] = []
+        self.direct_collection_calls = 0
 
     def set_breakpoints(self, locations):  # type: ignore[no-untyped-def]
         ident = current_thread().ident
@@ -217,6 +224,35 @@ class ControlledCaptureSession(ScriptedSession):
         self._pending_role = ""
         return event
 
+    def start_collection_evaluation(
+        self,
+        expression: str,
+        *,
+        start_index: int,
+        page_size: int,
+        max_text_size: int = 4096,
+        stack_level: int = 0,
+        timeout_s: float = 30.0,
+        on_transport_dispatch=None,  # type: ignore[no-untyped-def]
+    ) -> PendingEvaluation:
+        self.collection_starts.append(
+            (expression, start_index, page_size, max_text_size, stack_level)
+        )
+        pending = self.start_evaluation(
+            expression,
+            max_text_size=max_text_size,
+            stack_level=stack_level,
+            timeout_s=timeout_s,
+            on_transport_dispatch=on_transport_dispatch,
+        )
+        self._pending_role = "collection"
+        return pending
+
+    def evaluate_collection(self, *args: object, **kwargs: object) -> EvaluationResult:
+        del args, kwargs
+        self.direct_collection_calls += 1
+        raise AssertionError("CAPTURE collection evaluation bypassed its coordinator")
+
     def complete(
         self,
         presentation: str = "901",
@@ -232,6 +268,37 @@ class ControlledCaptureSession(ScriptedSession):
             presentation,
             bool(error),
             error_text=error,
+        ))
+
+    def complete_collection(
+        self,
+        names: tuple[str, ...],
+        *,
+        collection_size: int | None = None,
+    ) -> None:
+        pending = self.capture_pending
+        assert pending is not None
+        rows = tuple(
+            CollectionRow(
+                index,
+                (
+                    CollectionCell(
+                        "Имя",
+                        "Строка",
+                        '"' + name.replace('"', '""') + '"',
+                        value_string=name,
+                    ),
+                ),
+            )
+            for index, name in enumerate(names)
+        )
+        self.events.put(EvaluationResult(
+            pending.result_id,
+            "ТаблицаЗначений",
+            "ТаблицаЗначений",
+            False,
+            collection_size=(len(rows) if collection_size is None else collection_size),
+            collection_rows=rows,
         ))
 
     def complete_stop(self) -> None:
@@ -1317,3 +1384,183 @@ def test_controller_owned_internal_evaluations_use_explicit_kind_and_same_owner(
             assert session.workspace_call_count == workspace_call_baseline
     finally:
         close_owner(controller, session)
+
+
+def inspect_temporary_table_metadata(controller):  # type: ignore[no-untyped-def]
+    controller._capture_manager_paths["manager"] = (
+        "Контекст.КонтекстОтладки.Менеджер"
+    )
+    return controller.capture_temporary_tables(
+        "manager",
+        names=("Данные",),
+        cursor=0,
+        limit=1,
+        selection=None,
+    )
+
+
+def test_temporary_table_schema_has_one_owned_bounded_pending_capability() -> None:
+    private_name = "PRIVATE_TEMP_TABLE_COLUMN"
+    session = ControlledCaptureSession()
+    controller = captured_controller(session, command_timeout_s=0.02)
+    initiating_thread = current_thread().ident
+    try:
+        with pytest.raises(CaptureEvaluationPendingError) as caught:
+            inspect_temporary_table_metadata(controller)
+
+        status = capture_probe(controller).status()
+        assert caught.value.evaluation_kind is CaptureEvaluationKind.INSPECTION
+        assert status.phase is CapturePhase.EVALUATING
+        assert status.pending_evaluation_id == caught.value.evaluation_id
+        assert session.direct_collection_calls == 0
+        assert session.capture_start_count == 1
+        assert len(session.collection_starts) == 1
+        expression, start, size, max_text, stack_level = session.collection_starts[0]
+        assert expression.startswith(
+            "RuntimeKernelServer.ПолучитьСхемуВременнойТаблицыОтладки("
+        )
+        assert (start, size, max_text, stack_level) == (0, 101, 4096, 2)
+        owner_thread = session.dispatch_threads[0]
+        assert owner_thread != initiating_thread
+        assert set(
+            session.start_threads + session.dispatch_threads + session.poll_threads
+        ) == {owner_thread}
+
+        with pytest.raises(CaptureBusyError):
+            inspect_temporary_table_metadata(controller)
+        assert session.capture_start_count == 1
+
+        session.complete_collection((private_name,))
+        outcome = capture_probe(controller).wait(caught.value.evaluation_id, timeout_s=1)
+
+        assert outcome.state is CaptureEvaluationState.COMPLETED
+        assert outcome.result is None
+        assert private_name not in repr(outcome)
+        assert private_name not in repr(capture_probe(controller).status())
+        assert session.capture_start_count == 1
+        assert len({id(value) for value in session.polled_capabilities}) == 1
+        assert controller.state.value == "captured"
+    finally:
+        close_owner(controller, session)
+
+
+def test_temporary_table_schema_rejects_overwide_late_result_without_exposure() -> None:
+    private_name = "PRIVATE_COLUMN_"
+    session = ControlledCaptureSession()
+    controller = captured_controller(session, command_timeout_s=0.02)
+    try:
+        with pytest.raises(CaptureEvaluationPendingError) as caught:
+            inspect_temporary_table_metadata(controller)
+
+        session.complete_collection(
+            tuple(private_name + str(index) for index in range(101))
+        )
+        outcome = capture_probe(controller).wait(caught.value.evaluation_id, timeout_s=1)
+
+        assert outcome.state is CaptureEvaluationState.FAILED
+        assert outcome.result is None
+        assert outcome.diagnostic is not None
+        assert outcome.diagnostic.code == "result_policy_failed"
+        assert private_name not in repr(outcome)
+        assert session.capture_start_count == 1
+        assert controller.state.value == "captured"
+    finally:
+        close_owner(controller, session)
+
+
+def test_projected_temporary_table_schema_is_a_second_owned_inspection() -> None:
+    private_name = "PRIVATE_PROJECTED_COLUMN"
+    session = ControlledCaptureSession(auto_helpers=True)
+    controller = captured_controller(session, command_timeout_s=0.02)
+    try:
+        with pytest.raises(CaptureEvaluationPendingError) as caught:
+            inspect_temporary_table(controller)
+
+        status = capture_probe(controller).status()
+        assert caught.value.evaluation_kind is CaptureEvaluationKind.INSPECTION
+        assert status.phase is CapturePhase.EVALUATING
+        assert status.pending_evaluation_id == caught.value.evaluation_id
+        assert session.direct_collection_calls == 0
+        assert session.capture_start_count == 2
+        assert len(session.collection_starts) == 1
+        expression, start, size, max_text, stack_level = session.collection_starts[0]
+        assert expression.startswith(
+            "RuntimeTableTransferServer.ПолучитьКомпактнуюСхему("
+            "Контекст.__onec_capture_table_"
+        )
+        assert (start, size, max_text, stack_level) == (0, 101, 4096, 2)
+
+        with pytest.raises(CaptureBusyError):
+            inspect_temporary_table(controller)
+        assert session.capture_start_count == 2
+
+        session.complete_collection((private_name,))
+        outcome = capture_probe(controller).wait(caught.value.evaluation_id, timeout_s=1)
+
+        assert outcome.state is CaptureEvaluationState.COMPLETED
+        assert outcome.result is None
+        assert private_name not in repr(outcome)
+        assert session.capture_start_count == 2
+        assert controller.state.value == "captured"
+    finally:
+        close_owner(controller, session)
+
+
+def _direct_session_evaluation_methods() -> set[str]:
+    from onec_runtime.prototype_runtime import PrototypeRuntimeController
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(PrototypeRuntimeController)))
+    methods: set[str] = set()
+    current: list[str] = []
+
+    class Inventory(ast.NodeVisitor):
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            current.append(node.name)
+            self.generic_visit(node)
+            current.pop()
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_Call(self, node: ast.Call) -> None:
+            function = node.func
+            if (
+                current
+                and isinstance(function, ast.Attribute)
+                and function.attr in {"evaluate", "evaluate_collection"}
+                and isinstance(function.value, ast.Attribute)
+                and function.value.attr == "session"
+                and isinstance(function.value.value, ast.Name)
+                and function.value.value.id == "self"
+            ):
+                methods.add(current[-1])
+            self.generic_visit(node)
+
+    Inventory().visit(tree)
+    return methods
+
+
+def test_controller_has_no_legacy_capture_evaluation_or_resume_entrypoints() -> None:
+    from onec_runtime.prototype_runtime import PrototypeRuntimeController
+    from onec_runtime.runtime_api import PrototypeRuntimeApi
+
+    # Initial CAPTURE transition, MAIN completion/message collection and the
+    # explicitly non-CAPTURE branches remain synchronous. Task 8 owns removal
+    # of inspect_completion_fields and adds execute_system_inspection.
+    assert _direct_session_evaluation_methods() == {
+        "_begin_capture",
+        "_complete_main",
+        "_take_context_cell_messages",
+        "take_context_string",
+        "drop_context_value",
+        "inspect_completion_fields",
+    }
+    assert "resume" not in PrototypeRuntimeController.__dict__
+    assert "inspect_table_sample" not in PrototypeRuntimeController.__dict__
+    assert "inspect_declared_table_schema" not in PrototypeRuntimeController.__dict__
+    assert "_inspect_compact_columns" not in PrototypeRuntimeApi.__dict__
+    assert (
+        inspect.signature(PrototypeRuntimeController._resume_owned)
+        .parameters["step_context"]
+        .default
+        is inspect.Parameter.empty
+    )
