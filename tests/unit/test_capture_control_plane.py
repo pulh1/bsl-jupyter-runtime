@@ -2326,7 +2326,7 @@ def test_resume_is_rejected_during_capture_completion_window(
     api, controller, transport = _capture_runtime()
     owner = _capture_owner(controller)
     original_finalize = api._finalize_namespace_reply
-    original_resume = controller.resume
+    original_submit_resume = controller.submit_resume
     completion_entered = Event()
     release_completion = Event()
     resume_calls: list[dict[str, object]] = []
@@ -2337,13 +2337,13 @@ def test_resume_is_rejected_during_capture_completion_window(
         assert release_completion.wait(_JOIN_TIMEOUT_S)
         return original_finalize(*args, **kwargs)
 
-    def observed_resume(**kwargs):  # type: ignore[no-untyped-def]
+    def observed_submit_resume(**kwargs):  # type: ignore[no-untyped-def]
         resume_calls.append(kwargs)
         raise AssertionError("resume entered during CAPTURE completion")
 
     try:
         monkeypatch.setattr(api, "_finalize_namespace_reply", blocked_finalize)
-        monkeypatch.setattr(controller, "resume", observed_resume)
+        monkeypatch.setattr(controller, "submit_resume", observed_submit_resume)
         initiator, _finished, failures = _start_pending_capture(
             lambda: api.execute_bsl("РезультатИнструкции = 901;"),
             transport.accepted,
@@ -2367,7 +2367,7 @@ def test_resume_is_rejected_during_capture_completion_window(
             initiator.join(_JOIN_TIMEOUT_S)
             assert not initiator.is_alive(), "completion initiator leaked"
         monkeypatch.setattr(api, "_finalize_namespace_reply", original_finalize)
-        monkeypatch.setattr(controller, "resume", original_resume)
+        monkeypatch.setattr(controller, "submit_resume", original_submit_resume)
         close_owner(controller, transport)
 
 
