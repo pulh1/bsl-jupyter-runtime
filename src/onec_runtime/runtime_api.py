@@ -110,8 +110,6 @@ from onec_runtime.runtime_contracts import OperationExecutionProvenance
 from onec_runtime.compact_table import decode_compact_table_payload
 from onec_runtime.compact_table_backend import (
     CompactRuntimeTableTransfer,
-    infer_compact_columns,
-    infer_declared_compact_columns,
 )
 from onec_runtime.errors import (
     BslExecutionError,
@@ -681,13 +679,18 @@ class RuntimeController(Protocol):
 
     def drop_context_value(self, key: str) -> None: ...
 
-    def resume(
+    def submit_resume(
         self,
         *,
         dirty_roots: tuple[str, ...] = (),
         continuation_attempt_id: str | None = None,
         on_transport_dispatch: Callable[[], None] | None = None,
-    ) -> MainCompletion | CapturedStop | DebugStop: ...
+        completion: Callable[[object | None, BaseException | None], object] | None = None,
+        detached_completion: Callable[
+            [object | None, BaseException | None], None
+        ] | None = None,
+        before_resume: Callable[[object], None] | None = None,
+    ) -> CaptureResumeTicket: ...
 
     def resume_debug_stop(
         self,
@@ -4033,108 +4036,86 @@ class PrototypeRuntimeApi:
                     self._operation_generation_pin,
                     mode=LoweringMode.CAPTURE,
                 )
-                submit_resume = getattr(self._controller, "submit_resume", None)
-                if callable(submit_resume):
-                    def complete_resume(
-                        result: object | None,
-                        error: BaseException | None,
-                    ) -> object:
-                        completed: RuntimeReply | None = None
-                        try:
-                            if error is None:
-                                completed = self._reply(result)  # type: ignore[arg-type]
-                                self._pending_dirty_roots.clear()
-                                self._finalize_pending_namespace(completed)
-                                return completed
-                            return None
-                        finally:
-                            if error is None or resume_dispatched:
-                                self._finalize_controller_owned_resume_pin(
-                                    reply=completed,
-                                    outcome_unknown=(
-                                        resume_dispatched and completed is None
-                                    ),
-                                )
-
-                    resume_arguments["on_transport_dispatch"] = (
-                        mark_resume_dispatched
+                submit_resume = self._controller.submit_resume
+                if not callable(submit_resume):
+                    raise ProtocolError(
+                        "Runtime controller cannot submit a CAPTURE resume"
                     )
-                    resume_arguments["completion"] = complete_resume
-                    if self._operation_generation_pin is not None:
-                        clear_worker_pin = getattr(
-                            self._controller,
-                            "clear_capture_worker_generation_pin_for_resume",
-                            None,
-                        )
-                        if not callable(clear_worker_pin):
-                            raise ProtocolError(
-                                "Runtime controller cannot clear the CAPTURE "
-                                "Worker pin from its resume owner"
-                            )
-                        resume_arguments["before_resume"] = clear_worker_pin
-                    # A waiter that times out or is interrupted has no caller
-                    # stack left to retire Session-facing state. Its fallback
-                    # runs only after the coordinator published the terminal
-                    # ticket. An attached waiter invokes the same callback on
-                    # its own thread below, after it regains outer locks.
-                    resume_arguments["detached_completion"] = (
-                        on_completion
-                        if on_detached_completion is None
-                        else on_detached_completion
-                    )
-                    submission = _CaptureResumeSubmission()
-                    ticket: CaptureResumeTicket | None = None
+                def complete_resume(
+                    result: object | None,
+                    error: BaseException | None,
+                ) -> object:
+                    completed: RuntimeReply | None = None
                     try:
-                        ticket = submission.submit(submit_resume, **resume_arguments)
-                        if not isinstance(ticket, CaptureResumeTicket):
-                            raise ProtocolError(
-                                "CAPTURE controller did not return a resume ticket"
+                        if error is None:
+                            completed = self._reply(result)  # type: ignore[arg-type]
+                            self._pending_dirty_roots.clear()
+                            self._finalize_pending_namespace(completed)
+                            return completed
+                        return None
+                    finally:
+                        if error is None or resume_dispatched:
+                            self._finalize_controller_owned_resume_pin(
+                                reply=completed,
+                                outcome_unknown=(
+                                    resume_dispatched and completed is None
+                                ),
                             )
-                        # Submission is the outer-lock linearization point.
-                        # The worker now owns all target I/O and the next
-                        # event; the initiating Python/Jupyter thread only
-                        # waits on the coordinator condition.
-                        with self._capture_owner_handoff():
-                            with self._capture_session_waiter_handoff():
-                                completed = ticket.wait_initiator(timeout_s)
-                    except BaseException as error:
-                        # The coordinator may have adopted the resume before
-                        # Python assigned its normal ticket return.  Detach via
-                        # the receipt for every unwind path; it is idempotent
-                        # after a ticket wait has already detached itself.
-                        submission.detach_initiator()
-                        ticket = ticket or submission.ticket
-                        if (
-                            ticket is not None
-                            and not ticket.initiator_detached
-                            and on_completion is not None
-                        ):
-                            on_completion(None, error)
-                        raise
-                    assert ticket is not None
-                    if on_completion is not None:
-                        on_completion(completed, None)
-                    return completed
+
+                resume_arguments["on_transport_dispatch"] = mark_resume_dispatched
+                resume_arguments["completion"] = complete_resume
                 if self._operation_generation_pin is not None:
-                    self._clear_capture_worker_generation_pin_locked()
-                try:
-                    resume_arguments["on_transport_dispatch"] = (
-                        mark_resume_dispatched
+                    clear_worker_pin = getattr(
+                        self._controller,
+                        "clear_capture_worker_generation_pin_for_resume",
+                        None,
                     )
-                    reply = self._reply(
-                        self._controller.resume(**resume_arguments)  # type: ignore[arg-type]
-                    )
-                    self._pending_dirty_roots.clear()
-                    self._finalize_pending_namespace(reply)
-                    return reply
-                finally:
-                    # See _resume_debug_stop_locked: this is a continuation
-                    # of an existing MAIN, not a newly-created operation.
-                    if reply is not None or resume_dispatched:
-                        self._finalize_active_operation_pin_locked(
-                            reply=reply,
-                            outcome_unknown=resume_dispatched and reply is None,
+                    if not callable(clear_worker_pin):
+                        raise ProtocolError(
+                            "Runtime controller cannot clear the CAPTURE "
+                            "Worker pin from its resume owner"
                         )
+                    resume_arguments["before_resume"] = clear_worker_pin
+                # A waiter that times out or is interrupted has no caller
+                # stack left to retire Session-facing state. Its fallback
+                # runs only after the coordinator published the terminal
+                # ticket. An attached waiter invokes the same callback on
+                # its own thread below, after it regains outer locks.
+                resume_arguments["detached_completion"] = (
+                    on_completion
+                    if on_detached_completion is None
+                    else on_detached_completion
+                )
+                submission = _CaptureResumeSubmission()
+                ticket: CaptureResumeTicket | None = None
+                try:
+                    ticket = submission.submit(submit_resume, **resume_arguments)
+                    if not isinstance(ticket, CaptureResumeTicket):
+                        raise ProtocolError(
+                            "CAPTURE controller did not return a resume ticket"
+                        )
+                    # Submission is the outer-lock linearization point.
+                    # The worker now owns all target I/O and the next event;
+                    # the initiating thread only waits on the condition.
+                    with self._capture_owner_handoff():
+                        with self._capture_session_waiter_handoff():
+                            completed = ticket.wait_initiator(timeout_s)
+                except BaseException as error:
+                    # Adoption can precede the normal ticket return. Detach via
+                    # the receipt on every unwind path; this is idempotent.
+                    submission.detach_initiator()
+                    ticket = ticket or submission.ticket
+                    if (
+                        ticket is not None
+                        and not ticket.initiator_detached
+                        and on_completion is not None
+                    ):
+                        on_completion(None, error)
+                    raise
+                assert ticket is not None
+                if on_completion is not None:
+                    on_completion(completed, None)
+                return completed
             if self._controller.state in {
                 OperationState.DEBUG_STOPPED,
             }:
@@ -6417,20 +6398,6 @@ class PrototypeRuntimeApi:
             handle,
             ReferencePolicy(refs, ref_columns, uuid_suffix),
         )
-
-    def _inspect_compact_columns(self, table_handle: str):  # type: ignore[no-untyped-def]
-        with self._remaining_command_timeout():
-            declared_rows = self._controller.inspect_declared_table_schema(
-                table_handle
-            ).collection_rows
-        declared = infer_declared_compact_columns(declared_rows)
-        if declared is not None:
-            return declared
-        with self._remaining_command_timeout():
-            sample_rows = self._controller.inspect_table_sample(
-                table_handle
-            ).collection_rows
-        return infer_compact_columns(sample_rows)
 
     def _take_context_string(self, key: str, max_text_size: int) -> str:
         with self._remaining_command_timeout():

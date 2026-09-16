@@ -100,6 +100,31 @@ class StrictCaptureRdbg:
         self._pending[id(pending)] = (pending, result)
         return pending
 
+    def start_collection_evaluation(
+        self,
+        expression: str,
+        *,
+        start_index: int,
+        page_size: int,
+        stack_level: int,
+        timeout_s: float,
+        max_text_size: int = 4096,
+        on_transport_dispatch=None,  # type: ignore[no-untyped-def]
+    ) -> PendingEvaluation:
+        if on_transport_dispatch is not None:
+            on_transport_dispatch()
+        result = self.evaluate_collection(
+            expression,
+            start_index=start_index,
+            page_size=page_size,
+            stack_level=stack_level,
+            timeout_s=timeout_s,
+            max_text_size=max_text_size,
+        )
+        pending = PendingEvaluation(self.target_id, result.result_id, self)
+        self._pending[id(pending)] = (pending, result)
+        return pending
+
     def wait_evaluation_event(
         self,
         pending: PendingEvaluation,
@@ -153,7 +178,7 @@ def test_production_inventory_reads_descriptor_columns_without_row_materializati
     expression, start_index, page_size, stack_level = rdbg.collections[0]
     assert expression.startswith("RuntimeKernelServer.ПолучитьСхемуВременнойТаблицыОтладки(")
     assert "ПолучитьДанные" not in expression
-    assert (start_index, page_size, stack_level) == (0, 64, 2)
+    assert (start_index, page_size, stack_level) == (0, 101, 2)
 
 
 def test_extension_separates_metadata_from_bounded_descriptor_data_result() -> None:

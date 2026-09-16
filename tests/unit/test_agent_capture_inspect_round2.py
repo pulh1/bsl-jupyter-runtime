@@ -58,7 +58,7 @@ class StrictRdbgInspectionSession:
             "RuntimeKernelServer.ПолучитьСхемуВременнойТаблицыОтладки(",
             "RuntimeTableTransferServer.ПолучитьКомпактнуюСхему(Контекст.__onec_capture_table_",
         ))
-        assert start_index == 0 and page_size == 64 and stack_level == 2
+        assert start_index == 0 and page_size == 101 and stack_level == 2
         row = CollectionRow(0, (CollectionCell("Имя", "Строка", '"Employee"', value_string="Employee"),))
         return EvaluationResult(uuid4(), "ТаблицаЗначений", "", False, collection_rows=(row,))
 
@@ -75,6 +75,31 @@ class StrictRdbgInspectionSession:
             on_transport_dispatch()
         result = self.evaluate(
             expression,
+            stack_level=stack_level,
+            timeout_s=timeout_s,
+            max_text_size=max_text_size,
+        )
+        pending = PendingEvaluation(self.target_id, result.result_id, self)
+        self._pending[id(pending)] = (pending, result)
+        return pending
+
+    def start_collection_evaluation(
+        self,
+        expression: str,
+        *,
+        start_index: int,
+        page_size: int,
+        stack_level: int,
+        timeout_s: float,
+        max_text_size: int = 4096,
+        on_transport_dispatch=None,  # type: ignore[no-untyped-def]
+    ) -> PendingEvaluation:
+        if on_transport_dispatch is not None:
+            on_transport_dispatch()
+        result = self.evaluate_collection(
+            expression,
+            start_index=start_index,
+            page_size=page_size,
             stack_level=stack_level,
             timeout_s=timeout_s,
             max_text_size=max_text_size,

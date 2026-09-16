@@ -748,6 +748,47 @@ def test_evaluate_collection_correlates_deferred_ping_result(
     assert all(event.page_start == 0 for event in recorder.events)
 
 
+def test_started_collection_evaluation_retains_one_capability_until_late_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result_id = UUID("67676767-6767-6767-6767-676767676767")
+    deferred = f"""<response xmlns="{RDBG_NS}"><result><cmdID>exprEvaluated</cmdID>
+      <evalExprResBaseData><expressionResultID xmlns="{CALC_NS}">{result_id}</expressionResultID>
+      <resultValueInfo xmlns="{CALC_NS}"><typeName>ТаблицаЗначений</typeName>
+        <collectionSize>1</collectionSize></resultValueInfo>
+      <calculationResult xmlns="{CALC_NS}"><viewInterface>collection</viewInterface>
+        <valueOfCollectionInfo><valueInfo><typeName>Строка</typeName>
+          <valueString>Колонка</valueString><pres>0JrQvtC70L7QvdC60LA=</pres>
+        </valueInfo></valueOfCollectionInfo>
+      </calculationResult><errorOccurred>false</errorOccurred>
+      </evalExprResBaseData></result></response>""".encode()
+    transport = FakeTransport()
+    transport.responses["evalExpr"].append(b"")
+    transport.responses["pingDebugUIParams"].append(deferred)
+    session = ready_session(transport)
+    monkeypatch.setattr("onec_runtime.rdbg.session.uuid4", lambda: result_id)
+    dispatches: list[str] = []
+
+    pending = session.start_collection_evaluation(
+        "Контекст.Таблица",
+        start_index=100,
+        page_size=101,
+        stack_level=2,
+        on_transport_dispatch=lambda: dispatches.append("entered"),
+    )
+
+    assert isinstance(pending, PendingEvaluation)
+    assert dispatches == ["entered"]
+    assert transport.calls.count("evalExpr") == 1
+
+    result = session.wait_evaluation_event(pending, timeout_s=1)
+
+    assert isinstance(result, EvaluationResult)
+    assert [row.index for row in result.collection_rows] == [100]
+    assert transport.calls.count("evalExpr") == 1
+    assert session.state is SessionState.READY
+
+
 def test_collection_uses_one_deadline_for_http_dispatch_and_result_polling(monkeypatch):
     now = [100.0]
     requests = []

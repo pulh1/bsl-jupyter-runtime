@@ -5,7 +5,7 @@ from hashlib import sha256
 from pathlib import Path
 from threading import Event, Lock, Thread
 from types import SimpleNamespace
-from uuid import UUID
+from uuid import UUID, uuid4
 from weakref import ref
 import json
 import re
@@ -13,6 +13,7 @@ import re
 import pytest
 
 import onec_runtime_mcp.agent.contracts as agent_contracts
+from onec_runtime.capture_evaluation import CaptureResumeTicket
 from onec_runtime_mcp.agent.capture_contracts import CaptureFence
 from onec_runtime_mcp.agent.onec_values import OnecValueResolver
 from onec_runtime_mcp.agent.proxies import ProxyProvenance, ProxyRegistry
@@ -1542,6 +1543,23 @@ def test_projection_instruction_is_bounded_and_stages_only_projected_rows() -> N
     )
 
 
+class _ImmediateResumeOwner:
+    def _wait_resume_initiator(self, record: SimpleNamespace, timeout_s: float | None):
+        del timeout_s
+        if record.error is not None:
+            raise record.error
+        return record.result
+
+    def _detach_resume_initiator(self, record: SimpleNamespace) -> None:
+        record.detached = True
+
+    def _resume_initiator_detached(self, record: SimpleNamespace) -> bool:
+        return bool(record.detached)
+
+
+_IMMEDIATE_RESUME_OWNER = _ImmediateResumeOwner()
+
+
 class FakeController:
     runtime_generation = 1
     _supports_worker_universe_receipts = True
@@ -1623,6 +1641,32 @@ class FakeController:
         operation = OperationHandle(self.operation_id, "main", "main")
         return MainCompletion(operation, None, "", True)
 
+    def submit_resume(self, **kwargs: object) -> CaptureResumeTicket:
+        before_resume = kwargs.pop("before_resume", None)
+        completion = kwargs.pop("completion", None)
+        kwargs.pop("detached_completion", None)
+        if callable(before_resume):
+            before_resume(object())
+        result: object | None = None
+        error: BaseException | None = None
+        try:
+            result = self.resume(**kwargs)
+        except BaseException as caught:
+            error = caught
+        if callable(completion):
+            try:
+                result = completion(result, error)
+            except BaseException as caught:
+                if error is None:
+                    error = caught
+                    result = None
+        record = SimpleNamespace(result=result, error=error, detached=False)
+        return CaptureResumeTicket(
+            uuid4().hex,
+            _IMMEDIATE_RESUME_OWNER,  # type: ignore[arg-type]
+            record,  # type: ignore[arg-type]
+        )
+
     def resume_debug_stop(self, **kwargs: object) -> DebugStop:
         dispatch = kwargs.get("on_transport_dispatch")
         if callable(dispatch):
@@ -1663,6 +1707,9 @@ class FakeController:
 
     def clear_capture_worker_generation_pin(self) -> None:
         self.worker_pin_clears += 1
+
+    def clear_capture_worker_generation_pin_for_resume(self, _context: object) -> None:
+        self.clear_capture_worker_generation_pin()
 
     def _worker_universe_result(self, source: str) -> object:
         import re

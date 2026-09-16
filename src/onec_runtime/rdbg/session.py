@@ -72,6 +72,7 @@ class SessionState(Enum):
 class _PendingEvaluationState:
     capability: PendingEvaluation
     suspended_stop: StopEvent | None = None
+    collection_start_index: int = 0
 
 
 class RdbgSession:
@@ -583,8 +584,6 @@ class RdbgSession:
             raise ValueError("timeout_s must be finite and positive")
         if on_transport_dispatch is not None and not callable(on_transport_dispatch):
             raise TypeError("on_transport_dispatch must be callable")
-        if self._pending_evaluation_states:
-            raise ProtocolError("Another expression evaluation is already pending")
         result_id = uuid4()
         request = build_eval_request(
             self.alias,
@@ -595,13 +594,89 @@ class RdbgSession:
             max_text_size=max_text_size,
             stack_level=stack_level,
         )
+        return self._start_evaluation_request(
+            request,
+            result_id,
+            timeout_s=float(timeout_s),
+            on_transport_dispatch=on_transport_dispatch,
+        )
+
+    def start_collection_evaluation(
+        self,
+        expression: str,
+        *,
+        start_index: int,
+        page_size: int = 2400,
+        timeout_s: float = 30.0,
+        max_text_size: int = 4096,
+        stack_level: int = 0,
+        on_transport_dispatch: Callable[[], None] | None = None,
+    ) -> PendingEvaluation:
+        """Dispatch one collection evalExpr and return its owned capability."""
+
+        self._require(SessionState.READY)
+        if self.target is None:
+            raise TargetLost("No target has been selected")
+        if type(expression) is not str or not expression:
+            raise ValueError("evaluation expression must be non-empty")
+        if type(start_index) is not int or start_index < 0:
+            raise ValueError("start_index must be non-negative")
+        if type(page_size) is not int or page_size <= 0:
+            raise ValueError("page_size must be positive")
+        if type(max_text_size) is not int or max_text_size <= 0:
+            raise ValueError("max_text_size must be positive")
+        if type(stack_level) is not int or stack_level < 0:
+            raise ValueError("stack_level must be non-negative")
+        if (
+            isinstance(timeout_s, bool)
+            or not isinstance(timeout_s, (int, float))
+            or not isfinite(float(timeout_s))
+            or timeout_s <= 0
+        ):
+            raise ValueError("timeout_s must be finite and positive")
+        if on_transport_dispatch is not None and not callable(on_transport_dispatch):
+            raise TypeError("on_transport_dispatch must be callable")
+        result_id = uuid4()
+        request = build_collection_eval_request(
+            self.alias,
+            self.ui_id,
+            self.target.target_id,
+            expression,
+            result_id,
+            start_index=start_index,
+            page_size=page_size,
+            max_text_size=max_text_size,
+            stack_level=stack_level,
+        )
+        return self._start_evaluation_request(
+            request,
+            result_id,
+            timeout_s=float(timeout_s),
+            on_transport_dispatch=on_transport_dispatch,
+            collection_start_index=start_index,
+        )
+
+    def _start_evaluation_request(
+        self,
+        request: bytes,
+        result_id: UUID,
+        *,
+        timeout_s: float,
+        on_transport_dispatch: Callable[[], None] | None,
+        collection_start_index: int = 0,
+    ) -> PendingEvaluation:
+        if self.target is None:
+            raise TargetLost("No target has been selected")
+        if self._pending_evaluation_states:
+            raise ProtocolError("Another expression evaluation is already pending")
         pending = PendingEvaluation(
             self.target.target_id,
             result_id,
             self._evaluation_owner,
         )
         self._pending_evaluation_states[id(pending)] = _PendingEvaluationState(
-            pending
+            pending,
+            collection_start_index=collection_start_index,
         )
         try:
             if on_transport_dispatch is not None:
@@ -609,7 +684,7 @@ class RdbgSession:
             response = self._request(
                 "evalExpr",
                 request,
-                timeout_s=float(timeout_s),
+                timeout_s=timeout_s,
             )
         except BaseException:
             self._pending_evaluation_states.pop(id(pending), None)
@@ -656,6 +731,17 @@ class RdbgSession:
                 self._pending_evaluations.pop(event.result_id, None)
                 del self._pending_evaluation_states[id(pending)]
                 self.state = SessionState.READY
+                if state.collection_start_index:
+                    event = replace(
+                        event,
+                        collection_rows=tuple(
+                            replace(
+                                row,
+                                index=state.collection_start_index + offset,
+                            )
+                            for offset, row in enumerate(event.collection_rows)
+                        ),
+                    )
                 return event
             remaining = deadline - monotonic()
             if remaining <= 0:

@@ -403,6 +403,37 @@ class ScriptedSession:
         self._pending_evaluations[id(pending)] = (pending, result, None)
         return pending
 
+    def start_collection_evaluation(
+        self,
+        expression: str,
+        *,
+        start_index: int,
+        page_size: int,
+        timeout_s: float = 30.0,
+        max_text_size: int = 4096,
+        stack_level: int = 0,
+        on_transport_dispatch: Callable[[], None] | None = None,
+    ) -> PendingEvaluation:
+        if self._pending_evaluations:
+            raise ProtocolError("Another expression evaluation is already pending")
+        if on_transport_dispatch is not None:
+            on_transport_dispatch()
+        result = self.evaluate_collection(
+            expression,
+            start_index=start_index,
+            page_size=page_size,
+            timeout_s=timeout_s,
+            max_text_size=max_text_size,
+            stack_level=stack_level,
+        )
+        pending = PendingEvaluation(
+            TARGET,
+            result.result_id,
+            self._pending_evaluation_owner,
+        )
+        self._pending_evaluations[id(pending)] = (pending, result, None)
+        return pending
+
     def wait_evaluation_event(
         self,
         pending: PendingEvaluation,
@@ -790,40 +821,6 @@ def test_failed_capture_retains_dirty_root_for_reply_and_resume_writeback() -> N
     assert "e1cib/tempstorage/root" in scalar_writes[0][1]
 
 
-def test_table_schema_sample_uses_the_capture_kernel_frame() -> None:
-    session = ScriptedSession((), messages=("value",))
-    controller = runtime_module().PrototypeRuntimeController(session, SERVICE)
-    controller.state = runtime_module().OperationState.CAPTURED
-    controller.capture_kernel_stack_level = 2
-
-    result = controller.inspect_table_sample("Контекст.Таблица", page_size=16)
-
-    assert result.collection_size == 1
-    assert (
-        "evaluate_collection",
-        ("Контекст.Таблица", 0, 16, 2),
-    ) in session.calls
-
-
-def test_declared_table_schema_uses_extension_method_in_capture_kernel_frame() -> None:
-    session = ScriptedSession((), messages=("value",))
-    controller = runtime_module().PrototypeRuntimeController(session, SERVICE)
-    controller.state = runtime_module().OperationState.CAPTURED
-    controller.capture_kernel_stack_level = 2
-
-    controller.inspect_declared_table_schema("Контекст.Таблица")
-
-    assert (
-        "evaluate_collection",
-        (
-            "RuntimeTableTransferServer.ПолучитьКомпактнуюСхему(Контекст.Таблица)",
-            0,
-            64,
-            2,
-        ),
-    ) in session.calls
-
-
 def test_completion_fields_use_bounded_schema_helper_in_capture_kernel_frame() -> None:
     session = ScriptedSession((), messages=("value",))
     controller = runtime_module().PrototypeRuntimeController(session, SERVICE)
@@ -865,6 +862,11 @@ def captured_controller(
     )
     assert isinstance(stopped, runtime.CapturedStop)
     return controller
+
+
+def resume_controller(controller, **kwargs: object):  # type: ignore[no-untyped-def]
+    ticket = controller.submit_resume(**kwargs)
+    return ticket.wait_initiator(controller.command_timeout_s)
 
 
 def test_capture_shield_and_restore_both_preserve_worker_breakpoints() -> None:
@@ -2084,7 +2086,7 @@ def test_resume_journals_each_root_before_and_after_modify() -> None:
     session = ScriptedSession((CAPTURE_A, SERVICE))
     controller = captured_controller(session, journal=journal)
 
-    controller.resume(dirty_roots=("Скаляр",))
+    resume_controller(controller, dirty_roots=("Скаляр",))
 
     events = [
         str(value["event"])
@@ -2137,7 +2139,7 @@ def test_flushing_fault_never_replays_or_continues() -> None:
     controller = captured_controller(session, fault_hook=fault)
 
     with pytest.raises(InjectedTransportFailure):
-        controller.resume(dirty_roots=("Скаляр", "Результат"))
+        resume_controller(controller, dirty_roots=("Скаляр", "Результат"))
     reconnect_calls: list[object] = []
     result = controller.recover_transport(
         lambda *args: reconnect_calls.append(args)  # type: ignore[arg-type,return-value]
@@ -2171,7 +2173,7 @@ def test_resuming_fault_does_not_send_second_continue() -> None:
     controller = captured_controller(session, fault_hook=fault)
 
     with pytest.raises(InjectedTransportFailure):
-        controller.resume()
+        resume_controller(controller)
     before = session.continue_count
     new_session = ScriptedSession((SERVICE,))
     new_session.current_command = controller.active_operation.operation_id
@@ -2224,7 +2226,7 @@ def test_captured_recovery_mismatch_loses_generation_once() -> None:
     with pytest.raises(ProtocolError, match="lost"):
         controller.execute_capture("Значение = 2;")
     with pytest.raises(ProtocolError, match="lost"):
-        controller.resume()
+        resume_controller(controller)
 
 
 def test_operation_identity_survives_capture_and_final_completion() -> None:
@@ -2238,7 +2240,7 @@ def test_operation_identity_survives_capture_and_final_completion() -> None:
     cell = controller.execute_capture(
         "МаркерИзCapture = МаркерНоутбука + 1; РезультатИнструкции = МаркерИзCapture;"
     )
-    completed = controller.resume(dirty_roots=("Скаляр",))
+    completed = resume_controller(controller, dirty_roots=("Скаляр",))
 
     assert isinstance(captured, runtime.CapturedStop)
     assert captured.operation.operation_id == 1
@@ -2276,7 +2278,7 @@ def test_rearm_capture_successor_replaces_live_workspace_before_continue() -> No
     controller.execute_main("Результат = 1;", capture_points=(CAPTURE_A,))
 
     controller.rearm_capture_successor((CAPTURE_B,))
-    resumed = controller.resume()
+    resumed = resume_controller(controller)
 
     assert isinstance(resumed, runtime.CapturedStop)
     assert resumed.location == CAPTURE_B
@@ -2294,8 +2296,8 @@ def test_second_capture_keeps_main_operation_and_reinitializes_frame_structure()
         "РезультатВызова = СинтетическийCapture(40);",
         capture_points=(CAPTURE_A, CAPTURE_B),
     )
-    second = controller.resume()
-    completed = controller.resume()
+    second = resume_controller(controller)
+    completed = resume_controller(controller)
 
     assert isinstance(first, runtime.CapturedStop)
     assert isinstance(second, runtime.CapturedStop)
@@ -2328,7 +2330,7 @@ def test_partial_writeback_failure_keeps_target_paused() -> None:
     controller.execute_main("Результат = СинтетическийCapture(40);", capture_points=(CAPTURE_A,))
 
     with pytest.raises(runtime.PartialWritebackError, match="Скаляр"):
-        controller.resume(dirty_roots=("Скаляр", "Результат"))
+        resume_controller(controller, dirty_roots=("Скаляр", "Результат"))
 
     assert controller.state is runtime.OperationState.PARTIAL_WRITEBACK_FAILURE
     assert session.continue_count == 1
@@ -2358,7 +2360,8 @@ def test_continuation_attempt_evidence_is_exact_ordered_and_not_historical() -> 
     admission = controller.begin_continuation_admission(attempt, (CAPTURE_B,))
 
     with pytest.raises(runtime.PartialWritebackError, match="Второй"):
-        controller.resume(
+        resume_controller(
+            controller,
             dirty_roots=attempt.dirty_roots,
             continuation_attempt_id=attempt.attempt_id,
         )
@@ -3916,7 +3919,8 @@ def test_capture_and_continue_callbacks_mark_actual_transport_boundaries() -> No
 
     assert capture_boundaries == [runtime.OperationState.EVALUATING_CAPTURE]
     continue_boundaries: list[tuple[int, object]] = []
-    controller.resume(
+    resume_controller(
+        controller,
         on_transport_dispatch=lambda: continue_boundaries.append(
             (session.continue_count, controller.state)
         )

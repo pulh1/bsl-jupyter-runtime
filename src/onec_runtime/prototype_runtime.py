@@ -535,7 +535,7 @@ class PrototypeRuntimeController:
         return value
 
     def _require_capture_frame(self) -> int:
-        self._require_state(OperationState.CAPTURED)
+        self._require_capture_evaluation_admission()
         if self.capture_frame_stack_level is None:
             raise ProtocolError("capture frame is not initialized")
         return self.capture_frame_stack_level
@@ -611,6 +611,7 @@ class PrototypeRuntimeController:
         *,
         stack_level: int,
         max_text_size: int = 307_200,
+        collection_page: tuple[int, int] | None = None,
         timeout_s: float | None = None,
         before_dispatch: Callable[[], None] | None = None,
         pre_dispatch_cleanup: Callable[[], None] | None = None,
@@ -632,16 +633,24 @@ class PrototypeRuntimeController:
                 entered = True
 
             try:
-                return self.session.start_evaluation(
-                    expression,
-                    max_text_size=max_text_size,
-                    stack_level=stack_level,
-                    timeout_s=(
+                arguments = {
+                    "max_text_size": max_text_size,
+                    "stack_level": stack_level,
+                    "timeout_s": (
                         self.command_timeout_s
                         if timeout_s is None
                         else timeout_s
                     ),
-                    on_transport_dispatch=mark_transport_entry,
+                    "on_transport_dispatch": mark_transport_entry,
+                }
+                if collection_page is None:
+                    return self.session.start_evaluation(expression, **arguments)
+                start_index, page_size = collection_page
+                return self.session.start_collection_evaluation(
+                    expression,
+                    start_index=start_index,
+                    page_size=page_size,
+                    **arguments,
                 )
             except BaseException:
                 cleanup = pre_dispatch_cleanup or restore
@@ -772,6 +781,7 @@ class PrototypeRuntimeController:
         evaluation_kind: CaptureEvaluationKind,
         stack_level: int,
         max_text_size: int = 307_200,
+        collection_page: tuple[int, int] | None = None,
         result_policy: Callable[[EvaluationResult], object],
         timeout_s: float | None = None,
     ) -> object:
@@ -794,6 +804,7 @@ class PrototypeRuntimeController:
             expression,
             stack_level=stack_level,
             max_text_size=max_text_size,
+            collection_page=collection_page,
             timeout_s=selected_timeout,
         )
         try:
@@ -2699,12 +2710,13 @@ class PrototypeRuntimeController:
         )
         self._capture_remaining_timeout(deadline)
         native_path = "Контекст." + context_key
-        schema_result = self.inspect_declared_table_schema(
-            native_path,
-            timeout_s=self._capture_remaining_timeout(deadline),
+        schema = self._capture_table_schema(
+            "RuntimeTableTransferServer.ПолучитьКомпактнуюСхему("
+            + native_path
+            + ")",
+            deadline=deadline,
         )
         self._capture_remaining_timeout(deadline)
-        schema = self._capture_schema_names(schema_result.collection_rows)
         handle = "capture_table_" + uuid4().hex
         self._capture_value_paths[handle] = native_path
         return {
@@ -2716,41 +2728,39 @@ class PrototypeRuntimeController:
     def _capture_temporary_table_schema(
         self, manager_path: str, name: str, *, deadline: float
     ) -> tuple[str, ...]:
-        expression = (
+        return self._capture_table_schema(
             "RuntimeKernelServer.ПолучитьСхемуВременнойТаблицыОтладки("
             + manager_path
             + ", "
             + bsl_string_literal(name)
-            + ")"
+            + ")",
+            deadline=deadline,
         )
-        rows: list[object] = []
-        start_index = 0
-        while len(rows) <= MAX_CAPTURE_SCHEMA_COLUMNS:
-            page_size = min(64, MAX_CAPTURE_SCHEMA_COLUMNS + 1 - len(rows))
-            result = self.session.evaluate_collection(
-                expression,
-                start_index=start_index,
-                page_size=page_size,
-                timeout_s=self._capture_remaining_timeout(deadline),
-                max_text_size=4096,
-                stack_level=self._required_capture_kernel_stack_level(),
-            )
-            self._capture_remaining_timeout(deadline)
+
+    def _capture_table_schema(
+        self, expression: str, *, deadline: float
+    ) -> tuple[str, ...]:
+        def decode_schema(result: EvaluationResult) -> tuple[str, ...]:
             if result.error_occurred:
                 raise BslExecutionError(result.error_text)
-            page = result.collection_rows
-            rows.extend(page)
-            if len(rows) > MAX_CAPTURE_SCHEMA_COLUMNS:
+            size = result.collection_size
+            rows = result.collection_rows
+            if (
+                (size is not None and (type(size) is not int or size != len(rows)))
+                or len(rows) > MAX_CAPTURE_SCHEMA_COLUMNS
+            ):
                 raise ProtocolError("capture table schema exceeds bounded metadata")
-            if result.collection_size is not None:
-                if result.collection_size > MAX_CAPTURE_SCHEMA_COLUMNS:
-                    raise ProtocolError("capture table schema exceeds bounded metadata")
-                if len(rows) >= result.collection_size:
-                    break
-            if len(page) < page_size:
-                break
-            start_index += len(page)
-        return self._capture_schema_names(rows)
+            return self._capture_schema_names(rows)
+
+        return self._evaluate_capture_helper(
+            expression,
+            evaluation_kind=CaptureEvaluationKind.INSPECTION,
+            stack_level=self._required_capture_kernel_stack_level(),
+            max_text_size=4096,
+            collection_page=(0, MAX_CAPTURE_SCHEMA_COLUMNS + 1),
+            result_policy=decode_schema,
+            timeout_s=self._capture_remaining_timeout(deadline),
+        )  # type: ignore[return-value]
 
     @classmethod
     def _capture_table_selection(
@@ -2779,11 +2789,19 @@ class PrototypeRuntimeController:
         names: list[str] = []
         for row in rows:
             cells = getattr(row, "cells", ())
-            for cell in cells:
-                if getattr(cell, "name", "") == "Имя":
-                    name = getattr(cell, "value_string", "") or getattr(cell, "presentation", "")
-                    if isinstance(name, str) and name:
-                        names.append(name.strip('"'))
+            if len(cells) != 1 or getattr(cells[0], "name", "") != "Имя":
+                raise ProtocolError("capture table schema row is invalid")
+            name = (
+                getattr(cells[0], "value_string", "")
+                or getattr(cells[0], "presentation", "")
+            )
+            if not isinstance(name, str) or not name:
+                raise ProtocolError("capture table schema name is invalid")
+            names.append(
+                PrototypeRuntimeController._capture_identifier(
+                    name.strip('"'), name="table column"
+                )
+            )
         return tuple(names)
 
     def capture_value_handle(self, handle: str) -> str:
@@ -3309,26 +3327,6 @@ class PrototypeRuntimeController:
             ),
         )  # type: ignore[return-value]
 
-    def resume(
-        self,
-        *,
-        dirty_roots: tuple[str, ...] = (),
-        continuation_attempt_id: str | None = None,
-        on_transport_dispatch: Callable[[], None] | None = None,
-    ) -> MainCompletion | CapturedStop | DebugStop:
-        """Synchronously resume for legacy controller callers.
-
-        RuntimeApi uses ``submit_resume`` so its caller only waits on a ticket;
-        direct controller tests retain this small compatibility surface.
-        """
-        self._require_state(OperationState.CAPTURED)
-        return self._resume_owned(
-            dirty_roots=dirty_roots,
-            continuation_attempt_id=continuation_attempt_id,
-            on_transport_dispatch=on_transport_dispatch,
-            on_continue_acknowledged=None,
-        )
-
     def submit_resume(
         self,
         *,
@@ -3424,7 +3422,7 @@ class PrototypeRuntimeController:
         continuation_attempt_id: str | None,
         on_transport_dispatch: Callable[[], None] | None,
         on_continue_acknowledged: Callable[[], None] | None,
-        step_context: CaptureStepContext | None = None,
+        step_context: CaptureStepContext,
     ) -> MainCompletion | CapturedStop | DebugStop:
         dirty_roots = tuple(dirty_roots)
         attempt = self._continuation_attempt(
@@ -3434,8 +3432,6 @@ class PrototypeRuntimeController:
 
         def capture_step(expression: str) -> EvaluationResult:
             stack_level = self._required_capture_kernel_stack_level()
-            if step_context is None:
-                return self.session.evaluate(expression, stack_level=stack_level)
             return step_context.execute_inline(self._capture_remote_step(
                 expression,
                 stack_level=stack_level,
@@ -3990,37 +3986,6 @@ class PrototypeRuntimeController:
             stack_level=0,
         ))
 
-    def inspect_table_sample(
-        self,
-        handle: str,
-        *,
-        page_size: int = 16,
-    ) -> EvaluationResult:
-        if not re.fullmatch(
-            r"Контекст\.[^\W\d]\w*(?:\.[^\W\d]\w*)*", handle, re.UNICODE
-        ):
-            raise ProtocolError(
-                "table handle must be one direct or dotted persistent Context path"
-            )
-        if type(page_size) is not int or not 1 <= page_size <= 64:
-            raise ProtocolError("table schema sample size is invalid")
-        stack_level = (
-            self._required_capture_kernel_stack_level()
-            if self.state is OperationState.CAPTURED
-            else 0
-        )
-        result = self.session.evaluate_collection(
-            handle,
-            start_index=0,
-            page_size=page_size,
-            timeout_s=self.command_timeout_s,
-            max_text_size=4096,
-            stack_level=stack_level,
-        )
-        if result.error_occurred:
-            raise BslExecutionError(result.error_text)
-        return result
-
     def inspect_completion_fields(
         self,
         handle: str,
@@ -4058,34 +4023,6 @@ class PrototypeRuntimeController:
             start_index=0, page_size=129, max_text_size=512,
             timeout_s=self.command_timeout_s, stack_level=stack_level,
         )
-        if result.error_occurred:
-            raise BslExecutionError(result.error_text)
-        return result
-
-    def inspect_declared_table_schema(
-        self, handle: str, *, timeout_s: float | None = None
-    ) -> EvaluationResult:
-        deadline = self._capture_command_deadline(timeout_s)
-        if not re.fullmatch(
-            r"Контекст\.[^\W\d]\w*(?:\.[^\W\d]\w*)*", handle, re.UNICODE
-        ):
-            raise ProtocolError(
-                "table handle must be one direct or dotted persistent Context path"
-            )
-        stack_level = (
-            self._required_capture_kernel_stack_level()
-            if self.state is OperationState.CAPTURED
-            else 0
-        )
-        result = self.session.evaluate_collection(
-            "RuntimeTableTransferServer.ПолучитьКомпактнуюСхему(" + handle + ")",
-            start_index=0,
-            page_size=64,
-            timeout_s=self._capture_remaining_timeout(deadline),
-            max_text_size=4096,
-            stack_level=stack_level,
-        )
-        self._capture_remaining_timeout(deadline)
         if result.error_occurred:
             raise BslExecutionError(result.error_text)
         return result
