@@ -1,9 +1,11 @@
 from threading import RLock, Thread, Event
+from time import monotonic, sleep
 from types import SimpleNamespace
 
 import pytest
 
 from onec_runtime.capture_evaluation import (
+    CaptureEvaluationCoordinator,
     CaptureEvaluationKind,
     CaptureEvaluationTicket,
     CapturePhase,
@@ -444,4 +446,62 @@ def test_ready_completion_releases_session_and_api_locks_while_ticket_waits() ->
         if session.capture_pending is not None:
             session.complete(_completion_wire(), type_name="Строка")
         caller.join(1)
+        close_owner(controller, session)
+
+
+def test_ready_completion_submit_interruption_detaches_adopted_ticket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exception after adoption leaves the event owner as sole consumer."""
+    session = ControlledCaptureSession()
+    controller_module = __import__(
+        "onec_runtime.prototype_runtime", fromlist=("PrototypeRuntimeController",)
+    )
+    controller = controller_module.PrototypeRuntimeController(
+        session, SERVICE, command_timeout_s=1.0,
+    )
+    controller.state = OperationState.COMPLETED
+    api = PrototypeRuntimeApi(controller)
+    api._namespace_names = ("Данные",)
+    runtime = object.__new__(RuntimeSession)
+    runtime.runtime_api = api
+    runtime._operation_lock = RLock()
+    runtime._closed = False
+    original_submit = CaptureEvaluationCoordinator.submit_evaluation
+
+    def interrupt_after_adoption(
+        owner: CaptureEvaluationCoordinator,
+        request: object,
+    ) -> CaptureEvaluationTicket:
+        ticket = original_submit(owner, request)  # type: ignore[arg-type]
+        raise RuntimeError("planned submit-return interruption")
+
+    monkeypatch.setattr(
+        CaptureEvaluationCoordinator,
+        "submit_evaluation",
+        interrupt_after_adoption,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="planned submit-return interruption"):
+            runtime.completion_fields("Контекст.Данные", timeout_s=1.0)
+
+        assert session.accepted.wait(1)
+        owner = controller.ready_inspection_evaluation_owner()
+        assert owner is not None and owner._active is not None
+        assert owner._active.initiator_attached is False
+        assert controller.state is OperationState.RECOVERING
+        assert runtime._operation_lock.acquire(blocking=False)
+        runtime._operation_lock.release()
+        with pytest.raises(ProtocolError):
+            runtime.completion_fields("Контекст.Данные", timeout_s=0.1)
+        assert session.capture_start_count == 1
+
+        session.complete(_completion_wire(), type_name="Строка")
+        deadline = monotonic() + 1.0
+        while controller.state is OperationState.RECOVERING and monotonic() < deadline:
+            sleep(0.005)
+        assert controller.state is OperationState.COMPLETED
+    finally:
+        if session.capture_pending is not None:
+            session.complete(_completion_wire(), type_name="Строка")
         close_owner(controller, session)
