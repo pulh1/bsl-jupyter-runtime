@@ -1540,6 +1540,99 @@ def test_session_proxy_materialization_releases_operation_lock_after_ack() -> No
         close_owner(controller, transport)
 
 
+def test_session_proxy_adopts_ticket_before_releasing_admission_locks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A contender cannot enter the pre-submit gap between the two locks."""
+    api, controller, transport = _capture_runtime(timeout_s=1)
+    runtime = _materialization_runtime_session(api)
+    api._namespace_names = ("Таблица",)
+    owner = _capture_owner(controller)
+    proxy = OnecValueProxy(
+        runtime,
+        "Таблица",
+        runtime_generation=controller.runtime_generation,
+        context_generation=1,
+    )
+    submit_entered = Event()
+    release_submit = Event()
+    first_done = Event()
+    second_done = Event()
+    first_errors: list[BaseException] = []
+    second_errors: list[BaseException] = []
+    second_started = False
+    original_submit = owner.submit_evaluation
+
+    def submit_after_barrier(
+        request: CaptureEvaluationRequest,
+    ) -> CaptureEvaluationTicket:
+        submit_entered.set()
+        assert release_submit.wait(_JOIN_TIMEOUT_S), "submit barrier was not released"
+        return original_submit(request)
+
+    def first() -> None:
+        try:
+            proxy.to_df()
+        except BaseException as error:
+            first_errors.append(error)
+        finally:
+            first_done.set()
+
+    def second() -> None:
+        try:
+            proxy.to_df()
+        except BaseException as error:
+            second_errors.append(error)
+        finally:
+            second_done.set()
+
+    first_thread = Thread(target=first, name="session-proxy-pre-submit-first")
+    second_thread = Thread(target=second, name="session-proxy-pre-submit-second")
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(owner, "submit_evaluation", submit_after_barrier)
+            first_thread.start()
+            assert submit_entered.wait(1), "initiator did not reach submit barrier"
+
+            # A coordinator ticket has not been adopted yet. Both admission
+            # locks must still prevent another Session call from entering.
+            session_lock_acquired = runtime._operation_lock.acquire(blocking=False)
+            if session_lock_acquired:
+                runtime._operation_lock.release()
+            api_lock_acquired = api._lock.acquire(blocking=False)
+            if api_lock_acquired:
+                api._lock.release()
+            assert not session_lock_acquired
+            assert not api_lock_acquired
+
+            second_started = True
+            second_thread.start()
+            assert not second_done.wait(0.1), "contender entered before ticket adoption"
+
+            release_submit.set()
+            assert transport.accepted.wait(1), "adopted materialization was not dispatched"
+            assert second_done.wait(0.2), "contender did not reach busy admission"
+            assert len(second_errors) == 1
+            assert isinstance(second_errors[0], CaptureBusyError)
+            status = runtime.current_capture().status()
+            assert status.phase is CapturePhase.EVALUATING
+            assert status.pending_evaluation_id is not None
+            assert status.evaluation_kind is CaptureEvaluationKind.MATERIALIZATION_HELPER
+            assert transport.capture_start_count == 1
+            assert not first_done.is_set()
+    finally:
+        release_submit.set()
+        if transport.capture_pending is not None:
+            transport.complete()
+        first_thread.join(_JOIN_TIMEOUT_S)
+        if second_started:
+            second_thread.join(_JOIN_TIMEOUT_S)
+        assert not first_thread.is_alive(), "first Session caller leaked"
+        if second_started:
+            assert not second_thread.is_alive(), "second Session caller leaked"
+        close_owner(controller, transport)
+
+
 def test_session_proxy_materialization_restores_operation_lock_after_interrupt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
