@@ -938,6 +938,142 @@ def test_runtime_native_frame_uses_the_production_envelope_without_inventory_met
         assert owner.join(2)
 
 
+def test_runtime_native_frame_pages_wide_private_inventory_before_envelope_projection():
+    """Only the requested native roots may cross into one inspection source."""
+    from base64 import b64encode
+    from hashlib import sha256
+    import json
+    import re
+
+    from onec_runtime.capture_inspection import ResolvedFrameSource
+
+    names = [f"V{index}" for index in range(101)]
+    names[2] = "ParamB"
+    names[99] = "ParamA"
+    local_names = tuple(name for name in names if name not in {"ParamA", "ParamB"})
+
+    class WideEnvelopeNativeSession(FreshStackSession):
+        def __init__(self) -> None:
+            super().__init__()
+            self.private_inventory_reads = 0
+            self.projection_sources: list[str] = []
+            self.projection_roots: list[tuple[str, ...]] = []
+            self.payload_reads = 0
+            self.cleanups = 0
+            self.payload = ""
+            self.admission = ""
+
+        def local_variables(self, stack_level: int = 0) -> LocalVariablesResult:
+            if stack_level == 1:
+                self.calls.append(("local_variables", stack_level))
+                self.private_inventory_reads += 1
+                return LocalVariablesResult(uuid4(), tuple(
+                    FrameVariable(
+                        name, "PRIVATE_NATIVE_TYPE", "PRIVATE_NATIVE_PRESENTATION",
+                    )
+                    for name in names
+                ))
+            return super().local_variables(stack_level)
+
+        def evaluate(self, expression: str, **kwargs: object):  # type: ignore[no-untyped-def]
+            stack_level = kwargs.get("stack_level", 0)
+            call_value: object = (
+                expression if stack_level == 0 else (expression, stack_level)
+            )
+            self.calls.append(("evaluate", call_value))
+            if "СпроецироватьЗначенияИнспекции" in expression:
+                roots = tuple(name for name, value in re.findall(
+                    r'\.Вставить\("([^"\\]+)", '
+                    r'([A-Za-zА-Яа-яЁё_][0-9A-Za-zА-Яа-яЁё_]*)\);',
+                    expression,
+                ) if name == value)
+                self.projection_sources.append(expression)
+                self.projection_roots.append(roots)
+                document = {
+                    "v": 1,
+                    "action": "project",
+                    "entries": [{
+                        "name": name,
+                        "denied": False,
+                        "type_name": "Число",
+                        "preview": "1",
+                        "size": None,
+                        "shape": "scalar",
+                        "cycle": False,
+                    } for name in roots],
+                    "total": len(roots),
+                    "next": None,
+                }
+                payload = json.dumps(
+                    document, ensure_ascii=False, separators=(",", ":"),
+                ).encode("utf-8")
+                self.payload = b64encode(payload).decode("ascii")
+                self.admission = "R|1|1|{}|{}|{}".format(
+                    len(payload), sha256(payload).hexdigest(), len(self.payload),
+                )
+                return evaluation("Строка", f'"{self.admission}"')
+            if "ЗабратьКомпактнуюМатериализациюИзКонтекста" in expression:
+                self.payload_reads += 1
+                return evaluation("Строка", f'"{self.payload}"')
+            if "УдалитьМатериализациюИзКонтекста" in expression:
+                self.cleanups += 1
+                return evaluation("Булево", "Истина")
+            return super().evaluate(expression, **kwargs)
+
+    session = WideEnvelopeNativeSession()
+    controller = captured_controller(session)
+    runtime = PrototypeRuntimeApi(controller)
+    owner = controller._capture_evaluation_coordinator
+    assert owner is not None
+    source = "Procedure RunFixture(ParamA, ParamB)\nEndProcedure"
+    pin = SourceVersionRef.worker(
+        artifact_id="wide-native-frame", generation=1, source_text=source,
+    )
+    resolved = ResolvedFrameSource("Common.RunFixture", 1, IDENTITY, pin)
+    try:
+        capture = runtime._current_capture(
+            resolve_sources=lambda frames: tuple(
+                resolved if frame.level == 1 else None for frame in frames
+            ),
+        )
+        frame = capture.stack.native[1].with_method()
+
+        first = frame.variables[50:51]
+        second = frame.variables[51:52]
+        first_name = frame.variables[:1]
+        exact = frame.variables["v50"]
+        parameters = frame.parameters[:1]
+        locals_page = frame.locals[50:51]
+
+        assert [item.name for item in first.items] == ["V50"]
+        assert first.total == 101 and first.next_cursor == 51
+        assert [item.name for item in second.items] == ["V51"]
+        assert second.total == 101 and second.next_cursor == 52
+        assert [item.name for item in first_name.items] == ["V0"]
+        assert first_name.total == 101 and first_name.next_cursor == 1
+        assert exact.name == "V50"
+        assert [item.name for item in parameters.items] == ["ParamA"]
+        assert parameters.total == 2 and parameters.next_cursor == 1
+        assert [item.name for item in locals_page.items] == [local_names[50]]
+        assert locals_page.total == len(local_names) and locals_page.next_cursor == 51
+
+        assert session.private_inventory_reads == 6
+        assert session.projection_roots == [
+            ("V50",), ("V51",), ("V0",), ("V50",),
+            ("ParamA",), (local_names[50],),
+        ]
+        assert session.payload_reads == session.cleanups == 6
+        first_page_source = session.projection_sources[2]
+        assert 'Вставить("V0", V0);' in first_page_source
+        assert 'Вставить("V1", V1);' not in first_page_source
+        assert 'Вставить("ParamB", ParamB);' not in first_page_source
+        assert 'PRIVATE_NATIVE_TYPE' not in first_page_source
+        assert 'PRIVATE_NATIVE_PRESENTATION' not in first_page_source
+    finally:
+        owner.begin_close()
+        assert owner.join(2)
+
+
 def test_session_current_capture_binds_sources_methods_and_frame_value_scope() -> None:
     from onec_runtime.capture_inspection import ResolvedFrameSource
     from onec_runtime.capture_values import (
