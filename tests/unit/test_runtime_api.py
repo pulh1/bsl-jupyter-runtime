@@ -18,6 +18,7 @@ from onec_runtime_mcp.agent.onec_values import OnecValueResolver
 from onec_runtime_mcp.agent.proxies import ProxyProvenance, ProxyRegistry
 from onec_runtime.errors import (
     BslExecutionError,
+    CaptureValueCheckError,
     PoisonedRuntimeError,
     ProtocolError,
     StaleWorkerGeneration,
@@ -3929,11 +3930,8 @@ def test_api_project_value_decodes_only_bounded_array_projection() -> None:
     ).encode()
     encoded = b64encode(content).decode()
     controller.context_value = encoded
-    controller.worker_results.extend(
-        (
-            "value",
-            f"R|1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}",
-        )
+    controller.worker_results.append(
+        f"R|1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}"
     )
 
     result = api.project_value(
@@ -3944,7 +3942,7 @@ def test_api_project_value_decodes_only_bounded_array_projection() -> None:
     )
 
     assert result == [5]
-    assert "Для ИндексПроекции = 5" in controller.main_sources[1]
+    assert "Для ИндексПроекции = 5" in controller.main_sources[0]
     assert controller.context_drops[-1].startswith("__onec_projection_")
 
 
@@ -3969,11 +3967,8 @@ def test_api_project_value_preserves_table_materialize_dataframe_semantics() -> 
     ).encode()
     encoded = b64encode(content).decode()
     controller.context_value = encoded
-    controller.worker_results.extend(
-        (
-            "table",
-            f"R|1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}",
-        )
+    controller.worker_results.append(
+        f"R|1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}"
     )
 
     result = api.project_value(
@@ -3985,10 +3980,10 @@ def test_api_project_value_preserves_table_materialize_dataframe_semantics() -> 
     )
 
     assert result.to_dict("records") == [{"Имя": "А"}]
-    assert "Контекст.Таблица.Скопировать" in controller.main_sources[1]
+    assert "Контекст.Таблица.Скопировать" in controller.main_sources[0]
 
 
-def test_api_project_value_keeps_route_and_projection_under_one_writer(
+def test_api_project_value_keeps_composite_request_under_one_writer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     controller = FakeController()
@@ -4003,23 +3998,19 @@ def test_api_project_value_keeps_route_and_projection_under_one_writer(
     ).encode()
     encoded = b64encode(content).decode()
     controller.context_value = encoded
-    controller.worker_results.extend(
-        (
-            "value",
-            f"R|1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}",
-        )
+    controller.worker_results.append(
+        f"R|1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}"
     )
-    route_returned = Event()
+    request_started = Event()
     continue_projection = Event()
-    original_materialization_kind = api._materialization_kind_locked
+    original_execute_transfer = api._execute_transfer_plan_locked
 
-    def pause_after_public_route(handle: str) -> str:
-        result = original_materialization_kind(handle)
-        route_returned.set()
+    def pause_composite_request(*args: object, **kwargs: object) -> bytes:
+        request_started.set()
         assert continue_projection.wait(timeout=2)
-        return result
+        return original_execute_transfer(*args, **kwargs)
 
-    monkeypatch.setattr(api, "_materialization_kind_locked", pause_after_public_route)
+    monkeypatch.setattr(api, "_execute_transfer_plan_locked", pause_composite_request)
     results: list[object] = []
     failures: list[BaseException] = []
 
@@ -4038,7 +4029,7 @@ def test_api_project_value_keeps_route_and_projection_under_one_writer(
 
     thread = Thread(target=project)
     thread.start()
-    if route_returned.wait(timeout=0.25):
+    if request_started.wait(timeout=0.25):
         try:
             with pytest.raises(ProtocolError, match="already executing"):
                 api.status()
@@ -4067,11 +4058,8 @@ def test_api_routes_recursive_value_materialization_without_active_worker() -> N
     ).encode()
     encoded = b64encode(content).decode()
     controller.context_value = encoded
-    controller.worker_results.extend(
-        (
-            "value",
-            f"R|1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}",
-        )
+    controller.worker_results.append(
+        f"R|1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}"
     )
 
     result = api.materialize_value(
@@ -4079,13 +4067,13 @@ def test_api_routes_recursive_value_materialization_without_active_worker() -> N
     )
 
     assert result == {"Name": "value"}
-    assert len(controller.main_sources) == 2
+    assert len(controller.main_sources) == 1
     assert "RuntimeValueTransferServer.ДопуститьЗначение(Контекст.Данные" in controller.main_sources[0]
     assert controller.main_sources[0].index("ДопуститьЗначение") < controller.main_sources[0].index(
         "ПолучитьВидМатериализации"
     )
     assert "СериализоватьЗначение(Контекст.Данные, \"both\", 7, 99, 4096, ТипыОбъектовWorker)" in (
-        controller.main_sources[1]
+        controller.main_sources[0]
     )
     assert len(controller.context_reads) == 1
 
@@ -4111,18 +4099,15 @@ def test_api_routes_table_materialize_to_existing_dataframe_transport() -> None:
     ).encode()
     encoded = b64encode(content).decode()
     controller.context_value = encoded
-    controller.worker_results.extend(
-        (
-            "table",
-            f"R|1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}",
-        )
+    controller.worker_results.append(
+        f"R|1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}"
     )
 
     result = api.materialize_value("Контекст.Таблица")
 
     assert result.to_dict(orient="records") == [{"Имя": "А"}]
     assert controller.table_declared_schema_calls == []
-    assert len(controller.main_sources) == 2
+    assert len(controller.main_sources) == 1
 
 
 def test_api_materialize_value_uses_one_admitted_dynamic_route_request() -> None:
@@ -4237,11 +4222,8 @@ def _frame_table_preview(
     encoded = b64encode(payload).decode()
     controller.context_value = encoded
     controller.worker_results.clear()
-    controller.worker_results.extend(
-        (
-            "table",
-            f"R|1|1|{len(payload)}|{sha256(payload).hexdigest()}|{len(encoded)}",
-        )
+    controller.worker_results.append(
+        f"R|1|1|{len(payload)}|{sha256(payload).hexdigest()}|{len(encoded)}"
     )
     api = PrototypeRuntimeApi(controller)
     registry = ProxyRegistry()
@@ -4295,12 +4277,12 @@ def test_frame_table_preview_uses_server_owned_row_byte_and_deadline_bounds() ->
     assert preview.sample == ({"Имя": "А"},)
     assert preview.type_name == "РезультатЗапроса"
     assert preview.truncated is True
-    assert len(controller.capture_sources) == 2
-    transfer_source = controller.capture_sources[1]
+    assert len(controller.capture_sources) == 1
+    transfer_source = controller.capture_sources[0]
     assert "ТипыОбъектовWorker, 1, 512);" in transfer_source
     assert controller.table_declared_schema_calls == []
     assert len(controller.context_reads) == 1
-    assert len(controller.preview_command_timeouts) == 3
+    assert len(controller.preview_command_timeouts) == 2
     assert all(0 < value <= 0.75 for value in controller.preview_command_timeouts)
     assert controller.command_timeout_s == 30.0
 
@@ -4319,18 +4301,18 @@ def test_frame_table_preview_rejects_oversize_payload_before_transfer() -> None:
             byte_limit=64,
         )
 
-    assert len(controller.capture_sources) == 2
-    assert "ТипыОбъектовWorker, 1, 64);" in controller.capture_sources[1]
+    assert len(controller.capture_sources) == 1
+    assert "ТипыОбъектовWorker, 1, 64);" in controller.capture_sources[0]
     assert controller.context_reads == []
 
 
-def test_api_rejects_unknown_server_materialization_route() -> None:
+def test_api_rejects_invalid_dynamic_materialization_envelope() -> None:
     controller = FakeController()
     api = PrototypeRuntimeApi(controller)
     controller.worker_results.clear()
     controller.worker_results.append("executable")
 
-    with pytest.raises(ProtocolError, match="route"):
+    with pytest.raises(CaptureValueCheckError, match="admission result"):
         api.materialize_value("Контекст.Данные")
 
     assert controller.context_reads == []
@@ -4347,15 +4329,12 @@ def test_api_materializes_recursive_value_while_capture_is_paused() -> None:
     ).encode()
     encoded = b64encode(content).decode()
     controller.context_value = encoded
-    controller.worker_results.extend(
-        (
-            "value",
-            f"R|1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}",
-        )
+    controller.worker_results.append(
+        f"R|1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}"
     )
 
     assert api.materialize_value("Контекст.Данные") == "capture"
-    assert len(controller.capture_sources) == 2
+    assert len(controller.capture_sources) == 1
     assert all("РезультатИнструкции = Результат;" in source for source in controller.capture_sources)
 
 

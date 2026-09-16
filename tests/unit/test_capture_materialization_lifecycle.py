@@ -301,3 +301,59 @@ def test_materialization_kind_uses_an_explicit_inspection_record() -> None:
             session.complete()
         caller.join(1)
         close_owner(controller, session)
+
+
+@pytest.mark.parametrize(
+    ("operation", "evaluation_kind"),
+    (
+        (
+            lambda api: api.materialize_value(
+                "Контекст.Данные", max_depth=2, max_items=3, max_bytes=1024
+            ),
+            CaptureEvaluationKind.MATERIALIZATION_HELPER,
+        ),
+        (
+            lambda api: api.project_value(
+                "Контекст.Данные", {"offset": 0, "limit": 1},
+                max_depth=2, max_items=3, max_bytes=1024,
+            ),
+            CaptureEvaluationKind.INSPECTION,
+        ),
+    ),
+)
+def test_dynamic_routes_admit_before_route_or_payload_access(
+    operation,  # type: ignore[no-untyped-def]
+    evaluation_kind: CaptureEvaluationKind,
+) -> None:
+    session = ControlledCaptureSession()
+    controller = captured_controller(session, command_timeout_s=0.02)
+    api = PrototypeRuntimeApi(controller)
+    errors: list[BaseException] = []
+
+    def materialize() -> None:
+        try:
+            operation(api)
+        except BaseException as error:
+            errors.append(error)
+
+    caller = Thread(target=materialize, name="dynamic-materialization-initiator")
+    try:
+        caller.start()
+        assert session.accepted.wait(1)
+        caller.join(1)
+
+        assert len(errors) == 1
+        assert isinstance(errors[0], CaptureEvaluationPendingError)
+        assert api.current_capture().status().evaluation_kind is evaluation_kind
+        sources = [call[1][0] for call in session.calls if call[0] == "start_evaluation"]
+        assert len(sources) == 1
+        source = sources[0]
+        assert source.index("ДопуститьЗначение(") < source.index("ПолучитьВидМатериализации(")
+        assert source.index("ПолучитьВидМатериализации(") < source.index("Контекст.Вставить(")
+        assert "СериализоватьКомпактнуюТаблицу(" in source
+        assert "СериализоватьЗначение(" in source
+    finally:
+        if session.capture_pending is not None:
+            session.complete()
+        caller.join(1)
+        close_owner(controller, session)

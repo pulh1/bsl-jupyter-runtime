@@ -1721,10 +1721,9 @@ def test_unselected_preview_uses_one_native_selection_and_one_transfer_through_f
         def __init__(self) -> None:
             super().__init__(
                 (CAPTURE_A, SERVICE),
-                capture_evaluations=(
-                    evaluation("Число", "3"),
-                    evaluation("Строка", '"table"'),
-                    evaluation("Строка", '"' + metadata + '"'),
+                    capture_evaluations=(
+                        evaluation("Число", "3"),
+                        evaluation("Строка", '"' + metadata + '"'),
                     # The coordinator now owns the context payload read as the
                     # final step of the one materialization request.
                     evaluation("Строка", '"' + encoded + '"'),
