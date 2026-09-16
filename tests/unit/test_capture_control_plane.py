@@ -642,7 +642,10 @@ def assert_safe_shutdown_evidence(
     evidence = event.fields
     assert set(evidence) == _SHUTDOWN_EVIDENCE_FIELDS
     assert evidence["evaluation_id"] == evaluation_id
-    assert re.fullmatch(r"[0-9a-f]{32}", str(evidence["evaluation_id"]))
+    assert re.fullmatch(
+        r"capture-eval-v1-[0-9a-f]{32}",
+        str(evidence["evaluation_id"]),
+    )
     assert evidence["evaluation_kind"] == CaptureEvaluationKind.USER_BSL.value
     assert evidence["evaluation_kind"] in {
         kind.value for kind in CaptureEvaluationKind

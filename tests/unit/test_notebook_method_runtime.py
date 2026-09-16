@@ -171,6 +171,11 @@ def test_jupyter_magic_pending_user_bsl_detaches_core_ticket_and_keeps_controls_
         status = capture.status()
         assert status.phase is CapturePhase.EVALUATING
         assert status.evaluation_kind.value == "user_bsl"
+        assert status.pending_evaluation_id is not None
+        assert re.fullmatch(
+            r"capture-eval-v1-[0-9a-f]{32}",
+            status.pending_evaluation_id,
+        )
         assert capture.wait(timeout_s=0).state is CaptureEvaluationState.PENDING
 
         contender.start()
@@ -184,6 +189,13 @@ def test_jupyter_magic_pending_user_bsl_detaches_core_ticket_and_keeps_controls_
         assert errors == []
         assert len(result) == 1 and result[0] is not None
         bundle = result[0]._repr_mimebundle_()  # type: ignore[union-attr]
+        expected_pending = (
+            f"evaluation_id={status.pending_evaluation_id}\n"
+            "evaluation_kind=user_bsl\n"
+            "runtime.current_capture().wait(timeout_s=10)"
+        )
+        assert bundle["text/plain"] == expected_pending  # type: ignore[index]
+        assert bundle["text/html"] == f"<pre>{expected_pending}</pre>"  # type: ignore[index]
         assert (
             bundle[MACHINE_MIME_TYPE]["evaluation_id"]
             == status.pending_evaluation_id
@@ -207,7 +219,8 @@ def test_jupyter_magic_pending_user_bsl_detaches_core_ticket_and_keeps_controls_
         if session.capture_pending is not None:
             session.complete()
         initiator.join(1)
-        contender.join(1)
+        if contender.ident is not None:
+            contender.join(1)
         close_owner(controller, session)
 
 

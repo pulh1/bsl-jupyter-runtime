@@ -6,6 +6,7 @@ from typing import get_type_hints
 
 import pytest
 
+import onec_runtime.capture_evaluation as capture_evaluation
 from onec_runtime.capture_evaluation import (
     AdmissionEnvelopeV1,
     MAX_CAPTURE_TIMING_COUNT,
@@ -18,6 +19,7 @@ from onec_runtime.capture_evaluation import (
     CapturePhase,
     CaptureStatus,
     _enum,
+    is_public_capture_evaluation_id,
 )
 from onec_runtime.errors import (
     CaptureBusyError,
@@ -137,6 +139,34 @@ def test_safe_enums_have_the_public_wire_values() -> None:
 def test_enum_helper_annotations_are_resolvable() -> None:
     hints = get_type_hints(_enum)
     assert "return" in hints
+
+
+def test_public_evaluation_receipt_grammar_is_exported_and_disjoint_from_private_ids() -> None:
+    public_receipt = "capture-eval-v1-a4f1d86e1e1d4d45b0948e021f669d1f"
+
+    assert "is_public_capture_evaluation_id" in capture_evaluation.__all__
+    assert is_public_capture_evaluation_id(public_receipt)
+    for private_identifier in (
+        "a4f1d86e1e1d4d45b0948e021f669d1f",
+        "a4f1d86e-1e1d-4d45-b094-8e021f669d1f",
+        "capture_manager_" + "a" * 32,
+        "capture_table_metadata_" + "a" * 32,
+        "capture_table_" + "a" * 32,
+        "__onec_capture_table_" + "a" * 32,
+        "__onec_value_" + "a" * 32,
+        "__onec_materialization_" + "a" * 32,
+        "__onec_projection_" + "a" * 32,
+        "__onec_compact_table_" + "a" * 32,
+        "Контекст.Секрет",
+        "worker://private-handle",
+    ):
+        assert not is_public_capture_evaluation_id(private_identifier)
+    assert not is_public_capture_evaluation_id(
+        "capture-eval-v1-" + "A" * 32
+    )
+    assert not is_public_capture_evaluation_id(
+        "capture-eval-v1-" + "a" * 31
+    )
 
 
 def test_timing_is_bounded_rounded_and_does_not_retain_private_data() -> None:

@@ -423,7 +423,7 @@ def test_bsl_magic_renders_acknowledged_user_evaluation_pending_as_safe_mime_bun
     shell = FakeShell()
     runtime = FakeRuntime()
     runtime._poisoned_error = None  # type: ignore[attr-defined]
-    evaluation_id = "a4f1d86e1e1d4d45b0948e021f669d1f"
+    evaluation_id = "capture-eval-v1-a4f1d86e1e1d4d45b0948e021f669d1f"
     guidance = "runtime.current_capture().wait(timeout_s=10)"
     source = (
         "СекретныйИсточник = worker://private-handle; "
@@ -540,9 +540,17 @@ def test_bsl_magic_renders_acknowledged_user_evaluation_pending_as_safe_mime_bun
             "overlong-private",
         ),
         (
+            # RDBG expressionResultID values are UUIDs, never public receipts.
             "a4f1d86e-1e1d-4d45-b094-8e021f669d1f",
+            CaptureEvaluationKind.USER_BSL,
+            "<unavailable>",
+            "user_bsl",
+            "a4f1d86e-1e1d-4d45-b094-8e021f669d1f",
+        ),
+        (
+            "capture-eval-v1-a4f1d86e1e1d4d45b0948e021f669d1f",
             "worker://private-kind",
-            "a4f1d86e1e1d4d45b0948e021f669d1f",
+            "capture-eval-v1-a4f1d86e1e1d4d45b0948e021f669d1f",
             "unknown",
             "private-kind",
         ),
@@ -555,6 +563,7 @@ def test_bsl_magic_renders_acknowledged_user_evaluation_pending_as_safe_mime_bun
         "result-id",
         "control-id",
         "overlong-id",
+        "rdbg-expression-result-id",
         "untrusted-kind",
     ),
 )

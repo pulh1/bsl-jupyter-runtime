@@ -17,6 +17,7 @@ from onec_runtime.capture_evaluation import (
     CaptureFence,
     CapturePhase as Phase,
     CaptureRemoteStep,
+    is_public_capture_evaluation_id,
 )
 from onec_runtime.errors import (
     BslExecutionError,
@@ -167,6 +168,19 @@ def eventually(predicate):
     while not predicate():
         assert monotonic() < deadline, "coordinator did not make expected progress"
         sleep(0.002)
+
+
+def test_coordinator_mints_tagged_receipt_disjoint_from_rdbg_result_id(environment):
+    create, _ = environment
+    coordinator, driver, _ = create()
+
+    ticket = coordinator.submit_evaluation(driver.request())
+
+    assert is_public_capture_evaluation_id(ticket.evaluation_id)
+    assert not is_public_capture_evaluation_id(str(driver.pending.result_id))
+    driver.result()
+    outcome = coordinator.wait(FENCE, ticket.evaluation_id, timeout_s=1)
+    assert outcome.evaluation_id == ticket.evaluation_id
 
 
 def test_late_result_has_one_owner_after_repeated_interval_timeouts(environment):
