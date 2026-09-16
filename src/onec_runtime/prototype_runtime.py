@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextlib import AbstractContextManager, contextmanager
 from enum import Enum
 from hashlib import sha256
 from math import isfinite
@@ -586,31 +586,30 @@ class PrototypeRuntimeController:
         helper_handoff: bool = False,
     ) -> object:
         self.state = OperationState.EVALUATING_CAPTURE
-        handoff = (
-            getattr(self._capture_helper_handoffs, "factory")()
-            if helper_handoff
-            and callable(getattr(self._capture_helper_handoffs, "factory", None))
-            else nullcontext()
-        )
-        with handoff:
-            try:
-                ticket = self._capture_evaluation_owner().submit_evaluation(request)
-            except BaseException:
-                if self.state is OperationState.EVALUATING_CAPTURE:
-                    owner = self._capture_evaluation_owner()
-                    status = owner.status(request.fence)
-                    adopted = (
-                        status.phase is CapturePhase.EVALUATING
-                        and status.pending_evaluation_id is not None
-                    )
-                    if not adopted:
-                        self.state = OperationState.CAPTURED
-                raise
-            if return_ticket:
-                return ticket
-            return ticket.wait_initiator(
-                self.command_timeout_s if timeout_s is None else timeout_s
-            )
+        try:
+            ticket = self._capture_evaluation_owner().submit_evaluation(request)
+        except BaseException:
+            if self.state is OperationState.EVALUATING_CAPTURE:
+                owner = self._capture_evaluation_owner()
+                status = owner.status(request.fence)
+                adopted = (
+                    status.phase is CapturePhase.EVALUATING
+                    and status.pending_evaluation_id is not None
+                )
+                if not adopted:
+                    self.state = OperationState.CAPTURED
+            raise
+        if return_ticket:
+            return ticket
+        timeout = self.command_timeout_s if timeout_s is None else timeout_s
+        factory = getattr(self._capture_helper_handoffs, "factory", None)
+        if helper_handoff and callable(factory):
+            # Admission and coordinator ticket adoption remain protected by
+            # the caller's Session and API writer locks.  Only the owned
+            # coordinator wait may detach both locks for a contender.
+            with factory():
+                return ticket.wait_initiator(timeout)
+        return ticket.wait_initiator(timeout)
 
     @contextmanager
     def capture_helper_caller_handoff(
