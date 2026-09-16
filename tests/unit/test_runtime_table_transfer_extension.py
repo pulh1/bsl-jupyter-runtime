@@ -194,7 +194,7 @@ def test_compact_schema_classifier_never_reads_past_the_bounded_row_page() -> No
     )[0]
 
     assert "ОпределитьКомпактнуюСхемуКолонок(Таблица, ТипыОбъектовWorker, МаксимумСтрок)" in serializer
-    assert "(Таблица, ТипыОбъектовWorker, МаксимумСтрок)" in classifier
+    assert "(Таблица, ТипыОбъектовWorker, Знач МаксимумСтрок)" in classifier
     row_guard = classifier.index("КоличествоПроверенныхСтрок >= МаксимумСтрок")
     cell_read = classifier.index("ЗначениеЯчейки = СтрокаТаблицы[Колонка.Имя]")
     assert row_guard < cell_read
@@ -216,6 +216,16 @@ def test_compact_schema_classifier_never_reads_past_the_bounded_row_page() -> No
 
     page = [{"Колонка": "first"}, {"Колонка": "second"}, SentinelRow()]
     assert bounded_classifier_reads(page, 2) == ["first", "second"]
+
+
+def test_unbounded_schema_probe_keeps_the_serializer_row_budget_unbounded() -> None:
+    """A schema sample must not turn max_rows=0 into a one-row transfer."""
+    source = SERVICE_MODULE.read_text(encoding="utf-8-sig")
+    classifier = source.split("Функция ОпределитьКомпактнуюСхемуКолонок", 1)[1].split(
+        "КонецФункции", 1
+    )[0]
+
+    assert "(Таблица, ТипыОбъектовWorker, Знач МаксимумСтрок)" in classifier
 
 
 def test_compact_serializer_checks_budgets_before_base64_construction() -> None:

@@ -15,7 +15,11 @@ from uuid import UUID
 from xml.etree import ElementTree
 
 from onec_runtime.errors import ProtocolError
-from onec_runtime.kernel import COMMON_MODULE_PROPERTY_ID, OBJECT_MODULE_PROPERTY_ID
+from onec_runtime.kernel import (
+    COMMON_MODULE_PROPERTY_ID,
+    DOCUMENT_MANAGER_MODULE_PROPERTY_ID,
+    OBJECT_MODULE_PROPERTY_ID,
+)
 from onec_runtime.configuration_source import (
     ConfigurationSourceLayout,
     SourceLayer,
@@ -568,6 +572,13 @@ _MODULE_ROLES = {
         "ObjectModule",
         "Документ",
         "МодульОбъекта",
+    ),
+    UUID(DOCUMENT_MANAGER_MODULE_PROPERTY_ID): (
+        "Documents",
+        "Document",
+        "ManagerModule",
+        "Документ",
+        "МодульМенеджера",
     ),
 }
 

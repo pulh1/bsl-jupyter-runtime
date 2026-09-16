@@ -274,7 +274,7 @@ class ConfigurationSourceLayout:
         if (
             directory not in METADATA_DIRECTORIES
             or not name.isidentifier()
-            or role not in {"Module", "ObjectModule"}
+            or role not in {"Module", "ObjectModule", "ManagerModule"}
         ):
             raise ProtocolError("configuration module identity is invalid")
         folder = self.normalized_root / directory / name

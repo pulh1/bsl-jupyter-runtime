@@ -883,16 +883,22 @@ class RuntimeSession:
                             error, runtime_session.close
                         )
                     raise
-                if config.capture_source is not None:
+                capture_source = config.capture_source
+                if capture_source is None and config.source_root is not None:
+                    # The runtime source root is already the trusted configuration
+                    # tree for worker/source resolution.  Bind it to CAPTURE too
+                    # unless the caller selected a separate source explicitly.
+                    capture_source = CaptureSourceConfig("Notebook", config.source_root)
+                if capture_source is not None:
                     try:
                         source_options = {}
-                        if config.capture_source.layer != SourceLayer.AUTO:
-                            source_options["layer"] = config.capture_source.layer
-                        if config.capture_source.extension_name is not None:
-                            source_options["extension_name"] = config.capture_source.extension_name
+                        if capture_source.layer != SourceLayer.AUTO:
+                            source_options["layer"] = capture_source.layer
+                        if capture_source.extension_name is not None:
+                            source_options["extension_name"] = capture_source.extension_name
                         runtime_session.configure_capture_source(
-                            config.capture_source.project,
-                            config.capture_source.source_root,
+                            capture_source.project,
+                            capture_source.source_root,
                             **source_options,
                         )
                     except BaseException as error:

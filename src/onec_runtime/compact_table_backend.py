@@ -20,7 +20,11 @@ from onec_runtime.errors import CaptureValueCheckError, ProtocolError
 from onec_runtime.experiment import bsl_string_literal
 from onec_runtime.performance_profile import PhaseRecorder
 from onec_runtime.rdbg.models import CollectionRow
-from onec_runtime.table_materialization import ReferenceMode, ReferencePolicy
+from onec_runtime.table_materialization import (
+    ReferenceMode,
+    ReferencePolicy,
+    TableMaterializationError,
+)
 
 
 _HANDLE = re.compile(
@@ -32,6 +36,14 @@ _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _SCALAR_KINDS = frozenset(
     {"string", "nullable_string", "boolean", "integer", "number", "datetime", "uuid"}
 )
+_TABLE_FAILURE_MESSAGES = {
+    "E|table_row_limit_exceeded": "1C table row limit exceeded",
+    "E|table_byte_limit_exceeded": "1C table byte limit exceeded",
+    "E|table_column_type_mismatch": "1C table column contains incompatible value types",
+    "E|table_unsupported_value_type": "1C table contains an unsupported value type",
+    "E|table_row_limit_required": "1C query result requires an explicit row limit",
+    "E|value_admission_failed": "1C table serialization failed",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,7 +223,25 @@ def _build_compact_transfer_instruction(
             "\"ЧГ=0; ЧДЦ=0\");",
             "КонецЕсли;",
             "Исключение",
-            '    Результат = "E|value_admission_failed";',
+            "    ОписаниеОшибки = ИнформацияОбОшибке().Описание;",
+            '    Если ОписаниеОшибки = "Превышен лимит строк компактной таблицы" Тогда',
+            '        Результат = "E|table_row_limit_exceeded";',
+            '    ИначеЕсли ОписаниеОшибки = "Превышен лимит байтов компактной таблицы" Тогда',
+            '        Результат = "E|table_byte_limit_exceeded";',
+            '    ИначеЕсли СтрНачинаетсяС(ОписаниеОшибки, '
+            '"Несовместимый тип значения компактной колонки: ") Тогда',
+            '        Результат = "E|table_column_type_mismatch";',
+            '    ИначеЕсли СтрНачинаетсяС(ОписаниеОшибки, '
+            '"Неподдерживаемый тип компактной таблицы: ") '
+            'Или СтрНачинаетсяС(ОписаниеОшибки, '
+            '"Неподдерживаемое табличное значение: ") Тогда',
+            '        Результат = "E|table_unsupported_value_type";',
+            '    ИначеЕсли ОписаниеОшибки = '
+            '"Для результата запроса требуется положительный лимит строк" Тогда',
+            '        Результат = "E|table_row_limit_required";',
+            "    Иначе",
+            '        Результат = "E|value_admission_failed";',
+            "    КонецЕсли;",
             "КонецПопытки;",
         ]
     )
@@ -360,11 +390,25 @@ class CompactRuntimeTableTransfer:
         )
 
     def _validate_metadata(self, metadata: object, generation: int) -> tuple[int, int, str]:
-        observed = AdmissionEnvelopeV1.parse(
-            metadata,
-            max_payload_bytes=self._max_payload_bytes,
-            max_base64_chars=self._max_text_size,
+        failure_message = (
+            _TABLE_FAILURE_MESSAGES.get(metadata)
+            if isinstance(metadata, str) and len(metadata) <= 64
+            else None
         )
+        if failure_message is not None:
+            if self._capture_execute is not None:
+                raise CaptureValueCheckError(failure_message)
+            raise TableMaterializationError(failure_message)
+        try:
+            observed = AdmissionEnvelopeV1.parse(
+                metadata,
+                max_payload_bytes=self._max_payload_bytes,
+                max_base64_chars=self._max_text_size,
+            )
+        except CaptureValueCheckError:
+            if self._capture_execute is not None:
+                raise
+            raise TableMaterializationError("1C table transfer response is invalid") from None
         if (
             observed.runtime_generation != generation
             or observed.context_generation != self._context_generation
@@ -397,7 +441,7 @@ class CompactRuntimeTableTransfer:
         )
         try:
             self._validate_metadata(metadata, self._expected_runtime_generation)
-        except ProtocolError:
+        except (ProtocolError, TableMaterializationError):
             if self._clean is not None:
                 self._clean(plan.private_key)
             raise

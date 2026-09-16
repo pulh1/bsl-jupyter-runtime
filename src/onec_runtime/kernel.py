@@ -10,6 +10,7 @@ from onec_runtime.rdbg.models import ModuleLocation
 
 KERNEL_OBJECT_ID = "8fc91d24-20f5-4da4-8ff7-7a7c682f80f5"
 OBJECT_MODULE_PROPERTY_ID = "a637f77f-3840-441d-a1c3-699c8c5cb7e0"
+DOCUMENT_MANAGER_MODULE_PROPERTY_ID = "d1b64a2c-8078-4982-8190-8f81aefda192"
 SERVICE_BREAKPOINT_MARKER = "@runtime-service-breakpoint"
 with importlib.resources.as_file(
     importlib.resources.files("onec_runtime").joinpath(

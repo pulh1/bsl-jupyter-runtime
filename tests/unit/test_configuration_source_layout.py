@@ -60,6 +60,23 @@ def test_binding_checks_native_layer_and_exact_extension_name(layout):
             tree.bind("demo", layer=layer, extension_name=name)
 
 
+@pytest.mark.parametrize("layout", ["designer", "edt"])
+@pytest.mark.parametrize("layer", ["base", "extension"])
+def test_document_manager_module_path_preserves_layout_and_layer(layout, layer):
+    root = FIXTURES / f"{layout}_{layer}"
+    tree = layout_api().ConfigurationSourceLayout(root)
+
+    path = tree.module_path("Documents", "ПриемНаРаботу", "ManagerModule")
+
+    relative = (
+        "Documents/ПриемНаРаботу/Ext/ManagerModule.bsl"
+        if layout == "designer"
+        else "Documents/ПриемНаРаботу/ManagerModule.bsl"
+    )
+    assert path == (root / ("src" if layout == "edt" else "") / relative).resolve()
+    assert path.read_text(encoding="utf-8").splitlines()[1] == "    Значение = 1;"
+
+
 def test_rejects_ambiguous_direct_and_nested_metadata(tmp_path):
     api = layout_api()
     shutil.copytree(FIXTURES / "designer_base", tmp_path / "project")

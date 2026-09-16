@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+import shutil
 from threading import RLock
 from typing import cast
+from uuid import UUID
 
 import pytest
 
@@ -13,7 +15,8 @@ from onec_runtime.errors import (
     CaptureSourceNotConfigured,
     ProtocolError,
 )
-from onec_runtime.rdbg.models import ModuleLocation
+from onec_runtime.kernel import OBJECT_MODULE_PROPERTY_ID
+from onec_runtime.rdbg.models import ModuleLocation, StackFrame, TargetId
 from onec_runtime.runtime_api import PrototypeRuntimeApi
 from onec_runtime.session import RuntimeSession, RuntimeSessionConfig
 from tests.unit.test_extension_session import (
@@ -22,6 +25,7 @@ from tests.unit.test_extension_session import (
     patch_successful_runtime_attempt,
     session_config,
 )
+from tests.unit.test_configuration_source_layout import FIXTURES
 
 MODULE_UUID = "11111111-2222-3333-4444-555555555555"
 SESSION_STATUS_FIXTURE = object()
@@ -232,6 +236,115 @@ def test_bootstrap_source_is_configured_after_both_handshakes(
         "commit",
         "capture-source",
     ]
+    session.close()
+
+
+def test_bootstrap_source_root_configures_default_capture_source(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    lifecycle = FakeLifecycle(decisions=[fast_decision()])
+    patch_successful_runtime_attempt(monkeypatch, lifecycle)
+    source_root = tmp_path / "source"
+    shutil.copytree(FIXTURES / "designer_base", source_root)
+    config = replace(session_config(tmp_path), source_root=source_root)
+
+    configured: list[tuple[str, Path]] = []
+
+    def configure(
+        self: RuntimeSession,
+        project: str,
+        configured_root: Path,
+    ) -> None:
+        assert lifecycle.events[-1] == "commit"
+        configured.append((project, configured_root))
+
+    monkeypatch.setattr(RuntimeSession, "configure_capture_source", configure)
+
+    session = RuntimeSession.start(config)
+
+    assert configured == [("Notebook", source_root.resolve())]
+    session.close()
+
+
+def test_bootstrap_source_root_binds_capture_stack_source_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    lifecycle = FakeLifecycle(decisions=[fast_decision()])
+    patch_successful_runtime_attempt(monkeypatch, lifecycle)
+
+    class RuntimeApi:
+        def configure_capture_points(
+            self, _locations: tuple[ModuleLocation, ...]
+        ) -> None:
+            pass
+
+    import onec_runtime.session as session_module
+    monkeypatch.setattr(
+        session_module, "PrototypeRuntimeApi", lambda *_args, **_kwargs: RuntimeApi()
+    )
+    source_root = tmp_path / "source"
+    shutil.copytree(FIXTURES / "designer_base", source_root)
+
+    session = RuntimeSession.start(
+        replace(session_config(tmp_path), source_root=source_root)
+    )
+    try:
+        resolver = session._capture_stack_source_resolver
+        assert resolver is not None
+        frame = StackFrame(
+            TargetId(UUID(int=1), "test"),
+            0,
+            ModuleLocation(
+                "ConfigModule",
+                "",
+                UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+                UUID(OBJECT_MODULE_PROPERTY_ID),
+                2,
+            ),
+        )
+
+        resolved, = resolver((frame,))
+
+        assert resolved is not None
+        assert (resolved.source, resolved.line) == (
+            "Документ.ПриемНаРаботу.МодульОбъекта", 2
+        )
+    finally:
+        session.close()
+
+
+def test_bootstrap_explicit_capture_source_overrides_source_root(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    lifecycle = FakeLifecycle(decisions=[fast_decision()])
+    patch_successful_runtime_attempt(monkeypatch, lifecycle)
+    source_root = tmp_path / "source"
+    capture_root = tmp_path / "capture"
+    shutil.copytree(FIXTURES / "designer_base", source_root)
+    capture_root.mkdir()
+    config = replace(
+        session_config(tmp_path),
+        source_root=source_root,
+        capture_source=CaptureSourceConfig("ut", capture_root),
+    )
+
+    configured: list[tuple[str, Path]] = []
+
+    def configure(
+        self: RuntimeSession,
+        project: str,
+        configured_root: Path,
+    ) -> None:
+        configured.append((project, configured_root))
+
+    monkeypatch.setattr(RuntimeSession, "configure_capture_source", configure)
+
+    session = RuntimeSession.start(config)
+
+    assert configured == [("ut", capture_root)]
     session.close()
 
 

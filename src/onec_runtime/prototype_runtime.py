@@ -1988,30 +1988,21 @@ class PrototypeRuntimeController:
     def capture_stack_inventory(
         self, *, timeout_s: float | None = None,
     ) -> tuple[StackFrame, ...]:
-        """Read the debugger's current native stack for the still-fenced stop."""
+        """Return the native stack recorded for the still-fenced CAPTURE stop."""
         deadline = self._capture_command_deadline(timeout_s)
-        saved = self._require_capture_stack()
+        frames = self._require_capture_stack()
         expected_target = self._capture_target_id
-        read = getattr(self.session, "read_current_stack", None)
-        if not callable(read):
-            raise ProtocolError("RDBG session cannot read the current stack")
-        stop = read(timeout_s=self._capture_remaining_timeout(deadline))
-        if not isinstance(stop, StopEvent) or stop.target_id != expected_target:
-            raise ProtocolError("fresh capture stack target has changed")
-        frames = tuple(stop.stack_frames)
         levels = tuple(frame.level for frame in frames)
         if (
-            not frames
-            or any(type(frame) is not StackFrame for frame in frames)
+            any(type(frame) is not StackFrame for frame in frames)
             or any(frame.target_id != expected_target for frame in frames)
             or len(set(levels)) != len(levels)
             or levels != tuple(sorted(levels))
             or levels[0] != 0
-            or tuple(frame.location for frame in frames) != stop.stack
         ):
-            raise ProtocolError("fresh capture stack mapping is incoherent")
-        if frames[0].location != saved[0].location:
-            raise ProtocolError("fresh capture stack no longer names the captured stop")
+            raise ProtocolError("captured stack mapping is incoherent")
+        if frames[0].location != self.last_capture_location:
+            raise ProtocolError("captured stack no longer names the stopped frame")
         self._capture_remaining_timeout(deadline)
         return frames
 
@@ -3242,7 +3233,9 @@ class PrototypeRuntimeController:
 
         def step_factory(source: str) -> CaptureRemoteStep:
             return self._capture_remote_step(
-                build_live_current_capture_call(source),
+                build_live_current_capture_call(
+                    source + "\nРезультатИнструкции = Результат;"
+                ),
                 stack_level=stack_level,
                 max_text_size=plan.max_text_size,
                 before_dispatch=shield_workspace,
@@ -4107,7 +4100,8 @@ class PrototypeRuntimeController:
 
     def take_context_string(self, key: str, *, max_text_size: int) -> str:
         if not re.fullmatch(
-            r"__(?:onec_compact_table|onec_value)_[0-9a-f]{32}", key
+            r"__(?:onec_compact_table|onec_value|onec_projection)_[0-9a-f]{32}",
+            key,
         ):
             raise ProtocolError("materialization context key is invalid")
         if type(max_text_size) is not int or max_text_size <= 0:

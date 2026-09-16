@@ -1447,7 +1447,7 @@ class PrototypeRuntimeApi:
             self._require_capture_stack_fence(fence)
             read = getattr(self._controller, "capture_stack_inventory", None)
             if not callable(read):
-                raise ProtocolError("Runtime controller cannot read a fresh capture stack")
+                raise ProtocolError("Runtime controller cannot read the captured stack")
             inventory_failed = False
             inventory_timed_out = False
             try:
@@ -1470,12 +1470,12 @@ class PrototypeRuntimeApi:
                 # __cause__ or __context__ of the bounded public error.
                 self._require_capture_stack_fence(fence)
                 raise ProtocolError(
-                    "fresh capture stack inventory is unavailable"
+                    "captured stack inventory is unavailable"
                 )
             if type(frames) is not tuple or not frames or any(
                 type(frame) is not StackFrame for frame in frames
             ):
-                raise ProtocolError("fresh capture stack inventory is invalid")
+                raise ProtocolError("captured stack inventory is invalid")
             self._require_capture_stack_fence(fence)
             return frames
 

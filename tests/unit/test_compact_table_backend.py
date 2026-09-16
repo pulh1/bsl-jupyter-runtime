@@ -21,7 +21,7 @@ from onec_runtime.errors import (
 )
 from onec_runtime.performance_profile import PhaseRecorder
 from onec_runtime.rdbg.models import CollectionCell, CollectionRow
-from onec_runtime.table_materialization import ReferencePolicy
+from onec_runtime.table_materialization import ReferencePolicy, TableMaterializationError
 
 
 KEY = "__onec_compact_table_0123456789abcdef0123456789abcdef"
@@ -112,12 +112,27 @@ def test_compact_instruction_builds_protocol_two_admission_before_publication() 
     assert '"R|" + Формат(3, "ЧГ=0; ЧДЦ=0")' in source
 
 
+def test_compact_instruction_reports_only_allowlisted_server_failure_codes() -> None:
+    source = build_compact_transfer_instruction(
+        "Контекст.Таблица", ReferencePolicy(), KEY,
+        runtime_generation=3, context_generation=5,
+    )
+
+    assert 'Результат = "E|table_row_limit_exceeded"' in source
+    assert 'Результат = "E|table_byte_limit_exceeded"' in source
+    assert 'Результат = "E|table_column_type_mismatch"' in source
+    assert 'Результат = "E|table_unsupported_value_type"' in source
+    assert 'Результат = "E|table_row_limit_required"' in source
+    assert "ИнформацияОбОшибке().Описание" in source
+    assert "Результат = ОписаниеОшибки" not in source
+
+
 @pytest.mark.parametrize(
     ("metadata", "error_type"),
     [
         ("D|worker_generation_value", CaptureValueAccessDeniedError),
-        ("E|value_admission_failed", CaptureValueCheckError),
-        ("3|5|33|" + "0" * 64 + "|44", CaptureValueCheckError),
+        ("E|value_admission_failed", TableMaterializationError),
+        ("3|5|33|" + "0" * 64 + "|44", TableMaterializationError),
     ],
 )
 def test_nonready_or_predecessor_table_metadata_never_fetches_payload(
@@ -137,6 +152,72 @@ def test_nonready_or_predecessor_table_metadata_never_fetches_payload(
         transfer.payload("Контекст.Таблица", ReferencePolicy())
 
     assert reads == []
+
+
+@pytest.mark.parametrize(
+    ("metadata", "message"),
+    [
+        ("E|table_row_limit_exceeded", "row limit"),
+        ("E|table_byte_limit_exceeded", "byte limit"),
+        ("E|table_column_type_mismatch", "incompatible"),
+        ("E|table_unsupported_value_type", "unsupported"),
+        ("E|table_row_limit_required", "explicit row limit"),
+        ("E|value_admission_failed", "1C table serialization failed"),
+    ],
+)
+def test_main_table_failure_has_safe_specific_message_without_payload_fetch(
+    metadata: str, message: str
+) -> None:
+    reads: list[str] = []
+    cleaned: list[str] = []
+    transfer = CompactRuntimeTableTransfer(
+        lambda _source: metadata,
+        lambda key, _maximum: reads.append(key) or "private-payload",
+        runtime_generation=lambda: 3,
+        context_generation=5,
+        key_factory=lambda: KEY,
+        context_cleaner=cleaned.append,
+    )
+
+    with pytest.raises(TableMaterializationError, match=message) as raised:
+        transfer.payload("Контекст.Таблица", ReferencePolicy())
+
+    assert "CAPTURE" not in str(raised.value)
+    assert reads == []
+    assert cleaned == [KEY]
+
+
+def test_capture_table_failure_keeps_admission_error_type_with_safe_reason() -> None:
+    def capture_execute(plan, _kind):
+        return plan.admit_metadata("E|table_byte_limit_exceeded")
+
+    transfer = CompactRuntimeTableTransfer(
+        lambda _source: pytest.fail("CAPTURE used MAIN executor"),
+        lambda _key, _maximum: pytest.fail("CAPTURE fetched payload"),
+        runtime_generation=lambda: 3,
+        context_generation=5,
+        key_factory=lambda: KEY,
+        capture_executor=capture_execute,
+    )
+
+    with pytest.raises(CaptureValueCheckError, match="byte limit"):
+        transfer.payload("Контекст.Таблица", ReferencePolicy())
+
+
+def test_table_failure_code_rejects_extra_target_text_without_leaking_it() -> None:
+    transfer = CompactRuntimeTableTransfer(
+        lambda _source: "E|table_row_limit_exceeded|private-value",
+        lambda _key, _maximum: pytest.fail("invalid metadata fetched a payload"),
+        runtime_generation=lambda: 3,
+        context_generation=5,
+        key_factory=lambda: KEY,
+        context_cleaner=lambda _key: None,
+    )
+
+    with pytest.raises(TableMaterializationError) as raised:
+        transfer.payload("Контекст.Таблица", ReferencePolicy())
+
+    assert "private-value" not in str(raised.value)
 
 
 def test_builds_compact_transfer_for_validated_tabular_section_path() -> None:
@@ -264,7 +345,7 @@ def test_rejects_declared_payload_over_byte_budget_before_atomic_take() -> None:
         key_factory=lambda: KEY,
     )
 
-    with pytest.raises(CaptureValueCheckError, match="CAPTURE value admission"):
+    with pytest.raises(TableMaterializationError, match="invalid"):
         transfer.payload("Контекст.Таблица", ReferencePolicy())
 
     assert reads == []

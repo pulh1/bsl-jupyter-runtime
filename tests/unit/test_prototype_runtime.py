@@ -2277,6 +2277,23 @@ def test_compact_table_payload_is_taken_once_from_kernel_context() -> None:
     assert key in str(calls[0])
 
 
+def test_projection_payload_is_taken_once_from_kernel_context() -> None:
+    session = ScriptedSession((), compact_payload="QUJD")
+    controller = runtime_module().PrototypeRuntimeController(session, SERVICE)
+    key = "__onec_projection_" + "a" * 32
+
+    assert controller.take_context_string(key, max_text_size=1024) == "QUJD"
+    calls = [
+        value for name, value in session.calls
+        if name == "evaluate"
+        and "ЗабратьКомпактнуюМатериализациюИзКонтекста" in str(value)
+    ]
+    assert len(calls) == 1
+    assert key in str(calls[0])
+    with pytest.raises(ProtocolError, match="context key"):
+        controller.take_context_string("__onec_projection_not-a-uuid", max_text_size=1024)
+
+
 def test_system_main_is_rejected_while_capture_is_active() -> None:
     session = ScriptedSession((CAPTURE_A,))
     controller = captured_controller(session)

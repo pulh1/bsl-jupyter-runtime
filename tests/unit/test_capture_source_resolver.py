@@ -4,7 +4,11 @@ import os
 import shutil
 import pytest
 import onec_runtime.capture_source as capture_source
-from onec_runtime.kernel import COMMON_MODULE_PROPERTY_ID, OBJECT_MODULE_PROPERTY_ID
+from onec_runtime.kernel import (
+    COMMON_MODULE_PROPERTY_ID,
+    DOCUMENT_MANAGER_MODULE_PROPERTY_ID,
+    OBJECT_MODULE_PROPERTY_ID,
+)
 from onec_runtime.rdbg.models import ModuleLocation
 from tests.unit.test_configuration_source_layout import FIXTURES
 
@@ -85,6 +89,35 @@ def test_edt_src_root_resolves_common_and_document_object_frames():
         "trusted_export",
         "trusted_export",
     ]
+
+
+@pytest.mark.parametrize("layout", ["designer", "edt"])
+@pytest.mark.parametrize("layer", ["base", "extension"])
+def test_document_manager_module_resolves_by_layer_with_verified_property(
+    layout, layer
+):
+    extension = "Дополнение" if layer == "extension" else ""
+    source = catalog(
+        capture_source.CaptureSourceConfig("demo", FIXTURES / f"{layout}_{layer}")
+    )
+
+    result, = source.resolve_modules(
+        (location(DOCUMENT, DOCUMENT_MANAGER_MODULE_PROPERTY_ID, extension),)
+    )
+
+    assert result.canonical_name == "Документ.ПриемНаРаботу.МодульМенеджера"
+    assert result.module_role == "ManagerModule"
+    assert result.line == 2
+    assert result.binding.extension_name == (extension or None)
+    root = FIXTURES / f"{layout}_{layer}" / ("src" if layout == "edt" else "")
+    relative = (
+        "Documents/ПриемНаРаботу/Ext/ManagerModule.bsl"
+        if layout == "designer"
+        else "Documents/ПриемНаРаботу/ManagerModule.bsl"
+    )
+    assert result.source_path == (root / relative).resolve()
+    assert result.source_version.source_status == "trusted_export"
+    assert result.source_version.read_text().splitlines()[1] == "    Значение = 1;"
 
 
 def test_missing_extension_and_unknown_property_are_unavailable_without_fallback(

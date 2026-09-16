@@ -29,6 +29,7 @@ from onec_runtime.runtime_api import PrototypeRuntimeApi
 
 from test_prototype_runtime import (
     CAPTURE_A,
+    CAPTURE_B,
     SERVICE,
     ScriptedSession,
     captured_controller,
@@ -525,13 +526,15 @@ def test_configuration_resolver_builds_stable_private_binding_namespaces():
 
 
 class FreshStackSession(ScriptedSession):
-    def __init__(self) -> None:
-        super().__init__((CAPTURE_A,), stacks=((CAPTURE_A, LOCATION, SERVICE),))
+    def __init__(
+        self,
+        stack_locations: tuple[ModuleLocation, ...] = (CAPTURE_A, LOCATION, SERVICE),
+    ) -> None:
+        super().__init__((CAPTURE_A,), stacks=(stack_locations,))
         target = self.target.target_id
-        self.live_frames = (
-            StackFrame(target, 0, CAPTURE_A),
-            StackFrame(target, 1, LOCATION),
-            StackFrame(target, 2, SERVICE),
+        self.live_frames = tuple(
+            StackFrame(target, level, location)
+            for level, location in enumerate(stack_locations)
         )
         self.stack_reads = 0
 
@@ -547,8 +550,9 @@ class FreshStackSession(ScriptedSession):
 
 def captured_stack_api(
     *, capture_value_inspection_builder=None,
+    stack_locations: tuple[ModuleLocation, ...] = (CAPTURE_A, LOCATION, SERVICE),
 ) -> tuple[PrototypeRuntimeApi, object, FreshStackSession]:
-    session = FreshStackSession()
+    session = FreshStackSession(stack_locations)
     controller = captured_controller(
         session,
         capture_value_inspection_builder=capture_value_inspection_builder,
@@ -556,7 +560,7 @@ def captured_stack_api(
     return PrototypeRuntimeApi(controller), controller, session
 
 
-def test_runtime_capture_view_attaches_fresh_visible_and_native_stack_pages() -> None:
+def test_runtime_capture_view_pages_the_saved_stop_without_rereading_rdbg() -> None:
     runtime, _, session = captured_stack_api()
     capture = runtime.current_capture()
 
@@ -569,12 +573,12 @@ def test_runtime_capture_view_attaches_fresh_visible_and_native_stack_pages() ->
     second = capture.stack[:20]
     native = capture.stack.native[:20]
 
-    assert session.stack_reads == 3
+    assert session.stack_reads == 0
     assert first.total == second.total == 1
     first_frame = next(frame for frame in first.frames if isinstance(frame, api().DebugFrame))
     second_frame = next(frame for frame in second.frames if isinstance(frame, api().DebugFrame))
     assert first_frame.native_level == second_frame.native_level == 1
-    assert first_frame.line == 2 and second_frame.line == 8
+    assert first_frame.line == second_frame.line == 2
     assert native.total == 3
     assert [frame.native_level for frame in native.frames] == [0, 1, 2]
     assert native.frames[0].runtime_kernel and native.frames[2].runtime_kernel
@@ -591,24 +595,40 @@ def test_runtime_stack_validates_the_exact_capture_fence_before_rdbg() -> None:
     assert session.stack_reads == 0
 
 
-def test_public_stack_sanitizes_actual_rdbg_http_failure() -> None:
-    import traceback
+def test_resume_replaces_saved_stack_and_invalidates_the_previous_view() -> None:
+    session = ScriptedSession(
+        (CAPTURE_A, CAPTURE_B, SERVICE),
+        stacks=(
+            (CAPTURE_A, LOCATION, SERVICE),
+            (CAPTURE_B, replace(LOCATION, line=8), SERVICE),
+        ),
+    )
+    runtime = PrototypeRuntimeApi(captured_controller(session))
+    first = runtime.current_capture()
+    assert first.stack[0].line == 2
 
-    import httpx
+    runtime.resume_capture()
 
-    from onec_runtime.privacy import public_artifact_value
+    with pytest.raises(StaleCaptureError):
+        first.stack[:1]
+    second = runtime.current_capture()
+    assert second.stack[0].line == 8
+    assert [frame.native_level for frame in second.stack.native[:20].frames] == [0, 1, 2]
+
+
+def test_saved_capture_stack_does_not_request_rdbg_after_the_stop() -> None:
     from onec_runtime.rdbg.models import DebugTarget
     from onec_runtime.rdbg.session import RdbgSession, SessionState
     from onec_runtime.rdbg.transport import RdbgTransport
 
-    private_url = "file:///private/customer/CommonModules/Payroll/Ext/Module.bsl"
-    private_source = "СекретныйРасчет = ЗарплатаСотрудника;"
-    private_body = (
-        f"<error><target>{private_url}</target>"
-        f"<source>{private_source}</source></error>"
-    ).encode()
+    requests = []
+
+    def unavailable(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(500, content=b"private RDBG failure")
+
     client = httpx.Client(transport=httpx.MockTransport(
-        lambda _request: httpx.Response(500, content=private_body)
+        unavailable
     ))
     transport = RdbgTransport("private-rdbg.customer.internal", 19542, client=client)
     _, controller, _ = captured_stack_api()
@@ -622,28 +642,15 @@ def test_public_stack_sanitizes_actual_rdbg_http_failure() -> None:
     controller.session = rdbg
     runtime = PrototypeRuntimeApi(controller)
 
-    with pytest.raises(
-        ProtocolError, match="fresh capture stack inventory is unavailable"
-    ) as caught:
-        runtime.current_capture().stack[:20]
-    client.close()
+    try:
+        page = runtime.current_capture().stack[:20]
+        native = runtime.current_capture().stack.native[:20]
+    finally:
+        client.close()
 
-    assert caught.value.__cause__ is None
-    assert caught.value.__context__ is None
-    rendered = "\n".join((
-        str(caught.value),
-        repr(caught.value),
-        "".join(traceback.format_exception(caught.value)),
-        repr(public_artifact_value(caught.value)),
-    ))
-    for private in (
-        private_url,
-        private_source,
-        "private-rdbg.customer.internal",
-        "PrivateCustomerBase",
-        private_body.decode(),
-    ):
-        assert private not in rendered
+    assert page.total == 1
+    assert native.total == 3
+    assert requests == []
 
 
 def test_public_stack_maps_command_deadline_to_sanitized_inspection_timeout() -> None:
@@ -655,14 +662,14 @@ def test_public_stack_maps_command_deadline_to_sanitized_inspection_timeout() ->
     timeout_type = getattr(runtime_errors, "CaptureInspectionTimeout", None)
     assert isinstance(timeout_type, type), "CaptureInspectionTimeout is not public"
 
-    runtime, _, session = captured_stack_api()
+    runtime, controller, _ = captured_stack_api()
     private_evidence = "private stack deadline for СекретныйРасчет"
 
-    def timeout(*, timeout_s: float) -> StopEvent:
-        assert timeout_s > 0
+    def timeout(*, timeout_s: float | None) -> tuple[StackFrame, ...]:
+        assert timeout_s is None or timeout_s > 0
         raise CommandTimeout(private_evidence)
 
-    session.read_current_stack = timeout  # type: ignore[method-assign]
+    controller.capture_stack_inventory = timeout  # type: ignore[method-assign]
 
     with pytest.raises(timeout_type) as caught:
         runtime.current_capture().stack[:20]
@@ -677,78 +684,6 @@ def test_public_stack_maps_command_deadline_to_sanitized_inspection_timeout() ->
     ))
     assert "capture stack inventory timed out" in rendered
     assert private_evidence not in rendered
-
-
-@pytest.mark.parametrize(
-    "http_timeout_type",
-    (
-        pytest.param(httpx.ReadTimeout, id="read"),
-        pytest.param(httpx.ConnectTimeout, id="connect"),
-        pytest.param(httpx.WriteTimeout, id="write"),
-        pytest.param(httpx.PoolTimeout, id="pool"),
-    ),
-)
-def test_public_stack_maps_actual_rdbg_http_deadline_to_inspection_timeout(
-    http_timeout_type,
-) -> None:
-    import traceback
-
-    import onec_runtime.errors as runtime_errors
-    from onec_runtime.privacy import public_artifact_value
-    from onec_runtime.rdbg.models import DebugTarget
-    from onec_runtime.rdbg.session import RdbgSession, SessionState
-    from onec_runtime.rdbg.transport import RdbgTransport
-
-    inspection_timeout_type = getattr(
-        runtime_errors, "CaptureInspectionTimeout", None
-    )
-    assert isinstance(
-        inspection_timeout_type, type
-    ), "CaptureInspectionTimeout is not public"
-
-    private_url = "file:///private/customer/CommonModules/Payroll/Ext/Module.bsl"
-    private_source = "СекретныйРасчет = ЗарплатаСотрудника;"
-
-    def timeout(request: httpx.Request) -> httpx.Response:
-        raise http_timeout_type(
-            f"deadline at {private_url}: {private_source}",
-            request=request,
-        )
-
-    client = httpx.Client(transport=httpx.MockTransport(timeout))
-    transport = RdbgTransport("private-rdbg.customer.internal", 19542, client=client)
-    _, controller, _ = captured_stack_api()
-    rdbg = RdbgSession(transport, CAPTURE_A, alias="PrivateCustomerBase")
-    rdbg.target = DebugTarget(
-        controller._capture_target_id,
-        "ServerEmulation",
-        "stopped",
-    )
-    rdbg.state = SessionState.READY
-    controller.session = rdbg
-    runtime = PrototypeRuntimeApi(controller)
-
-    try:
-        with pytest.raises(inspection_timeout_type) as caught:
-            runtime.current_capture().stack[:20]
-    finally:
-        client.close()
-
-    assert caught.value.__cause__ is None
-    assert caught.value.__context__ is None
-    rendered = "\n".join((
-        str(caught.value),
-        repr(caught.value),
-        "".join(traceback.format_exception(caught.value)),
-        repr(public_artifact_value(caught.value)),
-    ))
-    for private in (
-        private_url,
-        private_source,
-        "private-rdbg.customer.internal",
-        "PrivateCustomerBase",
-    ):
-        assert private not in rendered
 
 
 def test_pending_capture_evaluation_precedes_stack_inspection_timeout() -> None:
@@ -787,7 +722,7 @@ def test_runtime_native_stack_bypasses_config_source_resolution_and_ast() -> Non
 
     page = runtime.current_capture().stack.native[:20]
 
-    assert page.total == 3 and session.stack_reads == 1
+    assert page.total == 3 and session.stack_reads == 0
     assert source_calls == []
 
 
@@ -802,7 +737,7 @@ def test_runtime_frame_scope_is_bound_without_target_value_io() -> None:
         scope = getattr(frame, attribute)
         assert isinstance(scope, VariableDescriptor)
         assert scope._root.native_level == 1
-    assert session.stack_reads == 1
+    assert session.stack_reads == 0
     assert sum(name == "local_variables" for name, _ in session.calls) == prior_local_reads
 
 
@@ -1160,7 +1095,7 @@ def test_session_current_capture_binds_sources_methods_and_frame_value_scope() -
     frame = capture.stack[0]
     detailed = frame.with_method()
 
-    assert session.stack_reads == 1
+    assert session.stack_reads == 0
     assert detailed.method.name == "RunFixture"
     assert detailed.method.parameters == ("Arg",)
     assert frame.variables._root.native_level == 1
@@ -1205,19 +1140,14 @@ def test_runtime_stack_uses_main_pinned_worker_source_and_shared_syntax(tmp_path
     ).generated_line
     assert generated_line is not None
 
-    _, controller, session = captured_stack_api()
+    _, controller, _ = captured_stack_api(stack_locations=(
+        CAPTURE_A,
+        first_module.registration.module_location(generated_line),
+        SERVICE,
+    ))
     worker_runtime._controller = controller
     worker_runtime._operation_generation_pin = operation_pin
     worker_runtime.load_worker_modules((second_unit,), common_modules=catalog)
-    session.live_frames = (
-        session.live_frames[0],
-        StackFrame(
-            session.live_frames[0].target_id,
-            1,
-            first_module.registration.module_location(generated_line),
-        ),
-        session.live_frames[2],
-    )
 
     frame = worker_runtime.current_capture().stack[0]
     detailed = frame.with_method()
@@ -1266,22 +1196,14 @@ def test_runtime_stack_resolves_multiple_notebook_cells_from_historical_generati
     assert all(line is not None for line in generated_lines)
 
     worker_runtime.execute_bsl(sources[2], source_unit=units[2])
-    _, controller, session = captured_stack_api()
+    _, controller, _ = captured_stack_api(stack_locations=(
+        CAPTURE_A,
+        historical_module.registration.module_location(generated_lines[0]),
+        SERVICE,
+        historical_module.registration.module_location(generated_lines[1]),
+    ))
     worker_runtime._controller = controller
     worker_runtime._operation_generation_pin = historical_pin
-    session.live_frames = (
-        session.live_frames[0],
-        *(
-            StackFrame(
-                session.live_frames[0].target_id,
-                level,
-                historical_module.registration.module_location(line),
-            )
-            for level, line in enumerate(generated_lines, start=1)
-            if line is not None
-        ),
-        replace(session.live_frames[2], level=3),
-    )
 
     page = worker_runtime.current_capture().stack[:20].with_methods()
     frames = tuple(frame for frame in page.frames if isinstance(frame, api().DebugFrame))
@@ -1332,18 +1254,13 @@ def test_common_source_is_repinned_after_notebook_publication_and_history_surviv
     ).generated_line
     assert generated_line is not None
 
-    _, controller, session = captured_stack_api()
+    _, controller, _ = captured_stack_api(stack_locations=(
+        CAPTURE_A,
+        common_module.registration.module_location(generated_line),
+        SERVICE,
+    ))
     worker_runtime._controller = controller
     worker_runtime._operation_generation_pin = current_pin
-    session.live_frames = (
-        session.live_frames[0],
-        StackFrame(
-            session.live_frames[0].target_id,
-            1,
-            common_module.registration.module_location(generated_line),
-        ),
-        session.live_frames[2],
-    )
 
     current_frame = worker_runtime.current_capture().stack[0]
     worker_runtime._operation_generation_pin = historical_pin
@@ -1354,15 +1271,12 @@ def test_common_source_is_repinned_after_notebook_publication_and_history_surviv
         historical_module, historical_module.source_unit, 2,
     ).generated_line
     assert historical_line is not None
-    session.live_frames = (
-        session.live_frames[0],
-        StackFrame(
-            session.live_frames[0].target_id,
-            1,
-            historical_module.registration.module_location(historical_line),
-        ),
-        session.live_frames[2],
-    )
+    _, historical_controller, _ = captured_stack_api(stack_locations=(
+        CAPTURE_A,
+        historical_module.registration.module_location(historical_line),
+        SERVICE,
+    ))
+    worker_runtime._controller = historical_controller
     historical_frame = worker_runtime.current_capture().stack[0]
 
     assert current_frame.source_status == historical_frame.source_status == "runtime_verified"
@@ -1413,25 +1327,14 @@ def test_shared_source_unit_keeps_distinct_common_and_notebook_physical_owners(
         source_sha256(later_source),
     )
     worker_runtime.execute_bsl(later_source, source_unit=later_ref)
-    _, controller, session = captured_stack_api()
+    _, controller, _ = captured_stack_api(stack_locations=(
+        CAPTURE_A,
+        common_module.registration.module_location(current_lines[0]),
+        SERVICE,
+        notebook_module.registration.module_location(current_lines[1]),
+    ))
     worker_runtime._controller = controller
     worker_runtime._operation_generation_pin = shared_pin
-    session.live_frames = (
-        session.live_frames[0],
-        *(
-            StackFrame(
-                session.live_frames[0].target_id,
-                level,
-                module.registration.module_location(line),
-            )
-            for level, (module, line) in enumerate(
-                zip((common_module, notebook_module), current_lines, strict=True),
-                start=1,
-            )
-            if line is not None
-        ),
-        replace(session.live_frames[2], level=3),
-    )
 
     current_page = worker_runtime.current_capture().stack[:20].with_methods()
     current_frames = tuple(
@@ -1446,15 +1349,12 @@ def test_shared_source_unit_keeps_distinct_common_and_notebook_physical_owners(
     ).generated_line
     assert historical_line is not None
     worker_runtime._operation_generation_pin = historical_pin
-    session.live_frames = (
-        session.live_frames[0],
-        StackFrame(
-            session.live_frames[0].target_id,
-            1,
-            historical_module.registration.module_location(historical_line),
-        ),
-        session.live_frames[2],
-    )
+    _, historical_controller, _ = captured_stack_api(stack_locations=(
+        CAPTURE_A,
+        historical_module.registration.module_location(historical_line),
+        SERVICE,
+    ))
+    worker_runtime._controller = historical_controller
     historical_frame = worker_runtime.current_capture().stack[0].with_method()
 
     assert [frame.source for frame in current_frames] == [
@@ -1523,18 +1423,13 @@ def test_worker_snapshots_follow_live_generations_without_stale_revisions(
         2,
     ).generated_line
     assert historical_line is not None
-    _, controller, session = captured_stack_api()
+    _, controller, _ = captured_stack_api(stack_locations=(
+        CAPTURE_A,
+        historical_module.registration.module_location(historical_line),
+        SERVICE,
+    ))
     worker_runtime._controller = controller
     worker_runtime._operation_generation_pin = historical_pin
-    session.live_frames = (
-        session.live_frames[0],
-        StackFrame(
-            session.live_frames[0].target_id,
-            1,
-            historical_module.registration.module_location(historical_line),
-        ),
-        session.live_frames[2],
-    )
 
     saved = worker_runtime.current_capture().stack[0]
 

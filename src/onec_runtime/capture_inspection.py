@@ -127,10 +127,10 @@ class CaptureView:
 
 class StackInventoryBackend(Protocol):
     def read_stack(self, fence: object) -> tuple[StackFrame, ...]:
-        """Validate the exact fence atomically with a fresh native inventory.
+        """Validate the exact fence and return its recorded native stack.
 
         The owner enforces command timeout, target/operation/stop identity and
-        can_inspect state. Do not satisfy this with the legacy cached stack API.
+        can_inspect state. A later stop must invalidate the previous fence.
         """
         ...
 

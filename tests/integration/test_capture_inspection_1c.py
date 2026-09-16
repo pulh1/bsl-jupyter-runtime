@@ -95,6 +95,29 @@ def _require_live_opt_in() -> None:
 @pytest.mark.integration
 @pytest.mark.live_1c
 @pytest.mark.timeout(600)
+def test_capture_stack_uses_recorded_stop_live(tmp_path: Path) -> None:
+    _require_live_opt_in()
+    with _fresh_live_harness(
+        tmp_path,
+        live_flag=LIVE_FLAG,
+        emit_evidence=False,
+    ) as harness:
+        stopped = _enter_synthetic_capture(harness)
+        capture = harness.session.current_capture()
+
+        visible = capture.stack[:20]
+        native = capture.stack.native[:20]
+
+        assert stopped.kind is RuntimeReplyKind.CAPTURED
+        assert native.total >= 1
+        assert native.total >= visible.total
+        assert native.frames[0].native_level == 0
+        assert all(isinstance(frame, DebugFrame) for frame in native.frames)
+
+
+@pytest.mark.integration
+@pytest.mark.live_1c
+@pytest.mark.timeout(600)
 def test_typed_capture_inspection_live(tmp_path: Path) -> None:
     _require_live_opt_in()
     with _fresh_live_harness(

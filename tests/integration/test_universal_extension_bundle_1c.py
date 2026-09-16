@@ -4,7 +4,7 @@ import json
 import os
 import shutil
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from hashlib import sha256
 from pathlib import Path
 from uuid import uuid4
@@ -24,6 +24,7 @@ from onec_runtime.extension_bundle import (
 from onec_runtime.extension_state import ExtensionStateStore, VerifiedExtensionState
 from onec_runtime.performance_profile import PhaseRecorder
 from onec_runtime.processes import FileModeProcesses, OwnedProcess
+from onec_runtime.runtime_api import RuntimeReplyKind
 from onec_runtime.session import ExtensionMode, RuntimeSession, RuntimeSessionConfig
 from onec_runtime.toolchain import (
     apply_product_extension,
@@ -379,7 +380,7 @@ def _build_table_bound_instrumented_bundle(
         source_root=source,
         output_root=root / "bundle",
         platform_bin=platform,
-        artifact_version="0.1.3",
+        artifact_version="0.1.5",
         protocol_version="2",
     )
 
@@ -468,6 +469,208 @@ def test_compact_table_bound_is_executed_before_value_table_and_query_sentinel_c
     _assert_no_owned_1c_process(config, _track_owned_runtime_processes)
 
 
+@pytest.mark.live_1c
+def test_unbounded_to_df_keeps_all_rows_after_schema_probe(
+    tmp_path: Path,
+    _track_owned_runtime_processes: _OwnedProcessTracker,
+) -> None:
+    """A two-row ValueTable must not inherit the schema probe's one-row limit."""
+    platform = _platform_bin()
+    bundle = build_runtime_extension_bundle(
+        source_root=_REPOSITORY / "onec" / "OnecInteractiveRuntime",
+        output_root=tmp_path / "bundle",
+        platform_bin=platform,
+        artifact_version="0.1.5",
+        protocol_version="2",
+    )
+    config = _config(tmp_path / "target", platform)
+    create_empty_infobase(config)
+    _install_cfe(config, bundle.cfe_path, tmp_path / "install")
+    session = RuntimeSession.start(RuntimeSessionConfig(
+        config, tmp_path / "evidence", extension_mode=ExtensionMode.MANUAL
+    ))
+    try:
+        reply = session.execute_bsl('''
+ТаблицаДляPython = Новый ТаблицаЗначений;
+ТаблицаДляPython.Колонки.Добавить("Значение", Новый ОписаниеТипов("Строка"));
+ТаблицаДляPython.Добавить().Значение = "first";
+ТаблицаДляPython.Добавить().Значение = "second";
+''')
+        assert reply.succeeded
+        frame = session.to_df("Контекст.ТаблицаДляPython")
+        assert frame["Значение"].tolist() == ["first", "second"]
+    finally:
+        session.close()
+
+    _assert_no_owned_1c_process(config, _track_owned_runtime_processes)
+
+
+@pytest.mark.live_1c
+def test_bounded_to_df_initializes_value_transfer_module(
+    tmp_path: Path,
+    _track_owned_runtime_processes: _OwnedProcessTracker,
+) -> None:
+    """A bounded table page must compile and run the real value-transfer module."""
+    platform = _platform_bin()
+    bundle = build_runtime_extension_bundle(
+        source_root=_REPOSITORY / "onec" / "OnecInteractiveRuntime",
+        output_root=tmp_path / "bundle",
+        platform_bin=platform,
+        artifact_version="0.1.5",
+        protocol_version="2",
+    )
+    config = _config(tmp_path / "target", platform)
+    create_empty_infobase(config)
+    _install_cfe(config, bundle.cfe_path, tmp_path / "install")
+    session = RuntimeSession.start(RuntimeSessionConfig(
+        config, tmp_path / "evidence", extension_mode=ExtensionMode.MANUAL
+    ))
+    try:
+        reply = session.execute_bsl('''
+ТаблицаДляСреза = Новый ТаблицаЗначений;
+ТаблицаДляСреза.Колонки.Добавить("Значение", Новый ОписаниеТипов("Строка"));
+Для Номер = 0 По 9 Цикл
+    ТаблицаДляСреза.Добавить().Значение = "row_" + Формат(Номер, "ЧГ=0; ЧДЦ=0");
+КонецЦикла;
+''')
+        assert reply.succeeded
+        frame = session.project_to_df(
+            "Контекст.ТаблицаДляСреза",
+            {"offset": 5, "limit": 5},
+            timeout_s=20,
+        )
+        assert frame["Значение"].tolist() == [
+            "row_5", "row_6", "row_7", "row_8", "row_9"
+        ]
+    finally:
+        session.close()
+
+    _assert_no_owned_1c_process(config, _track_owned_runtime_processes)
+
+
+@pytest.mark.live_1c
+def test_capture_cell_table_to_df_before_resume(
+    tmp_path: Path,
+    _track_owned_runtime_processes: _OwnedProcessTracker,
+) -> None:
+    """A table copied in a CAPTURE cell remains materializable while paused."""
+    platform = _platform_bin()
+    bundle = packaged_extension_bundle(tmp_path / "bundle")
+    config = _config(tmp_path / "target", platform)
+    create_empty_infobase(config)
+    _install_cfe(config, bundle.cfe_path, tmp_path / "install")
+    source = (
+        _REPOSITORY / "onec" / "OnecInteractiveRuntime" / "CommonModules"
+        / "RuntimeKernelServer" / "Ext" / "Module.bsl"
+    ).read_text(encoding="utf-8-sig")
+    marker_lines = [
+        number for number, line in enumerate(source.splitlines(), start=1)
+        if "@runtime-synthetic-capture-a" in line
+    ]
+    assert len(marker_lines) == 1
+    location = replace(bundle.manifest.breakpoints.server_entry, line=marker_lines[0])
+    session = RuntimeSession.start(RuntimeSessionConfig(
+        config, tmp_path / "evidence", extension_mode=ExtensionMode.MANUAL
+    ))
+    try:
+        session.configure_capture_points((location,))
+        captured = session.execute_bsl(
+            "Результат = RuntimeKernelServer.СинтетическийCapture(100);"
+        )
+        assert captured.kind is RuntimeReplyKind.CAPTURED
+        cell = session.execute_bsl('''
+ТаблицаДляPython = Новый ТаблицаЗначений;
+ТаблицаДляPython.Колонки.Добавить(
+    "Значение", Новый ОписаниеТипов("Строка"));
+ТаблицаДляPython.Добавить().Значение = "first";
+ТаблицаДляPython.Добавить().Значение = "second";
+СнимокПосле = ТаблицаДляPython.Скопировать();
+''')
+        assert cell.kind is RuntimeReplyKind.CAPTURE_CELL
+        assert cell.succeeded, cell.error
+        frame = session.to_df("Контекст.СнимокПосле")
+        assert frame["Значение"].tolist() == ["first", "second"]
+        resumed = session.resume_capture()
+        assert resumed.kind is RuntimeReplyKind.MAIN_COMPLETED
+        assert resumed.succeeded
+        session.clear_capture_points()
+    finally:
+        session.close()
+
+    _assert_no_owned_1c_process(config, _track_owned_runtime_processes)
+
+
+@pytest.mark.live_1c
+def test_capture_table_materialization_after_failed_then_fixed_cell(
+    tmp_path: Path,
+    _track_owned_runtime_processes: _OwnedProcessTracker,
+) -> None:
+    """A failed CAPTURE cell followed by a corrected cell must not poison to_df."""
+    platform = _platform_bin()
+    bundle = packaged_extension_bundle(tmp_path / "bundle")
+    config = _config(tmp_path / "target", platform)
+    create_empty_infobase(config)
+    _install_cfe(config, bundle.cfe_path, tmp_path / "install")
+    source = (
+        _REPOSITORY / "onec" / "OnecInteractiveRuntime" / "CommonModules"
+        / "RuntimeKernelServer" / "Ext" / "Module.bsl"
+    ).read_text(encoding="utf-8-sig")
+    marker_lines = [
+        number for number, line in enumerate(source.splitlines(), start=1)
+        if "@runtime-synthetic-capture-a" in line
+    ]
+    assert len(marker_lines) == 1
+    location = replace(bundle.manifest.breakpoints.server_entry, line=marker_lines[0])
+    session = RuntimeSession.start(RuntimeSessionConfig(
+        config, tmp_path / "evidence", extension_mode=ExtensionMode.MANUAL
+    ))
+    try:
+        session.configure_capture_points((location,))
+        captured = session.execute_bsl(
+            "Результат = RuntimeKernelServer.СинтетическийCapture(100);"
+        )
+        assert captured.kind is RuntimeReplyKind.CAPTURED
+        cell = session.execute_bsl('''
+СнимокПоказателей = Новый ТаблицаЗначений;
+СнимокПоказателей.Колонки.Добавить("Значение", Новый ОписаниеТипов("Строка"));
+СнимокПоказателей.Добавить().Значение = "after failure";
+''')
+        assert cell.kind is RuntimeReplyKind.CAPTURE_CELL
+        assert cell.succeeded, cell.error
+        page = session.project_to_df(
+            "Контекст.СнимокПоказателей", {"offset": 0, "limit": 1},
+        )
+        assert page["Значение"].tolist() == ["after failure"]
+        failed = session.execute_bsl('''
+Процедура ПоказатьОклад()
+    ВызватьИсключение "deliberate procedure failure";
+КонецПроцедуры
+
+ПоказатьОклад();
+''')
+        assert failed.kind is RuntimeReplyKind.CAPTURE_CELL
+        assert failed.succeeded is False
+        fixed = session.execute_bsl('''
+Процедура ПоказатьОклад()
+    Сообщить("fixed");
+КонецПроцедуры
+
+ПоказатьОклад();
+''')
+        assert fixed.kind is RuntimeReplyKind.CAPTURE_CELL
+        assert fixed.succeeded, fixed.error
+        frame = session.to_df("Контекст.СнимокПоказателей")
+        assert frame["Значение"].tolist() == ["after failure"]
+        resumed = session.resume_capture()
+        assert resumed.kind is RuntimeReplyKind.MAIN_COMPLETED
+        assert resumed.succeeded
+        session.clear_capture_points()
+    finally:
+        session.close()
+
+    _assert_no_owned_1c_process(config, _track_owned_runtime_processes)
+
+
 def test_minimal_first_install_then_structural_fast_path(
     tmp_path: Path,
     _track_owned_runtime_processes: _OwnedProcessTracker,
@@ -478,13 +681,15 @@ def test_minimal_first_install_then_structural_fast_path(
     _exercise_first_and_fast(config, tmp_path, _track_owned_runtime_processes)
 
 
+@pytest.mark.parametrize("predecessor_version", ["0.0.9", "0.1.3", "0.1.4"])
 def test_predecessor_is_updated_to_packaged_artifact(
     tmp_path: Path,
     _track_owned_runtime_processes: _OwnedProcessTracker,
+    predecessor_version: str,
 ) -> None:
     platform = _platform_bin()
     predecessor = _build_variant(
-        tmp_path / "predecessor", platform, artifact_version="0.0.9"
+        tmp_path / "predecessor", platform, artifact_version=predecessor_version
     )
     config = _config(tmp_path / "target", platform)
     create_empty_infobase(config)
