@@ -3,7 +3,7 @@ from base64 import b64encode
 import gc
 from hashlib import sha256
 from pathlib import Path
-from threading import Event, Lock, Thread
+from threading import Event, Lock, RLock, Thread
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 from weakref import ref
@@ -3984,6 +3984,20 @@ def test_api_materializes_deferred_capture_table_payload_through_trusted_interna
     assert controller.descriptor in controller.capture_sources[0]
     with pytest.raises(ProtocolError, match="persistent Context path"):
         validate_value_handle(controller.descriptor)
+
+
+def test_session_to_df_materializes_deferred_capture_table_handle() -> None:
+    api, controller, _content = _deferred_capture_table_runtime()
+    session = RuntimeSession.__new__(RuntimeSession)
+    session._operation_lock = RLock()
+    session.runtime_api = api
+    session.config = SimpleNamespace(chunk_size=2400)
+
+    frame = session.to_df("capture_table_deferred")
+
+    assert frame.to_dict(orient="records") == [{"Amount": 3}]
+    assert len(controller.capture_sources) == 1
+    assert controller.descriptor in controller.capture_sources[0]
 
 
 def test_api_enforces_table_payload_row_budget_before_transport() -> None:

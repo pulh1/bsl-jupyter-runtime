@@ -139,6 +139,29 @@ def build_compact_transfer_instruction(
         raise ProtocolError(
             "table handle must be one direct or dotted persistent Context path"
         )
+    return _build_compact_transfer_instruction(
+        handle,
+        policy,
+        context_key,
+        runtime_generation=runtime_generation,
+        context_generation=context_generation,
+        max_rows=max_rows,
+        max_payload_bytes=max_payload_bytes,
+        worker_type_registrations=worker_type_registrations,
+    )
+
+
+def _build_compact_transfer_instruction(
+    table_expression: str,
+    policy: ReferencePolicy,
+    context_key: str,
+    *,
+    runtime_generation: int,
+    context_generation: int,
+    max_rows: int | None = None,
+    max_payload_bytes: int | None = None,
+    worker_type_registrations: tuple[str, ...] = (),
+) -> str:
     if not _CONTEXT_KEY.fullmatch(context_key):
         raise ProtocolError("compact table context key is invalid")
     if runtime_generation <= 0 or context_generation <= 0:
@@ -171,7 +194,7 @@ def build_compact_transfer_instruction(
         [
             "Материализация = "
             "RuntimeTableTransferServer.СериализоватьКомпактнуюТаблицу("
-            f"{handle}, {bsl_string_literal(default.value)}, "
+            f"{table_expression}, {bsl_string_literal(default.value)}, "
             "РежимыСсылокМатериализации, "
             f"ТипыОбъектовWorker, {bounded_rows}, {bounded_bytes});",
             "Если Не Материализация.Доступ Тогда",
@@ -245,6 +268,22 @@ class CompactRuntimeTableTransfer:
 
     def to_df(self, handle: str, policy: ReferencePolicy) -> pd.DataFrame:
         payload = self.payload(handle, policy)
+        return self._build_dataframe(payload, policy)
+
+    def _to_df_trusted_expression(
+        self,
+        expression: str,
+        policy: ReferencePolicy,
+    ) -> pd.DataFrame:
+        """Materialize a descriptor already admitted by the runtime owner."""
+        payload = self._payload_trusted_expression(expression, policy)
+        return self._build_dataframe(payload, policy)
+
+    def _build_dataframe(
+        self,
+        payload: bytes,
+        policy: ReferencePolicy,
+    ) -> pd.DataFrame:
         return self._profile(
             "table.build_dataframe",
             lambda: decode_compact_table_payload(payload, policy),
@@ -253,12 +292,34 @@ class CompactRuntimeTableTransfer:
         )
 
     def prepare_payload(self, handle: str, policy: ReferencePolicy) -> CaptureTransferPlan:
+        return self._prepare_payload(handle, policy, trusted_expression=False)
+
+    def _prepare_trusted_expression_payload(
+        self,
+        expression: str,
+        policy: ReferencePolicy,
+    ) -> CaptureTransferPlan:
+        """Build a plan from a runtime-validated internal BSL expression."""
+        return self._prepare_payload(expression, policy, trusted_expression=True)
+
+    def _prepare_payload(
+        self,
+        table_source: str,
+        policy: ReferencePolicy,
+        *,
+        trusted_expression: bool,
+    ) -> CaptureTransferPlan:
         generation = self._runtime_generation()
         if generation != self._expected_runtime_generation:
             raise ProtocolError("table materializer runtime generation is stale")
         key = self._key_factory()
-        source = build_compact_transfer_instruction(
-            handle,
+        builder = (
+            _build_compact_transfer_instruction
+            if trusted_expression
+            else build_compact_transfer_instruction
+        )
+        source = builder(
+            table_source,
             policy,
             key,
             runtime_generation=generation,
@@ -313,6 +374,18 @@ class CompactRuntimeTableTransfer:
 
     def payload(self, handle: str, policy: ReferencePolicy) -> bytes:
         plan = self.prepare_payload(handle, policy)
+        return self._execute_plan(plan)
+
+    def _payload_trusted_expression(
+        self,
+        expression: str,
+        policy: ReferencePolicy,
+    ) -> bytes:
+        """Transfer a descriptor already admitted by the runtime owner."""
+        plan = self._prepare_trusted_expression_payload(expression, policy)
+        return self._execute_plan(plan)
+
+    def _execute_plan(self, plan: CaptureTransferPlan) -> bytes:
         if self._capture_execute is not None:
             return self._capture_execute(
                 plan,

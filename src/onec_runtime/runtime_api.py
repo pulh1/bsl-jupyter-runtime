@@ -5428,13 +5428,16 @@ class PrototypeRuntimeApi:
     ) -> pd.DataFrame:
         with self._capture_data_plane_writer():
             self._require_available()
-            safe_handle = self._resolve_value_handle_locked(handle)
+            table_source, trusted_expression = self._resolve_table_source_locked(
+                handle
+            )
             return self._materialize_table_locked(
-                safe_handle,
+                table_source,
                 refs=refs,
                 ref_columns=ref_columns,
                 uuid_suffix=uuid_suffix,
                 profiler=profiler,
+                trusted_expression=trusted_expression,
             )
 
     def materialize_value(
@@ -5640,7 +5643,9 @@ class PrototypeRuntimeApi:
     ) -> bytes:
         with self._capture_data_plane_writer(), self._bounded_command_timeout(timeout_s):
             self._require_available()
-            safe_handle = self._resolve_value_handle_locked(handle)
+            table_source, trusted_expression = self._resolve_table_source_locked(
+                handle
+            )
             transfer = CompactRuntimeTableTransfer(
                 self._materialization_instruction_executor,
                 self._take_context_string,
@@ -5654,10 +5659,10 @@ class PrototypeRuntimeApi:
                 profiler=profiler,
                 capture_executor=self._capture_transfer_executor_or_none(),
             )
-            return transfer.payload(
-                safe_handle,
-                ReferencePolicy(refs, ref_columns, uuid_suffix),
-            )
+            policy = ReferencePolicy(refs, ref_columns, uuid_suffix)
+            if trusted_expression:
+                return transfer._payload_trusted_expression(table_source, policy)
+            return transfer.payload(table_source, policy)
 
     def project_value_payload(
         self,
@@ -6334,16 +6339,31 @@ class PrototypeRuntimeApi:
             )
         return safe_handle
 
+    def _resolve_table_source_locked(self, handle: str) -> tuple[str, bool]:
+        safe_handle = self._validate_value_reference_locked(handle)
+        if (
+            handle.startswith("capture_table_")
+            and not handle.startswith("capture_table_metadata_")
+        ):
+            self._require_capture_inspection_available()
+            return (
+                self._capture_projection_expression(
+                    self._controller.capture_value_handle(handle)
+                ),
+                True,
+            )
+        return safe_handle, False
+
     @staticmethod
     def _capture_projection_expression(value: object) -> str:
-        if not isinstance(value, str) or len(value) > 4096:
+        if not isinstance(value, str) or len(value) > 64 * 1024:
             raise ProtocolError("capture table projection descriptor is invalid")
         identifier = r"[^\W\d]\w*"
         match = re.fullmatch(
             r"RuntimeKernelServer\.ПолучитьВременнуюТаблицуОтладки\("
             r"Контекст\.КонтекстОтладки\."
             + identifier
-            + r"(?:\." + identifier + r"){0,7}, \""
+            + r"(?:\." + identifier + r"){0,100}, \""
             + identifier
             + r"\", (?P<offset>\d{1,8}), (?P<limit>\d{1,3}), "
             + r"(?:Новый Массив|СтрРазделить\(\""
@@ -6419,6 +6439,7 @@ class PrototypeRuntimeApi:
         max_rows: int | None = None,
         max_bytes: int = 75_000_000,
         profiler: PhaseRecorder | None = None,
+        trusted_expression: bool = False,
     ) -> pd.DataFrame:
         transfer = CompactRuntimeTableTransfer(
             self._materialization_instruction_executor,
@@ -6433,10 +6454,10 @@ class PrototypeRuntimeApi:
             profiler=profiler,
             capture_executor=self._capture_transfer_executor_or_none(),
         )
-        return transfer.to_df(
-            handle,
-            ReferencePolicy(refs, ref_columns, uuid_suffix),
-        )
+        policy = ReferencePolicy(refs, ref_columns, uuid_suffix)
+        if trusted_expression:
+            return transfer._to_df_trusted_expression(handle, policy)
+        return transfer.to_df(handle, policy)
 
     def _take_context_string(self, key: str, max_text_size: int) -> str:
         with self._remaining_command_timeout():
