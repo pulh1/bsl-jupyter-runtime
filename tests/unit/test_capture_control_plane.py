@@ -50,6 +50,7 @@ from onec_runtime.rdbg.models import EvaluationResult, PendingEvaluation
 from onec_runtime.recovery_journal import RecoveryJournal
 from onec_runtime.runtime_api import PrototypeRuntimeApi, RuntimeStatus
 from onec_runtime.session import RuntimeSession
+from onec_runtime_jupyter.extension import OnecValueProxy
 
 from test_capture_evaluation_lifecycle import (
     ControlledCaptureSession,
@@ -200,6 +201,16 @@ def _runtime_session(api: PrototypeRuntimeApi) -> RuntimeSession:
     runtime.runtime_api = api
     runtime._operation_lock = _CrossThreadRejectingLock()
     runtime.config = SimpleNamespace(chunk_size=128)
+    return runtime
+
+
+def _materialization_runtime_session(api: PrototypeRuntimeApi) -> RuntimeSession:
+    """Use the production Session/proxy path with a real cross-thread lock."""
+    runtime = object.__new__(RuntimeSession)
+    runtime.runtime_api = api
+    runtime._operation_lock = RLock()
+    runtime.config = SimpleNamespace(chunk_size=128)
+    runtime._closed = False
     return runtime
 
 
@@ -1460,6 +1471,72 @@ def test_capture_control_plane_bypasses_api_writer_availability_and_worker_guard
         assert not failures
     finally:
         _finish_pending(thread, transport)
+        close_owner(controller, transport)
+
+
+def test_session_proxy_materialization_releases_operation_lock_after_ack() -> None:
+    """A second production Session call reaches the coordinator before timeout."""
+    api, controller, transport = _capture_runtime(timeout_s=0.5)
+    runtime = _materialization_runtime_session(api)
+    api._namespace_names = ("Таблица",)
+    proxy = OnecValueProxy(
+        runtime,
+        "Таблица",
+        runtime_generation=controller.runtime_generation,
+        context_generation=1,
+    )
+    first_errors: list[BaseException] = []
+    second_errors: list[BaseException] = []
+    first_done = Event()
+    second_done = Event()
+
+    def first() -> None:
+        try:
+            proxy.to_df()
+        except BaseException as error:
+            first_errors.append(error)
+        finally:
+            first_done.set()
+
+    def second() -> None:
+        try:
+            proxy.to_df()
+        except BaseException as error:
+            second_errors.append(error)
+        finally:
+            second_done.set()
+
+    first_thread = Thread(target=first, name="session-proxy-materialization-first")
+    second_thread = Thread(target=second, name="session-proxy-materialization-second")
+    try:
+        first_thread.start()
+        assert transport.accepted.wait(1), "materialization was not acknowledged"
+        second_thread.start()
+
+        # The second caller must observe the coordinator reservation while the
+        # first Session caller is still waiting for the withheld RDBG result.
+        assert second_done.wait(0.1), "second Session call waited for the deadline"
+        assert len(second_errors) == 1
+        assert isinstance(second_errors[0], CaptureBusyError)
+        pending = runtime.current_capture().status()
+        observed = runtime.current_capture().wait(timeout_s=0)
+        assert pending.phase is CapturePhase.EVALUATING
+        assert observed.state is CaptureEvaluationState.PENDING
+        assert transport.capture_start_count == 1
+        assert not first_done.is_set()
+
+        first_thread.join(_JOIN_TIMEOUT_S)
+        assert first_done.is_set()
+        assert len(first_errors) == 1
+        from onec_runtime.errors import CaptureEvaluationPendingError
+        assert isinstance(first_errors[0], CaptureEvaluationPendingError)
+    finally:
+        if transport.capture_pending is not None:
+            transport.complete()
+        first_thread.join(_JOIN_TIMEOUT_S)
+        second_thread.join(_JOIN_TIMEOUT_S)
+        assert not first_thread.is_alive(), "first Session caller leaked"
+        assert not second_thread.is_alive(), "second Session caller leaked"
         close_owner(controller, transport)
 
 
