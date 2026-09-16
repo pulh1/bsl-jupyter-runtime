@@ -64,6 +64,29 @@ def test_same_physical_ids_resolve_by_layer_with_canonical_names_and_lines(layou
         assert item.source_version.read_text().splitlines()[1] == "    Значение = 1;"
 
 
+def test_edt_src_root_resolves_common_and_document_object_frames():
+    source = catalog(
+        capture_source.CaptureSourceConfig("demo", FIXTURES / "edt_base" / "src")
+    )
+
+    result = source.resolve_modules(
+        (
+            location(COMMON, COMMON_MODULE_PROPERTY_ID),
+            location(DOCUMENT, OBJECT_MODULE_PROPERTY_ID),
+        )
+    )
+
+    assert [item.canonical_name for item in result] == [
+        "ОбщийМодуль.Общий.Модуль",
+        "Документ.ПриемНаРаботу.МодульОбъекта",
+    ]
+    assert [item.module_role for item in result] == ["Module", "ObjectModule"]
+    assert [item.source_version.source_status for item in result] == [
+        "trusted_export",
+        "trusted_export",
+    ]
+
+
 def test_missing_extension_and_unknown_property_are_unavailable_without_fallback(
     monkeypatch,
 ):
