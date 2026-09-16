@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from threading import Thread
+from threading import Thread, current_thread
 
 import pytest
 
@@ -21,7 +21,11 @@ from onec_runtime.prototype_runtime import OperationState
 from onec_runtime.runtime_api import PrototypeRuntimeApi
 from onec_runtime_jupyter.extension import OnecValueProxy
 
-from test_capture_evaluation_lifecycle import ControlledCaptureSession, close_owner
+from test_capture_evaluation_lifecycle import (
+    ControlledCaptureSession,
+    capture_probe,
+    close_owner,
+)
 from test_capture_control_plane import _eventually
 from test_prototype_runtime import CAPTURE_A, SERVICE, captured_controller
 
@@ -111,6 +115,49 @@ def test_proxy_table_materialization_detaches_one_composite_capture_helper() -> 
         if session.capture_pending is not None:
             session.complete()
         caller.join(1)
+        close_owner(controller, session)
+
+
+def test_interrupted_table_materialization_detaches_the_capture_waiter() -> None:
+    """KeyboardInterrupt leaves the admitted transfer and cleanup with its owner."""
+    session = ControlledCaptureSession()
+    controller = captured_controller(session, command_timeout_s=1)
+    api = PrototypeRuntimeApi(controller)
+    proxy = _table_proxy(api, runtime_generation=controller.runtime_generation)
+    owner = capture_probe(controller).owner
+    wait = owner._condition.wait
+    caller = current_thread()
+
+    def interrupt_caller_wait(timeout: float | None = None) -> object:
+        if current_thread() is caller:
+            raise KeyboardInterrupt
+        return wait(timeout)
+
+    owner._condition.wait = interrupt_caller_wait  # type: ignore[method-assign]
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            proxy.to_df()
+
+        assert session.accepted.wait(1), "materialization was not acknowledged"
+        assert api.current_capture().status().phase is CapturePhase.EVALUATING
+        assert session.capture_start_count == 1
+
+        # Restore normal observation before settling the late result.  No
+        # caller-owned read/decode is permitted after its interrupt.
+        owner._condition.wait = wait  # type: ignore[method-assign]
+        session.auto_helpers = True
+        session.complete("R|1|1|1|" + "a" * 64 + "|4", type_name="Строка")
+        outcome = api.current_capture().wait(timeout_s=1)
+
+        assert outcome.state is CaptureEvaluationState.COMPLETED
+        assert api.current_capture().status().phase is CapturePhase.PAUSED
+        assert session.capture_start_count == 2
+        sources = [call[1][0] for call in session.calls if call[0] == "start_evaluation"]
+        assert all("ЗабратьКомпактнуюМатериализациюИзКонтекста" not in source for source in sources)
+    finally:
+        owner._condition.wait = wait  # type: ignore[method-assign]
+        if session.capture_pending is not None:
+            session.complete()
         close_owner(controller, session)
 
 
