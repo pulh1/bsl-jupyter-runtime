@@ -23,7 +23,7 @@ from onec_runtime_jupyter.extension import OnecValueProxy
 
 from test_capture_evaluation_lifecycle import ControlledCaptureSession, close_owner
 from test_capture_control_plane import _eventually
-from test_prototype_runtime import captured_controller
+from test_prototype_runtime import CAPTURE_A, SERVICE, captured_controller
 
 
 def _table_proxy(api: PrototypeRuntimeApi, *, runtime_generation: int) -> OnecValueProxy:
@@ -38,7 +38,10 @@ def _table_proxy(api: PrototypeRuntimeApi, *, runtime_generation: int) -> OnecVa
 
 def test_proxy_table_materialization_detaches_one_composite_capture_helper() -> None:
     """The coordinator owns both late cleanup and the single CAPTURE capability."""
-    session = ControlledCaptureSession()
+    # The first stop captures the paused frame; the second is the MAIN
+    # completion consumed only after the coordinator has removed the late
+    # materialization payload.
+    session = ControlledCaptureSession(stops=(CAPTURE_A, SERVICE))
     controller = captured_controller(session, command_timeout_s=0.02)
     api = PrototypeRuntimeApi(controller)
     proxy = _table_proxy(api, runtime_generation=controller.runtime_generation)
@@ -102,6 +105,8 @@ def test_proxy_table_materialization_detaches_one_composite_capture_helper() -> 
         ][-1]
         assert "Контекст.Удалить(\"\"__onec_compact_table_" in cleanup_source
         assert controller.state is OperationState.CAPTURED
+        api.resume_capture()
+        assert controller.state is OperationState.COMPLETED
     finally:
         if session.capture_pending is not None:
             session.complete()

@@ -79,7 +79,7 @@ def test_matches_requires_exact_manifest_binding(tmp_path: Path) -> None:
     assert store.matches(manifest)
     assert not store.matches(replace(manifest, cfe_sha256="d" * 64))
     assert not store.matches(replace(manifest, artifact_version="0.2.0"))
-    assert not store.matches(replace(manifest, protocol_version="2"))
+    assert not store.matches(replace(manifest, protocol_version="1"))
     assert not store.matches(replace(manifest, product_id="another-product"))
     assert not store.matches(
         replace(
@@ -131,7 +131,7 @@ def test_replace_failure_preserves_previous_marker_and_removes_temp_file(
     monkeypatch.setattr("onec_runtime.extension_state.os.replace", fail_replace)
 
     with pytest.raises(OSError, match="cannot replace"):
-        store.write(replace(original, protocol_version="2"))
+        store.write(replace(original, protocol_version="1"))
 
     assert store.path.read_bytes() == original_bytes
     assert not tuple(store.path.parent.glob("*.tmp"))

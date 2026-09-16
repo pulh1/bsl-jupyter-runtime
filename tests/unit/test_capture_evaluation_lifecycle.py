@@ -139,16 +139,25 @@ class ControlledCaptureSession(ScriptedSession):
             raise AssertionError("controller redispatched while one capability was pending")
         pending = PendingEvaluation(TARGET, uuid4(), self._controlled_owner)
         self.capture_pending = pending
-        # CAPTURE helper sources are now correctly executed through the live
-        # current-capture wrapper too.  Classify cleanup by its operation,
-        # before looking for the common wrapper call, so the fake continues to
-        # model a completed helper rather than a second user evaluation.
+        # CAPTURE helpers and user cells share the same live-current-capture
+        # wrapper.  A lowered user cell can itself contain a message-context
+        # deletion, so identify only the dedicated transfer-key families as
+        # auto-completing cleanup helpers.
+        cleanup_transfer = "Контекст.Удалить(" in expression and any(
+            key in expression
+            for key in (
+                "__onec_compact_table_",
+                "__onec_materialization_",
+                "__onec_projection_",
+                "__onec_value_",
+            )
+        )
         self._pending_role = (
             "messages"
             if "ЗабратьСообщенияЯчейкиИзКонтекста" in expression
             else (
                 "helper"
-                if "Контекст.Удалить(" in expression and "__onec_" in expression
+                if cleanup_transfer
                 else (
                     "evaluation"
                     if "ВыполнитьКод" in expression
