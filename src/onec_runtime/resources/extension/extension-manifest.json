@@ -5,8 +5,8 @@
   "artifact_version": "0.1.3",
   "protocol_version": "2",
   "cfe_filename": "OnecInteractiveRuntime.cfe",
-  "cfe_size": 25146,
-  "cfe_sha256": "09ce2f75df7fcec0def68d80bcc9d9234c10b9bd6682730430b31c9423dfbf70",
+  "cfe_size": 25278,
+  "cfe_sha256": "06a005388bbf2119ed8b60558ff05395f7ae63e285d47a4fd55a371373095154",
   "fingerprints": {
     "identity": {
       "product_id": "onec-interactive-runtime",
@@ -71,12 +71,12 @@
       "source_sha256": {
         "CommonModules/RuntimeKernelServer/Ext/Module.bsl": "1500fa48f647969229bd0787f80cfb57f00f8d450105cdfe6944a4ddd4719550",
         "CommonModules/RuntimeTableTransferServer/Ext/Module.bsl": "a515acae1008c0d29346210f1e7b4cd43850af2e4d87f9ca8038213ad5da5e5f",
-        "CommonModules/RuntimeValueTransferServer/Ext/Module.bsl": "88678bac23ac0a4497e7a79d5fb04aaed6581c9602447ebd106fd358324f31ac",
+        "CommonModules/RuntimeValueTransferServer/Ext/Module.bsl": "7dc427bb1dd81facd3c02db66ce0532e39faf2406b0b8dfce48ee04e12592999",
         "Ext/ManagedApplicationModule.bsl": "fb94abd42102d72e4957b64b44f67c80538c460f828b92115b7a73cc73c62a3a"
       }
     },
     "identity_sha256": "726065a5d3c6f5472e24a83fc0c474fd5f13c42eace441b90c7eba1b404df496",
-    "artifact_sha256": "01ca02838cca146b8cd8650fb6bdaa67f245ea2fc35550f7a4af35891a3cafe6"
+    "artifact_sha256": "4ef6310fda7e3fcd64a01aa2f21a6b374b91d9693484f1b3069eece9a44ec2b8"
   },
   "breakpoints": {
     "managed": {

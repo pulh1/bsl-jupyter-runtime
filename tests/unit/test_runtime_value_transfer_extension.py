@@ -93,6 +93,28 @@ def test_value_inspection_projector_is_a_closed_inline_admission_protocol() -> N
     assert "Значение.Колонки.Количество() >= ЛимитКолонок" in names
 
 
+def test_value_inspection_projector_marks_cycles_only_after_admission() -> None:
+    """A cyclic container is public metadata but cannot be expanded again."""
+    source = MODULE.read_text(encoding="utf-8-sig")
+
+    def function(name: str) -> str:
+        start = source.index("Функция " + name)
+        end = source.index("КонецФункции", start)
+        return source[start:end]
+
+    projector = function("СпроецироватьЗначенияИнспекции")
+    resolver = function("РазрешитьПутьИнспекции")
+    entry = function("ЗаписьЗначенияИнспекции")
+
+    assert "Разрешение.Предки.Добавить(Значение)" in projector
+    assert '"Доступ,Значение,Имя,Предки"' in resolver
+    assert "ЭтоЦиклИнспекции" in entry
+    assert entry.index("ДопуститьЗначение(Значение") < entry.index(
+        "ЭтоЦиклИнспекции"
+    )
+    assert 'Результат.Вставить("cycle", ОбнаруженЦикл)' in entry
+
+
 def test_value_encoder_has_explicit_recursive_adapters_and_limits() -> None:
     source = MODULE.read_text(encoding="utf-8-sig")
 
