@@ -1469,7 +1469,7 @@ class PrototypeRuntimeController:
         self,
         *,
         on_transport_dispatch: Callable[[], None] | None = None,
-    ) -> MainCompletion | CapturedStop | CaptureCellResult | DebugStop:
+    ) -> MainCompletion | CapturedStop | DebugStop:
         if self.state is OperationState.RECOVERING:
             owner = self._capture_evaluation_coordinator
             if owner is not None:
@@ -1619,7 +1619,7 @@ class PrototypeRuntimeController:
         source: str,
         *,
         on_transport_dispatch: Callable[[], None] | None = None,
-    ) -> CaptureCellResult | DebugStop:
+    ) -> CaptureCellResult | CaptureEvaluationTicket:
         self._require_capture_evaluation_admission()
         message_collector_key = self.message_collector_key(LoweringMode.CAPTURE)
         lowering = self.lowerer.lower(
@@ -1649,7 +1649,7 @@ class PrototypeRuntimeController:
         message_collector_key: str = "",
         dirty_roots: tuple[str, ...] = (),
         on_transport_dispatch: Callable[[], None] | None = None,
-    ) -> CaptureCellResult | DebugStop:
+    ) -> CaptureCellResult | CaptureEvaluationTicket:
         return self._execute_capture(
             visible_source,
             self._compatibility_mapped_source(
@@ -1674,7 +1674,7 @@ class PrototypeRuntimeController:
         worker_globals: tuple[str, ...] = (),
         dirty_roots: tuple[str, ...] = (),
         on_transport_dispatch: Callable[[], None] | None = None,
-    ) -> CaptureCellResult | DebugStop:
+    ) -> CaptureCellResult | CaptureEvaluationTicket:
         return self._execute_capture(
             visible_source,
             lowered_source,
@@ -2995,7 +2995,7 @@ class PrototypeRuntimeController:
         source: str,
         *,
         evaluation_kind: CaptureEvaluationKind,
-    ) -> CaptureCellResult | DebugStop:
+    ) -> CaptureCellResult | CaptureEvaluationTicket:
         """Execute trusted runtime BSL verbatim in the current capture frame."""
         mapped = self._compatibility_mapped_source(source, "system-capture")
         return self._execute_capture(
@@ -3140,7 +3140,7 @@ class PrototypeRuntimeController:
         dirty_roots: tuple[str, ...] = (),
         on_transport_dispatch: Callable[[], None] | None = None,
         evaluation_kind: CaptureEvaluationKind = CaptureEvaluationKind.USER_BSL,
-    ) -> CaptureCellResult | DebugStop:
+    ) -> CaptureCellResult | CaptureEvaluationTicket:
         self._require_capture_evaluation_admission()
         if self.active_operation is None:
             raise ProtocolError("Capture cell has no active MAIN operation")

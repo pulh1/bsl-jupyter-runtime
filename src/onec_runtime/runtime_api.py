@@ -632,7 +632,7 @@ class RuntimeController(Protocol):
         source: str,
         *,
         on_transport_dispatch: Callable[[], None] | None = None,
-    ) -> CaptureCellResult | DebugStop: ...
+    ) -> CaptureCellResult | CaptureEvaluationTicket: ...
 
     def execute_mapped_main(
         self,
@@ -659,7 +659,7 @@ class RuntimeController(Protocol):
         worker_messages: bool = False,
         dirty_roots: tuple[str, ...] = (),
         on_transport_dispatch: Callable[[], None] | None = None,
-    ) -> CaptureCellResult | DebugStop: ...
+    ) -> CaptureCellResult | CaptureEvaluationTicket: ...
 
     def execute_system_main(self, source: str) -> MainCompletion: ...
 
@@ -668,7 +668,7 @@ class RuntimeController(Protocol):
         source: str,
         *,
         evaluation_kind: CaptureEvaluationKind,
-    ) -> CaptureCellResult | DebugStop: ...
+    ) -> CaptureCellResult | CaptureEvaluationTicket: ...
 
     def install_capture_worker_generation_pin(
         self,
@@ -693,7 +693,7 @@ class RuntimeController(Protocol):
         self,
         *,
         on_transport_dispatch: Callable[[], None] | None = None,
-    ) -> MainCompletion | CapturedStop | CaptureCellResult | DebugStop: ...
+    ) -> MainCompletion | CapturedStop | DebugStop: ...
 
     def rearm_capture_successor(
         self, capture_points: tuple[ModuleLocation, ...]
