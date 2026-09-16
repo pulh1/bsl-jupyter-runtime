@@ -1729,6 +1729,8 @@ def test_session_completion_uses_one_owned_inspection_ticket(
             assert status.pending_evaluation_id is not None
             assert observed.state is CaptureEvaluationState.PENDING
             assert transport.capture_start_count == 1
+            assert transport.capture_pending is not None
+            assert controller.breakpoint_workspace_owner.confirmed_snapshot.shielded
             assert not first_done.is_set()
 
             first_thread.join(_JOIN_TIMEOUT_S)
@@ -1737,7 +1739,7 @@ def test_session_completion_uses_one_owned_inspection_ticket(
             assert isinstance(first_errors[0], CaptureEvaluationPendingError)
 
             transport.complete(
-                '"R\t\nR\tНомер\nR\tНазвание"',
+                '"C\t3\nR\t\nR\tНомер\nR\tНазвание"',
                 type_name="Строка",
             )
             _eventually(
@@ -1749,6 +1751,8 @@ def test_session_completion_uses_one_owned_inspection_ticket(
             )
             assert settled.state is CaptureEvaluationState.COMPLETED
             assert controller.state is OperationState.CAPTURED
+            assert controller.breakpoint_workspaces[-1].phase == "full-restore"
+            assert not controller.breakpoint_workspace_owner.confirmed_snapshot.shielded
             assert transport.capture_start_count == 1
     finally:
         if transport.capture_pending is not None:

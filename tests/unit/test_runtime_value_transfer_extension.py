@@ -165,6 +165,19 @@ def test_value_serializer_admits_root_and_each_descendant_before_encoding() -> N
     assert 'Свойство("Exports")' in source
 
 
+def test_completion_schema_helper_admits_before_reading_target_field_names() -> None:
+    """Completion's one target instruction cannot inspect a denied root."""
+    source = MODULE.read_text(encoding="utf-8-sig")
+    helper = source.split(
+        "Функция ПолучитьДопущенныеИменаСвойствДляПодсказки", 1
+    )[1].split("КонецФункции", 1)[0]
+
+    admission = helper.index("Если Не ДопуститьЗначение(")
+    denied = helper.index('Состояние = "D|worker_generation_value"')
+    field_read = helper.index("ПолучитьИменаСвойствДляПодсказки(")
+    assert admission < denied < field_read
+
+
 def test_value_serializer_success_has_the_same_explicit_access_contract_as_denial() -> None:
     """A generated protocol-2 branch may read only an explicitly present field."""
     source = MODULE.read_text(encoding="utf-8-sig")
