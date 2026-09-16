@@ -8,6 +8,7 @@ import pytest
 
 from onec_runtime.capture_value_protocol import (
     MAX_CAPTURE_VALUE_WIRE_TOTAL,
+    NativeCandidatePage,
     VALUE_INSPECTION_CONTEXT_KEY_PREFIX,
     build_capture_value_inspection_envelope,
 )
@@ -18,6 +19,7 @@ from onec_runtime.capture_values import (
     ValueRoot,
     ValueRootKind,
     ValueViewKind,
+    VariableRole,
 )
 from onec_runtime.errors import CaptureValueCheckError
 
@@ -157,3 +159,88 @@ def test_production_value_wire_parser_accepts_only_each_advertised_shape(shape: 
     projection = envelope.decode(admission, content)
 
     assert projection.entries[0].describe().shape.value == shape
+
+
+def test_native_candidate_page_compacts_the_wire_request_and_restores_public_cursor():
+    path = SafeValuePath(ValueRoot(ValueRootKind.FRAME, 3))
+    request = ValueInspectionRequest(path, ValueViewKind.VARIABLES, 50, 51)
+    compact = NativeCandidatePage(
+        ValueInspectionRequest(path, ValueViewKind.VARIABLES, 0, 1),
+        ("V50",),
+        101,
+        51,
+    )
+    envelope = build_capture_value_inspection_envelope(
+        action="project",
+        path=path,
+        request=request,
+        limit=None,
+        runtime_generation=7,
+        context_generation=11,
+        worker_type_registrations=(),
+        native_candidates=("V50",),
+        native_page=compact,
+    )
+    document = {
+        "v": 1,
+        "action": "project",
+        "entries": [{
+            "name": "V50",
+            "denied": False,
+            "type_name": "Число",
+            "preview": "50",
+            "size": None,
+            "shape": "scalar",
+            "cycle": False,
+        }],
+        "total": 1,
+        "next": None,
+    }
+    payload = json.dumps(document, ensure_ascii=False, separators=(",", ":")).encode()
+    admission, content = _admission(envelope, payload)
+
+    projection = envelope.decode(admission, content)
+
+    assert 'Вставить("V50", V50);' in envelope.source
+    assert 'Вставить("V0", V0);' not in envelope.source
+    assert projection.total == 101 and projection.next_cursor == 51
+    assert [entry.name for entry in projection.entries] == ["V50"]
+
+
+def test_native_candidate_page_is_closed_over_the_compact_request_and_names():
+    path = SafeValuePath(ValueRoot(ValueRootKind.FRAME, 3))
+    request = ValueInspectionRequest(
+        path,
+        ValueViewKind.VARIABLES,
+        0,
+        1,
+        VariableRole.VARIABLES,
+    )
+    invalid = (
+        NativeCandidatePage(
+            ValueInspectionRequest(path, ValueViewKind.VARIABLES, 1, 2),
+            ("V0",),
+            1,
+            None,
+        ),
+        NativeCandidatePage(
+            ValueInspectionRequest(path, ValueViewKind.VARIABLES, 0, 1),
+            ("V1",),
+            1,
+            None,
+        ),
+    )
+
+    for compact in invalid:
+        with pytest.raises(CaptureValueCheckError):
+            build_capture_value_inspection_envelope(
+                action="project",
+                path=path,
+                request=request,
+                limit=None,
+                runtime_generation=7,
+                context_generation=11,
+                worker_type_registrations=(),
+                native_candidates=("V0",),
+                native_page=compact,
+            )

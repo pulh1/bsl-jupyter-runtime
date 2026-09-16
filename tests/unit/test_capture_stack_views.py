@@ -12,6 +12,7 @@ from onec_runtime.bsl.module_syntax import ModuleIdentity, ModuleSyntaxRegistry
 from onec_runtime.capture_source import SourceVersionRef
 from onec_runtime.errors import (
     CaptureBusyError,
+    CaptureSourceUnavailableError,
     CommandTimeout,
     ProtocolError,
     StaleCaptureError,
@@ -1025,18 +1026,21 @@ def test_runtime_native_frame_pages_wide_private_inventory_before_envelope_proje
     runtime = PrototypeRuntimeApi(controller)
     owner = controller._capture_evaluation_coordinator
     assert owner is not None
-    source = "Procedure RunFixture(ParamA, ParamB)\nEndProcedure"
+    source = "Procedure RunFixture(ParamA, ParamB)\nX = 1;\nEndProcedure"
     pin = SourceVersionRef.worker(
         artifact_id="wide-native-frame", generation=1, source_text=source,
     )
-    resolved = ResolvedFrameSource("Common.RunFixture", 1, IDENTITY, pin)
+    resolved = ResolvedFrameSource("Common.RunFixture", 2, IDENTITY, pin)
+    source_resolutions: list[tuple[int, ...]] = []
+
+    def resolve_sources(frames):  # type: ignore[no-untyped-def]
+        source_resolutions.append(tuple(frame.level for frame in frames))
+        return tuple(resolved if frame.level == 1 else None for frame in frames)
+
     try:
-        capture = runtime._current_capture(
-            resolve_sources=lambda frames: tuple(
-                resolved if frame.level == 1 else None for frame in frames
-            ),
-        )
-        frame = capture.stack.native[1].with_method()
+        capture = runtime._current_capture(resolve_sources=resolve_sources)
+        frame = capture.stack.native[1]
+        assert source_resolutions == []
 
         first = frame.variables[50:51]
         second = frame.variables[51:52]
@@ -1058,6 +1062,7 @@ def test_runtime_native_frame_pages_wide_private_inventory_before_envelope_proje
         assert locals_page.total == len(local_names) and locals_page.next_cursor == 51
 
         assert session.private_inventory_reads == 6
+        assert source_resolutions == [(1,), (1,)]
         assert session.projection_roots == [
             ("V50",), ("V51",), ("V0",), ("V50",),
             ("ParamA",), (local_names[50],),
@@ -1069,6 +1074,48 @@ def test_runtime_native_frame_pages_wide_private_inventory_before_envelope_proje
         assert 'Вставить("ParamB", ParamB);' not in first_page_source
         assert 'PRIVATE_NATIVE_TYPE' not in first_page_source
         assert 'PRIVATE_NATIVE_PRESENTATION' not in first_page_source
+    finally:
+        owner.begin_close()
+        assert owner.join(2)
+
+
+def test_runtime_native_frame_bounds_private_inventory_before_source_generation():
+    """A malformed wide RDBG inventory remains private and submits no source."""
+    from onec_runtime.prototype_runtime import MAX_CAPTURE_VALUE_NATIVE_INVENTORY
+
+    class OverboundNativeSession(FreshStackSession):
+        def __init__(self) -> None:
+            super().__init__()
+            self.projection_attempts = 0
+
+        def local_variables(self, stack_level: int = 0) -> LocalVariablesResult:
+            if stack_level == 1:
+                self.calls.append(("local_variables", stack_level))
+                return LocalVariablesResult(uuid4(), tuple(
+                    FrameVariable(
+                        f"V{index}", "PRIVATE_NATIVE_TYPE", "PRIVATE_NATIVE_PRESENTATION",
+                    )
+                    for index in range(MAX_CAPTURE_VALUE_NATIVE_INVENTORY + 1)
+                ))
+            return super().local_variables(stack_level)
+
+        def evaluate(self, expression: str, **kwargs: object):  # type: ignore[no-untyped-def]
+            if "СпроецироватьЗначенияИнспекции" in expression:
+                self.projection_attempts += 1
+            return super().evaluate(expression, **kwargs)
+
+    session = OverboundNativeSession()
+    controller = captured_controller(session)
+    runtime = PrototypeRuntimeApi(controller)
+    owner = controller._capture_evaluation_coordinator
+    assert owner is not None
+    try:
+        with pytest.raises(CaptureSourceUnavailableError) as rejected:
+            runtime.current_capture().stack.native[1].variables[:1]
+
+        assert "PRIVATE_NATIVE" not in str(rejected.value)
+        assert rejected.value.__cause__ is None and rejected.value.__context__ is None
+        assert session.projection_attempts == 0
     finally:
         owner.begin_close()
         assert owner.join(2)

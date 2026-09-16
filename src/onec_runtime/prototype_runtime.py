@@ -9,7 +9,7 @@ import json
 import re
 from collections.abc import Mapping, Sequence
 from time import monotonic
-from typing import Callable
+from typing import Callable, cast
 from functools import lru_cache
 from threading import local
 from uuid import UUID, uuid4
@@ -53,6 +53,8 @@ from onec_runtime.capture_evaluation import (
 )
 from onec_runtime.capture_value_protocol import (
     CaptureValueInspectionEnvelope,
+    MAX_CAPTURE_VALUE_NATIVE_CANDIDATES,
+    NativeCandidatePage,
     build_capture_value_inspection_envelope,
 )
 from onec_runtime.capture_values import (
@@ -124,6 +126,10 @@ MAX_CAPTURE_PROJECTION_POSITION = 10_000_000
 MAX_CAPTURE_SCHEMA_COLUMNS = 100
 MAX_CAPTURE_VALUE_INSPECTION_SOURCE_BYTES = 64 * 1024
 MAX_CAPTURE_VALUE_PATH_SEGMENTS = CaptureValuePolicy().max_depth + 1
+# RDBG local-variable inventory is private input, not a public result.  Keep
+# its pre-projection read finite even when the target reports an unexpected
+# frame shape; the selected BSL roots remain capped at the protocol's 100.
+MAX_CAPTURE_VALUE_NATIVE_INVENTORY = 10_000
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -164,6 +170,14 @@ class CaptureValueInspectionPlan:
 
 
 CaptureValueInspectionBuilder = Callable[..., CaptureValueInspectionPlan]
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _NativeCaptureCandidateSelection:
+    """The only private inventory data allowed into a native envelope."""
+
+    candidates: tuple[str, ...]
+    page: NativeCandidatePage | None = None
 
 
 def _denied_capture_value_metadata() -> ValueMetadata:
@@ -2095,10 +2109,15 @@ class PrototypeRuntimeController:
         deadline: float,
     ) -> CaptureValueInspectionPlan:
         """Create the only production target plan after complete local grammar."""
-        native_candidates = (
-            ()
+        native_selection = (
+            _NativeCaptureCandidateSelection(())
             if path.root.kind is ValueRootKind.CONTEXT
-            else self._capture_value_native_candidates(path, deadline=deadline)
+            else self._capture_value_native_candidates(
+                action=action,
+                path=path,
+                request=request,
+                deadline=deadline,
+            )
         )
         envelope = build_capture_value_inspection_envelope(
             action=action,
@@ -2108,18 +2127,55 @@ class PrototypeRuntimeController:
             runtime_generation=self.runtime_generation,
             context_generation=context_generation,
             worker_type_registrations=worker_type_registrations,
-            native_candidates=native_candidates,
+            native_candidates=native_selection.candidates,
+            native_page=native_selection.page,
             policy=CaptureValuePolicy(),
         )
         return CaptureValueInspectionPlan(envelope.source, lambda _result: None, envelope)
 
     def _capture_value_native_candidates(
         self,
+        *,
+        action: str,
+        path: SafeValuePath,
+        request: ValueInspectionRequest | None,
+        deadline: float,
+    ) -> _NativeCaptureCandidateSelection:
+        """Compact one private RDBG inventory before it can form BSL source."""
+        names = self._capture_value_native_inventory(path, deadline=deadline)
+        if action == "project" and not path.segments:
+            if not isinstance(request, ValueInspectionRequest):
+                raise CaptureValueCheckError("capture native frame page is invalid")
+            return self._capture_value_native_root_page(names, request)
+        selector = path.segments[0] if path.segments else None
+        canonical = (
+            None
+            if (
+                selector is None
+                or selector.kind is not ValuePathSegmentKind.VARIABLE
+                or not isinstance(selector.key, str)
+            )
+            else next(
+                (
+                    name for name in names
+                    if name.casefold() == selector.key.casefold()
+                ),
+                None,
+            )
+        )
+        if canonical is None:
+            raise CaptureValueCheckError(
+                "capture native frame root is unavailable"
+            )
+        return _NativeCaptureCandidateSelection((canonical,))
+
+    def _capture_value_native_inventory(
+        self,
         path: SafeValuePath,
         *,
         deadline: float,
     ) -> tuple[str, ...]:
-        """Keep native RDBG candidates private; only their safe names form BSL."""
+        """Read only bounded safe candidate names from one private RDBG reply."""
         root = path.root
         if root.kind is not ValueRootKind.FRAME or type(root.native_level) is not int:
             raise CaptureValueCheckError("capture native frame candidates are invalid")
@@ -2132,21 +2188,102 @@ class PrototypeRuntimeController:
                     "native frame value candidates are unavailable"
                 )
             variables = result.variables
-        self._capture_remaining_timeout(deadline)
-        try:
-            names = tuple(
-                SafePathSegment(ValuePathSegmentKind.VARIABLE, item.name).key
-                for item in variables
-            )
-        except Exception:
+        invalid_inventory = (
+            type(variables) is not tuple
+            or len(variables) > MAX_CAPTURE_VALUE_NATIVE_INVENTORY
+            or any(not isinstance(item, FrameVariable) for item in variables)
+        )
+        names: tuple[str, ...] = ()
+        if not invalid_inventory:
+            try:
+                names = tuple(
+                    SafePathSegment(ValuePathSegmentKind.VARIABLE, item.name).key
+                    for item in variables
+                )
+            except Exception:
+                invalid_inventory = True
+        if invalid_inventory:
             raise CaptureSourceUnavailableError(
                 "native frame value candidates are unavailable"
-            ) from None
+            )
         if len({name.casefold() for name in names}) != len(names):
             raise CaptureSourceUnavailableError(
                 "native frame value candidates are unavailable"
             )
+        self._capture_remaining_timeout(deadline)
         return names
+
+    @staticmethod
+    def _capture_value_native_root_page(
+        names: tuple[str, ...],
+        request: ValueInspectionRequest,
+    ) -> _NativeCaptureCandidateSelection:
+        """Apply root role, exact and slice semantics before target admission."""
+        by_folded_name = {name.casefold(): name for name in names}
+        if request.role is VariableRole.PARAMETERS:
+            candidates, total = (
+                PrototypeRuntimeController._capture_value_native_parameter_page(
+                    by_folded_name, request,
+                )
+            )
+        else:
+            inventory = names
+            if request.role is VariableRole.LOCALS:
+                parameters = {
+                    name.casefold() for name in request.parameter_names
+                }
+                inventory = tuple(
+                    name for name in names if name.casefold() not in parameters
+                )
+            if request.exact is not None:
+                candidates = tuple(
+                    name for name in inventory
+                    if name.casefold() == cast(str, request.exact).casefold()
+                )
+                total = len(candidates)
+            else:
+                candidates = inventory[request.start:request.stop]
+                total = len(inventory)
+        if len(candidates) > MAX_CAPTURE_VALUE_NATIVE_CANDIDATES:
+            raise CaptureValueCheckError("capture native frame page is invalid")
+        next_cursor = request.stop if request.exact is None and request.stop < total else None
+        source_request = ValueInspectionRequest(
+            request.path,
+            request.view,
+            0,
+            len(candidates),
+            request.role,
+            candidates if request.role is VariableRole.PARAMETERS else (),
+            request.exact,
+        )
+        return _NativeCaptureCandidateSelection(
+            candidates,
+            NativeCandidatePage(source_request, candidates, total, next_cursor),
+        )
+
+    @staticmethod
+    def _capture_value_native_parameter_page(
+        by_folded_name: Mapping[str, str],
+        request: ValueInspectionRequest,
+    ) -> tuple[tuple[str, ...], int]:
+        """Retain parameters in source order without exposing the inventory."""
+        if request.exact is not None:
+            candidate = by_folded_name.get(cast(str, request.exact).casefold())
+            if candidate is None or all(
+                candidate.casefold() != name.casefold()
+                for name in request.parameter_names
+            ):
+                return (), 0
+            return (candidate,), 1
+        selected = request.parameter_names[request.start:request.stop]
+        return (
+            tuple(
+                by_folded_name[name.casefold()]
+                for name in selected
+                if name.casefold() in by_folded_name
+            ),
+            len(request.parameter_names),
+        )
 
     def _evaluate_capture_value_envelope(
         self,

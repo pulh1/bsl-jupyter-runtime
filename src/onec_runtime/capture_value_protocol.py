@@ -70,6 +70,22 @@ def _base64_length(byte_count: int) -> int:
 
 
 @dataclass(frozen=True, slots=True, repr=False)
+class NativeCandidatePage:
+    """Private compact root page for one native-frame inspection source.
+
+    Native RDBG inventory is deliberately not a wire result.  The controller
+    selects this bounded page before source generation, and the envelope
+    restores only its already-validated public count and cursor after the
+    checked-in helper has admitted the selected roots.
+    """
+
+    source_request: ValueInspectionRequest
+    candidates: tuple[str, ...]
+    total: int
+    next_cursor: int | None
+
+
+@dataclass(frozen=True, slots=True, repr=False)
 class CaptureValueInspectionEnvelope:
     """One pre-registered private payload lifecycle owned by INSPECTION."""
 
@@ -107,6 +123,7 @@ def build_capture_value_inspection_envelope(
     context_generation: int,
     worker_type_registrations: tuple[str, ...],
     native_candidates: tuple[str, ...] = (),
+    native_page: NativeCandidatePage | None = None,
     policy: CaptureValuePolicy | None = None,
 ) -> CaptureValueInspectionEnvelope:
     """Build a target program with no values or target handles in its API."""
@@ -153,12 +170,25 @@ def build_capture_value_inspection_envelope(
     else:
         _validate_candidate_names(native_candidates)
 
+    source_request = request
+    if native_page is not None:
+        _validate_native_candidate_page(
+            native_page,
+            action=action,
+            path=path,
+            request=request,
+            limit=limit,
+            native_candidates=native_candidates,
+            max_depth=selected_policy.max_depth + 1,
+        )
+        source_request = native_page.source_request
+
     key = VALUE_INSPECTION_CONTEXT_KEY_PREFIX + uuid4().hex
     maximum_text_size = _base64_length(selected_policy.max_bytes)
     source = _inspection_source(
         action=action,
         path=path,
-        request=request,
+        request=source_request,
         limit=limit,
         context_key=key,
         runtime_generation=runtime_generation,
@@ -198,7 +228,16 @@ def build_capture_value_inspection_envelope(
             or sha256(payload).hexdigest() != observed.payload_sha256
         ):
             raise CaptureValueCheckError("CAPTURE value payload integrity check failed")
-        return _decode_wire_payload(payload, action=action, path=path, request=request, limit=limit)
+        decoded = _decode_wire_payload(
+            payload,
+            action=action,
+            path=path,
+            request=source_request,
+            limit=limit,
+        )
+        if native_page is not None:
+            return _restore_native_candidate_page(decoded, native_page)
+        return decoded
 
     return CaptureValueInspectionEnvelope(
         source,
@@ -219,6 +258,76 @@ def _validate_candidate_names(names: tuple[str, ...]) -> None:
     )
     if len({item.casefold() for item in checked}) != len(checked):
         raise CaptureValueCheckError("capture native frame candidates are ambiguous")
+
+
+def _validate_native_candidate_page(
+    page: NativeCandidatePage,
+    *,
+    action: str,
+    path: SafeValuePath,
+    request: ValueInspectionRequest | None,
+    limit: int | None,
+    native_candidates: tuple[str, ...],
+    max_depth: int,
+) -> None:
+    """Close the private compaction seam before any BSL is constructed."""
+    if (
+        not isinstance(page, NativeCandidatePage)
+        or action != "project"
+        or path.root.kind is not ValueRootKind.FRAME
+        or path.segments
+        or not isinstance(request, ValueInspectionRequest)
+        or limit is not None
+        or type(page.candidates) is not tuple
+        or page.candidates != native_candidates
+        or not isinstance(page.source_request, ValueInspectionRequest)
+        or page.source_request.path != request.path
+        or page.source_request.view is not request.view
+        or page.source_request.role is not request.role
+        or page.source_request.exact != request.exact
+        or page.source_request.start != 0
+        or page.source_request.stop != len(page.candidates)
+        or type(page.total) is not int
+        or page.total < len(page.candidates)
+        or page.total > MAX_CAPTURE_VALUE_WIRE_TOTAL
+    ):
+        raise CaptureValueCheckError("capture native frame page is invalid")
+    if page.next_cursor is not None and (
+        type(page.next_cursor) is not int
+        or page.next_cursor < 0
+        or page.next_cursor >= page.total
+    ):
+        raise CaptureValueCheckError("capture native frame page is invalid")
+    expected_next = request.stop if request.stop < page.total else None
+    if page.next_cursor != expected_next:
+        raise CaptureValueCheckError("capture native frame page is invalid")
+    expected_parameters = (
+        page.candidates
+        if request.role is VariableRole.PARAMETERS
+        else ()
+    )
+    if page.source_request.parameter_names != expected_parameters:
+        raise CaptureValueCheckError("capture native frame page is invalid")
+    _validate_builder_request(
+        action,
+        path=path,
+        request=page.source_request,
+        limit=limit,
+        max_depth=max_depth,
+    )
+
+
+def _restore_native_candidate_page(
+    value: object,
+    page: NativeCandidatePage,
+) -> PrivateValueProjection:
+    """Seal a compact helper page back to the original public cursor space."""
+    if not isinstance(value, PrivateValueProjection) or (
+        len(value.entries) != len(page.candidates)
+        or tuple(entry.name for entry in value.entries) != page.candidates
+    ):
+        raise CaptureValueCheckError("CAPTURE native frame payload is invalid")
+    return PrivateValueProjection(value.entries, page.total, page.next_cursor)
 
 
 def _validate_builder_request(

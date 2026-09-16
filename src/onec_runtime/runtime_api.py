@@ -1209,7 +1209,11 @@ class PrototypeRuntimeApi:
         stack_adapter: LocalStackAdapter
 
         def resolve_value_parameters(native_level: int) -> tuple[str, ...]:
-            frame = stack_adapter.stack.native[native_level].with_method()
+            # Native stack pages deliberately skip source work.  Role
+            # classification is an explicit descriptor request, so enrich
+            # only this physical frame instead of widening ordinary stack
+            # inventory into parser or source I/O.
+            frame = stack_adapter.native_frame_with_method(native_level)
             method = frame.method
             if method is None:
                 raise CaptureSourceUnavailableError(
