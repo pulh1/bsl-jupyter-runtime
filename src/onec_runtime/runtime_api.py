@@ -6358,23 +6358,64 @@ class PrototypeRuntimeApi:
     def _capture_projection_expression(value: object) -> str:
         if not isinstance(value, str) or len(value) > 64 * 1024:
             raise ProtocolError("capture table projection descriptor is invalid")
-        identifier = r"[^\W\d]\w*"
-        match = re.fullmatch(
-            r"RuntimeKernelServer\.ПолучитьВременнуюТаблицуОтладки\("
-            r"Контекст\.КонтекстОтладки\."
-            + identifier
-            + r"(?:\." + identifier + r"){0,100}, \""
-            + identifier
-            + r"\", (?P<offset>\d{1,8}), (?P<limit>\d{1,3}), "
-            + r"(?:Новый Массив|СтрРазделить\(\""
-            + identifier
-            + r"(?:," + identifier + r")*\", \",\"\))\)",
-            value,
-        )
-        if match is None:
+
+        prefix = "RuntimeKernelServer.ПолучитьВременнуюТаблицуОтладки("
+        if not value.startswith(prefix):
             raise ProtocolError("capture table projection descriptor is invalid")
-        offset = int(match.group("offset"))
-        limit = int(match.group("limit"))
+
+        manager_path, separator, remainder = value[len(prefix) :].partition(', "')
+        if not separator:
+            raise ProtocolError("capture table projection descriptor is invalid")
+        table_name, separator, remainder = remainder.partition('", ')
+        if not separator:
+            raise ProtocolError("capture table projection descriptor is invalid")
+        offset_text, separator, remainder = remainder.partition(", ")
+        if not separator:
+            raise ProtocolError("capture table projection descriptor is invalid")
+        limit_text, separator, selection = remainder.partition(", ")
+        if not separator:
+            raise ProtocolError("capture table projection descriptor is invalid")
+
+        manager_parts = manager_path.split(".")
+        identifiers = (*manager_parts[2:], table_name)
+        if (
+            manager_parts[:2] != ["Контекст", "КонтекстОтладки"]
+            or not 1 <= len(manager_parts[2:]) <= 101
+            or any(
+                len(identifier) > 256
+                or re.fullmatch(r"[^\W\d]\w*", identifier, re.UNICODE) is None
+                for identifier in identifiers
+            )
+        ):
+            raise ProtocolError("capture table projection descriptor is invalid")
+
+        columns: tuple[str, ...]
+        if selection == "Новый Массив)":
+            columns = ()
+        else:
+            columns_prefix = 'СтрРазделить("'
+            columns_suffix = '", ","))'
+            if not selection.startswith(columns_prefix) or not selection.endswith(
+                columns_suffix
+            ):
+                raise ProtocolError("capture table projection descriptor is invalid")
+            columns = tuple(
+                selection[len(columns_prefix) : -len(columns_suffix)].split(",")
+            )
+            if not 1 <= len(columns) <= 100 or any(
+                len(column) > 256
+                or re.fullmatch(r"[^\W\d]\w*", column, re.UNICODE) is None
+                for column in columns
+            ):
+                raise ProtocolError("capture table projection descriptor is invalid")
+
+        if (
+            re.fullmatch(r"(?:0|[1-9][0-9]{0,7})", offset_text) is None
+            or re.fullmatch(r"[1-9][0-9]{0,2}", limit_text) is None
+        ):
+            raise ProtocolError("capture table projection descriptor is invalid")
+        offset = int(offset_text)
+        limit = int(limit_text)
         if not 1 <= limit <= 100 or offset + limit > MAX_PROJECTION_POSITION:
             raise ProtocolError("capture table projection descriptor is invalid")
         return value
