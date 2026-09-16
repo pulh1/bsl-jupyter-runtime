@@ -161,6 +161,96 @@ def test_interrupted_table_materialization_detaches_the_capture_waiter() -> None
         close_owner(controller, session)
 
 
+def test_confirmed_table_materialization_restore_failure_skips_payload_read() -> None:
+    """A confirmed envelope still cannot read the target after restore fails."""
+    session = ControlledCaptureSession(fail_workspace_on_call=3)
+    controller = captured_controller(session, command_timeout_s=1)
+    api = PrototypeRuntimeApi(controller)
+    proxy = _table_proxy(api, runtime_generation=controller.runtime_generation)
+    errors: list[BaseException] = []
+
+    def materialize() -> None:
+        try:
+            proxy.to_df()
+        except BaseException as error:
+            errors.append(error)
+
+    caller = Thread(target=materialize, name="materialization-restore-failure")
+    try:
+        caller.start()
+        assert session.accepted.wait(1), "materialization was not acknowledged"
+        assert session.polling.wait(1), "materialization was not polling"
+        session.auto_helpers = True
+        session.complete("R|1|1|1|" + "a" * 64 + "|4", type_name="Строка")
+        caller.join(1)
+
+        assert not caller.is_alive()
+        assert len(errors) == 1
+        assert isinstance(errors[0], CaptureRecoveryRequiredError)
+        status = api.current_capture().status()
+        assert status.phase is CapturePhase.RECOVERY_REQUIRED
+        assert session.capture_start_count == 1
+        sources = [call[1][0] for call in session.calls if call[0] == "start_evaluation"]
+        assert all("ЗабратьКомпактнуюМатериализациюИзКонтекста" not in source for source in sources)
+    finally:
+        if session.capture_pending is not None:
+            session.complete()
+        caller.join(1)
+        close_owner(controller, session)
+
+
+def test_recursive_materialization_detaches_busy_waiter_and_late_payload() -> None:
+    """The recursive serializer follows the same single-record lifecycle."""
+    session = ControlledCaptureSession()
+    controller = captured_controller(session, command_timeout_s=0.02)
+    api = PrototypeRuntimeApi(controller)
+    errors: list[BaseException] = []
+
+    def materialize() -> None:
+        try:
+            api.materialize_value(
+                "Контекст.Данные", max_depth=2, max_items=3, max_bytes=1024
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    caller = Thread(target=materialize, name="recursive-materialization-initiator")
+    try:
+        caller.start()
+        assert session.accepted.wait(1), "recursive materialization was not acknowledged"
+        caller.join(1)
+
+        assert len(errors) == 1
+        assert isinstance(errors[0], CaptureEvaluationPendingError)
+        pending = api.current_capture().status()
+        assert pending.evaluation_kind is CaptureEvaluationKind.MATERIALIZATION_HELPER
+        with pytest.raises(CaptureBusyError) as busy:
+            api.materialize_value(
+                "Контекст.Данные", max_depth=2, max_items=3, max_bytes=1024
+            )
+        assert busy.value.evaluation_id == pending.pending_evaluation_id
+        assert session.capture_start_count == 1
+
+        session.auto_helpers = True
+        session.complete("R|1|1|1|" + "a" * 64 + "|4", type_name="Строка")
+        _eventually(lambda: api.current_capture().status().phase is CapturePhase.PAUSED)
+        settled = api.current_capture().wait(
+            timeout_s=1,
+            evaluation_id=errors[0].evaluation_id,
+        )
+
+        assert settled.state is CaptureEvaluationState.COMPLETED
+        assert session.capture_start_count == 2
+        sources = [call[1][0] for call in session.calls if call[0] == "start_evaluation"]
+        assert "СериализоватьЗначение(" in sources[0]
+        assert all("ЗабратьКомпактнуюМатериализациюИзКонтекста" not in source for source in sources)
+    finally:
+        if session.capture_pending is not None:
+            session.complete()
+        caller.join(1)
+        close_owner(controller, session)
+
+
 @pytest.mark.parametrize(
     ("envelope", "expected_error"),
     (
