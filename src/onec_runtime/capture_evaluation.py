@@ -722,6 +722,7 @@ class CaptureTransferPlan:
         step_factory: Callable[[str], CaptureRemoteStep],
         read: Callable[[CaptureStepContext, str, int], str],
         pin_lease: Callable[[str], None] = _no_pin,
+        completion: Callable[[object, BaseException | None], object] | None = None,
     ) -> CaptureEvaluationRequest:
         first = step_factory(self.instruction)
         cleanup = CaptureCleanupLease(self.private_key, step_factory(self.cleanup_instruction))
@@ -733,7 +734,7 @@ class CaptureTransferPlan:
             fence, CaptureEvaluationKind.MATERIALIZATION_HELPER,
             first.dispatch, first.poll, lambda result: result.presentation,
             restore=first.restore, pin_lease=pin_lease, cleanup_leases=(cleanup,),
-            step_continuation=continuation,
+            step_continuation=continuation, completion=completion,
         )
 
 

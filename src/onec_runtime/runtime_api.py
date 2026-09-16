@@ -27,6 +27,7 @@ from onec_runtime.capture_evaluation import (
     CaptureEvaluationTicket,
     CapturePhase,
     CaptureResumeTicket,
+    CaptureTransferPlan,
     _CapturePinDispositionLease,
     _CaptureResumeSubmission,
     _CaptureSubmission,
@@ -5308,6 +5309,7 @@ class PrototypeRuntimeApi:
                 context_generation=self._context_generation,
                 worker_type_registrations=self._worker_type_registrations,
                 profiler=profiler,
+                capture_executor=self._capture_transfer_executor_or_none(),
             )
             return transfer.materialize(safe_handle, options)
 
@@ -5340,6 +5342,7 @@ class PrototypeRuntimeApi:
                 context_generation=self._context_generation,
                 worker_type_registrations=self._worker_type_registrations,
                 profiler=profiler,
+                capture_executor=self._capture_transfer_executor_or_none(),
             )
             return transfer.payload(
                 safe_handle,
@@ -5372,6 +5375,7 @@ class PrototypeRuntimeApi:
                 max_payload_bytes=max_bytes,
                 max_rows=max_rows,
                 profiler=profiler,
+                capture_executor=self._capture_transfer_executor_or_none(),
             )
             return transfer.payload(
                 safe_handle,
@@ -5886,6 +5890,7 @@ class PrototypeRuntimeApi:
             max_payload_bytes=max_bytes,
             max_rows=max_rows,
             profiler=profiler,
+            capture_executor=self._capture_transfer_executor_or_none(),
         )
         return transfer.to_df(
             handle,
@@ -5934,6 +5939,27 @@ class PrototypeRuntimeApi:
                     diagnostic=completion.diagnostic,
                 )
             return completion.result
+
+    def _capture_transfer_executor_or_none(
+        self,
+    ) -> Callable[[CaptureTransferPlan], bytes] | None:
+        return (
+            self._execute_capture_transfer
+            if self._capture_control_owner() is not None
+            and self._controller.state is OperationState.CAPTURED
+            else None
+        )
+
+    def _execute_capture_transfer(self, plan: CaptureTransferPlan) -> bytes:
+        with self._remaining_command_timeout():
+            executor = getattr(self._controller, "_execute_capture_transfer", None)
+            if not callable(executor):
+                raise ProtocolError("Runtime controller cannot execute CAPTURE transfer")
+            with self._capture_helper_writer_handoff():
+                result = executor(plan)
+            if not isinstance(result, bytes):
+                raise ProtocolError("CAPTURE transfer returned an invalid payload")
+            return result
 
     def _finalize_namespace_reply(
         self,

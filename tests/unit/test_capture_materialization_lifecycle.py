@@ -93,7 +93,7 @@ def test_proxy_table_materialization_detaches_one_composite_capture_helper() -> 
             for call in session.calls
             if call[0] == "start_evaluation"
         ][-1]
-        assert "УдалитьМатериализациюИзКонтекста" in cleanup_source
+        assert "Контекст.Удалить(\"__onec_compact_table_" in cleanup_source
         assert controller.state is OperationState.CAPTURED
     finally:
         if session.capture_pending is not None:

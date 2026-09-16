@@ -52,6 +52,7 @@ from onec_runtime.capture_evaluation import (
     CaptureResumeRequest,
     CaptureResumeTicket,
     CaptureStepContext,
+    CaptureTransferPlan,
 )
 from onec_runtime.breakpoint_workspace import (
     BreakpointWorkspaceController,
@@ -2211,6 +2212,56 @@ class PrototypeRuntimeController:
             visible_source_context=self._visible_context(mapped, source),
             evaluation_kind=CaptureEvaluationKind.MATERIALIZATION_HELPER,
         )
+
+    def _execute_capture_transfer(self, plan: CaptureTransferPlan) -> bytes:
+        """Run the full private transfer as one coordinator-owned CAPTURE record."""
+        if not isinstance(plan, CaptureTransferPlan):
+            raise TypeError("CAPTURE transfer plan is required")
+        self._require_capture_evaluation_admission()
+        owner = self._capture_evaluation_owner()
+        stack_level = self._required_capture_kernel_stack_level()
+
+        def step_factory(source: str) -> CaptureRemoteStep:
+            return self._capture_remote_step(
+                source,
+                stack_level=stack_level,
+                max_text_size=plan.max_text_size,
+            )
+
+        def read(
+            context: CaptureStepContext,
+            key: str,
+            max_text_size: int,
+        ) -> str:
+            expression = (
+                "RuntimeKernelServer."
+                "ЗабратьКомпактнуюМатериализациюИзКонтекста(Контекст, "
+                + bsl_string_literal(key)
+                + ")"
+            )
+            result = context.execute_inline(self._capture_remote_step(
+                expression,
+                stack_level=stack_level,
+                max_text_size=max_text_size,
+            ))
+            if result.error_occurred:
+                raise BslExecutionError(result.error_text)
+            value = evaluation_to_python(result)
+            if not isinstance(value, str):
+                raise ProtocolError("CAPTURE materialization payload is not a string")
+            return value
+
+        request = plan.capture_request(
+            owner._fence,
+            step_factory=step_factory,
+            read=read,
+            completion=self._complete_capture_lifecycle,
+        )
+        return self._submit_capture_request(
+            request,
+            timeout_s=self.command_timeout_s,
+            helper_handoff=True,
+        )  # type: ignore[return-value]
 
     def install_capture_worker_generation_pin(
         self,
