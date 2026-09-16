@@ -656,6 +656,10 @@ class CaptureRemoteStep:
     dispatch: Callable[[Callable[[], None]], PendingEvaluation] = field(repr=False)
     poll: Callable[[PendingEvaluation, float], EvaluationResult | StopEvent] = field(repr=False)
     restore: Callable[[], None] = field(default=_nothing, repr=False)
+    resume_stop: Callable[[PendingEvaluation, StopEvent], None] | None = field(
+        default=None,
+        repr=False,
+    )
 
 
 class _CapturePinDispositionState(StrEnum):
@@ -866,6 +870,10 @@ class CaptureEvaluationRequest:
     poll: Callable[[PendingEvaluation, float], EvaluationResult | StopEvent] = field(repr=False)
     result_policy: Callable[[EvaluationResult], object] = field(repr=False)
     restore: Callable[[], None] = field(default=_nothing, repr=False)
+    resume_stop: Callable[[PendingEvaluation, StopEvent], None] | None = field(
+        default=None,
+        repr=False,
+    )
     continuation: Callable[[object], object] | None = field(default=None, repr=False)
     seal_messages: Callable[[], tuple[str, ...]] = field(default=_no_messages, repr=False)
     pin_lease: _CapturePinDispositionLease | Callable[[str], None] = field(
@@ -902,6 +910,8 @@ class CaptureEvaluationRequest:
             raise ValueError("evaluation callbacks must be callable")
         if self.continuation is not None and not callable(self.continuation):
             raise ValueError("continuation must be callable")
+        if self.resume_stop is not None and not callable(self.resume_stop):
+            raise ValueError("evaluation stop resume callback must be callable")
         if any(not isinstance(lease, CaptureCleanupLease) and not callable(lease)
                for lease in self.cleanup_leases):
             raise ValueError("cleanup must be a lease or callable")
@@ -1710,7 +1720,10 @@ class CaptureEvaluationCoordinator:
         context = CaptureStepContext(self, record)
         try:
             event = context.execute_inline(CaptureRemoteStep(
-                request.dispatch, request.poll, request.restore,
+                request.dispatch,
+                request.poll,
+                request.restore,
+                request.resume_stop,
             ))
         except _ShutdownStepSettled as settled:
             self._defer_shutdown(record, settled.disposition)
@@ -1902,7 +1915,27 @@ class CaptureEvaluationCoordinator:
                 raise _RemoteStepFailure(CapturePhase.RECOVERY_REQUIRED, code, uncertain=True) from None
             self._poll_evidence(record)
             if isinstance(event, StopEvent):
-                raise _RemoteStepFailure(CapturePhase.RECOVERY_REQUIRED, "unexpected_stop", uncertain=True)
+                if step.resume_stop is None:
+                    raise _RemoteStepFailure(
+                        CapturePhase.RECOVERY_REQUIRED,
+                        "unexpected_stop",
+                        uncertain=True,
+                    )
+                try:
+                    step.resume_stop(capability, event)
+                except TargetLost:
+                    raise _RemoteStepFailure(
+                        CapturePhase.STALE,
+                        "target_lost",
+                        uncertain=True,
+                    ) from None
+                except BaseException:
+                    raise _RemoteStepFailure(
+                        CapturePhase.RECOVERY_REQUIRED,
+                        "unexpected_stop",
+                        uncertain=True,
+                    ) from None
+                continue
             if not isinstance(event, EvaluationResult) or event.result_id != capability.result_id:
                 raise _RemoteStepFailure(CapturePhase.RECOVERY_REQUIRED, "evaluation_stream_failed", uncertain=True)
             with self._condition:

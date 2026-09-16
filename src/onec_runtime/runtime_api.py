@@ -655,6 +655,10 @@ class RuntimeController(Protocol):
 
     def execute_system_inspection(self, expression: str) -> object: ...
 
+    def ready_inspection_evaluation_owner(
+        self,
+    ) -> CaptureEvaluationCoordinator | None: ...
+
     def execute_system_capture(
         self,
         source: str,
@@ -1546,6 +1550,10 @@ class PrototypeRuntimeApi:
         owner = getattr(self._controller, "_capture_evaluation_coordinator", None)
         return owner if isinstance(owner, CaptureEvaluationCoordinator) else None
 
+    def _ready_inspection_control_owner(self) -> CaptureEvaluationCoordinator | None:
+        owner = self._controller.ready_inspection_evaluation_owner()
+        return owner if isinstance(owner, CaptureEvaluationCoordinator) else None
+
     def _require_capture_data_plane_admission(self) -> None:
         owner = self._capture_control_owner()
         if owner is None:
@@ -1623,7 +1631,12 @@ class PrototypeRuntimeApi:
                         evaluation_kind=CaptureEvaluationKind.INSPECTION,
                     )
                 else:
-                    wire = self._controller.execute_system_inspection(expression)
+                    # The controller adopts its ready-inspection ticket before
+                    # this handoff can release either outer writer.  Once the
+                    # ticket owns the pending capability, status/control-plane
+                    # callers must not wait behind the initiating caller.
+                    with self._capture_helper_writer_handoff():
+                        wire = self._controller.execute_system_inspection(expression)
             return self._parse_completion_fields_wire(wire)
 
     @staticmethod
@@ -5280,29 +5293,34 @@ class PrototypeRuntimeApi:
         if self._capture_shutdown_finished:
             return self._capture_shutdown_termination_proven
         owner = self._capture_control_owner()
-        if owner is None:
+        ready_owner = self._ready_inspection_control_owner()
+        if owner is None and ready_owner is None:
             self._capture_shutdown_finished = True
             self._capture_shutdown_termination_proven = True
             return True
-        shutdown = getattr(self._controller, "shutdown_capture_evaluation", None)
-        if callable(shutdown):
-            stopped = shutdown()
+        if ready_owner is not None:
+            stopped = self._controller.shutdown_capture_evaluation()
         else:
-            owner.begin_close()
-            session = getattr(self._controller, "session", None)
-            invalidate = getattr(session, "invalidate", None)
-            if callable(invalidate):
-                invalidate()
-            timeout_s = getattr(self._controller, "command_timeout_s", 1.0)
-            if (
-                isinstance(timeout_s, bool)
-                or not isinstance(timeout_s, (int, float))
-                or not isfinite(float(timeout_s))
-                or float(timeout_s) <= 0
-            ):
-                timeout_s = 1.0
-            stopped = owner.join(min(1.0, float(timeout_s)))
-            owner.finish_close(stopped)
+            shutdown = getattr(self._controller, "shutdown_capture_evaluation", None)
+            if callable(shutdown):
+                stopped = shutdown()
+            else:
+                assert owner is not None
+                owner.begin_close()
+                session = getattr(self._controller, "session", None)
+                invalidate = getattr(session, "invalidate", None)
+                if callable(invalidate):
+                    invalidate()
+                timeout_s = getattr(self._controller, "command_timeout_s", 1.0)
+                if (
+                    isinstance(timeout_s, bool)
+                    or not isinstance(timeout_s, (int, float))
+                    or not isfinite(float(timeout_s))
+                    or float(timeout_s) <= 0
+                ):
+                    timeout_s = 1.0
+                stopped = owner.join(min(1.0, float(timeout_s)))
+                owner.finish_close(stopped)
         self._capture_shutdown_finished = True
         self._capture_shutdown_termination_proven = bool(stopped)
         return self._capture_shutdown_termination_proven
