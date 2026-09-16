@@ -4,19 +4,39 @@ Only the external debugger session and target artifact transport are scripted.
 """
 from pathlib import Path
 import re
+from threading import Barrier, Event, RLock, Thread, current_thread
 
 import pytest
 
-from onec_runtime.errors import BslExecutionError, ProtocolError, WorkerPromotionOutcomeUnknown
+from onec_runtime.errors import (
+    BslExecutionError,
+    CaptureBusyError,
+    CaptureEvaluationPendingError,
+    CaptureOutcomeUnknownError,
+    CaptureRecoveryRequiredError,
+    ProtocolError,
+)
 from onec_runtime.prototype_runtime import PrototypeRuntimeController
 from onec_runtime.runtime_api import PrototypeRuntimeApi
 from onec_runtime.bsl.source_maps import SourceUnitKind, SourceUnitRef, source_sha256
 from onec_runtime.worker_universe import WorkerModuleArtifactBuilder, WorkerModuleArtifactCache
 
-from test_prototype_runtime import ScriptedSession, SERVICE, CAPTURE_A, CAPTURE_B, USER, evaluation
+from test_prototype_runtime import (
+    CAPTURE_A,
+    CAPTURE_B,
+    SERVICE,
+    USER,
+    ScriptedSession,
+    captured_controller,
+    evaluation,
+)
 from test_runtime_api import (
     _notebook_worker_builder, _UniverseInstructionExecutor,
     _SemanticSnapshotFailureTarget, _common_module_catalog, _worker_module_unit,
+)
+from test_capture_evaluation_lifecycle import (
+    ControlledCaptureSession,
+    close_owner,
 )
 
 
@@ -58,6 +78,231 @@ def runtime(tmp_path: Path, *, target=None, captured=False):
         user_breakpoints=(USER,) if captured else (),
     )
     return api, controller, session
+
+
+class _NotebookShell:
+    def __init__(self) -> None:
+        self.user_ns: dict[str, object] = {}
+
+
+def _session_backed_notebook_runtime(
+    api: PrototypeRuntimeApi,
+):  # type: ignore[no-untyped-def]
+    from onec_runtime.session import RuntimeSession
+
+    runtime = object.__new__(RuntimeSession)
+    runtime.runtime_api = api
+    runtime._operation_lock = RLock()
+    runtime._closed = False
+    return runtime
+
+
+def test_jupyter_magic_pending_user_bsl_detaches_core_ticket_and_keeps_controls_available(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The notebook waiter must not retain either Session/API writer lock."""
+
+    from onec_runtime.capture_evaluation import (
+        CaptureEvaluationState,
+        CaptureEvaluationTicket,
+        CapturePhase,
+    )
+    from onec_runtime_jupyter.extension import (
+        MACHINE_MIME_TYPE,
+        OnecRuntimeMagics,
+        install_runtime,
+    )
+
+    session = ControlledCaptureSession()
+    controller = captured_controller(session, command_timeout_s=30)
+    api = PrototypeRuntimeApi(
+        controller,
+        notebook_worker_builder=_notebook_worker_builder(tmp_path),
+    )
+    runtime = _session_backed_notebook_runtime(api)
+    shell = _NotebookShell()
+    install_runtime(shell, runtime)
+    magic = OnecRuntimeMagics(shell)  # type: ignore[arg-type]
+    result: list[object] = []
+    errors: list[BaseException] = []
+    finished = Event()
+    wait_handoff = Barrier(2)
+    release_initiator = Event()
+    original_wait = CaptureEvaluationTicket.wait_initiator
+
+    def held_wait(
+        ticket: CaptureEvaluationTicket,
+        timeout_s: float | None = None,
+    ) -> object:
+        assert timeout_s == 30
+        wait_handoff.wait(timeout=1)
+        assert release_initiator.wait(1)
+        return original_wait(ticket, timeout_s=0)
+
+    monkeypatch.setattr(CaptureEvaluationTicket, "wait_initiator", held_wait)
+
+    def execute() -> None:
+        try:
+            result.append(magic.bsl("", "РезультатИнструкции = 901;"))
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            finished.set()
+
+    initiator = Thread(target=execute, name="jupyter-user-bsl-initiator")
+    contender_done = Event()
+    contender_errors: list[BaseException] = []
+
+    def contend() -> None:
+        try:
+            runtime.execute_bsl("РезультатИнструкции = 902;")
+        except BaseException as error:
+            contender_errors.append(error)
+        finally:
+            contender_done.set()
+
+    contender = Thread(target=contend, name="jupyter-user-bsl-contender")
+    try:
+        initiator.start()
+        assert session.accepted.wait(1), "user BSL evaluation was not acknowledged"
+        wait_handoff.wait(timeout=1)
+        capture = runtime.current_capture()
+        status = capture.status()
+        assert status.phase is CapturePhase.EVALUATING
+        assert status.evaluation_kind.value == "user_bsl"
+        assert status.pending_evaluation_id is not None
+        assert re.fullmatch(
+            r"capture-eval-v1-[0-9a-f]{32}",
+            status.pending_evaluation_id,
+        )
+        assert capture.wait(timeout_s=0).state is CaptureEvaluationState.PENDING
+
+        contender.start()
+        assert contender_done.wait(1), "Session/API writer lock stayed with waiter"
+        assert len(contender_errors) == 1
+        assert isinstance(contender_errors[0], CaptureBusyError)
+        assert session.capture_start_count == 1
+
+        release_initiator.set()
+        assert finished.wait(1), "notebook command deadline did not detach waiter"
+        assert errors == []
+        assert len(result) == 1 and result[0] is not None
+        bundle = result[0]._repr_mimebundle_()  # type: ignore[union-attr]
+        expected_pending = (
+            f"evaluation_id={status.pending_evaluation_id}\n"
+            "evaluation_kind=user_bsl\n"
+            "runtime.current_capture().wait(timeout_s=10)"
+        )
+        assert bundle["text/plain"] == expected_pending  # type: ignore[index]
+        assert bundle["text/html"] == f"<pre>{expected_pending}</pre>"  # type: ignore[index]
+        assert (
+            bundle[MACHINE_MIME_TYPE]["evaluation_id"]
+            == status.pending_evaluation_id
+        )  # type: ignore[index]
+        assert (
+            bundle[MACHINE_MIME_TYPE]["evaluation_kind"] == "user_bsl"
+        )  # type: ignore[index]
+        assert api._poisoned_error is None
+        assert session.capture_start_count == 1
+
+        session.complete()
+        outcome = capture.wait(
+            timeout_s=1,
+            evaluation_id=status.pending_evaluation_id,
+        )
+        assert outcome.state is CaptureEvaluationState.COMPLETED
+        assert outcome.evaluation_id == status.pending_evaluation_id
+        assert session.capture_start_count == 1
+    finally:
+        release_initiator.set()
+        if session.capture_pending is not None:
+            session.complete()
+        initiator.join(1)
+        if contender.ident is not None:
+            contender.join(1)
+        close_owner(controller, session)
+
+
+def test_jupyter_magic_keyboard_interrupt_detaches_core_ticket_and_keeps_late_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from onec_runtime.capture_evaluation import (
+        CaptureEvaluationState,
+        CaptureEvaluationTicket,
+        CapturePhase,
+    )
+    from onec_runtime_jupyter.extension import OnecRuntimeMagics, install_runtime
+
+    session = ControlledCaptureSession()
+    controller = captured_controller(session, command_timeout_s=1)
+    api = PrototypeRuntimeApi(
+        controller,
+        notebook_worker_builder=_notebook_worker_builder(tmp_path),
+    )
+    runtime = _session_backed_notebook_runtime(api)
+    shell = _NotebookShell()
+    install_runtime(shell, runtime)
+    magic = OnecRuntimeMagics(shell)  # type: ignore[arg-type]
+    caller = current_thread()
+    original_wait = CaptureEvaluationTicket.wait_initiator
+
+    def interrupting_wait(
+        ticket: CaptureEvaluationTicket,
+        timeout_s: float | None = None,
+    ) -> object:
+        assert session.accepted.wait(1)
+        owner = ticket._coordinator
+        original_condition_wait = owner._condition.wait
+
+        def interrupt_after_acknowledgement(
+            wait_timeout: float | None = None,
+        ) -> bool:
+            if current_thread() is caller:
+                raise KeyboardInterrupt
+            return original_condition_wait(wait_timeout)
+
+        monkeypatch.setattr(
+            owner._condition,
+            "wait",
+            interrupt_after_acknowledgement,
+        )
+        try:
+            return original_wait(ticket, timeout_s)
+        finally:
+            monkeypatch.setattr(owner._condition, "wait", original_condition_wait)
+
+    monkeypatch.setattr(
+        CaptureEvaluationTicket,
+        "wait_initiator",
+        interrupting_wait,
+    )
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            magic.bsl("", "РезультатИнструкции = 903;")
+
+        capture = runtime.current_capture()
+        status = capture.status()
+        assert status.phase is CapturePhase.EVALUATING
+        assert status.evaluation_kind.value == "user_bsl"
+        assert status.evaluation_timing is not None
+        assert status.evaluation_timing.initiating_waiter_detached_ms is not None
+        assert api._poisoned_error is None
+        assert session.capture_start_count == 1
+
+        session.complete()
+        outcome = capture.wait(
+            timeout_s=1,
+            evaluation_id=status.pending_evaluation_id,
+        )
+        assert outcome.state is CaptureEvaluationState.COMPLETED
+        assert outcome.evaluation_id == status.pending_evaluation_id
+        assert session.capture_start_count == 1
+    finally:
+        if session.capture_pending is not None:
+            session.complete()
+        close_owner(controller, session)
 
 
 def paths(api):
@@ -174,13 +419,9 @@ def test_compile_invalid_worker_registration_is_not_recreated_by_value_guard(tmp
     registrations = api._worker_universe_target.privacy_registration_snapshot()
     assert set(registrations) == before
     assert len(api._worker_universe_target._registrations) > len(registrations)
-    target.public_value_guard_results.append(False)
-    api.require_public_value_handles(('Контекст.Число',))
-    guard_source = next(
-        source for source in reversed(target.sources)
-        if 'onec-worker-public-value-guard' in source
-    )
-    assert all(name in guard_source for name in registrations)
+    before_validation = list(target.sources)
+    assert api.validate_value_reference("Контекст.Число") == "Контекст.Число"
+    assert target.sources == before_validation
 
 
 @pytest.mark.parametrize('prepared', [False, True])
@@ -314,6 +555,250 @@ def test_prepared_capture_becomes_stale_after_notebook_publication(tmp_path):
         api.execute_prepared_capture_hypothesis(candidate)
 
 
+@pytest.mark.parametrize("uncertain", [False, True])
+def test_prepared_capture_coordinator_owns_pin_after_waiter_timeout(tmp_path, monkeypatch, uncertain):
+    from dataclasses import replace
+    from threading import Event, Thread, current_thread
+    from onec_runtime.capture_evaluation import CaptureEvaluationCoordinator, CapturePhase
+    from onec_runtime.errors import CaptureEvaluationPendingError
+    from onec_runtime.prototype_runtime import CaptureCellResult
+    from test_capture_evaluation_coordinator import Driver, FENCE
+
+    api, controller, _ = runtime(tmp_path, captured=True)
+    api.execute_bsl(UPDATE)
+    api.execute_bsl('Результат = Б();')
+    prepared = api.prepare_capture_hypothesis('РезультатИнструкции = Б();')
+    original_pin = api._operation_generation_pin
+    coordinator = CaptureEvaluationCoordinator(FENCE, poll_interval_s=0.01)
+    driver = Driver()
+    tickets = []
+    caller_finished = Event()
+    errors = []
+    pin_dispositions = []
+    for method_name in ('release_pin', 'retain_outcome_unknown'):
+        original = getattr(api._worker_universe, method_name)
+        def checked(pin, original=original, method_name=method_name):
+            assert not api._lock.locked()
+            assert not api._evaluation_pin_lock.locked()
+            assert not api._worker_universe_target._lock._is_owned()
+            pin_dispositions.append(method_name)
+            return original(pin)
+        monkeypatch.setattr(api._worker_universe, method_name, checked)
+    def submit(*, pin_lease, completion):
+        assert api._writer_owner == current_thread().ident
+        assert api._lock.locked(), "submission must retain runtime writer"
+        assert api._evaluation_generation_pin is None, "pin slot must detach before dispatch"
+        def settle(value, error):
+            return completion(CaptureCellResult(controller.operation_id, "visible", "lowered", value), error)
+        ticket = coordinator.submit_evaluation(replace(
+            driver.request(cleanup_leases=()), completion=settle, pin_lease=pin_lease,
+        ))
+        tickets.append(ticket)
+        return ticket
+    monkeypatch.setattr(api, '_execute_prepared_capture_handoff', lambda handoff: handoff.execute_owned(submit))
+    # The real public ticket wait detaches; only its default timeout is shortened.
+    from onec_runtime.capture_evaluation import CaptureEvaluationTicket
+    wait = CaptureEvaluationTicket.wait_initiator
+    monkeypatch.setattr(CaptureEvaluationTicket, 'wait_initiator', lambda ticket, timeout_s=None: wait(ticket, 0.01))
+    def caller():
+        try:
+            api.execute_prepared_capture_hypothesis(prepared)
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            caller_finished.set()
+    thread = Thread(target=caller)
+    thread.start()
+    try:
+        assert caller_finished.wait(1)
+        assert len(errors) == 1 and isinstance(errors[0], CaptureEvaluationPendingError), errors
+        assert api._poisoned_error is None
+        assert len(api._worker_universe._leases) == 2
+        assert api._evaluation_generation_pin is None
+        assert api._operation_generation_pin is original_pin
+        if uncertain:
+            driver.events.put(OSError('private disconnected stream'))
+        else:
+            driver.result()
+        outcome = coordinator.wait(FENCE, tickets[0].evaluation_id, timeout_s=1)
+        if uncertain:
+            assert coordinator.status(FENCE).phase == CapturePhase.RECOVERY_REQUIRED
+            assert sum(lease.outcome_unknown for lease in api._worker_universe._leases.values()) == 1
+        else:
+            assert outcome.result == 42
+            assert len(api._worker_universe._leases) == 1
+        assert pin_dispositions == ['retain_outcome_unknown' if uncertain else 'release_pin']
+    finally:
+        coordinator.begin_close()
+        driver.closed.set()
+        assert coordinator.join(2)
+        thread.join(2)
+        assert not thread.is_alive()
+
+
+@pytest.mark.parametrize("detach", ["timeout", "interrupt", "attached"])
+def test_owned_late_bsl_failure_records_dirty_roots_before_paused(tmp_path, monkeypatch, detach):
+    from dataclasses import replace
+    from threading import current_thread
+    from onec_runtime.capture_evaluation import CaptureEvaluationCoordinator, CaptureEvaluationState, CapturePhase
+    from onec_runtime.errors import CaptureEvaluationPendingError
+    from onec_runtime.prototype_runtime import CaptureCellResult
+    from test_capture_evaluation_coordinator import Driver, FENCE
+
+    api, controller, _ = runtime(tmp_path, captured=True)
+    api.execute_bsl(UPDATE)
+    api.execute_bsl('Результат = Б();')
+    context_before = controller.lowerer.persistent_names
+    prepared = api.prepare_capture_hypothesis(
+        'НовоеЗначение = 12; КонтекстОтладки.Скаляр = 778; ВызватьИсключение "synthetic failure";'
+    )
+    coordinator = CaptureEvaluationCoordinator(FENCE, poll_interval_s=0.01)
+    driver = Driver()
+    tickets, pin_observations = [], []
+    class Waiter:
+        def __init__(self, ticket):
+            self.ticket = ticket
+        def wait_initiator(self):
+            assert driver.polling.wait(1)
+            if detach == "attached":
+                driver.result(failed=True)
+            return self.ticket.wait_initiator(1 if detach == "attached" else 0.01)
+    def submit(*, pin_lease, completion):
+        def settle(value, error):
+            return completion(CaptureCellResult(controller.operation_id, "visible", "lowered", value), error)
+        def dispose(disposition):
+            pin_observations.append((
+                disposition, tuple(api._pending_dirty_roots.values()),
+                controller.lowerer.persistent_names, coordinator.status(FENCE).phase,
+            ))
+            pin_lease(disposition)
+        ticket = coordinator.submit_evaluation(replace(
+            driver.request(cleanup_leases=()), completion=settle, pin_lease=dispose,
+        ))
+        tickets.append(ticket)
+        return Waiter(ticket)
+    monkeypatch.setattr(api, '_execute_prepared_capture_handoff', lambda handoff: handoff.execute_owned(submit))
+    caller_thread = current_thread()
+    original_wait = coordinator._condition.wait
+    def interrupt_wait(timeout=None):
+        if current_thread() is caller_thread:
+            raise KeyboardInterrupt()
+        return original_wait(timeout)
+    try:
+        if detach == "interrupt":
+            monkeypatch.setattr(coordinator._condition, 'wait', interrupt_wait)
+        if detach == "attached":
+            reply = api.execute_prepared_capture_hypothesis(prepared)
+            assert not reply.succeeded
+            assert reply.capture_dirty_roots == ("Скаляр",)
+            assert reply.changed_roots == ("НовоеЗначение",)
+        else:
+            with pytest.raises(KeyboardInterrupt if detach == "interrupt" else CaptureEvaluationPendingError):
+                api.execute_prepared_capture_hypothesis(prepared)
+        monkeypatch.setattr(coordinator._condition, 'wait', original_wait)
+        if detach != "attached":
+            assert not api._pending_dirty_roots
+            driver.result(failed=True)
+        outcome = coordinator.wait(FENCE, tickets[0].evaluation_id, timeout_s=1)
+        assert outcome.state is CaptureEvaluationState.FAILED
+        assert outcome.diagnostic.code == "bsl_error"
+        assert pin_observations == [("release", ("Скаляр",), context_before, CapturePhase.EVALUATING)]
+        assert tuple(api._pending_dirty_roots.values()) == ("Скаляр",)
+        assert coordinator.status(FENCE).phase is CapturePhase.PAUSED
+        assert len(api._worker_universe._leases) == 1
+    finally:
+        coordinator.begin_close()
+        driver.closed.set()
+        assert coordinator.join(2)
+
+
+@pytest.mark.parametrize("window", ["notify", "adapter"])
+@pytest.mark.parametrize("error_type", [KeyboardInterrupt, RuntimeError])
+@pytest.mark.parametrize("late", ["success", "bsl_failure", "uncertain"])
+def test_owned_submit_interruption_keeps_accepted_record_owner(tmp_path, monkeypatch, window, error_type, late):
+    from dataclasses import replace
+    from threading import current_thread
+    from onec_runtime.capture_evaluation import CaptureEvaluationCoordinator, CapturePhase
+    from onec_runtime.prototype_runtime import CaptureCellResult
+    from test_capture_evaluation_coordinator import Driver, FENCE
+
+    api, controller, _ = runtime(tmp_path, captured=True)
+    api.execute_bsl(UPDATE)
+    api.execute_bsl('Результат = Б();')
+    context_before = controller.lowerer.persistent_names
+    prepared = api.prepare_capture_hypothesis('НовоеЗначение = 12; КонтекстОтладки.Скаляр = 778;')
+    coordinator = CaptureEvaluationCoordinator(FENCE, poll_interval_s=.01)
+    driver = Driver()
+    initiating = current_thread()
+    notify = coordinator._condition.notify_all
+    completions, disposals, continuations, cleanups = [], [], [], []
+
+    def interrupted_notify():
+        notify()
+        if current_thread() is initiating:
+            raise error_type('interrupted after acceptance')
+
+    def submit(*, pin_lease, completion):
+        def settle(value, error):
+            completions.append((current_thread(), error))
+            return completion(CaptureCellResult(controller.operation_id, 'visible', 'lowered', value), error)
+        # An adapter may wrap either callback. Acceptance must survive this.
+        def dispose(disposition):
+            assert not api._lock.locked()
+            assert not api._evaluation_pin_lock.locked()
+            disposals.append(disposition)
+            pin_lease(disposition)
+        ticket = coordinator.submit_evaluation(replace(
+            driver.request(cleanup_leases=(lambda: cleanups.append(current_thread()),)),
+            pin_lease=dispose, completion=settle,
+            continuation=lambda value: continuations.append(value),
+        ))
+        if window == 'adapter':
+            raise error_type('interrupted after acceptance')
+        return ticket
+
+    monkeypatch.setattr(api, '_execute_prepared_capture_handoff', lambda handoff: handoff.execute_owned(submit))
+    try:
+        if window == 'notify':
+            monkeypatch.setattr(coordinator._condition, 'notify_all', interrupted_notify)
+        with pytest.raises(error_type, match='after acceptance'):
+            api.execute_prepared_capture_hypothesis(prepared)
+        monkeypatch.setattr(coordinator._condition, 'notify_all', notify)
+        assert driver.polling.wait(1)
+        record = coordinator._active
+        assert record is not None and record.acknowledged
+        assert not record.initiator_attached
+        assert len(api._worker_universe._leases) == 2
+        assert not disposals and not completions and not cleanups
+        assert controller.lowerer.persistent_names != context_before
+        if late == 'uncertain':
+            driver.events.put(OSError('synthetic stream loss'))
+        else:
+            driver.result(failed=late == 'bsl_failure')
+        outcome = coordinator.wait(FENCE, record.evaluation_id, timeout_s=1)
+        assert driver.dispatch_count == 1
+        assert not continuations
+        assert len(completions) == 1 and completions[0][0] is coordinator._worker
+        if late == 'uncertain':
+            assert coordinator.status(FENCE).phase is CapturePhase.RECOVERY_REQUIRED
+            assert disposals == ['quarantine']
+            assert sum(lease.outcome_unknown for lease in api._worker_universe._leases.values()) == 1
+            assert not cleanups
+        else:
+            assert outcome.state.value == ('failed' if late == 'bsl_failure' else 'completed')
+            assert tuple(api._pending_dirty_roots.values()) == ('Скаляр',)
+            assert coordinator.status(FENCE).phase is CapturePhase.PAUSED
+            assert disposals == ['release'] and len(api._worker_universe._leases) == 1
+            assert cleanups == [coordinator._worker]
+        if late != 'success':
+            assert controller.lowerer.persistent_names == context_before
+    finally:
+        monkeypatch.setattr(coordinator._condition, 'notify_all', notify)
+        coordinator.begin_close()
+        driver.closed.set()
+        assert coordinator.join(2)
+
+
 def test_mixed_capture_added_name_uses_new_catalog_and_releases_cell_lease(tmp_path):
     api, _, session = runtime(tmp_path, captured=True)
     api.execute_bsl(UPDATE)
@@ -348,6 +833,12 @@ def test_known_capture_failure_releases_evaluation_lease_and_remains_captured(tm
 
 @pytest.mark.parametrize('prepared', [False, True])
 def test_unknown_capture_reply_retains_both_generation_leases_until_close(tmp_path, prepared):
+    from onec_runtime.capture_evaluation import (
+        CaptureEvaluationState,
+        CapturePhase,
+    )
+    from onec_runtime.prototype_runtime import OperationState
+
     api, _, session = runtime(tmp_path, captured=True)
     api.execute_bsl(UPDATE)
     api.execute_bsl('Результат = Б();')
@@ -356,16 +847,23 @@ def test_unknown_capture_reply_retains_both_generation_leases_until_close(tmp_pa
     source = 'РезультатИнструкции = В();'
     candidate = api.prepare_capture_hypothesis(source) if prepared else None
     session.lose_capture_reply = True
-    with pytest.raises(TimeoutError, match='transport loss'):
+    with pytest.raises(CaptureOutcomeUnknownError) as caught:
         if prepared:
             api.execute_prepared_capture_hypothesis(candidate)
         else:
             api.execute_bsl(source)
+    assert caught.value.diagnostic is not None
+    assert caught.value.diagnostic.code == 'dispatch_uncertain'
     assert api._operation_generation_pin is original
     assert len(api._worker_universe._leases) == 2
     assert sum(lease.outcome_unknown for lease in api._worker_universe._leases.values()) == 1
-    with pytest.raises(WorkerPromotionOutcomeUnknown):
-        api.status()
+    assert api.status().state is OperationState.RECOVERING
+    capture = api.current_capture()
+    capture_status = capture.status()
+    outcome = capture.wait(timeout_s=0)
+    assert capture_status.phase is CapturePhase.OUTCOME_UNKNOWN
+    assert outcome.state is CaptureEvaluationState.UNKNOWN
+    assert outcome.evaluation_id == caught.value.evaluation_id
     session.lose_capture_reply = False
     api.close()
     assert not api._worker_universe._leases
@@ -407,48 +905,68 @@ def test_prepared_capture_dispatch_admission_failure_releases_only_evaluation_le
     assert len(api._worker_universe._leases) == 1
 
 
+@pytest.mark.parametrize("error_type", [ProtocolError, BslExecutionError])
+def test_owned_capture_submission_rejection_restores_prepared_namespace(tmp_path, monkeypatch, error_type):
+    api, controller, _ = runtime(tmp_path, captured=True)
+    api.execute_bsl(UPDATE)
+    api.execute_bsl('Результат = Б();')
+    context_before = controller.lowerer.persistent_names
+    prepared = api.prepare_capture_hypothesis('НовоеЗначение = 12; КонтекстОтладки.Скаляр = 778;')
+    def reject(**kwargs):
+        raise error_type('rejected before record ownership')
+    monkeypatch.setattr(api, '_execute_prepared_capture_handoff', lambda handoff: handoff.execute_owned(reject))
+    if error_type is ProtocolError:
+        with pytest.raises(ProtocolError, match='before record ownership'):
+            api.execute_prepared_capture_hypothesis(prepared)
+    else:
+        assert not api.execute_prepared_capture_hypothesis(prepared).succeeded
+    assert controller.lowerer.persistent_names == context_before
+    assert not api._pending_dirty_roots
+    assert len(api._worker_universe._leases) == 1
+
+
+def test_owned_capture_rejection_disposes_pin_even_when_completion_fails():
+    from contextlib import nullcontext
+    from onec_runtime.runtime_api import _PreparedCaptureExecution
+    dispositions = []
+    def fail_completion(result, error):
+        raise RuntimeError('local completion failed')
+    def reject(**kwargs):
+        raise ProtocolError('rejected before record ownership')
+    handoff = _PreparedCaptureExecution(lambda: None, lambda: dispositions.append,
+                                        fail_completion, nullcontext)
+    with pytest.raises(RuntimeError, match='local completion failed'):
+        handoff.execute_owned(reject)
+    assert dispositions == ['release']
+
+
 @pytest.mark.parametrize('prepared', [False, True])
-@pytest.mark.parametrize('outcome', ['success', 'failure', 'unknown'])
-def test_pending_capture_evaluation_keeps_g2_across_debug_stops_and_resumes(tmp_path, prepared, outcome):
+def test_capture_evaluation_stop_requires_recovery_and_quarantines_g2(
+    tmp_path, prepared,
+):
     api, controller, session = runtime(tmp_path, captured=True)
     api.execute_bsl(UPDATE)
     api.execute_bsl('Результат = Б();')
     original = api._operation_generation_pin
     api.execute_bsl(THIRD)
-    if outcome == 'failure':
-        session.capture_evaluations.append(evaluation('Ошибка', '', error='planned pending failure'))
     user_stop = ScriptedSession((USER,)).stops[0]
     session.pending_evaluation_stops.append(user_stop)
     source = 'РезультатИнструкции = В();'
-    reply = (api.execute_prepared_capture_hypothesis(api.prepare_capture_hypothesis(source))
-             if prepared else api.execute_bsl(source))
-    assert reply.state.value == 'capture_debug_stopped'
-    evaluation_pin = api._evaluation_generation_pin
-    assert evaluation_pin is not None
-    assert evaluation_pin.handle is api.worker_generation_handle
-    assert evaluation_pin.handle is not original.handle
+    with pytest.raises(CaptureRecoveryRequiredError) as caught:
+        if prepared:
+            api.execute_prepared_capture_hypothesis(api.prepare_capture_hypothesis(source))
+        else:
+            api.execute_bsl(source)
+    assert caught.value.diagnostic is not None
+    assert caught.value.diagnostic.code == 'unexpected_stop'
+    assert controller.state.value == 'recovering'
+    assert api._evaluation_generation_pin is None
     assert len(api._worker_universe._leases) == 2
-    session.pending_evaluation_stops.append(user_stop)
-    repeated = api.resume_debug_stop()
-    assert repeated.state.value == 'capture_debug_stopped'
-    assert api._evaluation_generation_pin is evaluation_pin
+    assert sum(lease.outcome_unknown for lease in api._worker_universe._leases.values()) == 1
     assert api._operation_generation_pin is original
-
-    if outcome == 'unknown':
-        session.lose_capture_resume = True
-        with pytest.raises(TimeoutError, match='resume loss'):
-            api.resume_debug_stop()
-        assert len(api._worker_universe._leases) == 2
-        assert sum(lease.outcome_unknown for lease in api._worker_universe._leases.values()) == 1
-        with pytest.raises(WorkerPromotionOutcomeUnknown):
-            api.status()
-    else:
-        completed = api.resume_debug_stop()
-        assert completed.state.value == 'captured'
-        assert completed.succeeded == (outcome == 'success')
-        assert api._evaluation_generation_pin is None
-        assert len(api._worker_universe._leases) == 1
-    assert api._operation_generation_pin is original
+    with pytest.raises(CaptureRecoveryRequiredError):
+        controller.resume_debug_stop()
+    assert session.continue_count == 1
 
 
 @pytest.mark.parametrize('statements_only', [False, True])

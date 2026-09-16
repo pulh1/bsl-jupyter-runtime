@@ -15,6 +15,12 @@ from onec_runtime.bsl.diagnostics import (
     remap_platform_diagnostic,
 )
 from onec_runtime.bsl.preprocessor import preprocess_server_source
+from onec_runtime.bsl.module_syntax import (
+    MethodSyntaxInfo,
+    ModuleIdentity,
+    ModuleSyntaxIndex,
+    ModuleSyntaxRegistry,
+)
 from onec_runtime.bsl.semantic_lowering import (
     LoweringMode,
     MethodScope,
@@ -48,6 +54,10 @@ from onec_runtime.bsl.worker_projection_model import (
 )
 
 __all__ = [
+    "MethodSyntaxInfo",
+    "ModuleIdentity",
+    "ModuleSyntaxIndex",
+    "ModuleSyntaxRegistry",
     "DiagnosticCoordinateSpace",
     "DiagnosticStage",
     "LoweredSourceLocation",

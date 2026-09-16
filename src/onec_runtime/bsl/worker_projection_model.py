@@ -7,6 +7,7 @@ from enum import IntFlag
 import re
 
 from onec_runtime.bsl.source_maps import SourceSpan
+from onec_runtime.bsl.module_syntax import ModuleSyntaxIndex
 
 
 class BareNameKind(IntFlag):
@@ -97,6 +98,7 @@ class ParsedModuleModel:
     module_bare_names: tuple[BareName, ...]
     methods: tuple[ParsedMethodModel, ...]
     parser_identity: tuple[str, str] = field(compare=False, repr=False)
+    syntax_index: ModuleSyntaxIndex | None = field(default=None, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         if (
@@ -127,6 +129,12 @@ class ParsedModuleModel:
             )
         ):
             raise ValueError("parser_identity must contain two SHA-256 values")
+        if self.syntax_index is not None and (
+            type(self.syntax_index) is not ModuleSyntaxIndex
+            or self.syntax_index.source_sha256 != self.source_sha256
+            or self.syntax_index.parser_identity != self.parser_identity
+        ):
+            raise ValueError("syntax_index must match the model source and parser identity")
 
 
 __all__ = [

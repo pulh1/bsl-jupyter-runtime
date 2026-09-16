@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import re
+import os
+from collections import OrderedDict
+from threading import RLock
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
@@ -12,7 +15,15 @@ from uuid import UUID
 from xml.etree import ElementTree
 
 from onec_runtime.errors import ProtocolError
-from onec_runtime.kernel import COMMON_MODULE_PROPERTY_ID
+from onec_runtime.kernel import COMMON_MODULE_PROPERTY_ID, OBJECT_MODULE_PROPERTY_ID
+from onec_runtime.configuration_source import (
+    ConfigurationSourceLayout,
+    SourceLayer,
+    SourceRootBinding,
+    SourceTreeLayout,
+    local_name,
+    reject_links,
+)
 from onec_runtime.rdbg.models import ModuleLocation
 
 MAX_SOURCE_EXCERPT = 4_096
@@ -67,9 +78,18 @@ def _mapping(value: object, *, name: str, allowed: set[str]) -> Mapping[str, obj
 class CaptureSourceConfig:
     project: str
     source_root: Path | str
+    layer: SourceLayer | str = SourceLayer.AUTO
+    extension_name: str | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "source_root", Path(self.source_root).resolve())
+        object.__setattr__(self, "source_root", Path(self.source_root).absolute())
+        try:
+            layer = SourceLayer(self.layer)
+        except ValueError as error:
+            raise ProtocolError("configuration source layer is invalid") from error
+        if layer == SourceLayer.EXTENSION and not self.extension_name:
+            raise ProtocolError("configuration extension requires an explicit name")
+        object.__setattr__(self, "layer", layer)
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,8 +224,21 @@ class CommonModuleCaptureResolver:
         if not isinstance(project, str) or not project.isidentifier():
             raise ValueError("project must be an identifier")
         self.project = project
-        self.source_root = Path(source_root).resolve()
-        self.extension_name = self._designer_extension_name()
+        self.source_root = Path(source_root).absolute()
+        reject_links(self.source_root)
+        self._layout: ConfigurationSourceLayout | None = None
+        self.extension_name = ""
+        if self.source_root.exists():
+            self._layout = ConfigurationSourceLayout(self.source_root)
+            self.source_root = self._layout.normalized_root
+            if any(
+                path.is_file()
+                for path in (
+                    self.source_root / "Configuration.xml",
+                    self.source_root / "Configuration" / "Configuration.mdo",
+                )
+            ):
+                self.extension_name = self._layout.bind(project).extension_name or ""
 
     def resolve(
         self, points: Sequence[CapturePointRequest]
@@ -241,9 +274,7 @@ class CommonModuleCaptureResolver:
                     resolved,
                     ModuleLocation(
                         module_type=(
-                            "ExtensionModule"
-                            if self.extension_name
-                            else "ConfigModule"
+                            "ExtensionModule" if self.extension_name else "ConfigModule"
                         ),
                         url="",
                         object_id=source.object_id,
@@ -365,40 +396,6 @@ class CommonModuleCaptureResolver:
             raise ProtocolError("common-module procedure has no terminator")
         return tuple(regions)
 
-    def _designer_extension_name(self) -> str:
-        configuration_path = self.source_root / "Configuration.xml"
-        if not configuration_path.is_file():
-            return ""
-        try:
-            root = ElementTree.parse(configuration_path).getroot()
-            configuration = next(
-                element
-                for element in root.iter()
-                if element.tag.rsplit("}", 1)[-1] == "Configuration"
-            )
-            properties = next(
-                element
-                for element in configuration
-                if element.tag.rsplit("}", 1)[-1] == "Properties"
-            )
-            values = {
-                element.tag.rsplit("}", 1)[-1]: element.text or ""
-                for element in properties
-            }
-        except (OSError, ElementTree.ParseError, StopIteration) as error:
-            raise ProtocolError(
-                f"configuration source is invalid: {configuration_path}"
-            ) from error
-        if "ConfigurationExtensionPurpose" not in values:
-            return ""
-        name = values.get("Name", "")
-        try:
-            return _identifier(name, name="extension name")
-        except ValueError as error:
-            raise ProtocolError(
-                f"configuration extension name is invalid: {configuration_path}"
-            ) from error
-
     def _common_modules(self) -> Path:
         path = self.source_root / "CommonModules"
         if not path.is_dir():
@@ -406,18 +403,13 @@ class CommonModuleCaptureResolver:
         return path
 
     def _load_module(self, module_name: str) -> _ModuleSource:
+        _qualified_identifier(module_name, name="module")
         leaf_name = module_name.rsplit(".", 1)[-1]
-        module_root = self._common_modules() / leaf_name
-        edt_metadata = module_root / f"{leaf_name}.mdo"
-        edt_source = module_root / "Module.bsl"
-        designer_metadata = self._common_modules() / f"{leaf_name}.xml"
-        designer_source = module_root / "Ext" / "Module.bsl"
-        if edt_metadata.is_file() and edt_source.is_file():
-            metadata_path, source_path = edt_metadata, edt_source
-        elif designer_metadata.is_file() and designer_source.is_file():
-            metadata_path, source_path = designer_metadata, designer_source
-        else:
-            raise ProtocolError(f"common module source is missing: {module_name}")
+        if self._layout is None:
+            self._layout = ConfigurationSourceLayout(self.source_root)
+            self.source_root = self._layout.normalized_root
+        metadata_path = self._layout.metadata_path("CommonModules", leaf_name)
+        source_path = self._layout.module_path("CommonModules", leaf_name, "Module")
         try:
             root = ElementTree.parse(metadata_path).getroot()
             candidates = [
@@ -448,6 +440,384 @@ __all__ = [
     "CapturePointRequest",
     "CapturePointResolver",
     "CaptureSourceConfig",
+    "CaptureModuleResolver",
+    "CaptureModuleSource",
+    "CaptureSourceCatalog",
+    "CaptureSourceChangedError",
+    "CaptureSourceUnavailable",
+    "SourceVersionRef",
     "CommonModuleCaptureResolver",
     "ResolvedCapturePoint",
 ]
+
+
+class CaptureSourceChangedError(ProtocolError):
+    """The trusted export no longer has its pinned file signature."""
+
+
+@dataclass(frozen=True, slots=True)
+class SourceVersionRef:
+    """Immutable Worker text or a trusted export's observable file version.
+
+    File signatures are deliberately not runtime verification. Equal-sized
+    replacement content preserving modification time is outside this guarantee.
+    """
+
+    source_status: str
+    path: Path | None = None
+    size: int | None = None
+    mtime_ns: int | None = None
+    artifact_id: str | None = None
+    generation: int | None = None
+    source_sha256: str | None = None
+    _source_text: str | None = None
+
+    @classmethod
+    def trusted_export(cls, path: Path) -> SourceVersionRef:
+        reject_links(path)
+        signature = path.stat()
+        if not path.is_file():
+            raise ProtocolError("configuration source path is unavailable")
+        return cls("trusted_export", path, signature.st_size, signature.st_mtime_ns)
+
+    @classmethod
+    def worker(
+        cls, *, artifact_id: str, generation: int, source_text: str
+    ) -> SourceVersionRef:
+        if not artifact_id or type(generation) is not int or generation < 1:
+            raise ValueError("Worker source pin requires artifact and generation")
+        return cls(
+            "runtime_verified",
+            artifact_id=artifact_id,
+            generation=generation,
+            source_sha256=sha256(source_text.encode("utf-8")).hexdigest(),
+            _source_text=source_text,
+        )
+
+    def read_text(self) -> str:
+        if self.source_status == "runtime_verified":
+            if self._source_text is None:
+                raise ProtocolError("Worker source pin is unavailable")
+            return self._source_text
+        if self.path is None:
+            raise ProtocolError("configuration source pin is unavailable")
+        expected = (self.size, self.mtime_ns)
+        try:
+            reject_links(self.path)
+            with self.path.open("rb") as stream:
+                before = os.fstat(stream.fileno())
+                if (before.st_size, before.st_mtime_ns) != expected:
+                    raise CaptureSourceChangedError("source_changed")
+                content = stream.read()
+                after = os.fstat(stream.fileno())
+                # Also detect replacement of the path while the old file was open.
+                current = self.path.stat()
+                reject_links(self.path)
+                if (
+                    (after.st_size, after.st_mtime_ns) != expected
+                    or (current.st_size, current.st_mtime_ns) != expected
+                    or len(content) != self.size
+                ):
+                    raise CaptureSourceChangedError("source_changed")
+            return content.decode("utf-8-sig")
+        except (OSError, UnicodeError, ProtocolError) as error:
+            raise CaptureSourceChangedError("source_changed") from error
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureModuleSource:
+    binding: SourceRootBinding
+    canonical_name: str
+    module_kind: str
+    module_role: str
+    object_id: UUID
+    property_id: UUID
+    source_path: Path
+    line: int
+    source_version: SourceVersionRef
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureSourceUnavailable:
+    location: ModuleLocation
+    reason: str = "source_unavailable"
+
+
+@dataclass(frozen=True, slots=True)
+class _ModuleDescription:
+    name: str
+    object_id: UUID
+    kind: str
+    metadata_path: Path
+    signature: tuple[int, int]
+
+
+# An explicit kind/property table prevents a UUID in a different module role
+# from accidentally selecting a common-module source.
+_MODULE_ROLES = {
+    UUID(COMMON_MODULE_PROPERTY_ID): (
+        "CommonModules",
+        "CommonModule",
+        "Module",
+        "ОбщийМодуль",
+        "Модуль",
+    ),
+    UUID(OBJECT_MODULE_PROPERTY_ID): (
+        "Documents",
+        "Document",
+        "ObjectModule",
+        "Документ",
+        "МодульОбъекта",
+    ),
+}
+
+
+class CaptureModuleResolver:
+    """One bound configuration tree, scanned only for unresolved module kinds."""
+
+    def __init__(self, config: CaptureSourceConfig, *, cache_limit: int = 1024) -> None:
+        self.layout = ConfigurationSourceLayout(config.source_root)
+        self.binding = self.layout.bind(
+            config.project, layer=config.layer, extension_name=config.extension_name
+        )
+        self._descriptions: OrderedDict[Path, _ModuleDescription] = OrderedDict()
+        self._cache_limit = cache_limit
+
+    def _description(self, path: Path, kind: str) -> _ModuleDescription:
+        path = self.layout.safe_path(path)
+        stat = path.stat()
+        signature = (stat.st_size, stat.st_mtime_ns)
+        cached = self._descriptions.get(path)
+        if cached is not None and cached.signature == signature:
+            self._descriptions.move_to_end(path)
+            return cached
+        try:
+            document = ElementTree.fromstring(path.read_bytes())
+            owners = [node for node in document.iter() if local_name(node.tag) == kind]
+            if len(owners) != 1:
+                raise ValueError("metadata kind mismatch")
+            owner = owners[0]
+            object_id = UUID(owner.attrib["uuid"])
+            if self.binding.layout == SourceTreeLayout.DESIGNER:
+                properties = [
+                    node for node in owner if local_name(node.tag) == "Properties"
+                ]
+                if len(properties) != 1:
+                    raise ValueError("missing metadata properties")
+                owner = properties[0]
+            names = [
+                node.text or ""
+                for node in owner
+                if local_name(node.tag).casefold() == "name"
+            ]
+            if len(names) != 1 or not names[0].isidentifier() or names[0] != path.stem:
+                raise ValueError("metadata name mismatch")
+            name = names[0]
+        except (OSError, ValueError, KeyError, ElementTree.ParseError) as error:
+            raise ProtocolError("configuration module metadata is invalid") from error
+        result = _ModuleDescription(name, object_id, kind, path, signature)
+        self._descriptions[path] = result
+        self._descriptions.move_to_end(path)
+        while len(self._descriptions) > self._cache_limit:
+            self._descriptions.popitem(last=False)
+        return result
+
+    def resolve_batch(
+        self, requests: Sequence[ModuleLocation]
+    ) -> dict[tuple[UUID, UUID], _ModuleDescription]:
+        missing = {(item.object_id, item.property_id) for item in requests}
+        result: dict[tuple[UUID, UUID], _ModuleDescription] = {}
+        for description in tuple(self._descriptions.values()):
+            for property_id, (_directory, kind, *_role) in _MODULE_ROLES.items():
+                key = (description.object_id, property_id)
+                if description.kind == kind and key in missing:
+                    result[key] = description
+                    missing.remove(key)
+                    self._descriptions.move_to_end(description.metadata_path)
+        for property_id, (
+            directory,
+            kind,
+            _role,
+            _prefix,
+            _suffix,
+        ) in _MODULE_ROLES.items():
+            wanted = {key for key in missing if key[1] == property_id}
+            if not wanted:
+                continue
+            for path in self.layout.metadata_paths(directory):
+                description = self._description(path, kind)
+                key = (description.object_id, property_id)
+                if key in wanted:
+                    result[key] = description
+                    wanted.remove(key)
+                    if not wanted:
+                        break
+        return result
+
+    def refresh(self) -> None:
+        for path, description in tuple(self._descriptions.items()):
+            try:
+                self.layout.safe_path(path)
+                stat = path.stat()
+                unchanged = (stat.st_size, stat.st_mtime_ns) == description.signature
+            except (OSError, ProtocolError):
+                unchanged = False
+            if not unchanged:
+                del self._descriptions[path]
+
+    def materialize(
+        self, description: _ModuleDescription, location: ModuleLocation
+    ) -> CaptureModuleSource:
+        directory, kind, role, prefix, suffix = _MODULE_ROLES[location.property_id]
+        path = self.layout.module_path(directory, description.name, role)
+        return CaptureModuleSource(
+            self.binding,
+            f"{prefix}.{description.name}.{suffix}",
+            kind,
+            role,
+            location.object_id,
+            location.property_id,
+            path,
+            location.line,
+            SourceVersionRef.trusted_export(path),
+        )
+
+
+class CaptureSourceCatalog:
+    """Bounded session-local positive/negative mappings, with explicit refresh."""
+
+    def __init__(
+        self, configs: Sequence[CaptureSourceConfig], *, cache_limit: int = 1024
+    ) -> None:
+        if type(cache_limit) is not int or cache_limit < 1:
+            raise ValueError("capture source cache limit must be positive")
+        self._resolvers = tuple(
+            CaptureModuleResolver(config, cache_limit=cache_limit) for config in configs
+        )
+        self._cache_limit = cache_limit
+        self.generation = 1
+        self._cache: OrderedDict[
+            tuple[SourceRootBinding, int, str, UUID, UUID], _ModuleDescription | None
+        ] = OrderedDict()
+        self._lock = RLock()
+
+    @property
+    def cache_size(self) -> int:
+        with self._lock:
+            return len(self._cache)
+
+    @property
+    def bindings(self) -> tuple[SourceRootBinding, ...]:
+        return tuple(resolver.binding for resolver in self._resolvers)
+
+    def _key(
+        self, resolver: CaptureModuleResolver, location: ModuleLocation
+    ) -> tuple[SourceRootBinding, int, str, UUID, UUID]:
+        return (
+            resolver.binding,
+            self.generation,
+            location.module_type,
+            location.object_id,
+            location.property_id,
+        )
+
+    def _put(
+        self,
+        key: tuple[SourceRootBinding, int, str, UUID, UUID],
+        value: _ModuleDescription | None,
+    ) -> None:
+        self._cache[key] = value
+        self._cache.move_to_end(key)
+        while len(self._cache) > self._cache_limit:
+            self._cache.popitem(last=False)
+
+    def refresh(self) -> None:
+        with self._lock:
+            self.generation += 1
+            for resolver in self._resolvers:
+                resolver.refresh()
+            previous = tuple(self._cache.items())
+            self._cache.clear()
+            for (
+                binding,
+                _generation,
+                module_type,
+                object_id,
+                property_id,
+            ), description in previous:
+                if description is None:
+                    continue
+                try:
+                    reject_links(description.metadata_path)
+                    stat = description.metadata_path.stat()
+                except (OSError, ProtocolError):
+                    continue
+                if (stat.st_size, stat.st_mtime_ns) == description.signature:
+                    self._put(
+                        (binding, self.generation, module_type, object_id, property_id),
+                        description,
+                    )
+
+    def resolve_modules(
+        self, locations: Sequence[ModuleLocation]
+    ) -> tuple[CaptureModuleSource | CaptureSourceUnavailable, ...]:
+        with self._lock:
+            chosen: list[CaptureModuleResolver | None] = []
+            batches: dict[CaptureModuleResolver, list[ModuleLocation]] = {}
+            descriptions: dict[
+                tuple[SourceRootBinding, int, str, UUID, UUID],
+                _ModuleDescription | None,
+            ] = {}
+            for location in locations:
+                matches = (
+                    [
+                        resolver
+                        for resolver in self._resolvers
+                        if (
+                            (resolver.binding.extension_name or "")
+                            == location.extension_name
+                            and location.module_type
+                            == (
+                                "ExtensionModule"
+                                if resolver.binding.layer == SourceLayer.EXTENSION
+                                else "ConfigModule"
+                            )
+                        )
+                    ]
+                    if location.property_id in _MODULE_ROLES
+                    else []
+                )
+                # More than one configured project with this layer is ambiguous;
+                # physical debugger coordinates do not carry project identity.
+                resolver = matches[0] if len(matches) == 1 else None
+                chosen.append(resolver)
+                if resolver is None:
+                    continue
+                key = self._key(resolver, location)
+                if key in self._cache:
+                    descriptions[key] = self._cache[key]
+                    self._cache.move_to_end(key)
+                else:
+                    batches.setdefault(resolver, []).append(location)
+            for resolver, batch in batches.items():
+                found = resolver.resolve_batch(batch)
+                for location in batch:
+                    key = self._key(resolver, location)
+                    value = found.get((location.object_id, location.property_id))
+                    descriptions[key] = value
+                    self._put(key, value)
+            result: list[CaptureModuleSource | CaptureSourceUnavailable] = []
+            for resolver, location in zip(chosen, locations, strict=True):
+                description = (
+                    descriptions.get(self._key(resolver, location))
+                    if resolver
+                    else None
+                )
+                if resolver is None or description is None:
+                    result.append(CaptureSourceUnavailable(location))
+                else:
+                    try:
+                        result.append(resolver.materialize(description, location))
+                    except (OSError, ProtocolError):
+                        result.append(CaptureSourceUnavailable(location))
+            return tuple(result)

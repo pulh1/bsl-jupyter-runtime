@@ -24,7 +24,7 @@ from onec_runtime.extension_bundle import (
 from onec_runtime.extension_state import ExtensionStateStore, VerifiedExtensionState
 from onec_runtime.performance_profile import PhaseRecorder
 from onec_runtime.processes import FileModeProcesses, OwnedProcess
-from onec_runtime.session import RuntimeSession, RuntimeSessionConfig
+from onec_runtime.session import ExtensionMode, RuntimeSession, RuntimeSessionConfig
 from onec_runtime.toolchain import (
     apply_product_extension,
     create_empty_infobase,
@@ -312,9 +312,160 @@ def _build_variant(
     )
 
 
+def _build_table_bound_instrumented_bundle(
+    root: Path,
+    platform: Path,
+    *,
+    move_serializer_guard_after_read: bool,
+):  # type: ignore[no-untyped-def]
+    """Build an exact-source CFE with probes after each bounded BSL cell read."""
+    source = _copy_source(root)
+    module = source / "CommonModules" / "RuntimeTableTransferServer" / "Ext" / "Module.bsl"
+    text = module.read_text(encoding="utf-8-sig")
+    classifier_start = text.index("Функция ОпределитьКомпактнуюСхемуКолонок")
+    before_classifier, classifier = text[:classifier_start], text[classifier_start:]
+    serializer_read = "\t\t\tЗначениеЯчейки = СтрокаТаблицы[Колонка.Имя];"
+    serializer_probe = serializer_read + (
+        "\n\t\t\tЕсли ЗначениеЯчейки = \"__table_bound_sentinel__\" Тогда"
+        "\n\t\t\t\tВызватьИсключение \"out_of_page_serializer_cell_read\";"
+        "\n\t\t\tКонецЕсли;"
+    )
+    assert before_classifier.count(serializer_read) == 1
+    before_classifier = before_classifier.replace(serializer_read, serializer_probe, 1)
+    classifier_read = "\t\t\tЗначениеЯчейки = СтрокаТаблицы[Колонка.Имя];"
+    classifier_probe = classifier_read + (
+        "\n\t\t\tЕсли ЗначениеЯчейки = \"__table_bound_sentinel__\" Тогда"
+        "\n\t\t\t\tВызватьИсключение \"out_of_page_classifier_cell_read\";"
+        "\n\t\t\tКонецЕсли;"
+    )
+    assert classifier.count(classifier_read) == 1
+    classifier = classifier.replace(classifier_read, classifier_probe, 1)
+    query_read = (
+        "\t\t\tСтрокаРезультата[КолонкаРезультата.Имя]"
+        "\n\t\t\t\t= ВыборкаДанных[КолонкаРезультата.Имя];"
+    )
+    query_probe = (
+        "\t\t\tЕсли ВыборкаДанных[КолонкаРезультата.Имя]"
+        " = \"__table_bound_sentinel__\" Тогда"
+        "\n\t\t\t\tВызватьИсключение \"out_of_page_query_cell_read\";"
+        "\n\t\t\tКонецЕсли;\n"
+        + query_read
+    )
+    instrumented = before_classifier + classifier
+    if move_serializer_guard_after_read:
+        serializer_guard = (
+            "\t\tЕсли МаксимумСтрок > 0 И КоличествоСтрокJSONL >= МаксимумСтрок Тогда\n"
+            "\t\t\tВызватьИсключение \"Превышен лимит строк компактной таблицы\";\n"
+            "\t\tКонецЕсли;\n"
+        )
+        moved_guard = (
+            "\n\t\t\tЕсли МаксимумСтрок > 0 И КоличествоСтрокJSONL >= МаксимумСтрок Тогда\n"
+            "\t\t\t\tВызватьИсключение \"Превышен лимит строк компактной таблицы\";\n"
+            "\t\t\tКонецЕсли;"
+        )
+        assert instrumented.count(serializer_guard) == 1
+        instrumented = instrumented.replace(serializer_guard, "", 1)
+        assert instrumented.count(serializer_probe) == 1
+        instrumented = instrumented.replace(
+            serializer_probe, serializer_probe + moved_guard, 1
+        )
+    assert instrumented.count(query_read) == 1
+    module.write_text(
+        instrumented.replace(query_read, query_probe, 1),
+        encoding="utf-8",
+        newline="\n",
+    )
+    return build_runtime_extension_bundle(
+        source_root=source,
+        output_root=root / "bundle",
+        platform_bin=platform,
+        artifact_version="0.1.3",
+        protocol_version="2",
+    )
+
+
 def _install_cfe(config: RuntimeConfig, cfe: Path, root: Path) -> None:
     load_target_extension_cfe(config, cfe, root / "load.log")
     apply_product_extension(config, root / "apply.log")
+
+
+@pytest.mark.live_1c
+@pytest.mark.parametrize(
+    ("move_serializer_guard_after_read", "expected"),
+    ((False, "bounded|bounded"), (True, "serializer_probe|bounded")),
+    ids=("bounded", "guard_after_read_is_detected"),
+)
+def test_compact_table_bound_is_executed_before_value_table_and_query_sentinel_cells(
+    tmp_path: Path,
+    _track_owned_runtime_processes: _OwnedProcessTracker,
+    move_serializer_guard_after_read: bool,
+    expected: str,
+) -> None:
+    """Opt-in live qualification of the instrumented product BSL CFE, not a unit model."""
+    platform = _platform_bin()
+    bundle = _build_table_bound_instrumented_bundle(
+        tmp_path / "instrumented",
+        platform,
+        move_serializer_guard_after_read=move_serializer_guard_after_read,
+    )
+    config = _config(tmp_path / "target", platform)
+    create_empty_infobase(config)
+    _install_cfe(config, bundle.cfe_path, tmp_path / "install")
+    session = RuntimeSession.start(RuntimeSessionConfig(
+        config, tmp_path / "evidence", extension_mode=ExtensionMode.MANUAL
+    ))
+    try:
+        reply = session.execute_bsl('''
+Таблица = Новый ТаблицаЗначений;
+Таблица.Колонки.Добавить("Значение", Новый ОписаниеТипов("Строка"));
+Для Номер = 0 По 9999 Цикл
+    СтрокаТаблицы = Таблица.Добавить();
+    СтрокаТаблицы.Значение = ?(Номер = 3, "__table_bound_sentinel__", "safe");
+КонецЦикла;
+
+ПроверкаТаблицыЗначений = "";
+Попытка
+    Материализация = RuntimeTableTransferServer.СериализоватьКомпактнуюТаблицу(
+        Таблица, "presentation", Новый Соответствие, Новый Массив, 3, 1000000);
+    ПроверкаТаблицыЗначений = ?(Материализация.Доступ, "unexpected_success", "denied");
+Исключение
+    ОписаниеОшибки = ИнформацияОбОшибке().Описание;
+    Если ОписаниеОшибки = "Превышен лимит строк компактной таблицы" Тогда
+        ПроверкаТаблицыЗначений = "bounded";
+    ИначеЕсли ОписаниеОшибки = "out_of_page_serializer_cell_read" Тогда
+        ПроверкаТаблицыЗначений = "serializer_probe";
+    Иначе
+        ПроверкаТаблицыЗначений = "failed";
+    КонецЕсли;
+КонецПопытки;
+
+Запрос = Новый Запрос;
+Запрос.Текст = "ВЫБРАТЬ
+|    \"\"safe\"\" КАК Значение
+|ОБЪЕДИНИТЬ ВСЕ
+|ВЫБРАТЬ
+|    \"\"safe\"\" КАК Значение
+|ОБЪЕДИНИТЬ ВСЕ
+|ВЫБРАТЬ
+|    \"\"safe\"\" КАК Значение
+|ОБЪЕДИНИТЬ ВСЕ
+|ВЫБРАТЬ
+|    \"\"__table_bound_sentinel__\"\" КАК Значение";
+ПроверкаЗапроса = "";
+Попытка
+    МатериализацияЗапроса = RuntimeTableTransferServer.СериализоватьКомпактнуюТаблицу(
+        Запрос.Выполнить(), "presentation", Новый Соответствие, Новый Массив, 3, 1000000);
+    ПроверкаЗапроса = ?(МатериализацияЗапроса.Доступ, "bounded", "denied");
+Исключение
+    ПроверкаЗапроса = "failed";
+КонецПопытки;
+Результат = ПроверкаТаблицыЗначений + "|" + ПроверкаЗапроса;''')
+    finally:
+        session.close()
+
+    assert reply.succeeded
+    assert reply.result == expected
+    _assert_no_owned_1c_process(config, _track_owned_runtime_processes)
 
 
 def test_minimal_first_install_then_structural_fast_path(

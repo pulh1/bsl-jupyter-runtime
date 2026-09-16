@@ -1,20 +1,55 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
+from base64 import b64decode
+import binascii
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from hashlib import sha256
+from inspect import Parameter, signature
+import json
 from math import isfinite
 from pathlib import Path
-from threading import Lock, get_ident
+from threading import Lock, RLock, get_ident, local
 from time import monotonic
-from typing import Callable, Iterator, Protocol
+from types import MappingProxyType
+from typing import Callable, Iterator, Protocol, TypeVar
 import re
 from uuid import UUID, uuid4
 from weakref import WeakKeyDictionary
 
 import pandas as pd
+
+from onec_runtime.capture_evaluation import (
+    AdmissionEnvelopeV1,
+    CaptureEvaluationCoordinator,
+    CaptureEvaluationKind,
+    CaptureFence,
+    CaptureEvaluationTicket,
+    CapturePhase,
+    CaptureResumeTicket,
+    CaptureTransferPlan,
+    _CapturePinDispositionLease,
+    _CaptureResumeSubmission,
+    _CaptureSubmission,
+)
+from onec_runtime.capture_inspection import (
+    CaptureView,
+    DebugFrame,
+    LocalStackAdapter,
+    ResolvedFrameSource,
+)
+from onec_runtime.capture_values import (
+    CaptureValueBackend,
+    CaptureValuePolicy,
+    LocalCaptureValueAdapter,
+    PrivateProjectedValue,
+    PrivateValueProjection,
+    SafeValuePath,
+    ValueInspectionRequest,
+)
+from onec_runtime.capture_source import SourceVersionRef
 
 from onec_runtime.bsl import (
     DiagnosticStage,
@@ -47,6 +82,11 @@ from onec_runtime.bsl.module_universe import (
     lower_resolved_worker_module,
 )
 from onec_runtime.bsl.module_catalog import SessionCommonModuleCatalog
+from onec_runtime.bsl.module_syntax import (
+    ModuleIdentity,
+    ModuleSyntaxIndex,
+    ModuleSyntaxRegistry,
+)
 from onec_runtime.bsl.parser_target import BslParseError
 from onec_runtime.bsl.notebook_cells import NotebookCellProjection
 from onec_runtime.bsl.notebook_method_globals import bind_notebook_method_globals
@@ -70,13 +110,22 @@ from onec_runtime.runtime_contracts import OperationExecutionProvenance
 from onec_runtime.compact_table import decode_compact_table_payload
 from onec_runtime.compact_table_backend import (
     CompactRuntimeTableTransfer,
-    infer_compact_columns,
-    infer_declared_compact_columns,
 )
 from onec_runtime.errors import (
     BslExecutionError,
+    CaptureBusyError,
+    CaptureEvaluationPendingError,
+    CaptureInspectionTimeout,
+    CaptureOutcomeUnknownError,
+    CaptureRecoveryRequiredError,
+    CaptureSourceUnavailableError,
+    CaptureValueAccessDeniedError,
+    CaptureValueCheckError,
+    CommandTimeout,
+    NoActiveCaptureError,
     PoisonedRuntimeError,
     ProtocolError,
+    StaleCaptureError,
     StaleWorkerGeneration,
     WorkerPromotionOutcomeUnknown,
 )
@@ -96,7 +145,7 @@ from onec_runtime.prototype_runtime import (
     ContinuationAttemptSpec,
 )
 from onec_runtime.performance_profile import PhaseRecorder
-from onec_runtime.rdbg.models import ModuleLocation
+from onec_runtime.rdbg.models import ModuleLocation, StackFrame
 from onec_runtime.recovery_journal import RecoveryJournal
 from onec_runtime.server_worker import (
     NotebookWorkerArtifactBuilder,
@@ -113,6 +162,7 @@ from onec_runtime.worker_universe import (
     WorkerModuleArtifactBuilder,
     WorkerUniverseCandidate,
     WorkerUniverseRegistry,
+    WorkerUniverseState,
     worker_module_artifact_from_notebook,
 )
 from onec_runtime.worker_breakpoints import (
@@ -125,7 +175,9 @@ from onec_runtime.worker_breakpoints import (
     WorkerBreakpointReloadReport,
     WorkerBreakpointStatus,
     WorkerSourceLocation,
+    map_generated_line,
     map_worker_stop,
+    require_exact_worker_module_or_native,
 )
 from onec_runtime.value_materialization import (
     MaterializationOptions,
@@ -140,6 +192,38 @@ from onec_runtime.value_transfer_backend import (
 MAX_PROJECTION_POSITION = 10_000_000
 _BSL_EXECUTION_FAILURE_SUMMARY = "BSL execution failed"
 _RESERVED_WORKER_ROOT_CONTEXT_SLOT = "RuntimeWorkerPinnedOperationGeneration"
+_WorkerSnapshotT = TypeVar("_WorkerSnapshotT")
+
+
+def _retain_live_worker_generation_snapshots(
+    snapshots: Mapping[WorkerGenerationHandle, _WorkerSnapshotT],
+    live_handles: frozenset[WorkerGenerationHandle],
+) -> dict[WorkerGenerationHandle, _WorkerSnapshotT]:
+    return {
+        handle: snapshot
+        for handle, snapshot in snapshots.items()
+        if handle in live_handles
+    }
+
+
+def _no_capture_primary_execution() -> None:
+    return None
+
+
+def _identity_capture_error(error: BslExecutionError) -> BslExecutionError:
+    return error
+
+
+def _accepts_capture_execution_callbacks(callback: Callable[..., object]) -> bool:
+    try:
+        parameters = signature(callback).parameters.values()
+    except (TypeError, ValueError):
+        return True
+    names = {parameter.name for parameter in parameters}
+    return (
+        any(parameter.kind is Parameter.VAR_KEYWORD for parameter in parameters)
+        or {"primary_execution", "normalize_error"} <= names
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +233,13 @@ class _ActiveWorkerModule:
     plan: ResolvedModulePlan
     semantic_plan_key: tuple[object, ...]
     artifact: WorkerModuleArtifact
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _WorkerStackSource:
+    source: str
+    identity: ModuleIdentity
+    version: SourceVersionRef
 
 
 class RuntimeReplyKind(Enum):
@@ -517,10 +608,6 @@ class RuntimeController(Protocol):
     operation_id: int
     state: OperationState
 
-    def inspect_completion_fields(
-        self, handle: str, *, table_row: bool
-    ) -> EvaluationResult: ...
-
     def execute_main(
         self,
         source: str,
@@ -535,7 +622,7 @@ class RuntimeController(Protocol):
         source: str,
         *,
         on_transport_dispatch: Callable[[], None] | None = None,
-    ) -> CaptureCellResult | DebugStop: ...
+    ) -> CaptureCellResult | CaptureEvaluationTicket: ...
 
     def execute_mapped_main(
         self,
@@ -562,13 +649,24 @@ class RuntimeController(Protocol):
         worker_messages: bool = False,
         dirty_roots: tuple[str, ...] = (),
         on_transport_dispatch: Callable[[], None] | None = None,
-    ) -> CaptureCellResult | DebugStop: ...
+    ) -> CaptureCellResult | CaptureEvaluationTicket: ...
 
     def execute_system_main(self, source: str) -> MainCompletion: ...
 
+    def execute_system_inspection(self, expression: str) -> object: ...
+
+    def owns_debug_ui_stream(self) -> bool: ...
+
+    def ready_inspection_evaluation_owner(
+        self,
+    ) -> CaptureEvaluationCoordinator | None: ...
+
     def execute_system_capture(
-        self, source: str
-    ) -> CaptureCellResult | DebugStop: ...
+        self,
+        source: str,
+        *,
+        evaluation_kind: CaptureEvaluationKind,
+    ) -> CaptureCellResult | CaptureEvaluationTicket: ...
 
     def install_capture_worker_generation_pin(
         self,
@@ -581,19 +679,24 @@ class RuntimeController(Protocol):
 
     def drop_context_value(self, key: str) -> None: ...
 
-    def resume(
+    def submit_resume(
         self,
         *,
         dirty_roots: tuple[str, ...] = (),
         continuation_attempt_id: str | None = None,
         on_transport_dispatch: Callable[[], None] | None = None,
-    ) -> MainCompletion | CapturedStop | DebugStop: ...
+        completion: Callable[[object | None, BaseException | None], object] | None = None,
+        detached_completion: Callable[
+            [object | None, BaseException | None], None
+        ] | None = None,
+        before_resume: Callable[[object], None] | None = None,
+    ) -> CaptureResumeTicket: ...
 
     def resume_debug_stop(
         self,
         *,
         on_transport_dispatch: Callable[[], None] | None = None,
-    ) -> MainCompletion | CapturedStop | CaptureCellResult | DebugStop: ...
+    ) -> MainCompletion | CapturedStop | DebugStop: ...
 
     def rearm_capture_successor(
         self, capture_points: tuple[ModuleLocation, ...]
@@ -618,10 +721,26 @@ class RuntimeController(Protocol):
         self, *, cursor: int, limit: int, timeout_s: float | None = None,
     ) -> Mapping[str, object]: ...
 
+    def capture_stack_inventory(
+        self, *, timeout_s: float | None = None,
+    ) -> tuple[StackFrame, ...]: ...
+
     def capture_frame(
         self, *, level: int, cursor: int, limit: int,
         name: str | None = None, timeout_s: float | None = None,
     ) -> Mapping[str, object]: ...
+
+    def capture_value_inspection(
+        self,
+        action: str,
+        *,
+        path: SafeValuePath | None,
+        request: ValueInspectionRequest | None,
+        limit: int | None,
+        worker_type_registrations: tuple[str, ...],
+        context_generation: int = 1,
+        timeout_s: float | None = None,
+    ) -> object: ...
 
     def resolve_capture_manager_origin(
         self, root: str, fields: tuple[str, ...], *,
@@ -724,6 +843,114 @@ class _RuntimeContinuationAdmission:
             self._closed = True
 
 
+@dataclass(slots=True, repr=False)
+class _PreparedCaptureExecution:
+    """Prepared controller call with an explicit, one-way ownership handoff.
+
+    The synchronous controller retains its existing behavior. A coordinator
+    adapter consumes execute_owned and then owns pin disposition and mandatory
+    completion independently of the waiting caller.
+    """
+
+    execute: Callable[[], object]
+    detach_pin: Callable[[], Callable[[str], None]]
+    completion: Callable[[object, BaseException | None], object]
+    release_writer: Callable[[], AbstractContextManager[None]]
+    release_waiter: Callable[[], AbstractContextManager[None]] = nullcontext
+    primary_execution: Callable[[], None] = _no_capture_primary_execution
+    normalize_error: Callable[[BslExecutionError], BslExecutionError] = (
+        _identity_capture_error
+    )
+    transferred: bool = False
+    rejection: Callable[[BaseException], object] | None = None
+    submitted: bool = False
+
+    def execute_sync(self) -> object:
+        if self.transferred:
+            raise ProtocolError("Prepared CAPTURE execution was already transferred")
+        return self.execute()
+
+    def execute_owned(self, submit: Callable[..., CaptureEvaluationTicket]) -> object:
+        if self.transferred:
+            raise ProtocolError("Prepared CAPTURE execution was already transferred")
+        submission = _CaptureSubmission()
+        lease = self.detach_pin()
+        self.transferred = True
+        try:
+            ownership: dict[str, object] = {
+                "pin_lease": lease,
+                "completion": self.completion,
+            }
+            if _accepts_capture_execution_callbacks(submit):
+                ownership.update(
+                    primary_execution=self.primary_execution,
+                    normalize_error=self.normalize_error,
+                )
+            ticket = submission.submit(submit, **ownership)
+            self.submitted = True
+            with self.release_writer():
+                with self.release_waiter():
+                    return ticket.wait_initiator()
+        except BaseException as error:
+            if submission.ticket is not None:
+                self.submitted = True
+                submission.detach_initiator()
+                raise
+            try:
+                if self.rejection is not None:
+                    self.rejection(error)
+                else:
+                    self.completion(None, error)
+            finally:
+                lease("release")
+            raise
+
+
+class _RuntimeStackInventoryBackend:
+    __slots__ = ("_runtime",)
+
+    def __init__(self, runtime: PrototypeRuntimeApi) -> None:
+        self._runtime = runtime
+
+    def read_stack(self, fence: object) -> tuple[StackFrame, ...]:
+        if not isinstance(fence, CaptureFence):
+            raise StaleCaptureError()
+        return self._runtime._read_capture_stack_inventory(fence)
+
+
+class _RuntimeCaptureValueBackend(CaptureValueBackend):
+    """Fence-owning bridge from saved value descriptors to RuntimeApi.
+
+    Constructing a descriptor deliberately does no target work.  Each adapter
+    call re-enters the RuntimeApi data plane, validates the exact stop fence,
+    and delegates the actual target-side projection to the controller's
+    coordinator-owned inspection seam.
+    """
+
+    __slots__ = ("_runtime",)
+
+    def __init__(self, runtime: PrototypeRuntimeApi) -> None:
+        self._runtime = runtime
+
+    def validate_inspection(self, fence: object) -> None:
+        self._runtime._validate_capture_value_inspection(fence)
+
+    def resolve_value(
+        self, fence: object, path: SafeValuePath,
+    ) -> PrivateProjectedValue:
+        return self._runtime._capture_value_resolve(fence, path)
+
+    def project_values(
+        self, fence: object, request: ValueInspectionRequest,
+    ) -> PrivateValueProjection:
+        return self._runtime._capture_value_project(fence, request)
+
+    def discover_table_columns(
+        self, fence: object, path: SafeValuePath, limit: int,
+    ) -> tuple[str, ...]:
+        return self._runtime._capture_value_columns(fence, path, limit)
+
+
 class PrototypeRuntimeApi:
     """Single-writer frontend boundary over the proven prototype Controller."""
 
@@ -761,12 +988,25 @@ class PrototypeRuntimeApi:
         self._capture_points = tuple(capture_points)
         self._capture_ticket: CaptureCorrelationTicket | None = None
         self._capture_inspection_quarantined = False
+        self._capture_stack_source_resolver: Callable[
+            [tuple[StackFrame, ...]], tuple[ResolvedFrameSource | None, ...]
+        ] | None = None
+        self._capture_stack_frame_binder: Callable[[DebugFrame], DebugFrame] | None = None
         self._user_breakpoints = tuple(user_breakpoints)
         self._lock = Lock()
+        self._close_lock = RLock()
         self._writer_owner: int | None = None
         self._worker_exports: tuple[WorkerExport, ...] = ()
         self._poisoned_error: ProtocolError | None = None
+        # Shutdown has three independent monotonic facts.  Admission closes
+        # before a bounded CAPTURE join, while data-plane ownership may remain
+        # reachable until RuntimeSession has terminated the target.
+        self._admission_closed = False
+        self._data_plane_finalized = False
         self._closed = False
+        self._capture_shutdown_finished = False
+        self._capture_shutdown_termination_proven = True
+        self._target_terminated = False
         self._context_generation = context_generation
         self._pending_dirty_roots: dict[str, str] = {}
         self._active_command_deadline: float | None = None
@@ -795,6 +1035,14 @@ class PrototypeRuntimeApi:
             tuple[str, str, int, str, str], WorkerModuleArtifact
         ] = {}
         self._worker_active_modules: dict[str, _ActiveWorkerModule] = {}
+        self._module_syntax_registry = ModuleSyntaxRegistry()
+        self._worker_syntax_generations: dict[
+            WorkerGenerationHandle, Mapping[str, ModuleSyntaxIndex]
+        ] = {}
+        self._worker_source_generations: dict[
+            WorkerGenerationHandle,
+            Mapping[tuple[str, SourceUnitRef], _WorkerStackSource],
+        ] = {}
         self._worker_catalog_snapshot: CommonModuleCatalogSnapshot | None = None
         self._notebook_worker_revision = 0
         self._notebook_method_set: NotebookMethodSet | None = None
@@ -817,8 +1065,11 @@ class PrototypeRuntimeApi:
         self._operation_generation_pin: OperationGenerationPin | None = None
         self._preparing_generation_pin: OperationGenerationPin | None = None
         self._evaluation_generation_pin: OperationGenerationPin | None = None
+        self._generation_lock = Lock()
+        self._evaluation_pin_lock = self._generation_lock
+        self._session_waiter_handoffs = local()
         self._worker_instruction_executor = (
-            worker_instruction_executor or self._execute_worker_instruction
+            worker_instruction_executor or self._materialization_instruction_executor
         )
         self._worker_journal = journal or RecoveryJournal()
         self._worker_universe = WorkerUniverseRegistry(
@@ -835,19 +1086,514 @@ class PrototypeRuntimeApi:
         return self._worker_generation_handle
 
     @property
+    def module_syntax_registry(self) -> ModuleSyntaxRegistry:
+        """Shared exact-version source facts; publication alone is not activation."""
+        return self._module_syntax_registry
+
+    def _worker_module_identity(self, unit: WorkerModuleUnit) -> ModuleIdentity:
+        return ModuleIdentity(
+            namespace=self._anonymous_notebook_id,
+            source_kind="worker",
+            module_kind=unit.kind,
+            object_id=unit.logical_name.casefold(),
+            property_id="Module",
+        )
+
+    def _worker_module_syntax(
+        self, logical_name: str, *, generation: WorkerGenerationHandle | None = None,
+    ) -> ModuleSyntaxIndex | None:
+        """Select syntax through the physical frame's generation or MAIN pin.
+
+        This internal lookup does no parsing or transport. Capture callers must
+        still own the runtime single-writer scope, validate their stop fence
+        and apply strict Worker source mapping.
+        """
+        handle = (
+            generation or self.operation_worker_generation or self._worker_generation_handle
+        )
+        return self._worker_syntax_generations.get(handle, {}).get(logical_name.casefold())
+
+    @property
     def operation_worker_generation(self) -> WorkerGenerationHandle | None:
         pin = self._operation_generation_pin or self._preparing_generation_pin
         return None if pin is None else pin.handle
 
     def status(self) -> RuntimeStatus:
-        with self._single_writer():
-            self._require_available()
-            return RuntimeStatus(
-                self._controller.state,
-                self._controller.runtime_generation,
-                self._controller.operation_id,
-                self._worker_generation_handle,
+        owner = self._capture_control_owner()
+        capture_status = None if owner is None else owner.status(owner._fence)
+        capture_controls_state = (
+            capture_status is not None
+            and (
+                capture_status.phase in {
+                    CapturePhase.EVALUATING,
+                    CapturePhase.RESUMING,
+                    CapturePhase.OUTCOME_UNKNOWN,
+                    CapturePhase.RECOVERY_REQUIRED,
+                }
+                or (
+                    capture_status.phase is CapturePhase.PAUSED
+                    and self._controller.state in {
+                        OperationState.CAPTURED,
+                        OperationState.EVALUATING_CAPTURE,
+                    }
+                )
             )
+        )
+        if not capture_controls_state:
+            with self._single_writer():
+                self._require_available()
+                return RuntimeStatus(
+                    self._controller.state,
+                    self._controller.runtime_generation,
+                    self._controller.operation_id,
+                    self._worker_generation_handle,
+                )
+        state = self._controller.state
+        assert capture_status is not None
+        state = {
+            CapturePhase.PAUSED: OperationState.CAPTURED,
+            CapturePhase.EVALUATING: OperationState.EVALUATING_CAPTURE,
+            CapturePhase.RESUMING: OperationState.RESUMING,
+            CapturePhase.OUTCOME_UNKNOWN: OperationState.RECOVERING,
+            CapturePhase.RECOVERY_REQUIRED: OperationState.RECOVERING,
+        }.get(capture_status.phase, state)
+        with self._generation_lock:
+            worker_generation = self._worker_generation_handle
+        return RuntimeStatus(
+            state,
+            capture_status.capture_generation,
+            capture_status.operation_id,
+            worker_generation,
+        )
+
+    def current_capture(self) -> CaptureView:
+        return self._current_capture()
+
+    def _current_capture(
+        self,
+        *,
+        resolve_sources: Callable[
+            [tuple[StackFrame, ...]], tuple[ResolvedFrameSource | None, ...]
+        ] | None = None,
+        bind_frame: Callable[[DebugFrame], DebugFrame] | None = None,
+    ) -> CaptureView:
+        owner = self._capture_control_owner()
+        if owner is None:
+            state = getattr(self._controller, "state", None)
+            raise NoActiveCaptureError(
+                state.value if isinstance(state, OperationState) else None
+            )
+        fence = owner._fence
+        effective_resolver = resolve_sources or self._capture_stack_source_resolver
+        effective_binder = bind_frame or self._capture_stack_frame_binder
+        operation_pin = self._operation_generation_pin
+
+        def resolve_stack_sources(
+            frames: tuple[StackFrame, ...],
+        ) -> tuple[ResolvedFrameSource | None, ...]:
+            with self._capture_data_plane_writer():
+                self._require_available()
+                self._require_capture_inspection_available()
+                self._require_capture_stack_fence(fence)
+                resolved = self._capture_stack_sources(
+                    frames,
+                    operation_pin=operation_pin,
+                    configuration_resolver=effective_resolver,
+                )
+                if type(resolved) is not tuple or len(resolved) != len(frames) or any(
+                    item is not None and not isinstance(item, ResolvedFrameSource)
+                    for item in resolved
+                ):
+                    raise ProtocolError("capture stack source mapping is invalid")
+                self._require_capture_stack_fence(fence)
+                return resolved
+
+        command_timeout_s = getattr(self._controller, "command_timeout_s", 30.0)
+        context_native_level = getattr(
+            self._controller, "capture_frame_stack_level", 0,
+        )
+        if type(context_native_level) is not int or context_native_level < 0:
+            context_native_level = 0
+        value_adapter = LocalCaptureValueAdapter(
+            _RuntimeCaptureValueBackend(self),
+            fence,
+            policy=CaptureValuePolicy(),
+            resolve_parameters=lambda root: resolve_value_parameters(
+                root.native_level
+                if root.native_level is not None
+                else context_native_level
+            ),
+        )
+
+        stack_adapter: LocalStackAdapter
+
+        def resolve_value_parameters(native_level: int) -> tuple[str, ...]:
+            # Native stack pages deliberately skip source work.  Role
+            # classification is an explicit descriptor request, so enrich
+            # only this physical frame instead of widening ordinary stack
+            # inventory into parser or source I/O.
+            frame = stack_adapter.native_frame_with_method(native_level)
+            method = frame.method
+            if method is None:
+                raise CaptureSourceUnavailableError(
+                    "method source unavailable; use variables for unclassified values"
+                )
+            return method.parameters
+
+        def bind_value_frame(frame: DebugFrame) -> DebugFrame:
+            bound = frame if effective_binder is None else effective_binder(frame)
+            if not isinstance(bound, DebugFrame):
+                raise ProtocolError("capture stack frame binder is invalid")
+            # Source/session binding may annotate a saved frame, but its value
+            # scope must never replace this stop's canonical fence-owned
+            # adapter.  In particular, a preattached local fake cannot bypass
+            # the controller's inline admission path.
+            return value_adapter.bind_frame(bound)
+
+        stack_adapter = LocalStackAdapter(
+            _RuntimeStackInventoryBackend(self),
+            fence,
+            resolve_sources=resolve_stack_sources,
+            is_runtime_frame=self._capture_stack_runtime_frame,
+            registry=self._module_syntax_registry,
+            command_timeout_s=float(command_timeout_s),
+            bind_frame=bind_value_frame,
+        )
+
+        def is_current() -> bool:
+            return (
+                self._capture_control_owner() is owner
+                and owner.capture_view_is_current(fence)
+                and self._controller.operation_id == fence.operation_id
+                and self._controller.runtime_generation == fence.capture_generation
+                and getattr(self._controller, "stop_sequence", None)
+                == fence.stop_sequence
+            )
+
+        return CaptureView(
+            fence.operation_id,
+            fence.capture_generation,
+            fence.stop_sequence,
+            is_current,
+            lambda: owner.status(fence),
+            lambda timeout_s, evaluation_id: owner.wait(
+                fence,
+                evaluation_id,
+                timeout_s,
+            ),
+            stack_adapter.stack,
+            value_adapter.context,
+        )
+
+    def _capture_stack_runtime_frame(self, frame: StackFrame) -> bool:
+        classifier = getattr(self._controller, "_same_kernel_module", None)
+        return callable(classifier) and classifier(frame.location) is True
+
+    def _require_capture_stack_fence(self, fence: CaptureFence) -> None:
+        self._require_capture_fence_identity(fence)
+        owner = self._capture_control_owner()
+        assert owner is not None
+        status = owner.status(fence)
+        if not status.can_inspect:
+            self._require_capture_data_plane_admission()
+            raise StaleCaptureError("CAPTURE inspection is unavailable")
+
+    def _require_capture_fence_identity(self, fence: CaptureFence) -> None:
+        """Validate identity without treating an active helper as stale.
+
+        An initiating helper waiter may time out after RDBG acknowledgement.
+        In that case ``CaptureEvaluationPendingError`` is still the useful
+        result while the coordinator status is evaluating, provided this is
+        still the saved operation/generation/stop fence.
+        """
+        owner = self._capture_control_owner()
+        if (
+            owner is None
+            or owner._fence != fence
+            or self._controller.operation_id != fence.operation_id
+            or self._controller.runtime_generation != fence.capture_generation
+            or getattr(self._controller, "stop_sequence", None) != fence.stop_sequence
+        ):
+            raise StaleCaptureError()
+
+    def _validate_capture_value_inspection(self, fence: object) -> None:
+        """Check lifecycle before local path validation or target admission."""
+        if not isinstance(fence, CaptureFence):
+            raise StaleCaptureError()
+        with self._capture_data_plane_writer():
+            self._require_available()
+            self._require_capture_inspection_available()
+            self._require_capture_stack_fence(fence)
+
+    def _capture_value_resolve(
+        self, fence: object, path: SafeValuePath,
+    ) -> PrivateProjectedValue:
+        result = self._capture_value_operation(
+            fence, action="resolve", path=path,
+        )
+        if not isinstance(result, PrivateProjectedValue):
+            raise CaptureValueCheckError("capture value root projection is invalid")
+        return result
+
+    def _capture_value_project(
+        self, fence: object, request: ValueInspectionRequest,
+    ) -> PrivateValueProjection:
+        result = self._capture_value_operation(
+            fence, action="project", request=request,
+        )
+        if not isinstance(result, PrivateValueProjection):
+            raise CaptureValueCheckError("capture value page projection is invalid")
+        return result
+
+    def _capture_value_columns(
+        self, fence: object, path: SafeValuePath, limit: int,
+    ) -> tuple[str, ...]:
+        result = self._capture_value_operation(
+            fence, action="columns", path=path, limit=limit,
+        )
+        if type(result) is not tuple or any(not isinstance(name, str) for name in result):
+            raise CaptureValueCheckError("capture value schema projection is invalid")
+        return result
+
+    def _capture_value_operation(
+        self,
+        fence: object,
+        *,
+        action: str,
+        path: SafeValuePath | None = None,
+        request: ValueInspectionRequest | None = None,
+        limit: int | None = None,
+    ) -> object:
+        """Run one controller-owned, coordinator-backed value operation.
+
+        The controller seam receives frozen paths and a bounded request only.
+        It is responsible for the inline admission of the root and every
+        selected descendant before it constructs ``PrivateProjectedValue``
+        records.  The RuntimeApi deliberately has no direct RDBG fallback:
+        inventory metadata is not public projection data.
+        """
+        if not isinstance(fence, CaptureFence):
+            raise StaleCaptureError()
+        if action not in {"resolve", "project", "columns"}:
+            raise CaptureValueCheckError("capture value operation is invalid")
+        with self._capture_data_plane_writer():
+            self._require_available()
+            self._require_capture_inspection_available()
+            self._require_capture_stack_fence(fence)
+            inspect = getattr(self._controller, "capture_value_inspection", None)
+            if not callable(inspect):
+                raise CaptureSourceUnavailableError(
+                    "capture value target projection is not attached"
+                )
+            expected_error: BaseException | None = None
+            failed = False
+            try:
+                registrations = self._worker_type_registrations()
+                with self._remaining_command_timeout() as remaining:
+                    # The controller submits the qualified target plan to its
+                    # coordinator.  This handoff releases the API writer while
+                    # that coordinator owns dispatch, polling and any required
+                    # cleanup; it must wrap the whole initiating wait rather
+                    # than only a later payload read.
+                    with self._capture_helper_writer_handoff():
+                        result = inspect(
+                            action,
+                            path=path,
+                            request=request,
+                            limit=limit,
+                            worker_type_registrations=registrations,
+                            context_generation=self._context_generation,
+                            timeout_s=remaining,
+                        )
+            except (
+                CaptureBusyError,
+                CaptureEvaluationPendingError,
+                CaptureOutcomeUnknownError,
+                CaptureRecoveryRequiredError,
+                CaptureSourceUnavailableError,
+                CaptureValueAccessDeniedError,
+                CaptureValueCheckError,
+                StaleCaptureError,
+            ) as error:
+                expected_error = error
+            except Exception:
+                failed = True
+                result = None
+            # A lifecycle transition races ahead of a private denial or
+            # malformed target reply.  Recheck it before assigning any public
+            # value error so stale/busy semantics always win.
+            self._require_capture_fence_identity(fence)
+            if expected_error is not None:
+                # The coordinator remains actively evaluating after an
+                # acknowledged initiating timeout.  Preserve its typed pending
+                # guidance while still rejecting an old fence above.
+                if isinstance(expected_error, CaptureEvaluationPendingError):
+                    raise expected_error
+                self._require_capture_stack_fence(fence)
+                raise expected_error
+            self._require_capture_stack_fence(fence)
+            if failed:
+                raise CaptureValueCheckError(
+                    "capture value target projection is unavailable"
+                ) from None
+            return result
+
+    def _read_capture_stack_inventory(
+        self, fence: CaptureFence,
+    ) -> tuple[StackFrame, ...]:
+        with self._capture_data_plane_writer():
+            self._require_available()
+            self._require_capture_inspection_available()
+            self._require_capture_stack_fence(fence)
+            read = getattr(self._controller, "capture_stack_inventory", None)
+            if not callable(read):
+                raise ProtocolError("Runtime controller cannot read a fresh capture stack")
+            inventory_failed = False
+            inventory_timed_out = False
+            try:
+                with self._remaining_command_timeout() as remaining:
+                    frames = read(timeout_s=remaining)
+            except CommandTimeout:
+                inventory_timed_out = True
+            except Exception:
+                inventory_failed = True
+            if inventory_timed_out:
+                # Let a concurrent lifecycle transition take precedence, then
+                # discard the private transport exception outside its handler.
+                self._require_capture_stack_fence(fence)
+                raise CaptureInspectionTimeout(
+                    "capture stack inventory timed out"
+                )
+            if inventory_failed:
+                # Recheck lifecycle outside the exception handler so a concurrent
+                # stale/busy transition wins and no transport exception remains as
+                # __cause__ or __context__ of the bounded public error.
+                self._require_capture_stack_fence(fence)
+                raise ProtocolError(
+                    "fresh capture stack inventory is unavailable"
+                )
+            if type(frames) is not tuple or not frames or any(
+                type(frame) is not StackFrame for frame in frames
+            ):
+                raise ProtocolError("fresh capture stack inventory is invalid")
+            self._require_capture_stack_fence(fence)
+            return frames
+
+    def _capture_stack_sources(
+        self,
+        frames: tuple[StackFrame, ...],
+        *,
+        operation_pin: OperationGenerationPin | None,
+        configuration_resolver: Callable[
+            [tuple[StackFrame, ...]], tuple[ResolvedFrameSource | None, ...]
+        ] | None,
+    ) -> tuple[ResolvedFrameSource | None, ...]:
+        resolved: list[ResolvedFrameSource | None] = [None] * len(frames)
+        configuration_indexes: list[int] = []
+        worker_view = (
+            None
+            if operation_pin is None
+            else self._worker_universe._operation_debug_view(operation_pin)
+        )
+        worker_sources = (
+            {}
+            if operation_pin is None
+            else self._worker_source_generations.get(operation_pin.handle, {})
+        )
+        for index, frame in enumerate(frames):
+            module = (
+                None
+                if worker_view is None
+                else require_exact_worker_module_or_native(frame.location, worker_view)
+            )
+            if module is None:
+                configuration_indexes.append(index)
+                continue
+            mapped = map_generated_line(module, frame.location.line)
+            if mapped is None:
+                continue
+            source_entry = worker_sources.get((
+                mapped.canonical_module,
+                mapped.source_unit,
+            ))
+            if (
+                source_entry is None
+                or source_entry.version.source_sha256
+                != mapped.source_unit.source_sha256
+            ):
+                continue
+            resolved[index] = ResolvedFrameSource(
+                source_entry.source,
+                mapped.line,
+                source_entry.identity,
+                source_entry.version,
+            )
+        if configuration_resolver is not None and configuration_indexes:
+            configuration_frames = tuple(frames[index] for index in configuration_indexes)
+            try:
+                configuration_sources = configuration_resolver(configuration_frames)
+            except Exception:
+                # Configuration sources are optional inspection metadata.  Resolver
+                # failures can contain local paths in OSError fields and exception
+                # chains, so they degrade to the ordinary unavailable status here.
+                configuration_sources = (None,) * len(configuration_frames)
+            if (
+                type(configuration_sources) is not tuple
+                or len(configuration_sources) != len(configuration_frames)
+            ):
+                raise ProtocolError("configuration stack source mapping is invalid")
+            for index, source in zip(
+                configuration_indexes, configuration_sources, strict=True,
+            ):
+                resolved[index] = source
+        return tuple(resolved)
+
+    def _capture_control_owner(self) -> CaptureEvaluationCoordinator | None:
+        owner = getattr(self._controller, "_capture_evaluation_coordinator", None)
+        return owner if isinstance(owner, CaptureEvaluationCoordinator) else None
+
+    def _ready_inspection_control_owner(self) -> CaptureEvaluationCoordinator | None:
+        owner = self._controller.ready_inspection_evaluation_owner()
+        return owner if isinstance(owner, CaptureEvaluationCoordinator) else None
+
+    def owns_debug_ui_stream(self) -> bool:
+        """Expose controller stream ownership to RuntimeSession's heartbeat."""
+        return self._controller.owns_debug_ui_stream()
+
+    def _require_capture_data_plane_admission(self) -> None:
+        owner = self._capture_control_owner()
+        if owner is None:
+            return
+        status = owner.status(owner._fence)
+        if status.phase is CapturePhase.PAUSED:
+            return
+        if status.phase is CapturePhase.EVALUATING:
+            assert status.pending_evaluation_id is not None
+            assert status.evaluation_kind is not None
+            raise CaptureBusyError(
+                status.pending_evaluation_id,
+                status.evaluation_kind,
+                status.phase,
+            )
+        if status.phase is CapturePhase.RESUMING:
+            raise CaptureBusyError(None, None, status.phase)
+        if status.phase is CapturePhase.OUTCOME_UNKNOWN:
+            raise CaptureOutcomeUnknownError(
+                status.last_evaluation_id,
+                status.failure,
+            )
+        if status.phase is CapturePhase.RECOVERY_REQUIRED:
+            raise CaptureRecoveryRequiredError(status.failure)
+        if status.phase is CapturePhase.STALE:
+            if self._controller.state in {
+                OperationState.CAPTURED,
+                OperationState.EVALUATING_CAPTURE,
+                OperationState.FLUSHING,
+                OperationState.RESUMING,
+            }:
+                raise StaleCaptureError()
+            return
+        raise ProtocolError(f"CAPTURE data plane is unavailable ({status.phase.value})")
 
     def namespace_snapshot(self) -> RuntimeNamespaceSnapshot:
         with self._single_writer():
@@ -862,7 +1608,7 @@ class PrototypeRuntimeApi:
         self, handle: str, *, table_row: bool = False, timeout_s: float = 1.0
     ) -> tuple[str, ...]:
         """Read current field names only; never evaluate caller-provided expressions."""
-        with self._single_writer(), self._bounded_command_timeout(timeout_s):
+        with self._capture_data_plane_writer(), self._bounded_command_timeout(timeout_s):
             self._require_available()
             if self._controller.state not in self._WORKER_STATES:
                 raise ProtocolError("Completion requires an idle or captured runtime")
@@ -878,27 +1624,111 @@ class PrototypeRuntimeApi:
                 name.casefold() for name in self._namespace_names
             }:
                 raise ProtocolError("Completion root is not in the current namespace")
-            # The schema helper admits only table/structure types and excludes
-            # private Worker container shapes. Do not run the general MAIN
-            # privacy instruction here: completion must preserve operation state.
-            self._public_value_guard_handle_locked(handle)
+            safe_handle = self._validate_value_reference_locked(handle)
+            expression = self._completion_fields_expression(
+                safe_handle,
+                table_row=table_row,
+                worker_type_registrations=self._worker_type_registrations(),
+            )
             with self._remaining_command_timeout():
-                result = self._controller.inspect_completion_fields(handle, table_row=table_row)
-            if result.error_occurred or len(result.collection_rows) > 128:
+                if self._controller.state is OperationState.CAPTURED:
+                    wire = self._execute_worker_instruction(
+                        "Результат = " + expression + ";",
+                        evaluation_kind=CaptureEvaluationKind.INSPECTION,
+                    )
+                else:
+                    # The controller adopts its ready-inspection ticket before
+                    # this handoff can release either outer writer.  Once the
+                    # ticket owns the pending capability, status/control-plane
+                    # callers must not wait behind the initiating caller.
+                    with self._capture_helper_writer_handoff():
+                        wire = self._controller.execute_system_inspection(expression)
+            return self._parse_completion_fields_wire(wire)
+
+    @staticmethod
+    def _completion_fields_instruction(
+        handle: str,
+        *,
+        table_row: bool,
+        worker_type_registrations: tuple[str, ...],
+    ) -> str:
+        """Read the admitted bounded schema inside one generated instruction."""
+        return "Результат = " + PrototypeRuntimeApi._completion_fields_expression(
+            handle,
+            table_row=table_row,
+            worker_type_registrations=worker_type_registrations,
+        ) + ";"
+
+    @staticmethod
+    def _completion_fields_expression(
+        handle: str,
+        *,
+        table_row: bool,
+        worker_type_registrations: tuple[str, ...],
+    ) -> str:
+        """Build the one admitted scalar target expression for completion."""
+        if (
+            type(worker_type_registrations) is not tuple
+            or any(
+                not isinstance(registration, str)
+                or not registration
+                or "\n" in registration
+                or "\r" in registration
+                for registration in worker_type_registrations
+            )
+        ):
+            raise ProtocolError("Completion Worker type registrations are invalid")
+        return (
+            "RuntimeValueTransferServer."
+            "СериализоватьДопущенныеИменаСвойствДляПодсказки("
+            + handle
+            + (", Истина, " if table_row else ", Ложь, ")
+            + bsl_string_literal("\n".join(worker_type_registrations))
+            + ")"
+        )
+
+    @staticmethod
+    def _parse_completion_fields_wire(wire: object) -> tuple[str, ...]:
+        if not isinstance(wire, str):
+            raise ProtocolError("Invalid completion field schema")
+        rows = wire.splitlines()
+        if not 2 <= len(rows) <= 130:
+            raise ProtocolError("Invalid completion field schema")
+        header_kind, header_separator, declared_size = rows[0].partition("\t")
+        if (
+            header_kind != "C"
+            or not header_separator
+            or re.fullmatch(r"[1-9]\d*", declared_size) is None
+        ):
+            raise ProtocolError("Invalid completion field schema")
+        row_count = int(declared_size)
+        if not 1 <= row_count <= 129 or len(rows) - 1 != row_count:
+            raise ProtocolError("Invalid completion field schema")
+        names: list[str] = []
+        seen: set[str] = set()
+        for index, row in enumerate(rows[1:]):
+            outcome, separator, name = row.partition("\t")
+            if not separator:
                 raise ProtocolError("Invalid completion field schema")
-            names: list[str] = []
-            seen: set[str] = set()
-            for row in result.collection_rows:
-                if len(row.cells) != 1 or row.cells[0].name != "Имя":
-                    raise ProtocolError("Invalid completion field schema")
-                name = row.cells[0].value_string
-                if (not isinstance(name, str) or len(name) > 128
-                        or not re.fullmatch(r"[^\W\d]\w*", name)
-                        or name.casefold() in seen):
-                    raise ProtocolError("Invalid completion field name")
-                seen.add(name.casefold())
-                names.append(name)
-            return tuple(names)
+            if outcome == AdmissionEnvelopeV1.denied():
+                raise CaptureValueAccessDeniedError(
+                    "Worker generation objects are not public values"
+                )
+            if outcome == AdmissionEnvelopeV1.failed():
+                raise CaptureValueCheckError("CAPTURE value admission failed")
+            if outcome != "R":
+                raise ProtocolError("Invalid completion admission result")
+            if index == 0:
+                if name != "":
+                    raise ProtocolError("Invalid completion admission result")
+                continue
+            if (len(name) > 128
+                    or not re.fullmatch(r"[^\W\d]\w*", name)
+                    or name.casefold() in seen):
+                raise ProtocolError("Invalid completion field name")
+            seen.add(name.casefold())
+            names.append(name)
+        return tuple(names)
 
     def continuation_admission_is_uncertain(self) -> bool:
         """Report only whether a failed paused admission is safe to restore."""
@@ -912,7 +1742,7 @@ class PrototypeRuntimeApi:
         self,
         locations: tuple[ModuleLocation, ...],
     ) -> None:
-        with self._single_writer():
+        with self._capture_data_plane_writer():
             self._require_available()
             if self._controller.state not in self._MAIN_READY_STATES:
                 raise ProtocolError(
@@ -933,7 +1763,7 @@ class PrototypeRuntimeApi:
         self, locations: tuple[ModuleLocation, ...]
     ) -> None:
         """Atomically replace only the successor capture points while paused."""
-        with self._single_writer():
+        with self._capture_data_plane_writer():
             self._require_available()
             if self._controller.state is not OperationState.CAPTURED:
                 raise ProtocolError("Continuation capture points require a captured runtime")
@@ -955,7 +1785,7 @@ class PrototypeRuntimeApi:
         enabled: bool = True,
         column: int | None = None,
     ) -> WorkerBreakpointStatus:
-        with self._single_writer():
+        with self._capture_data_plane_writer():
             self._require_worker_breakpoint_mutation_boundary_locked()
             plan = self._worker_breakpoints.prepare_add(
                 source_unit,
@@ -968,7 +1798,7 @@ class PrototypeRuntimeApi:
             return self._worker_breakpoints.status(plan.result_id)
 
     def remove_worker_breakpoint(self, breakpoint_id: UUID) -> None:
-        with self._single_writer():
+        with self._capture_data_plane_writer():
             self._require_worker_breakpoint_mutation_boundary_locked()
             plan = self._worker_breakpoints.prepare_remove(breakpoint_id)
             self._apply_worker_breakpoint_plan_locked(plan)
@@ -978,7 +1808,7 @@ class PrototypeRuntimeApi:
         breakpoint_id: UUID,
         enabled: bool,
     ) -> WorkerBreakpointStatus:
-        with self._single_writer():
+        with self._capture_data_plane_writer():
             self._require_worker_breakpoint_mutation_boundary_locked()
             plan = self._worker_breakpoints.prepare_enabled(
                 breakpoint_id,
@@ -999,6 +1829,7 @@ class PrototypeRuntimeApi:
             return self._worker_breakpoints.list_statuses()
 
     def _require_worker_breakpoint_mutation_boundary_locked(self) -> None:
+        self._require_capture_data_plane_admission()
         self._require_available()
         if self._controller.state not in {
             OperationState.IDLE,
@@ -1039,7 +1870,7 @@ class PrototypeRuntimeApi:
         locations: tuple[ModuleLocation, ...],
     ) -> _RuntimeContinuationAdmission:
         """Snapshot API metadata around the controller's physical admission."""
-        with self._single_writer():
+        with self._capture_data_plane_writer():
             self._require_available()
             if self._controller.state is not OperationState.CAPTURED:
                 raise ProtocolError(
@@ -1101,7 +1932,7 @@ class PrototypeRuntimeApi:
         The returned controller number remains internal to the runtime/session
         boundary; agent-facing capture views never serialize it.
         """
-        with self._single_writer():
+        with self._capture_data_plane_writer():
             self._require_available()
             if self._controller.state not in (*self._MAIN_READY_STATES, OperationState.CAPTURED):
                 raise ProtocolError("Capture ticket requires a main-ready or captured runtime")
@@ -1127,7 +1958,7 @@ class PrototypeRuntimeApi:
         return ticket
 
     def _begin_prepared_operation_pin(self) -> OperationGenerationPin | None:
-        with self._single_writer():
+        with self._capture_data_plane_writer():
             self._require_available()
             if self._controller.state not in self._MAIN_READY_STATES:
                 raise ProtocolError("MAIN preparation requires a main-ready runtime")
@@ -1405,7 +2236,7 @@ class PrototypeRuntimeApi:
 
     def activate_prepared_main_for_capture(self, prepared: object) -> object:
         """Activate an already-built Worker and reseal the prepared user MAIN."""
-        with self._single_writer():
+        with self._capture_data_plane_writer():
             self._require_available()
             if not isinstance(prepared, _PreparedMainExecution):
                 raise ProtocolError("Runtime API requires a prepared main")
@@ -1580,7 +2411,7 @@ class PrototypeRuntimeApi:
         _dispatch_evidence: Callable[[], None] | None = None,
     ) -> RuntimeReply:
         """Consume one post-activation MAIN without parsing, building, or lowering."""
-        with self._single_writer():
+        with self._capture_data_plane_writer():
             self._require_available()
             if not isinstance(prepared, _ActivatedPreparedMainExecution):
                 raise ProtocolError("Runtime API requires an activated prepared main")
@@ -1726,7 +2557,7 @@ class PrototypeRuntimeApi:
 
     def discard_prepared_main_for_capture(self, prepared: object) -> None:
         """Consume one unused MAIN capability and release its operation pin."""
-        with self._single_writer():
+        with self._capture_data_plane_writer():
             if isinstance(prepared, _PreparedMainExecution):
                 payload = prepared.contents(self._prepared_main_owner)
                 token = payload.token
@@ -1997,7 +2828,7 @@ class PrototypeRuntimeApi:
         namespace is restored before the single-writer fence is released; the
         sealed result is committed only by its one execution consumer.
         """
-        with self._single_writer():
+        with self._capture_data_plane_writer():
             self._require_available()
             self._require_capture_inspection_available()
             if self._controller.state is not OperationState.CAPTURED:
@@ -2136,7 +2967,7 @@ class PrototypeRuntimeApi:
 
     def execute_prepared_capture_hypothesis(self, prepared: object) -> RuntimeReply:
         """Consume one exact prepared CAPTURE lowering without lowering again."""
-        with self._single_writer():
+        with self._capture_data_plane_writer():
             self._require_available()
             self._require_capture_inspection_available()
             if not isinstance(prepared, _PreparedCaptureHypothesis):
@@ -2197,6 +3028,7 @@ class PrototypeRuntimeApi:
                 capture_dispatched = True
 
             evaluation_pin = self._pin_capture_evaluation_locked()
+            handoff = None
             try:
                 lowerer.restore_persistent_names(lowering.context_names)
                 self._require_operation_pin_dispatch_fence_locked(
@@ -2204,12 +3036,42 @@ class PrototypeRuntimeApi:
                     mode=LoweringMode.CAPTURE,
                     capture_evaluation=True,
                 )
+                primary_execution, normalize_capture_error = (
+                    self._capture_execution_callbacks_locked(
+                        lowering.dirty_roots,
+                    )
+                )
+
+                def completion(result: object, error: BaseException | None) -> object:
+                    # Mandatory local completion is owned by the record,
+                    # including after its initiating waiter detaches.
+                    # A confirmed execution may write a captured root before
+                    # BSL fails. This ledger belongs to coordinator completion,
+                    # even when no initiating caller remains to see it.
+                    if error is None or isinstance(error, BslExecutionError):
+                        for root in lowering.dirty_roots:
+                            self._pending_dirty_roots.setdefault(root.casefold(), root)
+                    if error is not None:
+                        lowerer.restore_persistent_names(context_before)
+                        return None
+                    reply = self._reply(result)
+                    return self._finalize_namespace_reply(
+                        reply,
+                        lowering=lowering,
+                        context_before=context_before,
+                        lowerer=lowerer,
+                    )
+
+                def rejection(error: BaseException) -> None:
+                    # Submission did not create an owned record. Its error
+                    # type is not proof that captured BSL actually executed.
+                    lowerer.restore_persistent_names(context_before)
+
                 try:
                     if callable(execute_mapped):
-                        reply = self._reply(
-                            execute_mapped(
-                                source,
-                                lowering.mapped_source,
+                        handoff = _PreparedCaptureExecution(
+                            execute=lambda: execute_mapped(
+                                source, lowering.mapped_source,
                                 visible_source_context=visible_source_context,
                                 messages_intercepted=lowering.messages_intercepted,
                                 message_collector_key=message_collector_key,
@@ -2217,16 +3079,31 @@ class PrototypeRuntimeApi:
                                 worker_globals=self._notebook_worker_globals(),
                                 dirty_roots=lowering.dirty_roots,
                                 on_transport_dispatch=mark_capture_dispatched,
-                            )
+                            ),
+                            detach_pin=self._detach_capture_evaluation_pin_locked,
+                            completion=completion,
+                            release_writer=self._capture_owner_handoff,
+                            release_waiter=self._capture_session_waiter_handoff,
+                            primary_execution=primary_execution,
+                            normalize_error=normalize_capture_error,
+                            rejection=rejection,
                         )
+                        result = self._execute_prepared_capture_handoff(handoff)
+                        if handoff.transferred:
+                            return result
+                        reply = self._reply(result)
                     else:
                         raise ProtocolError(
                             "Runtime controller requires mapped CAPTURE execution"
                         )
                 except BslExecutionError as error:
-                    diagnostic = self._worker_runtime_diagnostic(
-                        str(error),
-                        error.diagnostic,
+                    diagnostic = (
+                        error.diagnostic
+                        if handoff is not None and handoff.transferred
+                        else self._worker_runtime_diagnostic(
+                            str(error),
+                            error.diagnostic,
+                        )
                     )
                     reply = RuntimeReply(
                         RuntimeReplyKind.CAPTURE_CELL,
@@ -2237,7 +3114,18 @@ class PrototypeRuntimeApi:
                         messages=error.messages,
                         diagnostic=diagnostic,
                     )
+                    if handoff is not None and handoff.transferred:
+                        # Mandatory completion/rejection already updated
+                        # namespace and dirty roots on the owning path.
+                        if handoff.submitted:
+                            reply = replace(
+                                reply, changed_roots=lowering.persistent_write_roots,
+                                capture_dirty_roots=lowering.dirty_roots,
+                            )
+                        return reply
             except BaseException:
+                if handoff is not None and handoff.transferred:
+                    raise
                 try:
                     lowerer.restore_persistent_names(context_before)
                 finally:
@@ -2251,6 +3139,17 @@ class PrototypeRuntimeApi:
                 )
             finally:
                 self._finish_capture_evaluation_pin_locked(reply=reply)
+
+    def _execute_prepared_capture_handoff(self, handoff: _PreparedCaptureExecution) -> object:
+        submit_owned = getattr(self._controller, "submit_capture_execution", None)
+        if not callable(submit_owned):
+            return handoff.execute_sync()
+        return handoff.execute_owned(
+            lambda **ownership: submit_owned(
+                handoff.execute,
+                **ownership,
+            )
+        )
 
     def _capture_controller_fence(self) -> tuple[int, int, int, int]:
         values = (
@@ -2311,44 +3210,109 @@ class PrototypeRuntimeApi:
         return pin.export_catalog
 
     def _pin_capture_evaluation_locked(self) -> OperationGenerationPin | None:
-        if self._evaluation_generation_pin is not None:
-            raise ProtocolError("CAPTURE evaluation already owns a generation pin")
-        if self._worker_generation_handle is None:
+        with self._generation_lock:
+            if self._evaluation_generation_pin is not None:
+                raise ProtocolError("CAPTURE evaluation already owns a generation pin")
+            expected = self._worker_generation_handle
+        if expected is None:
             return None
         pin = self._worker_universe.pin_active()
-        if pin.handle is not self._worker_generation_handle:
-            self._release_generation_pin_locked(pin)
-            raise ProtocolError("Active Worker generation changed while pinning CAPTURE")
-        self._evaluation_generation_pin = pin
-        return pin
+        failure = "Active Worker generation changed while pinning CAPTURE"
+        with self._generation_lock:
+            if self._evaluation_generation_pin is not None:
+                failure = "CAPTURE evaluation already owns a generation pin"
+            elif (
+                self._worker_generation_handle is expected
+                and pin.handle is expected
+            ):
+                self._evaluation_generation_pin = pin
+                return pin
+        self._release_generation_pin_locked(pin)
+        raise ProtocolError(failure)
+
+    def _detach_capture_evaluation_pin_locked(self) -> _CapturePinDispositionLease:
+        with self._generation_lock:
+            pin = self._evaluation_generation_pin
+            self._evaluation_generation_pin = None
+
+        def dispose_physical(disposition: str) -> None:
+            if disposition not in {"release", "quarantine"}:
+                raise ValueError("invalid CAPTURE pin disposition")
+            # The shared lease owns idempotence and the physical outcome. No
+            # RuntimeApi lock is held while Worker ownership is disposed.
+            if pin is None:
+                return
+            if disposition == "quarantine":
+                try:
+                    self._worker_universe.retain_outcome_unknown(pin)
+                finally:
+                    self._poisoned_error = WorkerPromotionOutcomeUnknown(
+                        pin.handle.generation, pin.handle.manifest_sha256,
+                    )
+            else:
+                self._release_generation_pin_locked(pin)
+
+        return _CapturePinDispositionLease(dispose_physical)
+
+    def _capture_execution_callbacks_locked(
+        self,
+        dirty_roots: tuple[str, ...],
+    ) -> tuple[
+        Callable[[], None],
+        Callable[[BslExecutionError], BslExecutionError],
+    ]:
+        """Bind post-dispatch evidence to this exact CAPTURE generation.
+
+        The callbacks outlive the caller-side writer handoff.  Capture the
+        immutable diagnostic artifacts now, while the evaluation pin still
+        identifies the generation that will execute the request.
+        """
+        with self._confirmed_single_writer():
+            pin = self._evaluation_generation_pin
+            manifest_sha256 = (
+                None if pin is None else pin.handle.manifest_sha256
+            )
+            artifacts = (
+                ()
+                if manifest_sha256 is None
+                else self._worker_generation_diagnostics.get(
+                    manifest_sha256,
+                    (),
+                )
+            )
+
+        def primary_execution() -> None:
+            for root in dirty_roots:
+                self._pending_dirty_roots.setdefault(root.casefold(), root)
+
+        def normalize_error(error: BslExecutionError) -> BslExecutionError:
+            if manifest_sha256 is None or not artifacts:
+                return error
+            diagnostic = self._worker_runtime_diagnostic_from_artifacts(
+                str(error),
+                error.diagnostic,
+                manifest_sha256=manifest_sha256,
+                artifacts=artifacts,
+            )
+            if diagnostic is error.diagnostic:
+                return error
+            return BslExecutionError(
+                str(error),
+                messages=error.messages,
+                diagnostic=diagnostic,
+            )
+
+        return primary_execution, normalize_error
 
     def _finish_capture_evaluation_pin_locked(
         self, *, reply: RuntimeReply | None = None, outcome_unknown: bool = False
     ) -> None:
-        pin = self._evaluation_generation_pin
         if self._poisoned_error is not None:
             # Publication may already have quarantined the universe. Its
             # leases remain owned until teardown; release cannot be trusted.
             return
-        if (
-            not outcome_unknown
-            and reply is not None
-            and reply.kind is RuntimeReplyKind.DEBUG_STOPPED
-            and self._controller.state is OperationState.CAPTURE_DEBUG_STOPPED
-        ):
-            return
-        self._evaluation_generation_pin = None
-        if pin is None:
-            return
-        if outcome_unknown:
-            try:
-                self._worker_universe.retain_outcome_unknown(pin)
-            finally:
-                self._poisoned_error = WorkerPromotionOutcomeUnknown(
-                    pin.handle.generation, pin.handle.manifest_sha256
-                )
-        else:
-            self._release_generation_pin_locked(pin)
+        dispose = self._detach_capture_evaluation_pin_locked()
+        dispose("quarantine" if outcome_unknown else "release")
 
     def _require_operation_pin_dispatch_fence_locked(
         self,
@@ -2441,6 +3405,51 @@ class PrototypeRuntimeApi:
         self._operation_generation_pin = None
         self._release_generation_pin_locked(pin)
 
+    def _finalize_controller_owned_resume_pin(
+        self,
+        *,
+        reply: RuntimeReply | None,
+        outcome_unknown: bool = False,
+    ) -> None:
+        """Detach a resume-owned pin before the coordinator disposes it.
+
+        Resume completion runs on the coordinator after the initiating caller
+        has released the API writer.  Slot ownership is synchronized briefly;
+        Worker lifecycle and CAPTURE helper work happen only after that lock
+        is released.
+        """
+        pin: OperationGenerationPin | None
+        action: str | None = None
+        install_capture_pin = False
+        with self._generation_lock:
+            pin = self._operation_generation_pin
+            if pin is None or self._poisoned_error is not None:
+                return
+            if self._reply_keeps_operation_pin(reply):
+                install_capture_pin = (
+                    reply is not None and reply.kind is RuntimeReplyKind.CAPTURED
+                )
+            elif reply is None and outcome_unknown:
+                self._operation_generation_pin = None
+                action = "quarantine"
+            else:
+                self._operation_generation_pin = None
+                action = "release"
+        if install_capture_pin:
+            self._install_capture_worker_generation_pin_locked(pin)
+            return
+        if action == "quarantine":
+            try:
+                self._worker_universe.retain_outcome_unknown(pin)
+            finally:
+                self._poisoned_error = WorkerPromotionOutcomeUnknown(
+                    pin.handle.generation,
+                    pin.handle.manifest_sha256,
+                )
+            return
+        if action == "release":
+            self._release_generation_pin_locked(pin)
+
     def _reply_keeps_operation_pin(
         self,
         reply: RuntimeReply | None,
@@ -2486,7 +3495,8 @@ class PrototypeRuntimeApi:
         active = self._worker_generation_handle
         if active is None:
             raise ProtocolError("CAPTURE evaluation generation is unavailable")
-        install(active.manifest_sha256)
+        with self._capture_helper_writer_handoff():
+            install(active.manifest_sha256)
 
     def _clear_capture_worker_generation_pin_locked(self) -> None:
         clear = getattr(
@@ -2498,7 +3508,8 @@ class PrototypeRuntimeApi:
             raise ProtocolError(
                 "Runtime controller cannot clear the CAPTURE Worker pin"
             )
-        clear()
+        with self._capture_helper_writer_handoff():
+            clear()
 
     @staticmethod
     def _with_generation_pin_prelude(
@@ -2555,7 +3566,7 @@ class PrototypeRuntimeApi:
             Callable[[OperationExecutionProvenance], None] | None
         ) = None,
     ) -> RuntimeReply:
-        with self._single_writer():
+        with self._capture_data_plane_writer():
             self._require_available()
             pin, shared_capture_pin = self._begin_user_operation_pin_locked()
             user_bsl_dispatched = False
@@ -2837,6 +3848,7 @@ class PrototypeRuntimeApi:
             )
             if self._controller.state is OperationState.CAPTURED:
                 execute_mapped = getattr(self._controller, "execute_mapped_capture", None)
+                handoff: _PreparedCaptureExecution | None = None
                 try:
                     if callable(execute_mapped):
                         assert source_maps.statement_execution is not None
@@ -2845,8 +3857,47 @@ class PrototypeRuntimeApi:
                             if lowering is None
                             else lowering.mapped_source
                         )
-                        reply = self._reply(
-                            execute_mapped(
+                        dirty_roots = (
+                            () if lowering is None else lowering.dirty_roots
+                        )
+                        primary_execution, normalize_capture_error = (
+                            self._capture_execution_callbacks_locked(
+                                dirty_roots,
+                            )
+                        )
+
+                        def completion(
+                            result: object,
+                            error: BaseException | None,
+                        ) -> object:
+                            if error is None or isinstance(error, BslExecutionError):
+                                for root in dirty_roots:
+                                    self._pending_dirty_roots.setdefault(
+                                        root.casefold(), root,
+                                    )
+                            if error is not None:
+                                self._restore_namespace_context(
+                                    lowerer, context_before,
+                                )
+                                return None
+                            completed_reply = self._reply(result)
+                            if _reply_evidence is not None:
+                                _reply_evidence(completed_reply)
+                            return self._finalize_namespace_reply(
+                                completed_reply,
+                                lowering=lowering,
+                                context_before=context_before,
+                                lowerer=lowerer,
+                            )
+
+                        def rejection(error: BaseException) -> None:
+                            del error
+                            self._restore_namespace_context(
+                                lowerer, context_before,
+                            )
+
+                        handoff = _PreparedCaptureExecution(
+                            execute=lambda: execute_mapped(
                                 source,
                                 mapped_execution,
                                 visible_source_context=visible_source_context,
@@ -2858,20 +3909,33 @@ class PrototypeRuntimeApi:
                                 message_collector_key=message_collector_key,
                                 worker_messages=self._notebook_worker_messages_enabled(),
                                 worker_globals=self._notebook_worker_globals(),
-                                dirty_roots=(
-                                    () if lowering is None else lowering.dirty_roots
-                                ),
+                                dirty_roots=dirty_roots,
                                 on_transport_dispatch=_dispatch_evidence,
-                            )
+                            ),
+                            detach_pin=self._detach_capture_evaluation_pin_locked,
+                            completion=completion,
+                            release_writer=self._capture_owner_handoff,
+                            release_waiter=self._capture_session_waiter_handoff,
+                            primary_execution=primary_execution,
+                            normalize_error=normalize_capture_error,
+                            rejection=rejection,
                         )
+                        result = self._execute_prepared_capture_handoff(handoff)
+                        if handoff.transferred:
+                            return result  # type: ignore[return-value]
+                        reply = self._reply(result)
                     else:
                         raise ProtocolError(
                             "Runtime controller requires mapped CAPTURE execution"
                         )
                 except BslExecutionError as error:
-                    diagnostic = self._worker_runtime_diagnostic(
-                        str(error),
-                        error.diagnostic,
+                    diagnostic = (
+                        error.diagnostic
+                        if handoff is not None and handoff.transferred
+                        else self._worker_runtime_diagnostic(
+                            str(error),
+                            error.diagnostic,
+                        )
                     )
                     reply = RuntimeReply(
                         RuntimeReplyKind.CAPTURE_CELL,
@@ -2882,7 +3946,19 @@ class PrototypeRuntimeApi:
                         messages=error.messages,
                         diagnostic=diagnostic,
                     )
+                    if handoff is not None and handoff.transferred:
+                        if _reply_evidence is not None:
+                            _reply_evidence(reply)
+                        if handoff.submitted and lowering is not None:
+                            reply = replace(
+                                reply,
+                                changed_roots=lowering.persistent_write_roots,
+                                capture_dirty_roots=lowering.dirty_roots,
+                            )
+                        return reply
                 except BaseException:
+                    if handoff is not None and handoff.transferred:
+                        raise
                     self._restore_namespace_context(lowerer, context_before)
                     raise
                 if _reply_evidence is not None:
@@ -2945,19 +4021,13 @@ class PrototypeRuntimeApi:
         *,
         timeout_s: float | None = None,
     ) -> RuntimeReply:
-        with self._single_writer(), self._bounded_command_timeout(timeout_s):
+        with self._capture_data_plane_writer(), self._bounded_command_timeout(timeout_s):
             self._require_available()
             return self._resume_debug_stop_locked()
 
     def _resume_debug_stop_locked(self) -> RuntimeReply:
-        if self._controller.state not in {
-            OperationState.DEBUG_STOPPED,
-            OperationState.CAPTURE_DEBUG_STOPPED,
-        }:
-            raise ProtocolError(
-                "Resume requires a debug_stopped or capture_debug_stopped runtime"
-            )
-        capture_evaluation = self._controller.state is OperationState.CAPTURE_DEBUG_STOPPED
+        if self._controller.state is not OperationState.DEBUG_STOPPED:
+            raise ProtocolError("Resume requires a debug_stopped runtime")
         reply: RuntimeReply | None = None
         resume_dispatched = False
 
@@ -2966,37 +4036,16 @@ class PrototypeRuntimeApi:
             resume_dispatched = True
 
         self._require_operation_pin_dispatch_fence_locked(
-            self._evaluation_generation_pin if capture_evaluation else self._operation_generation_pin,
+            self._operation_generation_pin,
             mode=LoweringMode.CAPTURE,
-            capture_evaluation=capture_evaluation,
             require_active=False,
         )
         try:
-            try:
-                reply = self._reply(
-                    self._controller.resume_debug_stop(
-                        on_transport_dispatch=mark_debug_resume_dispatched,
-                    )
+            reply = self._reply(
+                self._controller.resume_debug_stop(
+                    on_transport_dispatch=mark_debug_resume_dispatched,
                 )
-            except BslExecutionError as error:
-                if not (
-                    capture_evaluation
-                    and self._controller.state is OperationState.CAPTURED
-                ):
-                    raise
-                diagnostic = self._worker_runtime_diagnostic(
-                    str(error),
-                    error.diagnostic,
-                )
-                reply = RuntimeReply(
-                    RuntimeReplyKind.CAPTURE_CELL,
-                    self._controller.operation_id,
-                    self._controller.state,
-                    error=_BSL_EXECUTION_FAILURE_SUMMARY,
-                    succeeded=False,
-                    messages=error.messages,
-                    diagnostic=diagnostic,
-                )
+            )
             self._finalize_pending_namespace(reply)
             return reply
         finally:
@@ -3005,24 +4054,34 @@ class PrototypeRuntimeApi:
             # nothing about whether that operation completed; retain its exact
             # pin until a known reply or an outcome-unknown dispatch result.
             if reply is not None or resume_dispatched:
-                if capture_evaluation:
-                    self._finish_capture_evaluation_pin_locked(
-                        reply=reply,
-                        outcome_unknown=resume_dispatched and reply is None,
-                    )
-                else:
-                    self._finalize_active_operation_pin_locked(
-                        reply=reply,
-                        outcome_unknown=resume_dispatched and reply is None,
-                    )
+                self._finalize_active_operation_pin_locked(
+                    reply=reply,
+                    outcome_unknown=resume_dispatched and reply is None,
+                )
 
     def resume_capture(
         self,
         *,
         dirty_roots: tuple[str, ...] = (),
         continuation_attempt_id: str | None = None,
+        timeout_s: float | None = None,
+        on_completion: Callable[[RuntimeReply | None, BaseException | None], None]
+        | None = None,
+        on_detached_completion: Callable[
+            [RuntimeReply | None, BaseException | None], None
+        ]
+        | None = None,
     ) -> RuntimeReply:
-        with self._single_writer():
+        with self._capture_data_plane_writer():
+            if timeout_s is not None and (
+                isinstance(timeout_s, bool)
+                or not isinstance(timeout_s, (int, float))
+                or not isfinite(float(timeout_s))
+                or timeout_s < 0
+            ):
+                raise ProtocolError(
+                    "capture resume timeout must be finite and non-negative"
+                )
             self._require_available()
             if self._controller.state is OperationState.CAPTURED:
                 combined = dict(self._pending_dirty_roots)
@@ -3046,26 +4105,86 @@ class PrototypeRuntimeApi:
                     self._operation_generation_pin,
                     mode=LoweringMode.CAPTURE,
                 )
+                submit_resume = self._controller.submit_resume
+                if not callable(submit_resume):
+                    raise ProtocolError(
+                        "Runtime controller cannot submit a CAPTURE resume"
+                    )
+                def complete_resume(
+                    result: object | None,
+                    error: BaseException | None,
+                ) -> object:
+                    completed: RuntimeReply | None = None
+                    try:
+                        if error is None:
+                            completed = self._reply(result)  # type: ignore[arg-type]
+                            self._pending_dirty_roots.clear()
+                            self._finalize_pending_namespace(completed)
+                            return completed
+                        return None
+                    finally:
+                        if error is None or resume_dispatched:
+                            self._finalize_controller_owned_resume_pin(
+                                reply=completed,
+                                outcome_unknown=(
+                                    resume_dispatched and completed is None
+                                ),
+                            )
+
+                resume_arguments["on_transport_dispatch"] = mark_resume_dispatched
+                resume_arguments["completion"] = complete_resume
                 if self._operation_generation_pin is not None:
-                    self._clear_capture_worker_generation_pin_locked()
-                try:
-                    resume_arguments["on_transport_dispatch"] = (
-                        mark_resume_dispatched
+                    clear_worker_pin = getattr(
+                        self._controller,
+                        "clear_capture_worker_generation_pin_for_resume",
+                        None,
                     )
-                    reply = self._reply(
-                        self._controller.resume(**resume_arguments)  # type: ignore[arg-type]
-                    )
-                    self._pending_dirty_roots.clear()
-                    self._finalize_pending_namespace(reply)
-                    return reply
-                finally:
-                    # See _resume_debug_stop_locked: this is a continuation
-                    # of an existing MAIN, not a newly-created operation.
-                    if reply is not None or resume_dispatched:
-                        self._finalize_active_operation_pin_locked(
-                            reply=reply,
-                            outcome_unknown=resume_dispatched and reply is None,
+                    if not callable(clear_worker_pin):
+                        raise ProtocolError(
+                            "Runtime controller cannot clear the CAPTURE "
+                            "Worker pin from its resume owner"
                         )
+                    resume_arguments["before_resume"] = clear_worker_pin
+                # A waiter that times out or is interrupted has no caller
+                # stack left to retire Session-facing state. Its fallback
+                # runs only after the coordinator published the terminal
+                # ticket. An attached waiter invokes the same callback on
+                # its own thread below, after it regains outer locks.
+                resume_arguments["detached_completion"] = (
+                    on_completion
+                    if on_detached_completion is None
+                    else on_detached_completion
+                )
+                submission = _CaptureResumeSubmission()
+                ticket: CaptureResumeTicket | None = None
+                try:
+                    ticket = submission.submit(submit_resume, **resume_arguments)
+                    if not isinstance(ticket, CaptureResumeTicket):
+                        raise ProtocolError(
+                            "CAPTURE controller did not return a resume ticket"
+                        )
+                    # Submission is the outer-lock linearization point.
+                    # The worker now owns all target I/O and the next event;
+                    # the initiating thread only waits on the condition.
+                    with self._capture_owner_handoff():
+                        with self._capture_session_waiter_handoff():
+                            completed = ticket.wait_initiator(timeout_s)
+                except BaseException as error:
+                    # Adoption can precede the normal ticket return. Detach via
+                    # the receipt on every unwind path; this is idempotent.
+                    submission.detach_initiator()
+                    ticket = ticket or submission.ticket
+                    if (
+                        ticket is not None
+                        and not ticket.initiator_detached
+                        and on_completion is not None
+                    ):
+                        on_completion(None, error)
+                    raise
+                assert ticket is not None
+                if on_completion is not None:
+                    on_completion(completed, None)
+                return completed
             if self._controller.state in {
                 OperationState.DEBUG_STOPPED,
             }:
@@ -3074,10 +4193,6 @@ class PrototypeRuntimeApi:
                         "Dirty capture roots cannot be used at a user breakpoint"
                     )
                 return self._resume_debug_stop_locked()
-            if self._controller.state is OperationState.CAPTURE_DEBUG_STOPPED:
-                raise ProtocolError(
-                    "Pending CAPTURE evaluation requires resume_debug_stop"
-                )
             raise ProtocolError(
                 "Resume requires captured or debug_stopped runtime; current state "
                 f"is {self._controller.state.value}"
@@ -3108,7 +4223,7 @@ class PrototypeRuntimeApi:
     ) -> WorkerGenerationHandle:
         """Upsert modules and atomically publish the complete active graph."""
         with (
-            self._single_writer(),
+            self._capture_data_plane_writer(),
             self._prune_worker_caches_after_failure_locked(),
         ):
             self._require_available()
@@ -3168,12 +4283,121 @@ class PrototypeRuntimeApi:
                 lowering_catalog=self._descriptor_catalog(descriptors),
                 profiler=profiler,
                 breakpoint_policy=breakpoint_policy,
+                module_syntax={name: models[name].syntax_index for name in ordered_names},
             )
             self._worker_active_modules = staged_active
+            sources = dict(self._worker_source_generations.get(handle, {}))
+            sources.update(self._worker_source_snapshot(
+                staged_active, generation=handle.generation,
+            ))
+            self._worker_source_generations[handle] = MappingProxyType(sources)
             self._worker_module_artifacts.update(cache_additions)
             self._worker_catalog_snapshot = catalog
             self._prune_worker_caches_locked()
             return handle
+
+    def _worker_source_snapshot(
+        self,
+        modules: Mapping[str, _ActiveWorkerModule],
+        *,
+        generation: int,
+    ) -> Mapping[tuple[str, SourceUnitRef], _WorkerStackSource]:
+        result: dict[tuple[str, SourceUnitRef], _WorkerStackSource] = {}
+        for active in modules.values():
+            unit = active.unit
+            version = SourceVersionRef.worker(
+                artifact_id=unit.mapped_source.artifact.source_sha256,
+                generation=generation,
+                source_text=unit.mapped_source.text,
+            )
+            references = {
+                reference
+                for segment in unit.mapped_source.source_map.segments
+                for reference in (segment.origin_ref, segment.anchor_ref)
+                if isinstance(reference, SourceUnitRef)
+                and reference.source_sha256 == version.source_sha256
+            }
+            for reference in references:
+                result[(unit.logical_name.casefold(), reference)] = _WorkerStackSource(
+                    unit.logical_name,
+                    self._worker_module_identity(unit),
+                    version,
+                )
+        return MappingProxyType(result)
+
+    @staticmethod
+    def _repin_worker_source_snapshot(
+        sources: Mapping[tuple[str, SourceUnitRef], _WorkerStackSource],
+        *,
+        generation: int,
+        required_keys: frozenset[tuple[str, SourceUnitRef]],
+    ) -> Mapping[tuple[str, SourceUnitRef], _WorkerStackSource]:
+        return MappingProxyType({
+            key: _WorkerStackSource(
+                source.source,
+                source.identity,
+                SourceVersionRef.worker(
+                    artifact_id=(
+                        source.version.artifact_id
+                        or source.version.source_sha256
+                        or key[1].source_sha256
+                    ),
+                    generation=generation,
+                    source_text=source.version.read_text(),
+                ),
+            )
+            for key, source in sources.items()
+            if key in required_keys
+        })
+
+    def _notebook_source_snapshot(
+        self,
+        method_set: NotebookMethodSet,
+        *,
+        generation: int,
+    ) -> Mapping[tuple[str, SourceUnitRef], _WorkerStackSource]:
+        result: dict[tuple[str, SourceUnitRef], _WorkerStackSource] = {}
+        for visible in method_set._visible_sources:
+            mapped = visible.source_map.map_offset(0)
+            unit = mapped.unit
+            if unit is None or unit.source_sha256 != source_sha256(visible.text):
+                raise ProtocolError("Notebook source snapshot is invalid")
+            result[("worker", unit)] = _WorkerStackSource(
+                "ЯчейкаНоутбука",
+                ModuleIdentity(
+                    self._anonymous_notebook_id,
+                    "worker",
+                    unit.kind.value,
+                    source_sha256(unit.unit_id),
+                    "Module",
+                ),
+                SourceVersionRef.worker(
+                    artifact_id=unit.source_sha256,
+                    generation=generation,
+                    source_text=visible.text,
+                ),
+            )
+        return MappingProxyType(result)
+
+    def confirmed_worker_module_units(
+        self, handle: WorkerGenerationHandle,
+    ) -> tuple[WorkerModuleUnit, ...]:
+        """Read the complete source set of the current confirmed generation.
+
+        This is local inventory access, not a target evaluation. An older or
+        unconfirmed handle must never be relabeled as the current source set.
+        """
+        with self._single_writer():
+            self._require_available()
+            if (
+                not isinstance(handle, WorkerGenerationHandle)
+                or handle is not self._worker_generation_handle
+            ):
+                raise ProtocolError("Worker source generation is not current")
+            return tuple(
+                self._worker_active_modules[name].unit
+                for name in sorted(self._worker_active_modules)
+            )
 
     def _worker_units_with_updates(
         self,
@@ -3206,16 +4430,21 @@ class PrototypeRuntimeApi:
                 and current.model.source_sha256 == source_hash
                 and current.model.parser_identity == parser_identity
             ):
-                models[normalized] = current.model
-                continue
-            model = parse_full_ast_module(
-                unit.mapped_source.text,
-                profiler=profiler,
-            )
+                model = current.model
+            else:
+                model = parse_full_ast_module(
+                    unit.mapped_source.text,
+                    profiler=profiler,
+                )
             if model.source_sha256 != source_hash:
                 raise ProtocolError("Worker projected source identity changed")
             if model.parser_identity != parser_identity:
                 raise ProtocolError("Worker parser provenance changed during parse")
+            if model.syntax_index is None:
+                raise ProtocolError("Worker projected syntax index is unavailable")
+            self._module_syntax_registry.publish(
+                self._worker_module_identity(unit), model.syntax_index
+            )
             models[normalized] = model
         return models
 
@@ -3450,6 +4679,7 @@ class PrototypeRuntimeApi:
         prepared_catalog: tuple[object, ...] | None = None,
         before_promote: Callable[[], None] | None = None,
         on_prepared_generation: Callable[[WorkerGenerationHandle], None] | None = None,
+        module_syntax: Mapping[str, ModuleSyntaxIndex] | None = None,
         profiler: PhaseRecorder | None = None,
         breakpoint_policy: WorkerBreakpointReloadPolicy = (
             WorkerBreakpointReloadPolicy.STRICT
@@ -3458,6 +4688,12 @@ class PrototypeRuntimeApi:
         """Publish through the sole host/target universe and commit after swap."""
         if type(breakpoint_policy) is not WorkerBreakpointReloadPolicy:
             raise TypeError("worker breakpoint reload policy is required")
+        # Snapshot candidates before remote work. Notebook-only publications
+        # inherit the confirmed module versions without consulting MAIN's pin.
+        candidate_syntax = MappingProxyType(dict(
+            self._worker_syntax_generations.get(self._worker_generation_handle, {})
+            if module_syntax is None else module_syntax
+        ))
         effective_catalog = (
             None
             if lowering_catalog is None
@@ -3469,6 +4705,9 @@ class PrototypeRuntimeApi:
         )
         try:
             candidate_diagnostics = self._worker_candidate_diagnostics(candidate)
+            candidate_source_keys = self._worker_universe._candidate_source_keys(
+                candidate
+            )
         except BaseException:
             self._worker_universe.discard(candidate)
             raise
@@ -3598,7 +4837,17 @@ class PrototypeRuntimeApi:
                 )
                 raise self._poisoned_error from error
         previous_api_owned_handle = self._api_owned_worker_generation_handle
+        inherited_sources = self._worker_source_generations.get(
+            self._worker_generation_handle,
+            MappingProxyType({}),
+        )
         self._worker_generation_handle = handle
+        self._worker_syntax_generations[handle] = candidate_syntax
+        self._worker_source_generations[handle] = self._repin_worker_source_snapshot(
+            inherited_sources,
+            generation=handle.generation,
+            required_keys=candidate_source_keys,
+        )
         self._worker_generation_diagnostics[handle.manifest_sha256] = (
             candidate_diagnostics
         )
@@ -3936,6 +5185,14 @@ class PrototypeRuntimeApi:
             for manifest_sha256, diagnostics in self._worker_generation_diagnostics.items()
             if manifest_sha256 in inventory.manifest_sha256s
         }
+        self._worker_syntax_generations = _retain_live_worker_generation_snapshots(
+            self._worker_syntax_generations,
+            inventory.generation_handles,
+        )
+        self._worker_source_generations = _retain_live_worker_generation_snapshots(
+            self._worker_source_generations,
+            inventory.generation_handles,
+        )
 
     @contextmanager
     def _prune_worker_caches_after_failure_locked(self) -> Iterator[None]:
@@ -3951,7 +5208,7 @@ class PrototypeRuntimeApi:
 
     def release_worker_generation(self, handle: WorkerGenerationHandle) -> None:
         """Release the current API-owned generation; superseded handles are stale."""
-        with self._single_writer():
+        with self._capture_data_plane_writer():
             self._require_available()
             try:
                 self._release_worker_lifecycle_locked(handle)
@@ -4029,48 +5286,140 @@ class PrototypeRuntimeApi:
             )
             raise self._poisoned_error from error
 
+    def _close_capture_control_plane(self) -> bool:
+        """Stop CAPTURE polling without entering the data-plane writer."""
+        with self._close_lock:
+            return self._close_capture_control_plane_locked()
+
+    def _close_capture_control_plane_locked(self) -> bool:
+        # This is an admission fence, not a claim that local Worker ownership
+        # has been finalized.  It must be installed before bounded shutdown
+        # work starts so no new data-plane operation can race it.
+        self._admission_closed = True
+        if self._capture_shutdown_finished:
+            return self._capture_shutdown_termination_proven
+        owner = self._capture_control_owner()
+        ready_owner = self._ready_inspection_control_owner()
+        if owner is None and ready_owner is None:
+            self._capture_shutdown_finished = True
+            self._capture_shutdown_termination_proven = True
+            return True
+        if ready_owner is not None:
+            stopped = self._controller.shutdown_capture_evaluation()
+        else:
+            shutdown = getattr(self._controller, "shutdown_capture_evaluation", None)
+            if callable(shutdown):
+                stopped = shutdown()
+            else:
+                assert owner is not None
+                owner.begin_close()
+                session = getattr(self._controller, "session", None)
+                invalidate = getattr(session, "invalidate", None)
+                if callable(invalidate):
+                    invalidate()
+                timeout_s = getattr(self._controller, "command_timeout_s", 1.0)
+                if (
+                    isinstance(timeout_s, bool)
+                    or not isinstance(timeout_s, (int, float))
+                    or not isfinite(float(timeout_s))
+                    or float(timeout_s) <= 0
+                ):
+                    timeout_s = 1.0
+                stopped = owner.join(min(1.0, float(timeout_s)))
+                owner.finish_close(stopped)
+        self._capture_shutdown_finished = True
+        self._capture_shutdown_termination_proven = bool(stopped)
+        return self._capture_shutdown_termination_proven
+
     def close(self) -> None:
         """Release all generation roots, pins and target registrations once."""
-        with self._single_writer():
-            if self._closed:
+        with self._close_lock:
+            self._admission_closed = True
+            if self._data_plane_finalized:
                 return
+            capture_termination_proven = self._close_capture_control_plane_locked()
+            if self._target_terminated:
+                # Session has already destroyed the target.  Capture worker
+                # termination and publication are separate facts, so a cached
+                # unproven join result must not strand local Worker ownership.
+                with self._single_writer():
+                    self._close_data_plane_locked(target_terminated=True)
+                return
+            if not capture_termination_proven:
+                # The event consumer still owns its pending record and leases.
+                # Process/session teardown is now the only safe cleanup owner.
+                return
+            with self._single_writer():
+                self._close_data_plane_locked()
+
+    def _mark_target_terminated(self) -> None:
+        """Publish target death and converge completed capture publication."""
+        with self._close_lock:
+            self._target_terminated = True
             if (
-                self._controller.state is OperationState.CAPTURED
-                and self._operation_generation_pin is not None
+                self._capture_shutdown_finished
+                and not self._data_plane_finalized
             ):
-                self._clear_capture_worker_generation_pin_locked()
-            try:
-                if self._controller.state is OperationState.RECOVERING:
-                    self._worker_universe_target.abandon_target()
-                else:
-                    self._worker_universe_target.teardown()
-            except WorkerPromotionOutcomeUnknown:
-                raise
-            except BaseException as error:
-                self._poisoned_error = PoisonedRuntimeError(
-                    "Runtime API cleanup could not release Worker generations"
+                # Session may have read capture publication before a concurrent
+                # direct close completed it.  The target-death publisher is
+                # then the second monotonic fact and must finish local teardown
+                # before releasing this shared shutdown lock.
+                with self._single_writer():
+                    self._close_data_plane_locked(target_terminated=True)
+
+    def _close_after_target_termination(self) -> None:
+        """Finish local API teardown after RuntimeSession killed the target."""
+        with self._close_lock:
+            self._admission_closed = True
+            self._target_terminated = True
+            if self._data_plane_finalized:
+                return
+            if not self._capture_shutdown_finished:
+                raise ProtocolError(
+                    "CAPTURE shutdown publication is incomplete"
                 )
-                raise self._poisoned_error from error
-            self._operation_generation_pin = None
-            self._preparing_generation_pin = None
-            self._evaluation_generation_pin = None
-            self._worker_generation_handle = None
-            self._api_owned_worker_generation_handle = None
-            prune_binary_cache = getattr(
-                self._worker_module_builder,
-                "_prune_cache",
-                None,
+            with self._single_writer():
+                self._close_data_plane_locked(target_terminated=True)
+
+    def _close_data_plane_locked(self, *, target_terminated: bool = False) -> None:
+        if self._data_plane_finalized:
+            return
+        try:
+            if target_terminated or self._controller.state is OperationState.RECOVERING:
+                self._worker_universe_target.abandon_target()
+            else:
+                self._worker_universe_target.teardown()
+        except WorkerPromotionOutcomeUnknown:
+            raise
+        except BaseException as error:
+            self._poisoned_error = PoisonedRuntimeError(
+                "Runtime API cleanup could not release Worker generations"
             )
-            if callable(prune_binary_cache):
-                prune_binary_cache(frozenset())
-            self._worker_module_artifacts.clear()
-            self._worker_generation_diagnostics.clear()
-            self._worker_active_modules.clear()
-            self._notebook_method_set = None
-            self._notebook_worker_descriptor = None
-            self._worker_exports = ()
-            self._prepared_source_units.clear()
-            self._closed = True
+            raise self._poisoned_error from error
+        self._operation_generation_pin = None
+        self._preparing_generation_pin = None
+        self._evaluation_generation_pin = None
+        self._worker_generation_handle = None
+        self._api_owned_worker_generation_handle = None
+        prune_binary_cache = getattr(
+            self._worker_module_builder,
+            "_prune_cache",
+            None,
+        )
+        if callable(prune_binary_cache):
+            prune_binary_cache(frozenset())
+        self._worker_module_artifacts.clear()
+        self._worker_generation_diagnostics.clear()
+        self._worker_syntax_generations.clear()
+        self._worker_source_generations.clear()
+        self._module_syntax_registry = ModuleSyntaxRegistry()
+        self._worker_active_modules.clear()
+        self._notebook_method_set = None
+        self._notebook_worker_descriptor = None
+        self._worker_exports = ()
+        self._prepared_source_units.clear()
+        self._data_plane_finalized = True
+        self._closed = True
 
     def _notebook_publication_artifacts(
         self, artifact: WorkerArtifact,
@@ -4120,6 +5469,13 @@ class PrototypeRuntimeApi:
             before_promote=record_upload_planned,
             on_prepared_generation=on_prepared_generation,
         )
+        if method_set_candidate is not None:
+            sources = dict(self._worker_source_generations.get(generation, {}))
+            sources.update(self._notebook_source_snapshot(
+                method_set_candidate,
+                generation=generation.generation,
+            ))
+            self._worker_source_generations[generation] = MappingProxyType(sources)
         self._notebook_worker_descriptor = descriptor
         self._notebook_worker_revision = revision
         try:
@@ -4144,15 +5500,18 @@ class PrototypeRuntimeApi:
         chunk_size: int = 65_536,
         profiler: PhaseRecorder | None = None,
     ) -> pd.DataFrame:
-        with self._single_writer():
+        with self._capture_data_plane_writer():
             self._require_available()
-            safe_handle = self._resolve_value_handle_locked(handle)
+            table_source, trusted_expression = self._resolve_table_source_locked(
+                handle
+            )
             return self._materialize_table_locked(
-                safe_handle,
+                table_source,
                 refs=refs,
                 ref_columns=ref_columns,
                 uuid_suffix=uuid_suffix,
                 profiler=profiler,
+                trusted_expression=trusted_expression,
             )
 
     def materialize_value(
@@ -4170,22 +5529,9 @@ class PrototypeRuntimeApi:
         profiler: PhaseRecorder | None = None,
     ) -> object:
         del chunk_size
-        with self._single_writer(), self._bounded_command_timeout(timeout_s):
+        with self._capture_data_plane_writer(), self._bounded_command_timeout(timeout_s):
             self._require_available()
             safe_handle = self._resolve_value_handle_locked(handle)
-            route = self._materialization_kind_locked(safe_handle)
-            if route == "table":
-                return self._materialize_table_locked(
-                    safe_handle,
-                    refs=refs,
-                    ref_columns=ref_columns,
-                    uuid_suffix=uuid_suffix,
-                    max_rows=max_items,
-                    max_bytes=max_bytes,
-                    profiler=profiler,
-                )
-            if route != "value":
-                raise ProtocolError("1C value materialization route is invalid")
             mode = refs.value if isinstance(refs, ReferenceMode) else refs
             options = MaterializationOptions(
                 refs=mode,
@@ -4193,20 +5539,138 @@ class PrototypeRuntimeApi:
                 max_items=max_items,
                 max_bytes=max_bytes,
             )
-            transfer = RuntimeValueTransfer(
-                self._execute_worker_instruction,
-                self._take_context_string,
-                context_cleaner=self._controller.drop_context_value,
-                runtime_generation=lambda: self._controller.runtime_generation,
-                context_generation=self._context_generation,
-                profiler=profiler,
+            context_key = f"__onec_materialization_{uuid4().hex}"
+            plan = self._projection_transfer_plan(
+                self._dynamic_materialization_instruction(
+                    safe_handle,
+                    context_key=context_key,
+                    options=options,
+                    refs=refs,
+                    ref_columns=ref_columns,
+                    max_rows=max_items,
+                    worker_type_registrations=self._worker_type_registrations(),
+                ),
+                context_key=context_key,
+                max_bytes=max_bytes,
             )
-            return transfer.materialize(safe_handle, options)
+            payload = self._execute_transfer_plan_locked(
+                plan,
+                max_bytes=max_bytes,
+                evaluation_kind=CaptureEvaluationKind.MATERIALIZATION_HELPER,
+            )
+            route = self._payload_materialization_route(payload)
+            if route == "table":
+                operation = lambda: decode_compact_table_payload(
+                    payload, ReferencePolicy(refs, ref_columns, uuid_suffix)
+                )
+                if profiler is None:
+                    return operation()
+                return profiler.measure(
+                    "table.build_dataframe",
+                    operation,
+                    input_bytes=len(payload),
+                    item_count=lambda frame: len(frame.index),
+                )
+            operation = lambda: decode_value_payload(payload, options)
+            if profiler is None:
+                return operation()
+            return profiler.measure(
+                "value.decode_snapshot",
+                operation,
+                input_bytes=len(payload),
+            )
+
+    def _dynamic_materialization_instruction(
+        self,
+        handle: str,
+        *,
+        context_key: str,
+        options: MaterializationOptions,
+        refs: str | ReferenceMode,
+        ref_columns: dict[str, str | ReferenceMode] | None,
+        max_rows: int,
+        worker_type_registrations: tuple[str, ...],
+    ) -> str:
+        """Choose the serializer only after the same instruction admits its handle."""
+        try:
+            table_reference_mode = ReferenceMode(refs).value
+        except ValueError as error:
+            raise ProtocolError("unknown table reference mode") from error
+        if type(max_rows) is not int or max_rows <= 0:
+            raise ProtocolError("table row budget must be positive")
+        overrides = dict(ref_columns or {})
+        for column, mode in overrides.items():
+            if not isinstance(column, str) or not column:
+                raise ProtocolError("table reference column name is invalid")
+            try:
+                ReferenceMode(mode)
+            except ValueError as error:
+                raise ProtocolError("unknown table reference mode") from error
+        if any(not isinstance(registration, str) or not registration
+               for registration in worker_type_registrations):
+            raise ProtocolError("materialization Worker type registrations are invalid")
+        lines = ["Попытка", "ТипыОбъектовWorker = Новый Массив;"]
+        for index, registration in enumerate(worker_type_registrations):
+            lines.extend((
+                f"ВременныйОбъектWorker{index} = ВнешниеОбработки.Создать("
+                f"{bsl_string_literal(registration)}, Ложь);",
+                f"ТипыОбъектовWorker.Добавить(ТипЗнч(ВременныйОбъектWorker{index}));",
+            ))
+        lines.extend((
+            "Если Не RuntimeValueTransferServer.ДопуститьЗначение("
+            f"{handle}, ТипыОбъектовWorker) Тогда",
+            '    Результат = "D|worker_generation_value";',
+            "Иначе",
+            "    ВидМатериализации = RuntimeValueTransferServer."
+            f"ПолучитьВидМатериализации({handle});",
+            '    Если ВидМатериализации = "table" Тогда',
+            "        РежимыСсылокМатериализации = Новый Соответствие;",
+        ))
+        for column in sorted(overrides):
+            lines.append(
+                "        РежимыСсылокМатериализации.Вставить("
+                f"{bsl_string_literal(column)}, "
+                f"{bsl_string_literal(ReferenceMode(overrides[column]).value)});"
+            )
+        lines.extend((
+            "        Материализация = RuntimeTableTransferServer."
+            "СериализоватьКомпактнуюТаблицу("
+            f"{handle}, {bsl_string_literal(table_reference_mode)}, "
+            "РежимыСсылокМатериализации, ТипыОбъектовWorker, "
+            f"{max_rows}, {options.max_bytes});",
+            '    ИначеЕсли ВидМатериализации = "value" Тогда',
+            "        Материализация = RuntimeValueTransferServer."
+            "СериализоватьЗначение("
+            f"{handle}, {bsl_string_literal(options.refs)}, "
+            f"{options.max_depth}, {options.max_items}, {options.max_bytes}, "
+            "ТипыОбъектовWorker);",
+            "    Иначе",
+            '        Результат = "E|value_admission_failed";',
+            "    КонецЕсли;",
+            '    Если ВидМатериализации = "table" Или ВидМатериализации = "value" Тогда',
+            "        Если Не Материализация.Доступ Тогда",
+            '            Результат = "D|worker_generation_value";',
+            "        Иначе",
+            f"            Контекст.Вставить({bsl_string_literal(context_key)}, Материализация.Base64);",
+            '            Результат = "R|" + '
+            f'Формат({self._controller.runtime_generation}, "ЧГ=0; ЧДЦ=0") + "|" + '
+            f'Формат({self._context_generation}, "ЧГ=0; ЧДЦ=0") + "|" + '
+            'Формат(Материализация.Размер, "ЧГ=0; ЧДЦ=0") + "|" + '
+            'Материализация.Хеш + "|" + '
+            'Формат(СтрДлина(Материализация.Base64), "ЧГ=0; ЧДЦ=0");',
+            "        КонецЕсли;",
+            "    КонецЕсли;",
+            "КонецЕсли;",
+            "Исключение",
+            '    Результат = "E|value_admission_failed";',
+            "КонецПопытки;",
+        ))
+        return "\n".join(lines)
 
     def materialization_kind(
         self, handle: str, *, timeout_s: float | None = None
     ) -> str:
-        with self._single_writer(), self._bounded_command_timeout(timeout_s):
+        with self._capture_data_plane_writer(), self._bounded_command_timeout(timeout_s):
             self._require_available()
             return self._materialization_kind_locked(self._resolve_value_handle_locked(handle))
 
@@ -4221,18 +5685,18 @@ class PrototypeRuntimeApi:
         timeout_s: float | None = None,
         profiler: PhaseRecorder | None = None,
     ) -> bytes:
-        with self._single_writer(), self._bounded_command_timeout(timeout_s):
+        with self._capture_data_plane_writer(), self._bounded_command_timeout(timeout_s):
             self._require_available()
             safe_handle = self._resolve_value_handle_locked(handle)
-            if self._materialization_kind_locked(safe_handle) != "value":
-                raise ProtocolError("1C value is not a recursive value payload")
             transfer = RuntimeValueTransfer(
-                self._execute_worker_instruction,
+                self._materialization_instruction_executor,
                 self._take_context_string,
-                context_cleaner=self._controller.drop_context_value,
+                context_cleaner=self._drop_context_value,
                 runtime_generation=lambda: self._controller.runtime_generation,
                 context_generation=self._context_generation,
+                worker_type_registrations=self._worker_type_registrations,
                 profiler=profiler,
+                capture_executor=self._capture_transfer_executor_or_none(),
             )
             return transfer.payload(
                 safe_handle,
@@ -4251,27 +5715,28 @@ class PrototypeRuntimeApi:
         timeout_s: float | None = None,
         profiler: PhaseRecorder | None = None,
     ) -> bytes:
-        with self._single_writer(), self._bounded_command_timeout(timeout_s):
+        with self._capture_data_plane_writer(), self._bounded_command_timeout(timeout_s):
             self._require_available()
-            safe_handle = self._resolve_value_handle_locked(handle)
-            if self._materialization_kind_locked(safe_handle) != "table":
-                raise ProtocolError("1C value is not a tabular payload")
+            table_source, trusted_expression = self._resolve_table_source_locked(
+                handle
+            )
             transfer = CompactRuntimeTableTransfer(
-                self._execute_worker_instruction,
+                self._materialization_instruction_executor,
                 self._take_context_string,
                 runtime_generation=lambda: self._controller.runtime_generation,
                 context_generation=self._context_generation,
-                context_cleaner=self._controller.drop_context_value,
-                schema_reader=self._inspect_compact_columns,
+                context_cleaner=self._drop_context_value,
+                worker_type_registrations=self._worker_type_registrations,
                 max_text_size=((max_bytes + 2) // 3) * 4,
                 max_payload_bytes=max_bytes,
                 max_rows=max_rows,
                 profiler=profiler,
+                capture_executor=self._capture_transfer_executor_or_none(),
             )
-            return transfer.payload(
-                safe_handle,
-                ReferencePolicy(refs, ref_columns, uuid_suffix),
-            )
+            policy = ReferencePolicy(refs, ref_columns, uuid_suffix)
+            if trusted_expression:
+                return transfer._payload_trusted_expression(table_source, policy)
+            return transfer.payload(table_source, policy)
 
     def project_value_payload(
         self,
@@ -4292,7 +5757,7 @@ class PrototypeRuntimeApi:
         uuid_suffix: str = "__uuid",
     ) -> tuple[str, bytes]:
         """Build and serialize a bounded projection without scanning past its limit."""
-        with self._single_writer(), self._bounded_command_timeout(timeout_s):
+        with self._capture_data_plane_writer(), self._bounded_command_timeout(timeout_s):
             self._require_available()
             safe_handle = self._resolve_value_handle_locked(handle)
             return self._project_value_payload_locked(
@@ -4328,6 +5793,11 @@ class PrototypeRuntimeApi:
         ref_columns: dict[str, str | ReferenceMode] | None,
         uuid_suffix: str,
     ) -> tuple[str, bytes]:
+        if any(
+            type(value) is not int or value <= 0
+            for value in (max_depth, max_items, max_rows, max_bytes)
+        ):
+            raise ProtocolError("projection materialization budgets must be positive")
         if (
             type(offset) is not int
             or offset < 0
@@ -4358,7 +5828,13 @@ class PrototypeRuntimeApi:
             raise ProtocolError("projection kind is unsupported")
 
         context_key = f"__onec_projection_{uuid4().hex}"
-        projection_handle = f"Контекст.{context_key}"
+        if kind != "table_rows":
+            MaterializationOptions(
+                refs.value if isinstance(refs, ReferenceMode) else refs,
+                max_depth,
+                max_items,
+                max_bytes,
+            )
         instruction = self._projection_instruction(
             safe_handle,
             context_key=context_key,
@@ -4367,49 +5843,174 @@ class PrototypeRuntimeApi:
             limit=limit,
             columns=columns,
             names=names,
+            refs=refs,
+            ref_columns=ref_columns,
+            max_depth=max_depth,
+            max_items=max_items,
+            max_rows=max_rows,
+            max_bytes=max_bytes,
+            runtime_generation=self._controller.runtime_generation,
+            context_generation=self._context_generation,
+            worker_type_registrations=self._worker_type_registrations(),
         )
+        capture_transfer = self._capture_transfer_executor_or_none() is not None
         try:
-            self._execute_worker_instruction(instruction)
+            if capture_transfer:
+                payload = self._execute_capture_transfer(
+                    self._projection_transfer_plan(
+                        instruction,
+                        context_key=context_key,
+                        max_bytes=max_bytes,
+                    ),
+                    evaluation_kind=CaptureEvaluationKind.INSPECTION,
+                )
+            else:
+                metadata = self._execute_worker_instruction(
+                    instruction,
+                    evaluation_kind=CaptureEvaluationKind.INSPECTION,
+                )
+                payload = self._consume_projection_payload_locked(
+                    metadata,
+                    context_key=context_key,
+                    max_bytes=max_bytes,
+                )
             if kind == "table_rows":
-                transfer = CompactRuntimeTableTransfer(
-                    self._execute_worker_instruction,
-                    self._take_context_string,
-                    runtime_generation=lambda: self._controller.runtime_generation,
-                    context_generation=self._context_generation,
-                    context_cleaner=self._controller.drop_context_value,
-                    schema_reader=self._inspect_compact_columns,
-                    max_text_size=((max_bytes + 2) // 3) * 4,
-                    max_payload_bytes=max_bytes,
-                    max_rows=limit,
-                )
-                return (
-                    "compact_table",
-                    transfer.payload(
-                        projection_handle,
-                        ReferencePolicy(refs, ref_columns, uuid_suffix),
-                    ),
-                )
-            transfer = RuntimeValueTransfer(
-                self._execute_worker_instruction,
-                self._take_context_string,
-                context_cleaner=self._controller.drop_context_value,
-                runtime_generation=lambda: self._controller.runtime_generation,
-                context_generation=self._context_generation,
+                return "compact_table", payload
+            return "value", payload
+        finally:
+            if not capture_transfer:
+                self._drop_context_value(context_key)
+
+    def _projection_transfer_plan(
+        self,
+        instruction: str,
+        *,
+        context_key: str,
+        max_bytes: int,
+    ) -> CaptureTransferPlan:
+        max_base64_chars = ((max_bytes + 2) // 3) * 4
+
+        def admit(metadata: object) -> object:
+            envelope = AdmissionEnvelopeV1.parse(
+                metadata,
+                max_payload_bytes=max_bytes,
+                max_base64_chars=max_base64_chars,
             )
-            return (
-                "value",
-                transfer.payload(
-                    projection_handle,
-                    MaterializationOptions(
-                        refs.value if isinstance(refs, ReferenceMode) else refs,
-                        max_depth,
-                        max_items,
-                        max_bytes,
-                    ),
-                ),
+            if (
+                envelope.runtime_generation != self._controller.runtime_generation
+                or envelope.context_generation != self._context_generation
+            ):
+                raise CaptureValueCheckError("CAPTURE value admission result is invalid")
+            return metadata
+
+        def decode(metadata: object, content: str) -> bytes:
+            envelope = AdmissionEnvelopeV1.parse(
+                metadata,
+                max_payload_bytes=max_bytes,
+                max_base64_chars=max_base64_chars,
+            )
+            if (
+                envelope.runtime_generation != self._controller.runtime_generation
+                or envelope.context_generation != self._context_generation
+                or len(content) != envelope.base64_chars
+            ):
+                raise CaptureValueCheckError("CAPTURE value admission result is invalid")
+            try:
+                payload = b64decode("".join(content.split()), validate=True)
+            except (ValueError, binascii.Error) as error:
+                raise ProtocolError("projection Base64 payload is invalid") from error
+            if (
+                len(payload) != envelope.payload_bytes
+                or sha256(payload).hexdigest() != envelope.payload_sha256
+            ):
+                raise CaptureValueCheckError(
+                    "CAPTURE value payload integrity check failed"
+                )
+            return payload
+
+        return CaptureTransferPlan(
+            instruction,
+            context_key,
+            f"Контекст.Удалить({bsl_string_literal(context_key)});\nРезультат = Истина;",
+            max_base64_chars,
+            decode,
+            admit,
+        )
+
+    def _execute_transfer_plan_locked(
+        self,
+        plan: CaptureTransferPlan,
+        *,
+        max_bytes: int,
+        evaluation_kind: CaptureEvaluationKind,
+    ) -> bytes:
+        """Use the coordinator in CAPTURE and the same admitted plan in MAIN."""
+        capture_transfer = self._capture_transfer_executor_or_none() is not None
+        try:
+            if capture_transfer:
+                return self._execute_capture_transfer(
+                    plan,
+                    evaluation_kind=evaluation_kind,
+                )
+            metadata = self._execute_worker_instruction(
+                plan.instruction,
+                evaluation_kind=evaluation_kind,
+            )
+            return self._consume_projection_payload_locked(
+                metadata,
+                context_key=plan.private_key,
+                max_bytes=max_bytes,
             )
         finally:
-            self._controller.drop_context_value(context_key)
+            if not capture_transfer:
+                self._drop_context_value(plan.private_key)
+
+    @staticmethod
+    def _payload_materialization_route(payload: bytes) -> str:
+        """Classify only an integrity-checked public payload, never the target."""
+        try:
+            header = json.loads(payload.split(b"\n", 1)[0].decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ProtocolError("materialization payload route is invalid") from error
+        if not isinstance(header, dict) or header.get("version") != 1:
+            raise ProtocolError("materialization payload route is invalid")
+        if "root" in header:
+            return "value"
+        if {"columns", "kinds", "reference_modes"} <= header.keys():
+            return "table"
+        raise ProtocolError("materialization payload route is invalid")
+
+    def _consume_projection_payload_locked(
+        self,
+        metadata: object,
+        *,
+        context_key: str,
+        max_bytes: int,
+    ) -> bytes:
+        max_base64_chars = ((max_bytes + 2) // 3) * 4
+        envelope = AdmissionEnvelopeV1.parse(
+            metadata,
+            max_payload_bytes=max_bytes,
+            max_base64_chars=max_base64_chars,
+        )
+        if (
+            envelope.runtime_generation != self._controller.runtime_generation
+            or envelope.context_generation != self._context_generation
+        ):
+            raise CaptureValueCheckError("CAPTURE value admission result is invalid")
+        content = self._take_context_string(context_key, max_base64_chars)
+        if len(content) != envelope.base64_chars:
+            raise CaptureValueCheckError("CAPTURE value admission result is invalid")
+        try:
+            payload = b64decode("".join(content.split()), validate=True)
+        except (ValueError, binascii.Error) as error:
+            raise ProtocolError("projection Base64 payload is invalid") from error
+        if (
+            len(payload) != envelope.payload_bytes
+            or sha256(payload).hexdigest() != envelope.payload_sha256
+        ):
+            raise CaptureValueCheckError("CAPTURE value payload integrity check failed")
+        return payload
 
     def project_to_df(
         self,
@@ -4425,8 +6026,8 @@ class PrototypeRuntimeApi:
         timeout_s: float | None = None,
     ) -> pd.DataFrame:
         del chunk_size
-        offset, limit = self._bounded_slice(selection, maximum=max_rows)
-        with self._single_writer(), self._bounded_command_timeout(timeout_s):
+        with self._capture_data_plane_writer(), self._bounded_command_timeout(timeout_s):
+            offset, limit = self._bounded_slice(selection, maximum=max_rows)
             self._require_available()
             safe_handle = self._resolve_value_handle_locked(handle)
             kind, payload = self._project_value_payload_locked(
@@ -4465,41 +6066,149 @@ class PrototypeRuntimeApi:
         timeout_s: float | None = None,
     ) -> object:
         del chunk_size
-        offset, limit = self._bounded_slice(selection, maximum=max_items)
-        with self._single_writer(), self._bounded_command_timeout(timeout_s):
+        with self._capture_data_plane_writer(), self._bounded_command_timeout(timeout_s):
+            offset, limit = self._bounded_slice(selection, maximum=max_items)
             self._require_available()
             safe_handle = self._resolve_value_handle_locked(handle)
-            route = self._materialization_kind_locked(safe_handle)
-            projection_kind = "table_rows" if route == "table" else "slice"
-            kind, payload = self._project_value_payload_locked(
-                safe_handle,
-                kind=projection_kind,
-                offset=offset,
-                limit=limit,
-                columns=(),
-                names=(),
-                max_depth=1 if route == "table" else max_depth,
-                max_items=limit if route == "table" else max_items,
-                max_rows=max_items if route == "table" else limit,
+            context_key = f"__onec_projection_{uuid4().hex}"
+            payload = self._execute_transfer_plan_locked(
+                self._projection_transfer_plan(
+                    self._dynamic_projection_instruction(
+                        safe_handle,
+                        context_key=context_key,
+                        offset=offset,
+                        limit=limit,
+                        refs=refs,
+                        ref_columns=ref_columns,
+                        max_depth=max_depth,
+                        max_items=max_items,
+                        max_bytes=max_bytes,
+                        worker_type_registrations=self._worker_type_registrations(),
+                        runtime_generation=self._controller.runtime_generation,
+                        context_generation=self._context_generation,
+                    ),
+                    context_key=context_key,
+                    max_bytes=max_bytes,
+                ),
                 max_bytes=max_bytes,
-                refs=refs,
-                ref_columns=ref_columns,
-                uuid_suffix=uuid_suffix,
+                evaluation_kind=CaptureEvaluationKind.INSPECTION,
             )
+            route = self._payload_materialization_route(payload)
             if route == "table":
-                if kind != "compact_table":
-                    raise ProtocolError(
-                        "table projection returned an invalid payload kind"
-                    )
                 return decode_compact_table_payload(
                     payload, ReferencePolicy(refs, ref_columns, uuid_suffix)
                 )
-            if kind != "value":
-                raise ProtocolError("value projection returned an invalid payload kind")
+            if route != "value":
+                raise ProtocolError("1C value materialization route is invalid")
             return decode_value_payload(
                 payload,
                 MaterializationOptions(refs, max_depth, max_items, max_bytes),
             )
+
+    @staticmethod
+    def _dynamic_projection_instruction(
+        handle: str,
+        *,
+        context_key: str,
+        offset: int,
+        limit: int,
+        refs: str | ReferenceMode,
+        ref_columns: dict[str, str | ReferenceMode] | None,
+        max_depth: int,
+        max_items: int,
+        max_bytes: int,
+        worker_type_registrations: tuple[str, ...],
+        runtime_generation: int = 1,
+        context_generation: int = 1,
+    ) -> str:
+        """Project either supported route after one inline admission branch."""
+        if any(not isinstance(registration, str) or not registration
+               for registration in worker_type_registrations):
+            raise ProtocolError("projection Worker type registrations are invalid")
+        try:
+            table_reference_mode = ReferenceMode(refs).value
+        except ValueError as error:
+            raise ProtocolError("unknown table reference mode") from error
+        value_options = MaterializationOptions(
+            refs=refs.value if isinstance(refs, ReferenceMode) else refs,
+            max_depth=max_depth,
+            max_items=max_items,
+            max_bytes=max_bytes,
+        )
+        overrides = dict(ref_columns or {})
+        for column, mode in overrides.items():
+            if not isinstance(column, str) or not column:
+                raise ProtocolError("table reference column name is invalid")
+            try:
+                ReferenceMode(mode)
+            except ValueError as error:
+                raise ProtocolError("unknown table reference mode") from error
+        lines = ["Попытка", "ТипыОбъектовWorker = Новый Массив;"]
+        for index, registration in enumerate(worker_type_registrations):
+            lines.extend((
+                f"ВременныйОбъектWorker{index} = ВнешниеОбработки.Создать("
+                f"{bsl_string_literal(registration)}, Ложь);",
+                f"ТипыОбъектовWorker.Добавить(ТипЗнч(ВременныйОбъектWorker{index}));",
+            ))
+        lines.extend((
+            "Если Не RuntimeValueTransferServer.ДопуститьЗначение("
+            f"{handle}, ТипыОбъектовWorker) Тогда",
+            '    Результат = "D|worker_generation_value";',
+            "Иначе",
+            "    ВидМатериализации = RuntimeValueTransferServer."
+            f"ПолучитьВидМатериализации({handle});",
+            '    Если ВидМатериализации = "table" Тогда',
+            "        СтрокиПроекции = Новый Массив;",
+            f"        Для ИндексПроекции = {offset} По Мин({handle}.Количество() - 1, {offset + limit - 1}) Цикл",
+            f"            СтрокиПроекции.Добавить({handle}[ИндексПроекции]);",
+            "        КонецЦикла;",
+            f"        ПроекцияЗначения = {handle}.Скопировать(СтрокиПроекции);",
+            "        РежимыСсылокМатериализации = Новый Соответствие;",
+        ))
+        for column in sorted(overrides):
+            lines.append(
+                "        РежимыСсылокМатериализации.Вставить("
+                f"{bsl_string_literal(column)}, "
+                f"{bsl_string_literal(ReferenceMode(overrides[column]).value)});"
+            )
+        lines.extend((
+            "        Материализация = RuntimeTableTransferServer."
+            "СериализоватьКомпактнуюТаблицу("
+            f"ПроекцияЗначения, {bsl_string_literal(table_reference_mode)}, "
+            "РежимыСсылокМатериализации, ТипыОбъектовWorker, "
+            f"{limit}, {max_bytes});",
+            '    ИначеЕсли ВидМатериализации = "value" Тогда',
+            "        ПроекцияЗначения = Новый Массив;",
+            f"        Для ИндексПроекции = {offset} По Мин({handle}.Количество() - 1, {offset + limit - 1}) Цикл",
+            f"            ПроекцияЗначения.Добавить({handle}[ИндексПроекции]);",
+            "        КонецЦикла;",
+            "        Материализация = RuntimeValueTransferServer."
+            "СериализоватьЗначение("
+            f"ПроекцияЗначения, {bsl_string_literal(value_options.refs)}, "
+            f"{value_options.max_depth}, {value_options.max_items}, {value_options.max_bytes}, "
+            "ТипыОбъектовWorker);",
+            "    Иначе",
+            '        Результат = "E|value_admission_failed";',
+            "    КонецЕсли;",
+            '    Если ВидМатериализации = "table" Или ВидМатериализации = "value" Тогда',
+            "        Если Не Материализация.Доступ Тогда",
+            '            Результат = "D|worker_generation_value";',
+            "        Иначе",
+            f"            Контекст.Вставить({bsl_string_literal(context_key)}, Материализация.Base64);",
+            '            Результат = "R|" + '
+            f'Формат({runtime_generation}, "ЧГ=0; ЧДЦ=0") + "|" + '
+            f'Формат({context_generation}, "ЧГ=0; ЧДЦ=0") + "|" + '
+            'Формат(Материализация.Размер, "ЧГ=0; ЧДЦ=0") + "|" + '
+            'Материализация.Хеш + "|" + '
+            'Формат(СтрДлина(Материализация.Base64), "ЧГ=0; ЧДЦ=0");',
+            "        КонецЕсли;",
+            "    КонецЕсли;",
+            "КонецЕсли;",
+            "Исключение",
+            '    Результат = "E|value_admission_failed";',
+            "КонецПопытки;",
+        ))
+        return "\n".join(lines)
 
     @staticmethod
     def _bounded_slice(
@@ -4531,17 +6240,50 @@ class PrototypeRuntimeApi:
         limit: int | None,
         columns: tuple[str, ...],
         names: tuple[str, ...],
+        refs: str | ReferenceMode = ReferenceMode.PRESENTATION,
+        ref_columns: dict[str, str | ReferenceMode] | None = None,
+        max_depth: int = 32,
+        max_items: int = 100_000,
+        max_rows: int = 100_000,
+        max_bytes: int = 64 * 1024 * 1024,
+        runtime_generation: int = 1,
+        context_generation: int = 1,
+        worker_type_registrations: tuple[str, ...] = (),
     ) -> str:
-        lines: list[str]
+        if any(
+            not isinstance(registration, str) or not registration
+            for registration in worker_type_registrations
+        ):
+            raise ProtocolError("projection Worker type registrations are invalid")
+        if runtime_generation <= 0 or context_generation <= 0:
+            raise ProtocolError("projection generations must be positive")
+        if kind == "table_rows":
+            try:
+                reference_mode = ReferenceMode(refs).value
+            except ValueError as error:
+                raise ProtocolError("unknown table reference mode") from error
+            overrides = dict(ref_columns or {})
+            for column, mode in overrides.items():
+                if not isinstance(column, str) or not column:
+                    raise ProtocolError("table reference column name is invalid")
+                try:
+                    ReferenceMode(mode)
+                except ValueError as error:
+                    raise ProtocolError("unknown table reference mode") from error
+        else:
+            reference_mode = "presentation"
+            overrides = {}
+
+        projection_lines: list[str]
         if kind == "slice":
-            lines = [
+            projection_lines = [
                 "ПроекцияЗначения = Новый Массив;",
                 f"Для ИндексПроекции = {offset} По Мин({handle}.Количество() - 1, {offset + (limit or 0) - 1}) Цикл",
                 f"    ПроекцияЗначения.Добавить({handle}[ИндексПроекции]);",
                 "КонецЦикла;",
             ]
         elif kind == "table_rows":
-            lines = [
+            projection_lines = [
                 "СтрокиПроекции = Новый Массив;",
                 f"Для ИндексПроекции = {offset} По Мин({handle}.Количество() - 1, {offset + (limit or 0) - 1}) Цикл",
                 f"    СтрокиПроекции.Добавить({handle}[ИндексПроекции]);",
@@ -4552,69 +6294,214 @@ class PrototypeRuntimeApi:
                 if not columns
                 else ", " + bsl_string_literal(",".join(columns))
             )
-            lines.append(
+            projection_lines.append(
                 f"ПроекцияЗначения = {handle}.Скопировать(СтрокиПроекции{column_argument});"
             )
         elif kind == "fields":
-            lines = ["ПроекцияЗначения = Новый Структура;"]
-            lines.extend(
+            projection_lines = ["ПроекцияЗначения = Новый Структура;"]
+            projection_lines.extend(
                 "ПроекцияЗначения.Вставить("
                 f"{bsl_string_literal(name)}, {handle}.{name});"
                 for name in names
             )
         else:
-            lines = ["ПроекцияЗначения = Новый Соответствие;"]
-            lines.extend(
+            projection_lines = ["ПроекцияЗначения = Новый Соответствие;"]
+            projection_lines.extend(
                 "ПроекцияЗначения.Вставить("
                 f"{bsl_string_literal(name)}, {handle}.Получить({bsl_string_literal(name)}));"
                 for name in names
             )
-        lines.extend(
-            (
-                f"Контекст.Вставить({bsl_string_literal(context_key)}, ПроекцияЗначения);",
-                "Результат = Истина;",
+        lines = ["Попытка", "ТипыОбъектовWorker = Новый Массив;"]
+        for index, registration in enumerate(worker_type_registrations):
+            lines.extend((
+                f"ВременныйОбъектWorker{index} = ВнешниеОбработки.Создать("
+                f"{bsl_string_literal(registration)}, Ложь);",
+                f"ТипыОбъектовWorker.Добавить(ТипЗнч(ВременныйОбъектWorker{index}));",
+            ))
+        lines.extend((
+            "Если Не RuntimeValueTransferServer.ДопуститьЗначение("
+            f"{handle}, ТипыОбъектовWorker) Тогда",
+            '    Результат = "D|worker_generation_value";',
+            "Иначе",
+            *(f"    {line}" for line in projection_lines),
+        ))
+        if kind == "table_rows":
+            lines.append("    РежимыСсылокМатериализации = Новый Соответствие;")
+            for column in sorted(overrides):
+                lines.append(
+                    "    РежимыСсылокМатериализации.Вставить("
+                    f"{bsl_string_literal(column)}, "
+                    f"{bsl_string_literal(ReferenceMode(overrides[column]).value)});"
+                )
+            lines.append(
+                "    Материализация = RuntimeTableTransferServer."
+                "СериализоватьКомпактнуюТаблицу("
+                f"ПроекцияЗначения, {bsl_string_literal(reference_mode)}, "
+                "РежимыСсылокМатериализации, ТипыОбъектовWorker, "
+                f"{limit or 0}, {max_bytes});"
             )
-        )
+        else:
+            lines.append(
+                "    Материализация = RuntimeValueTransferServer."
+                "СериализоватьЗначение("
+                f"ПроекцияЗначения, {bsl_string_literal(refs.value if isinstance(refs, ReferenceMode) else refs)}, "
+                f"{max_depth}, {max_items}, {max_bytes}, ТипыОбъектовWorker);"
+            )
+        lines.extend((
+            "    Если Не Материализация.Доступ Тогда",
+            '        Результат = "D|worker_generation_value";',
+            "    Иначе",
+            f"        Контекст.Вставить({bsl_string_literal(context_key)}, Материализация.Base64);",
+            "        Результат = \"R|\" + "
+            f"Формат({runtime_generation}, \"ЧГ=0; ЧДЦ=0\") + \"|\" + "
+            f"Формат({context_generation}, \"ЧГ=0; ЧДЦ=0\") + \"|\" + "
+            "Формат(Материализация.Размер, \"ЧГ=0; ЧДЦ=0\") + \"|\" + "
+            "Материализация.Хеш + \"|\" + "
+            "Формат(СтрДлина(Материализация.Base64), \"ЧГ=0; ЧДЦ=0\");",
+            "    КонецЕсли;",
+            "КонецЕсли;",
+            "Исключение",
+            '    Результат = "E|value_admission_failed";',
+            "КонецПопытки;",
+        ))
         return "\n".join(lines)
 
     def _materialization_kind_locked(self, safe_handle: str) -> str:
+        registrations = self._worker_type_registrations()
+        lines = ["Попытка", "ТипыОбъектовWorker = Новый Массив;"]
+        for index, registration in enumerate(registrations):
+            lines.extend((
+                f"ВременныйОбъектWorker{index} = ВнешниеОбработки.Создать("
+                f"{bsl_string_literal(registration)}, Ложь);",
+                f"ТипыОбъектовWorker.Добавить(ТипЗнч(ВременныйОбъектWorker{index}));",
+            ))
+        lines.extend((
+            "Если Не RuntimeValueTransferServer.ДопуститьЗначение("
+            f"{safe_handle}, ТипыОбъектовWorker) Тогда",
+            '    Результат = "D|worker_generation_value";',
+            "Иначе",
+            "    Результат = RuntimeValueTransferServer."
+            f"ПолучитьВидМатериализации({safe_handle});",
+            "КонецЕсли;",
+            "Исключение",
+            '    Результат = "E|value_admission_failed";',
+            "КонецПопытки;",
+        ))
         route = self._execute_worker_instruction(
-            "Результат = RuntimeValueTransferServer."
-            f"ПолучитьВидМатериализации({safe_handle});"
+            "\n".join(lines),
+            evaluation_kind=CaptureEvaluationKind.INSPECTION,
         )
+        if route == AdmissionEnvelopeV1.denied():
+            raise CaptureValueAccessDeniedError(
+                "Worker generation objects are not public values"
+            )
+        if route == AdmissionEnvelopeV1.failed():
+            raise CaptureValueCheckError("CAPTURE value admission failed")
         if route not in {"value", "table"}:
             raise ProtocolError("1C value materialization route is invalid")
         return route
 
     def _resolve_value_handle_locked(self, handle: str) -> str:
-        self._require_public_value_handle_locked(handle)
-        if isinstance(handle, str) and handle.startswith("capture_table_"):
+        safe_handle = self._validate_value_reference_locked(handle)
+        if (
+            handle.startswith("capture_table_")
+            and not handle.startswith("capture_table_metadata_")
+        ):
             self._require_capture_inspection_available()
-            return validate_value_handle(self._controller.capture_value_handle(handle))
-        return validate_value_handle(handle)
+            return self._capture_projection_expression(
+                self._controller.capture_value_handle(handle)
+            )
+        return safe_handle
 
-    def require_public_value_handle(self, handle: str) -> None:
-        """Reject target Worker roots/modules before any public proxy can escape."""
-        with self._single_writer():
-            self._require_available()
-            self._require_public_value_handle_locked(handle)
+    def _resolve_table_source_locked(self, handle: str) -> tuple[str, bool]:
+        safe_handle = self._validate_value_reference_locked(handle)
+        if (
+            handle.startswith("capture_table_")
+            and not handle.startswith("capture_table_metadata_")
+        ):
+            self._require_capture_inspection_available()
+            return (
+                self._capture_projection_expression(
+                    self._controller.capture_value_handle(handle)
+                ),
+                True,
+            )
+        return safe_handle, False
 
-    def require_public_value_handles(self, handles: tuple[str, ...]) -> None:
-        """Prove every handle public with at most one target privacy instruction."""
-        with self._single_writer():
-            self._require_available()
-            if not isinstance(handles, tuple) or any(
-                not isinstance(handle, str) for handle in handles
+    @staticmethod
+    def _capture_projection_expression(value: object) -> str:
+        if not isinstance(value, str) or len(value) > 64 * 1024:
+            raise ProtocolError("capture table projection descriptor is invalid")
+
+        prefix = "RuntimeKernelServer.ПолучитьВременнуюТаблицуОтладки("
+        if not value.startswith(prefix):
+            raise ProtocolError("capture table projection descriptor is invalid")
+
+        manager_path, separator, remainder = value[len(prefix) :].partition(', "')
+        if not separator:
+            raise ProtocolError("capture table projection descriptor is invalid")
+        table_name, separator, remainder = remainder.partition('", ')
+        if not separator:
+            raise ProtocolError("capture table projection descriptor is invalid")
+        offset_text, separator, remainder = remainder.partition(", ")
+        if not separator:
+            raise ProtocolError("capture table projection descriptor is invalid")
+        limit_text, separator, selection = remainder.partition(", ")
+        if not separator:
+            raise ProtocolError("capture table projection descriptor is invalid")
+
+        manager_parts = manager_path.split(".")
+        identifiers = (*manager_parts[2:], table_name)
+        if (
+            manager_parts[:2] != ["Контекст", "КонтекстОтладки"]
+            or not 1 <= len(manager_parts[2:]) <= 101
+            or any(
+                len(identifier) > 256
+                or re.fullmatch(r"[^\W\d]\w*", identifier, re.UNICODE) is None
+                for identifier in identifiers
+            )
+        ):
+            raise ProtocolError("capture table projection descriptor is invalid")
+
+        columns: tuple[str, ...]
+        if selection == "Новый Массив)":
+            columns = ()
+        else:
+            columns_prefix = 'СтрРазделить("'
+            columns_suffix = '", ","))'
+            if not selection.startswith(columns_prefix) or not selection.endswith(
+                columns_suffix
             ):
-                raise ProtocolError("value handles must be a tuple of strings")
-            self._require_public_value_handles_locked(handles)
+                raise ProtocolError("capture table projection descriptor is invalid")
+            columns = tuple(
+                selection[len(columns_prefix) : -len(columns_suffix)].split(",")
+            )
+            if not 1 <= len(columns) <= 100 or any(
+                len(column) > 256
+                or re.fullmatch(r"[^\W\d]\w*", column, re.UNICODE) is None
+                for column in columns
+            ):
+                raise ProtocolError("capture table projection descriptor is invalid")
 
-    def _require_public_value_handle_locked(self, handle: object) -> None:
-        self._require_public_value_handles_locked((handle,))
+        if (
+            re.fullmatch(r"(?:0|[1-9][0-9]{0,7})", offset_text) is None
+            or re.fullmatch(r"[1-9][0-9]{0,2}", limit_text) is None
+        ):
+            raise ProtocolError("capture table projection descriptor is invalid")
+        offset = int(offset_text)
+        limit = int(limit_text)
+        if not 1 <= limit <= 100 or offset + limit > MAX_PROJECTION_POSITION:
+            raise ProtocolError("capture table projection descriptor is invalid")
+        return value
 
-    def _public_value_guard_handle_locked(self, handle: object) -> str | None:
+    def validate_value_reference(self, handle: str) -> str:
+        """Validate a proxy reference locally without target-side value policy."""
+        with self._capture_data_plane_writer():
+            return self._validate_value_reference_locked(handle)
+
+    def _validate_value_reference_locked(self, handle: object) -> str:
         if not isinstance(handle, str):
-            return None
+            raise ProtocolError("value reference must be a string")
         normalized = handle.casefold()
         if normalized.startswith(
             "Контекст.RuntimeWorkerActiveGeneration".casefold()
@@ -4630,11 +6517,20 @@ class PrototypeRuntimeApi:
                 raise ProtocolError(
                     "Worker generation objects are not public values"
                 )
-            # An admitted inventory handle identifies metadata, not a target
-            # value.  Its controller-owned identity is the complete privacy
-            # proof; materialization still rejects it via capture_value_handle.
-            return None
-        if handle.startswith(("capture_table_", "capture_manager_")):
+            # This is an admitted inventory handle, not a target value. It can
+            # be published as a bounded-table descriptor; _resolve_value_handle_locked
+            # later rejects materialization through capture_value_handle.
+            return handle
+        if handle.startswith("capture_table_"):
+            self._require_capture_inspection_available()
+            self._capture_projection_expression(
+                self._controller.capture_value_handle(handle)
+            )
+            # Validation preserves the opaque public reference. Resolution
+            # expands this trusted controller-owned descriptor only inside a
+            # bounded runtime instruction.
+            safe_handle = handle
+        elif handle.startswith("capture_manager_"):
             self._require_capture_inspection_available()
             safe_handle = validate_value_handle(
                 self._controller.capture_value_handle(handle)
@@ -4643,92 +6539,10 @@ class PrototypeRuntimeApi:
             safe_handle = validate_value_handle(handle)
         return safe_handle
 
-    def _require_public_value_handles_locked(self, handles: tuple[object, ...]) -> None:
-        # Resolve and admit the entire batch before any target privacy work.
-        safe_handles = tuple(
-            safe_handle
-            for handle in handles
-            if (safe_handle := self._public_value_guard_handle_locked(handle))
-            is not None
-        )
-        if not safe_handles or self._worker_generation_handle is None:
-            return
-        try:
-            privacy_registrations = (
-                self._worker_universe_target.privacy_registration_snapshot()
-            )
-        except BaseException:
-            raise ProtocolError(
-                "Worker generation objects are not public values"
-            ) from None
-        type_probes = tuple(
-            line
-            for index, registration in enumerate(privacy_registrations)
-            for line in (
-                f"ВременныйОбъектWorker{index} = "
-                "ВнешниеОбработки.Создать("
-                f"{bsl_string_literal(registration)}, Ложь);",
-                "ТипыОбъектовWorker.Добавить(ТипЗнч("
-                f"ВременныйОбъектWorker{index}));",
-            )
-        )
-        instruction = (
-            "// onec-worker-public-value-guard\n"
-            "ТипыОбъектовWorker = Новый Массив;\n"
-            + "\n".join(type_probes)
-            + "\n"
-            "ПроверяемыеЗначенияWorker = Новый Массив;\n"
-            + "\n".join(
-                f"ПроверяемыеЗначенияWorker.Добавить({safe_handle});"
-                for safe_handle in safe_handles
-            )
-            + "\n"
-            "ЕстьОбъектыWorker = Ложь;\n"
-            "Для Каждого ПроверяемоеЗначениеWorker "
-            "Из ПроверяемыеЗначенияWorker Цикл\n"
-            "ТипПроверяемогоWorker = ТипЗнч(ПроверяемоеЗначениеWorker);\n"
-            "ЭтоОбъектWorker = "
-            "ТипыОбъектовWorker.Найти(ТипПроверяемогоWorker) "
-            "<> Неопределено;\n"
-            "Если Не ЭтоОбъектWorker "
-            'И ТипПроверяемогоWorker = Тип("ФиксированнаяСтруктура") '
-            "Тогда\n"
-            "    ЭтоКореньWorker = "
-            'ПроверяемоеЗначениеWorker.Свойство("ManifestSha256") '
-            'И ПроверяемоеЗначениеWorker.Свойство("Modules") '
-            'И ПроверяемоеЗначениеWorker.Свойство("Exports");\n'
-            "    ВидКонтейнераWorker = Неопределено;\n"
-            "    ЭтоЭкспортыWorker = "
-            'ПроверяемоеЗначениеWorker.Свойство("Kind", ВидКонтейнераWorker) '
-            'И ВидКонтейнераWorker = "OnecWorkerExportsV1" '
-            'И ПроверяемоеЗначениеWorker.Свойство("Items");\n'
-            "    ЭтоОбъектWorker = ЭтоКореньWorker Или ЭтоЭкспортыWorker;\n"
-            "КонецЕсли;\n"
-            "Если Не ЭтоОбъектWorker "
-            'И ТипПроверяемогоWorker = Тип("ФиксированноеСоответствие") '
-            "Тогда\n"
-            "    Для Каждого ЭлементМодулейWorker "
-            "Из ПроверяемоеЗначениеWorker Цикл\n"
-            "        Если ТипыОбъектовWorker.Найти("
-            "ТипЗнч(ЭлементМодулейWorker.Значение)) "
-            "<> Неопределено Тогда\n"
-            "            ЭтоОбъектWorker = Истина;\n"
-            "            Прервать;\n"
-            "        КонецЕсли;\n"
-            "    КонецЦикла;\n"
-            "КонецЕсли;\n"
-            "ЕстьОбъектыWorker = ЕстьОбъектыWorker Или ЭтоОбъектWorker;\n"
-            "КонецЦикла;\n"
-            "Результат = ЕстьОбъектыWorker;"
-        )
-        try:
-            forbidden = self._worker_instruction_executor(instruction)
-        except BaseException:
-            raise ProtocolError(
-                "Worker generation objects are not public values"
-            ) from None
-        if forbidden is not False:
-            raise ProtocolError("Worker generation objects are not public values")
+    def _worker_type_registrations(self) -> tuple[str, ...]:
+        if self._worker_universe.state is WorkerUniverseState.EMPTY:
+            return ()
+        return self._worker_universe_target.privacy_registration_snapshot()
 
     def _materialize_table_locked(
         self,
@@ -4740,51 +6554,51 @@ class PrototypeRuntimeApi:
         max_rows: int | None = None,
         max_bytes: int = 75_000_000,
         profiler: PhaseRecorder | None = None,
+        trusted_expression: bool = False,
     ) -> pd.DataFrame:
         transfer = CompactRuntimeTableTransfer(
-            self._execute_worker_instruction,
+            self._materialization_instruction_executor,
             self._take_context_string,
             runtime_generation=lambda: self._controller.runtime_generation,
             context_generation=self._context_generation,
-            context_cleaner=self._controller.drop_context_value,
-            schema_reader=self._inspect_compact_columns,
+            context_cleaner=self._drop_context_value,
+            worker_type_registrations=self._worker_type_registrations,
             max_text_size=((max_bytes + 2) // 3) * 4,
             max_payload_bytes=max_bytes,
             max_rows=max_rows,
             profiler=profiler,
+            capture_executor=self._capture_transfer_executor_or_none(),
         )
-        return transfer.to_df(
-            handle,
-            ReferencePolicy(refs, ref_columns, uuid_suffix),
-        )
-
-    def _inspect_compact_columns(self, table_handle: str):  # type: ignore[no-untyped-def]
-        with self._remaining_command_timeout():
-            declared_rows = self._controller.inspect_declared_table_schema(
-                table_handle
-            ).collection_rows
-        declared = infer_declared_compact_columns(declared_rows)
-        if declared is not None:
-            return declared
-        with self._remaining_command_timeout():
-            sample_rows = self._controller.inspect_table_sample(
-                table_handle
-            ).collection_rows
-        return infer_compact_columns(sample_rows)
+        policy = ReferencePolicy(refs, ref_columns, uuid_suffix)
+        if trusted_expression:
+            return transfer._to_df_trusted_expression(handle, policy)
+        return transfer.to_df(handle, policy)
 
     def _take_context_string(self, key: str, max_text_size: int) -> str:
         with self._remaining_command_timeout():
-            return self._controller.take_context_string(
-                key,
-                max_text_size=max_text_size,
-            )
+            with self._capture_helper_writer_handoff():
+                return self._controller.take_context_string(
+                    key,
+                    max_text_size=max_text_size,
+                )
 
-    def _execute_worker_instruction(self, source: str) -> object:
+    def _drop_context_value(self, key: str) -> None:
+        with self._capture_helper_writer_handoff():
+            self._controller.drop_context_value(key)
+
+    def _execute_worker_instruction(
+        self,
+        source: str,
+        *,
+        evaluation_kind: CaptureEvaluationKind,
+    ) -> object:
         with self._remaining_command_timeout():
             if self._controller.state is OperationState.CAPTURED:
-                cell = self._controller.execute_system_capture(
-                    source + "\nРезультатИнструкции = Результат;"
-                )
+                with self._capture_helper_writer_handoff():
+                    cell = self._controller.execute_system_capture(
+                        source + "\nРезультатИнструкции = Результат;",
+                        evaluation_kind=evaluation_kind,
+                    )
                 return cell.result
             completion = self._controller.execute_system_main(source)
             if not completion.succeeded:
@@ -4794,6 +6608,48 @@ class PrototypeRuntimeApi:
                     diagnostic=completion.diagnostic,
                 )
             return completion.result
+
+    def _materialization_instruction_executor(self, source: str) -> object:
+        return self._execute_worker_instruction(
+            source,
+            evaluation_kind=CaptureEvaluationKind.MATERIALIZATION_HELPER,
+        )
+
+    def _capture_transfer_executor_or_none(
+        self,
+    ) -> Callable[[CaptureTransferPlan, CaptureEvaluationKind], bytes] | None:
+        return (
+            self._dispatch_capture_transfer
+            if self._capture_control_owner() is not None
+            and self._controller.state is OperationState.CAPTURED
+            else None
+        )
+
+    def _dispatch_capture_transfer(
+        self,
+        plan: CaptureTransferPlan,
+        evaluation_kind: CaptureEvaluationKind,
+    ) -> bytes:
+        return self._execute_capture_transfer(
+            plan,
+            evaluation_kind=evaluation_kind,
+        )
+
+    def _execute_capture_transfer(
+        self,
+        plan: CaptureTransferPlan,
+        *,
+        evaluation_kind: CaptureEvaluationKind,
+    ) -> bytes:
+        with self._remaining_command_timeout():
+            executor = getattr(self._controller, "_execute_capture_transfer", None)
+            if not callable(executor):
+                raise ProtocolError("Runtime controller cannot execute CAPTURE transfer")
+            with self._capture_helper_writer_handoff():
+                result = executor(plan, evaluation_kind=evaluation_kind)
+            if not isinstance(result, bytes):
+                raise ProtocolError("CAPTURE transfer returned an invalid payload")
+            return result
 
     def _finalize_namespace_reply(
         self,
@@ -4966,7 +6822,7 @@ class PrototypeRuntimeApi:
         return tuple(result.values())
 
     def _require_available(self) -> None:
-        if self._closed:
+        if self._admission_closed or self._data_plane_finalized:
             raise ProtocolError("Runtime API is closed")
         if self._poisoned_error is not None:
             raise self._poisoned_error
@@ -5030,6 +6886,75 @@ class PrototypeRuntimeApi:
             setattr(self._controller, "command_timeout_s", original)
 
     @contextmanager
+    def _capture_owner_handoff(self) -> Iterator[None]:
+        """Drop the caller's writer boundary while the coordinator owns work."""
+        owns_writer = self._writer_owner == get_ident()
+        if owns_writer:
+            self._writer_owner = None
+            self._lock.release()
+        try:
+            yield
+        finally:
+            if owns_writer:
+                self._lock.acquire()
+                self._writer_owner = get_ident()
+
+    @contextmanager
+    def capture_session_caller_handoff(
+        self,
+        factory: Callable[[], AbstractContextManager[None]],
+    ) -> Iterator[None]:
+        """Bind one Session admission lock to this caller's CAPTURE wait."""
+        if not callable(factory):
+            raise TypeError("CAPTURE Session handoff factory must be callable")
+        if getattr(self._session_waiter_handoffs, "factory", None) is not None:
+            raise ProtocolError("CAPTURE Session handoff is already bound")
+        self._session_waiter_handoffs.factory = factory
+        try:
+            yield
+        finally:
+            del self._session_waiter_handoffs.factory
+
+    @contextmanager
+    def _capture_session_waiter_handoff(self) -> Iterator[None]:
+        factory = getattr(self._session_waiter_handoffs, "factory", None)
+        if not callable(factory):
+            yield
+            return
+        with factory():
+            yield
+
+    @contextmanager
+    def _capture_helper_writer_handoff(self) -> Iterator[None]:
+        """Keep helper admission local, but release the writer for remote work."""
+        bind = getattr(
+            self._controller,
+            "capture_helper_caller_handoff",
+            None,
+        )
+        if not callable(bind):
+            yield
+            return
+        @contextmanager
+        def release_waiters() -> Iterator[None]:
+            # Preserve the capture handoff nesting used by resume: the
+            # Session lock returns before the API writer, after the
+            # coordinator wait has finished or detached.
+            with self._capture_owner_handoff():
+                with self._capture_session_waiter_handoff():
+                    yield
+
+        with bind(release_waiters):
+            yield
+
+    @contextmanager
+    def _capture_data_plane_writer(self) -> Iterator[None]:
+        """Reserve the public data plane before validation or state mutation."""
+        with self._single_writer():
+            self._require_capture_data_plane_admission()
+            yield
+
+    @contextmanager
     def _single_writer(self) -> Iterator[None]:
         if not self._lock.acquire(blocking=False):
             raise ProtocolError("Runtime is already executing another request")
@@ -5063,6 +6988,21 @@ class PrototypeRuntimeApi:
         )
         if artifacts is None:
             return current
+        return self._worker_runtime_diagnostic_from_artifacts(
+            message,
+            current,
+            manifest_sha256=pin.handle.manifest_sha256,
+            artifacts=artifacts,
+        )
+
+    @staticmethod
+    def _worker_runtime_diagnostic_from_artifacts(
+        message: str,
+        current: NormalizedDiagnostic | None,
+        *,
+        manifest_sha256: str,
+        artifacts: tuple[WorkerDiagnosticArtifact, ...],
+    ) -> NormalizedDiagnostic | None:
         try:
             parsed = parse_platform_diagnostic(message)
             if not any(
@@ -5072,7 +7012,7 @@ class PrototypeRuntimeApi:
                 return current
             return remap_worker_runtime_diagnostic(
                 parsed,
-                pinned_manifest_sha256=pin.handle.manifest_sha256,
+                pinned_manifest_sha256=manifest_sha256,
                 pinned_artifacts=artifacts,
             )
         except (TypeError, ValueError):
@@ -5160,23 +7100,14 @@ class PrototypeRuntimeApi:
                 messages=result.messages,
             )
         mapped_stop: RuntimeDebugStop | None = None
-        pin = (
-            self._evaluation_generation_pin
-            if self._controller.state is OperationState.CAPTURE_DEBUG_STOPPED
-            else self._operation_generation_pin
-        )
+        pin = self._operation_generation_pin
         if pin is not None:
             view = self._worker_universe._operation_debug_view(pin)
             mapped_stop = map_worker_stop(
                 result.stop,
                 operation_id=result.operation.operation_id,
                 view=view,
-                origin=(
-                    "capture_evaluation"
-                    if self._controller.state
-                    is OperationState.CAPTURE_DEBUG_STOPPED
-                    else "main"
-                ),
+                origin="main",
                 bindings=self._worker_breakpoints.bindings_for_view(view),
                 reason=result.reason,
             )
@@ -5194,7 +7125,7 @@ class PrototypeRuntimeApi:
 
     def invalidate_capture_inspection(self) -> None:
         """Fail closed after uncertain preparation without resuming execution."""
-        with self._single_writer():
+        with self._capture_data_plane_writer():
             self._capture_inspection_quarantined = True
             self._capture_ticket = None
             invalidate = getattr(
@@ -5207,7 +7138,7 @@ class PrototypeRuntimeApi:
             invalidate()
 
     def capture_frame_variables(self, *, filters: Mapping[str, object], cursor: int, limit: int, timeout_s: float | None = None) -> Mapping[str, object]:
-        with self._single_writer():
+        with self._capture_data_plane_writer():
             self._require_available()
             self._require_capture_inspection_available()
             with self._bounded_command_timeout(timeout_s):
@@ -5218,7 +7149,7 @@ class PrototypeRuntimeApi:
                     )
 
     def capture_stack(self, *, cursor: int, limit: int, timeout_s: float | None = None) -> Mapping[str, object]:
-        with self._single_writer():
+        with self._capture_data_plane_writer():
             self._require_available()
             self._require_capture_inspection_available()
             with self._bounded_command_timeout(timeout_s):
@@ -5228,7 +7159,7 @@ class PrototypeRuntimeApi:
                     )
 
     def capture_frame(self, *, level: int, cursor: int, limit: int, name: str | None = None, timeout_s: float | None = None) -> Mapping[str, object]:
-        with self._single_writer():
+        with self._capture_data_plane_writer():
             self._require_available()
             self._require_capture_inspection_available()
             with self._bounded_command_timeout(timeout_s):
@@ -5239,19 +7170,20 @@ class PrototypeRuntimeApi:
                     )
 
     def resolve_capture_manager_origin(self, origin: ManagerOrigin, *, timeout_s: float | None = None) -> Mapping[str, object]:
-        with self._single_writer():
+        with self._capture_data_plane_writer():
             self._require_available()
             self._require_capture_inspection_available()
             if not isinstance(origin, ManagerOrigin) or origin.namespace != "frame":
                 raise ProtocolError("capture manager origin must be frame-scoped")
             with self._bounded_command_timeout(timeout_s):
                 with self._remaining_command_timeout() as remaining:
-                    return self._controller.resolve_capture_manager_origin(
-                        origin.root, origin.fields, timeout_s=remaining
-                    )
+                    with self._capture_helper_writer_handoff():
+                        return self._controller.resolve_capture_manager_origin(
+                            origin.root, origin.fields, timeout_s=remaining
+                        )
 
     def capture_temporary_tables(self, manager_handle: str, *, names: tuple[str, ...] | None, cursor: int, limit: int, selection: ValueSelection | None, timeout_s: float | None = None) -> Mapping[str, object]:
-        with self._single_writer():
+        with self._capture_data_plane_writer():
             self._require_available()
             self._require_capture_inspection_available()
             if selection is not None and (
@@ -5266,7 +7198,8 @@ class PrototypeRuntimeApi:
             )
             with self._bounded_command_timeout(timeout_s):
                 with self._remaining_command_timeout() as remaining:
-                    return self._controller.capture_temporary_tables(
-                        manager_handle, names=names, cursor=cursor, limit=limit,
-                        selection=wire_selection, timeout_s=remaining,
-                    )
+                    with self._capture_helper_writer_handoff():
+                        return self._controller.capture_temporary_tables(
+                            manager_handle, names=names, cursor=cursor, limit=limit,
+                            selection=wire_selection, timeout_s=remaining,
+                        )

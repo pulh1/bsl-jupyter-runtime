@@ -25,6 +25,17 @@ _MD_NAMESPACE = "http://v8.1c.ru/8.3/MDClasses"
 _DUMP_NAMESPACE = "http://v8.1c.ru/8.3/xcf/dumpinfo"
 _MANAGED_SOURCE = "Ext/ManagedApplicationModule.bsl"
 _SERVER_SOURCE = "CommonModules/RuntimeKernelServer/Ext/Module.bsl"
+_VALUE_TRANSFER_SOURCE = "CommonModules/RuntimeValueTransferServer/Ext/Module.bsl"
+_TABLE_TRANSFER_SOURCE = "CommonModules/RuntimeTableTransferServer/Ext/Module.bsl"
+_PROTOCOL_SOURCES = frozenset(
+    {
+        _MANAGED_SOURCE,
+        _SERVER_SOURCE,
+        _VALUE_TRANSFER_SOURCE,
+        _TABLE_TRANSFER_SOURCE,
+    }
+)
+_PROTOCOL_VERSION = "2"
 _PERMANENT_IDENTITY_RUNTIME_MODULE_NAMES = (
     "RuntimeContextStoreServer",
     "RuntimeKernelServer",
@@ -328,9 +339,9 @@ def _parse_artifact(value: object) -> ExactExtensionArtifact:
             for name, digest in sources.items()
         )
     )
-    if {name for name, _ in source_hashes} != {_MANAGED_SOURCE, _SERVER_SOURCE}:
+    if {name for name, _ in source_hashes} != _PROTOCOL_SOURCES:
         raise _fail(
-            "fingerprints.artifact.source_sha256 must bind both runtime BSL modules"
+            "fingerprints.artifact.source_sha256 must bind all runtime protocol BSL modules"
         )
     return ExactExtensionArtifact(
         artifact_version=_string(
@@ -519,6 +530,8 @@ def read_extension_manifest(path: Path) -> ExtensionManifest:
         raise _fail("manifest product_id is not this product")
     if extension_name != EXTENSION_NAME:
         raise _fail("manifest extension_name is not the packaged extension")
+    if protocol_version != _PROTOCOL_VERSION:
+        raise _fail("manifest protocol_version must be protocol 2")
     if cfe_filename != f"{EXTENSION_NAME}.cfe":
         raise _fail("manifest cfe_filename is invalid")
     fingerprints = _parse_fingerprints(root["fingerprints"])
@@ -801,9 +814,10 @@ def fingerprint_extension_dump(
     source_hashes = tuple(
         sorted(
             (
-                (_MANAGED_SOURCE, sha256(managed_source.encode("utf-8")).hexdigest()),
-                (_SERVER_SOURCE, sha256(server_source.encode("utf-8")).hexdigest()),
+                relative,
+                sha256(_read_bsl(source_dir / Path(relative)).encode("utf-8")).hexdigest(),
             )
+            for relative in _PROTOCOL_SOURCES
         )
     )
     identity = PermanentExtensionIdentity(

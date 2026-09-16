@@ -38,7 +38,7 @@ class Frame:
         self.variables = variables
         self.value_reads: list[str] = []
 
-    def require_public_value_handle(self, handle: str) -> None:
+    def validate_value_reference(self, handle: str) -> None:
         del handle
 
     def frame_variables(

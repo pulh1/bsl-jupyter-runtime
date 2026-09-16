@@ -119,6 +119,93 @@ def _span_wire(value: object) -> dict[str, object]:
 def public_artifact_value(value: Any) -> Any:
     """Recursively redact reversible BSL sources from automatic evidence paths."""
     kind = type(value).__name__
+    if kind == "CaptureView":
+        # A live control-plane capability is not a saved status snapshot.
+        return {"type": "CaptureView"}
+    if kind == "ValueNode":
+        return {
+            "name": value.name,
+            "type_name": value.type_name,
+            "preview": value.preview,
+            "size": value.size,
+            "expandable": value.expandable,
+            "shape": public_artifact_value(value.shape),
+            "path": public_artifact_value(value.path),
+            "cycle": value.cycle,
+        }
+    if kind == "DeniedValueNode":
+        return {
+            "name": value.name,
+            "access": "denied",
+            "expandable": False,
+        }
+    if kind == "ValuePage":
+        return {
+            "items": public_artifact_value(value.items),
+            "total": value.total,
+            "next_cursor": value.next_cursor,
+            "path": public_artifact_value(value.path),
+            "view": value.view,
+            "start": value.start,
+            "stop": value.stop,
+        }
+    if kind == "SafeValuePath":
+        return {
+            "root": public_artifact_value(value.root),
+            "segments": public_artifact_value(value.segments),
+        }
+    if kind == "ValueRoot":
+        return {"kind": value.kind, "native_level": value.native_level}
+    if kind == "SafePathSegment":
+        return {"kind": value.kind, "key": value.key}
+    if kind == "PrivateProjectedValue":
+        return "<private capture projection>"
+    if kind == "DebugFrame":
+        method = value.method
+        return {
+            "native_level": value.native_level,
+            "visible_index": value.visible_index,
+            "source": value.source,
+            "line": value.line,
+            "source_status": value.source_status,
+            "detail": value.detail,
+            "method": (
+                None
+                if method is None
+                else {
+                    "name": method.name,
+                    "parameters": public_artifact_value(method.parameters),
+                    "start_line": method.start_line,
+                    "end_line": method.end_line,
+                }
+            ),
+            "method_status": value.method_status,
+            "method_reason": value.method_reason,
+            "runtime_kernel": value.runtime_kernel,
+            "source_sha256": value.source_sha256,
+        }
+    if kind == "RuntimeFrameMarker":
+        return {"count": value.count}
+    if kind == "StackPage":
+        return {
+            "frames": public_artifact_value(value.frames),
+            "total": value.total,
+            "next_cursor": value.next_cursor,
+            "detail": value.detail,
+            "native": value.native,
+        }
+    if kind == "CaptureContextView":
+        return {"root": public_artifact_value(value._root)}
+    if kind == "VariableDescriptor":
+        return {
+            "root": public_artifact_value(value._root),
+            "role": value._role,
+        }
+    if kind == "ChildValueDescriptor":
+        return {
+            "path": public_artifact_value(value._node.path),
+            "alias": value._alias,
+        }
     if kind == "ModuleLocation":
         return {
             "module_type": value.module_type,

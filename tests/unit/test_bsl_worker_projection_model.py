@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from enum import Enum
 import gc
 from types import FunctionType, ModuleType
@@ -93,6 +93,19 @@ def test_worker_model_retains_full_parser_provenance() -> None:
     model = parse_full_ast_module("Процедура P()\nКонецПроцедуры")
 
     assert model.parser_identity == full_ast_parser_identity()
+
+
+def test_worker_model_rejects_syntax_for_a_different_source_or_parser() -> None:
+    """A cached Worker model must not carry capture facts for another parse."""
+    model = parse_full_ast_module("Процедура P()\nКонецПроцедуры")
+    index = model.syntax_index
+    for other in (replace(index, source_sha256="a" * 64),
+                  replace(index, parser_identity=("a" * 64, "b" * 64))):
+        with pytest.raises(ValueError, match="syntax"):
+            replace(model, syntax_index=other)
+    reachable = _reachable_values(index)
+    assert not any(isinstance(value, Token) for value in reachable)
+    assert not any(isinstance(value, tuple(generated.AST_CLASSES.values())) for value in reachable)
 
 
 def test_normalizes_interleaved_declarations_from_comma_locals_and_both_loops() -> None:

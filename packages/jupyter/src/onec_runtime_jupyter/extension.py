@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, is_dataclass
 from enum import Enum
+from html import escape
 from inspect import Parameter, signature
 import json
 import keyword
@@ -22,7 +23,11 @@ from onec_runtime.runtime_contracts import (
     sanitize_normalized_diagnostic,
 )
 from onec_runtime.bsl import SourceUnitKind, SourceUnitRef, source_sha256
-from onec_runtime.errors import ProtocolError
+from onec_runtime.capture_evaluation import (
+    CaptureEvaluationKind,
+    is_public_capture_evaluation_id,
+)
+from onec_runtime.errors import CaptureEvaluationPendingError, ProtocolError
 from onec_runtime.runtime_api import (
     MAX_PROJECTION_POSITION,
     RuntimeNamespaceSnapshot,
@@ -44,6 +49,11 @@ _DISPLAY_CONFIG_NAME = "_onec_runtime_display"
 _NAMESPACE_BRIDGE_NAME = "_onec_runtime_bsl_bridge"
 _SOURCE_SESSION_NAME = "_onec_runtime_source_session"
 _DIAGNOSTIC_EXCERPT_LIMIT = 512
+_PENDING_EVALUATION_ID_UNAVAILABLE = "<unavailable>"
+_PENDING_EVALUATION_KIND_UNKNOWN = "unknown"
+_PENDING_WAIT_GUIDANCE = "runtime.current_capture().wait(timeout_s=10)"
+
+
 class BslCellError(RuntimeError):
     """A failed BSL reply surfaced as a Jupyter execution error."""
 
@@ -95,6 +105,7 @@ class NotebookDisplay:
     text: str
     payload: dict[str, object]
     diagnostic: bool = False
+    html: str | None = None
 
     def __repr__(self) -> str:
         return self.text
@@ -109,6 +120,8 @@ class NotebookDisplay:
             "text/plain": self.text,
             MACHINE_MIME_TYPE: self.payload,
         }
+        if self.html is not None:
+            bundle["text/html"] = self.html
         if self.diagnostic:
             bundle["application/json"] = self.payload
         return bundle
@@ -369,9 +382,9 @@ class OnecValueProxy:
             raise ProtocolError("1C value proxy is stale after runtime generation change")
         if self.name.casefold() not in {name.casefold() for name in snapshot.names}:
             raise ProtocolError(f"BSL name {self.name!r} is no longer persistent")
-        guard = getattr(runtime, "require_public_value_handle", None)
+        guard = getattr(runtime, "validate_value_reference", None)
         if not callable(guard):
-            raise ProtocolError("1C runtime does not expose a public-value guard")
+            raise ProtocolError("1C runtime does not expose local reference validation")
         guard(self._context_handle())
         return runtime
 
@@ -401,16 +414,12 @@ class _BslNamespaceBridge:
         snapshot = method()
         if not isinstance(snapshot, RuntimeNamespaceSnapshot):
             raise ProtocolError("1C runtime namespace snapshot is invalid")
-        guard = getattr(runtime, "require_public_value_handle", None)
+        guard = getattr(runtime, "validate_value_reference", None)
         if not callable(guard):
-            raise ProtocolError("1C runtime does not expose a public-value guard")
+            raise ProtocolError("1C runtime does not expose local reference validation")
         handles = tuple(f"Контекст.{name}" for name in snapshot.names)
-        batch_guard = getattr(runtime, "require_public_value_handles", None)
-        if callable(batch_guard):
-            batch_guard(handles)
-        else:
-            for handle in handles:
-                guard(handle)
+        for handle in handles:
+            guard(handle)
 
         proposed = dict(self._proxies)
         for name in snapshot.names:
@@ -566,14 +575,17 @@ class OnecRuntimeMagics(Magics):
                 provenance.append(value)
 
         execute = runtime.execute_bsl
-        if _accepts_keyword(execute, "on_execution_provenance"):
-            reply = cast(Any, execute)(
-                cell,
-                source_unit=source_unit,
-                on_execution_provenance=capture,
-            )
-        else:
-            reply = execute(cell, source_unit=source_unit)
+        try:
+            if _accepts_keyword(execute, "on_execution_provenance"):
+                reply = cast(Any, execute)(
+                    cell,
+                    source_unit=source_unit,
+                    on_execution_provenance=capture,
+                )
+            else:
+                reply = execute(cell, source_unit=source_unit)
+        except CaptureEvaluationPendingError as error:
+            return _display_pending_evaluation(error)
         return self._finish_reply(
             reply,
             visible_source=cell,
@@ -680,8 +692,55 @@ class OnecRuntimeMagics(Magics):
         return displayed
 
 
+def _display_pending_evaluation(
+    error: CaptureEvaluationPendingError,
+) -> NotebookDisplay:
+    """Render the safe ticket receipt without inspecting live runtime state."""
+
+    evaluation_id = _safe_pending_evaluation_id(
+        getattr(error, "evaluation_id", None)
+    )
+    evaluation_kind = _safe_pending_evaluation_kind(
+        getattr(error, "evaluation_kind", None)
+    )
+    text = "\n".join(
+        (
+            f"evaluation_id={evaluation_id}",
+            f"evaluation_kind={evaluation_kind}",
+            _PENDING_WAIT_GUIDANCE,
+        )
+    )
+    return NotebookDisplay(
+        text,
+        {
+            "evaluation_id": evaluation_id,
+            "evaluation_kind": evaluation_kind,
+            "guidance": _PENDING_WAIT_GUIDANCE,
+        },
+        html="<pre>" + escape(text) + "</pre>",
+    )
+
+
+def _safe_pending_evaluation_id(value: object) -> str:
+    """Return the only public receipt grammar emitted by the coordinator."""
+
+    if is_public_capture_evaluation_id(value):
+        return value
+    return _PENDING_EVALUATION_ID_UNAVAILABLE
+
+
+def _safe_pending_evaluation_kind(value: object) -> str:
+    """Reflect a finite public enum member, never an exception-provided string."""
+
+    if type(value) is CaptureEvaluationKind:
+        return value.value
+    return _PENDING_EVALUATION_KIND_UNKNOWN
+
+
 def load_ipython_extension(ipython: InteractiveShell) -> None:
     ipython.register_magics(OnecRuntimeMagics(ipython))
+    from .capture_display import install_capture_formatters
+    install_capture_formatters(ipython)
     from .completion import install_completion_matcher
     install_completion_matcher(ipython)
     from .lsp_kernel import install_project_bridge
@@ -690,6 +749,8 @@ def load_ipython_extension(ipython: InteractiveShell) -> None:
 
 
 def unload_ipython_extension(ipython: InteractiveShell) -> None:
+    from .capture_display import remove_capture_formatters
+    remove_capture_formatters(ipython)
     from .completion import remove_completion_matcher
     remove_completion_matcher(ipython)
     source_session = _source_session_for_shell(ipython, create=False)

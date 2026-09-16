@@ -27,13 +27,15 @@ def write_dump_fixture(
     root: Path,
     *,
     extension_name: str = "OnecInteractiveRuntime",
-    artifact_version: str = "0.1.0",
-    protocol_version: str = "1",
+    artifact_version: str = "0.1.3",
+    protocol_version: str = "2",
 ) -> Path:
     dump = root / "dump"
     managed = dump / "Ext" / "ManagedApplicationModule.bsl"
     server = dump / "CommonModules" / "RuntimeKernelServer" / "Ext" / "Module.bsl"
-    for parent in (managed.parent, server.parent):
+    table = dump / "CommonModules" / "RuntimeTableTransferServer" / "Ext" / "Module.bsl"
+    value = dump / "CommonModules" / "RuntimeValueTransferServer" / "Ext" / "Module.bsl"
+    for parent in (managed.parent, server.parent, table.parent, value.parent):
         parent.mkdir(parents=True, exist_ok=True)
 
     (dump / "Configuration.xml").write_text(
@@ -96,6 +98,20 @@ def write_dump_fixture(
         encoding="utf-8-sig",
         newline="",
     )
+    table.write_text(
+        "Функция СериализоватьКомпактнуюТаблицу() Экспорт\n"
+        "\tВозврат Истина;\n"
+        "КонецФункции\n",
+        encoding="utf-8-sig",
+        newline="",
+    )
+    value.write_text(
+        "Функция СериализоватьЗначение() Экспорт\n"
+        "\tВозврат Истина;\n"
+        "КонецФункции\n",
+        encoding="utf-8-sig",
+        newline="",
+    )
     return dump
 
 
@@ -114,6 +130,8 @@ def write_manifest_fixture(
     *,
     cfe_sha256: str,
     cfe_size: int = 0,
+    artifact_version: str = "0.1.3",
+    protocol_version: str = "2",
 ) -> Path:
     identity = {
         "product_id": "onec-interactive-runtime",
@@ -129,9 +147,34 @@ def write_manifest_fixture(
         "name_prefix": "OnecInteractiveRuntime_",
         "vendor": "onec-interactive-runtime",
     }
+    source_hashes = {
+        "Ext/ManagedApplicationModule.bsl": sha256(
+            (
+                "Процедура Запуск()\n"
+                + _handshake(artifact_version, protocol_version)
+                + "\tС = 1; // @runtime-extension-service-breakpoint\nКонецПроцедуры\n"
+            ).encode("utf-8")
+        ).hexdigest(),
+        "CommonModules/RuntimeKernelServer/Ext/Module.bsl": sha256(
+            (
+                "Процедура Запустить()\n"
+                + _handshake(artifact_version, protocol_version)
+                + "\tКонтекст = Новый Структура; // @runtime-server-extension-entry-breakpoint\n"
+                + "\tС = 1; // @runtime-server-extension-service-breakpoint\nКонецПроцедуры\n"
+            ).encode("utf-8")
+        ).hexdigest(),
+        "CommonModules/RuntimeTableTransferServer/Ext/Module.bsl": sha256(
+            "Функция СериализоватьКомпактнуюТаблицу() Экспорт\n"
+            "\tВозврат Истина;\nКонецФункции\n".encode("utf-8")
+        ).hexdigest(),
+        "CommonModules/RuntimeValueTransferServer/Ext/Module.bsl": sha256(
+            "Функция СериализоватьЗначение() Экспорт\n"
+            "\tВозврат Истина;\nКонецФункции\n".encode("utf-8")
+        ).hexdigest(),
+    }
     artifact = {
-        "artifact_version": "0.1.0",
-        "protocol_version": "1",
+        "artifact_version": artifact_version,
+        "protocol_version": protocol_version,
         "language_bound_by_name": False,
         "metadata": [
             {
@@ -172,10 +215,7 @@ def write_manifest_fixture(
                 "object_id": MANAGED_OBJECT_ID,
             },
         ],
-        "source_sha256": {
-            "CommonModules/RuntimeKernelServer/Ext/Module.bsl": "05e02a1ff3063eb9208d97a94ccd2a4ce3ac0f8c6de1588587d2103d46ad11e9",
-            "Ext/ManagedApplicationModule.bsl": "90738a90599154558cfb12e7646fcb8fd6b765c9381a03716368a05de374828a",
-        },
+        "source_sha256": source_hashes,
     }
     location = {
         "module_type": "ExtensionModule",
@@ -190,8 +230,8 @@ def write_manifest_fixture(
         "schema_version": 1,
         "product_id": "onec-interactive-runtime",
         "extension_name": "OnecInteractiveRuntime",
-        "artifact_version": "0.1.0",
-        "protocol_version": "1",
+        "artifact_version": artifact_version,
+        "protocol_version": protocol_version,
         "cfe_filename": "OnecInteractiveRuntime.cfe",
         "cfe_size": cfe_size,
         "cfe_sha256": cfe_sha256,

@@ -202,7 +202,7 @@ def _older_dump(root: Path) -> Path:
 
 
 def _version_dump(
-    root: Path, artifact_version: str, *, protocol_version: str = "1"
+    root: Path, artifact_version: str, *, protocol_version: str = "2"
 ) -> Path:
     return write_dump_fixture(
         root,
@@ -413,7 +413,7 @@ def test_same_0_1_0_exact_mismatch_fails_closed_without_mutation(
     mismatch: str,
 ) -> None:
     installed = (
-        _version_dump(tmp_path / mismatch, "0.1.0", protocol_version="999")
+        _version_dump(tmp_path / mismatch, "0.1.3", protocol_version="999")
         if mismatch == "protocol"
         else _same_version_source_mismatch(tmp_path / mismatch)
     )
@@ -686,7 +686,7 @@ def test_two_sided_handshake_commits_exact_manifest_bound_marker(
             replace(client, artifact_version="0.0.9"),
             server,
         ),
-        lambda client, server: (replace(client, protocol_version="2"), server),
+        lambda client, server: (replace(client, protocol_version="1"), server),
         lambda client, server: (
             replace(client, location=server.location),
             server,
@@ -782,6 +782,30 @@ def test_manual_handshake_accepts_common_custom_artifact_version_without_marker(
     assert [event.phase for event in fixture.profiler.events] == [
         "extension.handshake"
     ]
+
+
+def test_manual_handshake_rejects_predecessor_protocol_before_target_work(
+    tmp_path: Path,
+) -> None:
+    tools = FakeExtensionTools(fail_on_any_call=True)
+    fixture = make_lifecycle(
+        tmp_path,
+        tools=tools,
+        marker_matches=False,
+    )
+    assert fixture.manifest.protocol_version == "2"
+
+    with pytest.raises(ExtensionLifecycleError, match="packaged manifest"):
+        fixture.lifecycle.accept_manual_handshake(
+            _handshake_pair(
+                fixture,
+                artifact_version="0.1.2-user-managed",
+                protocol_version="1",
+            )
+        )
+
+    assert tools.calls == []
+    assert fixture.state_store.read() is None
 
 
 @pytest.mark.parametrize(  # type: ignore[untyped-decorator]

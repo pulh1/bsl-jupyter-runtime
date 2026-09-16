@@ -1,9 +1,11 @@
 from collections import defaultdict, deque
+from threading import Event, Thread
 from uuid import UUID
 from xml.etree import ElementTree
 
 import pytest
 
+import onec_runtime.rdbg.session as session_module
 from onec_runtime.errors import CommandTimeout, ProtocolError, TargetLost, UnexpectedStop
 from onec_runtime.performance_profile import PhaseRecorder
 from onec_runtime.rdbg.models import (
@@ -103,6 +105,81 @@ def test_set_breakpoints_accepts_explicit_success_acknowledgement() -> None:
     session.set_breakpoints((LOCATION, CAPTURE_A))
 
     assert session._breakpoint_locations == (LOCATION, CAPTURE_A)
+
+
+def test_invalidate_fences_breakpoint_request_after_validation_and_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = FakeTransport()
+    session = ready_session(transport)
+    build_entered = Event()
+    release_build = Event()
+    errors = []
+    original_build = session_module.build_breakpoints_request
+
+    def blocked_build(*args, **kwargs):  # type: ignore[no-untyped-def]
+        build_entered.set()
+        assert release_build.wait(2)
+        return original_build(*args, **kwargs)
+
+    monkeypatch.setattr(session_module, "build_breakpoints_request", blocked_build)
+
+    def set_breakpoints() -> None:
+        try:
+            session.set_breakpoints((LOCATION, CAPTURE_A))
+        except BaseException as error:
+            errors.append(error)
+
+    worker = Thread(target=set_breakpoints)
+    worker.start()
+    assert build_entered.wait(1), "breakpoint request did not pass validation"
+    session.invalidate()
+    assert session.state is SessionState.FAILED
+    assert transport.calls == []
+    release_build.set()
+    worker.join(1)
+
+    assert not worker.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], ProtocolError)
+    assert transport.calls == []
+    assert session._breakpoint_installed is False
+
+
+def test_invalidate_fences_eval_request_after_dispatch_marker() -> None:
+    transport = FakeTransport()
+    session = ready_session(transport)
+    dispatch_entered = Event()
+    release_dispatch = Event()
+    errors = []
+
+    def dispatch_marker() -> None:
+        dispatch_entered.set()
+        assert release_dispatch.wait(2)
+
+    def evaluate() -> None:
+        try:
+            session.start_evaluation(
+                "Результат = 1;",
+                timeout_s=0.05,
+                on_transport_dispatch=dispatch_marker,
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    worker = Thread(target=evaluate)
+    worker.start()
+    assert dispatch_entered.wait(1), "evalExpr did not reach its dispatch marker"
+    session.invalidate()
+    assert transport.calls == []
+    release_dispatch.set()
+    worker.join(1)
+
+    assert not worker.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], ProtocolError)
+    assert transport.calls == []
+    assert session._pending_evaluation_states == {}
 
 
 @pytest.mark.parametrize(
@@ -671,6 +748,47 @@ def test_evaluate_collection_correlates_deferred_ping_result(
     assert all(event.page_start == 0 for event in recorder.events)
 
 
+def test_started_collection_evaluation_retains_one_capability_until_late_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result_id = UUID("67676767-6767-6767-6767-676767676767")
+    deferred = f"""<response xmlns="{RDBG_NS}"><result><cmdID>exprEvaluated</cmdID>
+      <evalExprResBaseData><expressionResultID xmlns="{CALC_NS}">{result_id}</expressionResultID>
+      <resultValueInfo xmlns="{CALC_NS}"><typeName>ТаблицаЗначений</typeName>
+        <collectionSize>1</collectionSize></resultValueInfo>
+      <calculationResult xmlns="{CALC_NS}"><viewInterface>collection</viewInterface>
+        <valueOfCollectionInfo><valueInfo><typeName>Строка</typeName>
+          <valueString>Колонка</valueString><pres>0JrQvtC70L7QvdC60LA=</pres>
+        </valueInfo></valueOfCollectionInfo>
+      </calculationResult><errorOccurred>false</errorOccurred>
+      </evalExprResBaseData></result></response>""".encode()
+    transport = FakeTransport()
+    transport.responses["evalExpr"].append(b"")
+    transport.responses["pingDebugUIParams"].append(deferred)
+    session = ready_session(transport)
+    monkeypatch.setattr("onec_runtime.rdbg.session.uuid4", lambda: result_id)
+    dispatches: list[str] = []
+
+    pending = session.start_collection_evaluation(
+        "Контекст.Таблица",
+        start_index=100,
+        page_size=101,
+        stack_level=2,
+        on_transport_dispatch=lambda: dispatches.append("entered"),
+    )
+
+    assert isinstance(pending, PendingEvaluation)
+    assert dispatches == ["entered"]
+    assert transport.calls.count("evalExpr") == 1
+
+    result = session.wait_evaluation_event(pending, timeout_s=1)
+
+    assert isinstance(result, EvaluationResult)
+    assert [row.index for row in result.collection_rows] == [100]
+    assert transport.calls.count("evalExpr") == 1
+    assert session.state is SessionState.READY
+
+
 def test_collection_uses_one_deadline_for_http_dispatch_and_result_polling(monkeypatch):
     now = [100.0]
     requests = []
@@ -764,3 +882,31 @@ def test_modify_rejects_mismatched_result_id(
 
     with pytest.raises(ProtocolError, match="modifyValue result"):
         session.modify("Счетчик", "1")
+
+
+def test_pending_evaluation_survives_interval_timeout_and_consumes_one_late_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An interval timeout must preserve the original capability without redispatch."""
+    transport = FakeTransport()
+    session = ready_session(transport)
+    pending = session.start_evaluation("1")
+    result = EvaluationResult(pending.result_id, "Число", "1", False)
+    intervals = []
+
+    def timed_out(timeout_s):
+        intervals.append(timeout_s)
+        raise CommandTimeout("interval elapsed")
+
+    monkeypatch.setattr(session, "_poll", timed_out)
+    for _ in range(3):
+        with pytest.raises(CommandTimeout):
+            session.wait_evaluation_event(pending, timeout_s=0.025)
+    assert len(session._pending_evaluation_states) == 1
+    assert all(0 < interval <= 0.025 for interval in intervals)
+    monkeypatch.setattr(session, "_poll", lambda timeout_s: ([], [result]))
+    assert session.wait_evaluation_event(pending, timeout_s=0.025) is result
+    with pytest.raises(ProtocolError, match="stale or foreign"):
+        session.wait_evaluation_event(pending, timeout_s=0.025)
+    assert transport.calls.count("evalExpr") == 1
+    assert not session._pending_evaluation_states

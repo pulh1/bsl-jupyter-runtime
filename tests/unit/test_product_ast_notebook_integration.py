@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import json
 import re
+from uuid import uuid4
 
 import pytest
 
@@ -26,6 +27,7 @@ from onec_runtime.bsl.notebook_cells import split_notebook_cell
 from onec_runtime.bsl.parser_target import PythonParserTarget
 from onec_runtime.artifacts import ArtifactWriter
 from onec_runtime.config import RuntimeConfig
+from onec_runtime.capture_evaluation import CaptureResumeTicket
 from onec_runtime.errors import PoisonedRuntimeError, ProtocolError
 from onec_runtime_jupyter.extension import MACHINE_MIME_TYPE, _display_reply
 from onec_runtime.prototype_runtime import (
@@ -111,6 +113,28 @@ class RecordingLowerer:
         )
 
 
+class _ImmediateResumeOwner:
+    @staticmethod
+    def _wait_resume_initiator(
+        record: SimpleNamespace,
+        _timeout_s: float | None,
+    ) -> object:
+        if record.error is not None:
+            raise record.error
+        return record.result
+
+    @staticmethod
+    def _detach_resume_initiator(record: SimpleNamespace) -> None:
+        record.detached = True
+
+    @staticmethod
+    def _resume_initiator_detached(record: SimpleNamespace) -> bool:
+        return bool(record.detached)
+
+
+_IMMEDIATE_RESUME_OWNER = _ImmediateResumeOwner()
+
+
 class FakeController:
     runtime_generation = 1
 
@@ -182,11 +206,17 @@ class FakeController:
             True,
         )
 
-    def execute_system_capture(self, source: str) -> CaptureCellResult:
+    def execute_system_capture(
+        self,
+        source: str,
+        *,
+        evaluation_kind: object,
+    ) -> CaptureCellResult:
+        del evaluation_kind
         self.capture_sources.append(source)
         return CaptureCellResult(self.operation_id, source, source, self.worker_results.popleft())
 
-    def resume(
+    def _resume_owned(
         self,
         *,
         dirty_roots: tuple[str, ...] = (),
@@ -199,6 +229,32 @@ class FakeController:
             on_transport_dispatch()
         self.state = OperationState.COMPLETED
         return MainCompletion(OperationHandle(self.operation_id, "main", "main"), None, "", True)
+
+    def submit_resume(self, **kwargs: object) -> CaptureResumeTicket:
+        before_resume = kwargs.pop("before_resume", None)
+        completion = kwargs.pop("completion", None)
+        kwargs.pop("detached_completion", None)
+        result: object | None = None
+        error: BaseException | None = None
+        try:
+            if callable(before_resume):
+                before_resume(object())
+            result = self._resume_owned(**kwargs)
+        except BaseException as caught:
+            error = caught
+        if callable(completion):
+            try:
+                result = completion(result, error)
+            except BaseException as caught:
+                if error is None:
+                    error = caught
+                    result = None
+        record = SimpleNamespace(result=result, error=error, detached=False)
+        return CaptureResumeTicket(
+            uuid4().hex,
+            _IMMEDIATE_RESUME_OWNER,  # type: ignore[arg-type]
+            record,  # type: ignore[arg-type]
+        )
 
     def resume_debug_stop(
         self,

@@ -31,8 +31,8 @@ def test_product_extension_metadata_is_universal() -> None:
 def test_product_extension_exposes_exact_handshake_values() -> None:
     expected = {
         'ИдентификаторПродуктаRuntime = "onec-interactive-runtime";',
-        'ВерсияАртефактаRuntime = "0.1.2";',
-        'ВерсияПротоколаRuntime = "1";',
+        'ВерсияАртефактаRuntime = "0.1.3";',
+        'ВерсияПротоколаRuntime = "2";',
     }
     for relative in (
         Path("Ext/ManagedApplicationModule.bsl"),

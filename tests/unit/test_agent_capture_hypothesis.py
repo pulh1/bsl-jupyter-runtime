@@ -249,7 +249,7 @@ class _Runtime:
     def namespace_snapshot(self) -> RuntimeNamespaceSnapshot:
         return RuntimeNamespaceSnapshot(1, 1, ())
 
-    def require_public_value_handle(self, handle: str) -> None:
+    def validate_value_reference(self, handle: str) -> None:
         del handle
 
     def status(self) -> RuntimeDescriptor:
