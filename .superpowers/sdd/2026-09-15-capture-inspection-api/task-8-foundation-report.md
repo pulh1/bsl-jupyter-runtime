@@ -383,3 +383,62 @@ suite passed `657 passed` in 46.61 seconds. The final full unit suite passed
 Proactor warning. `uv run python -m compileall -q src/onec_runtime
 packages/jupyter/src packages/mcp/src`, `git diff --check`, and the manifest
 fingerprint/protocol/artifact verification pass.
+
+## Ready-inspection retained-owner correction
+
+A ready/non-CAPTURE `completion_fields()` inspection cannot use
+`RdbgSession.evaluate()`: when RDBG reports a stop or the initiator’s deadline
+expires, that convenience API has already registered a `PendingEvaluation` but
+does not expose it to a controller owner. The result can wedge the RDBG session
+on a hidden pending capability.
+
+`PrototypeRuntimeController.execute_system_inspection()` now creates a private
+controller-owned `CaptureEvaluationCoordinator` record with evaluation kind
+`INSPECTION`. It submits through `start_evaluation()`, polls the exact returned
+capability, resumes a `StopEvent` through `continue_evaluation()`, and restores
+the temporary workspace before it publishes the outcome. The private owner
+keeps polling and cleans up after a caller deadline or `KeyboardInterrupt`.
+Its state fence is `RECOVERING`, so a subsequent completion or MAIN dispatch is
+rejected without another target request; late completion restores the prior
+ready state. The ticket exposes only the coordinator’s safe logical evaluation
+ID, never the RDBG UUID. An acknowledged deadline is therefore
+`CaptureEvaluationPendingError(…, INSPECTION)`, not
+`CaptureInspectionTimeout`.
+
+The record is adopted while the RuntimeSession operation lock and RuntimeApi
+writer remain held. Only `ticket.wait_initiator()` runs under the existing
+composed caller handoff, which releases the API writer and Session lock and
+reacquires them in the existing order. The submit path uses the Task-7
+`_CaptureSubmission` receipt, so an exception between record adoption and a
+normal ticket return detaches the vanished initiator while the event-stream
+owner remains sole consumer. The controller’s bounded shutdown joins every
+owned coordinator without short-circuiting and calls `finish_close()` with each
+owner’s individual join result.
+
+RED commits: `7df4b0b`, `ff84a4f`, and `2679fef`. GREEN:
+`6e784ef`. The regressions include real `RdbgSession` stop/resume and withheld
+result paths, safe pending-ID verification, late-result recovery, owner close,
+a two-owner shutdown join, the ready Session/API lock-contention probe, and a
+post-adoption exception. The latter proves the active record has a detached
+initiator, one dispatch, and no second completion dispatch.
+
+Fresh validation:
+
+- exact ready lock/adoption regressions: `2 passed`;
+- completion plus prototype runtime: `126 passed`;
+- coordinator/control/runtime API: `419 passed`;
+- Session/proxy/resume: `47 passed`;
+- Jupyter completion/adapter/value/display: `154 passed`; Jupyter shutdown:
+  `59 passed` (existing IPython/Windows Proactor warnings);
+- MCP/runtime-backend: `107 passed`; transfer/control surface: `196 passed`;
+  extension bundle/source: `184 passed, 1 skipped`;
+- `uv run python -m pytest tests/unit -q`: `4584 passed, 58 skipped` in
+  261.13s (the known IPython virtualenv and Windows ZMQ Proactor warnings);
+- `uv run python -m compileall -q src/onec_runtime packages/jupyter/src
+  packages/mcp/src` and `git diff --check` passed.
+
+No BSL, CFE, manifest, protocol, or artifact source was changed in this
+correction. The checked-in Designer-built bundle remains the matching
+protocol-`2` / artifact-`0.1.3` bundle with the existing four-source
+fingerprint; this is a core Python lifecycle change, not live 1C
+qualification.
