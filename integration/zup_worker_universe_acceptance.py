@@ -2600,8 +2600,8 @@ class _PrivateProxyRuntimeView:
             names = (*names, self._name)
         return replace(snapshot, names=names)
 
-    def require_public_value_handle(self, handle: str) -> None:
-        self._runtime.require_public_value_handle(handle)
+    def validate_value_reference(self, handle: str) -> str:
+        return self._runtime.validate_value_reference(handle)
 
 
 def _require_private_proxy_rejection(
@@ -2757,7 +2757,12 @@ def _execute_trusted_incremental_object_probe(api: object, source: str) -> objec
     execute = getattr(controller, "execute_system_capture", None)
     if not callable(execute):
         raise ProtocolError("ZUP trusted incremental capture is unavailable")
-    probe = execute(source)
+    from onec_runtime.capture_evaluation import CaptureEvaluationKind
+
+    probe = execute(
+        source,
+        evaluation_kind=CaptureEvaluationKind.MATERIALIZATION_HELPER,
+    )
     if not isinstance(probe, CaptureCellResult):
         raise ProtocolError("ZUP trusted incremental capture result is invalid")
     return probe.result

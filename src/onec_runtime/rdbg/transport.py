@@ -10,6 +10,7 @@ from onec_runtime.errors import (
     ProtocolError,
     RdbgDebugUiNotRegistered,
     RdbgTransportError,
+    RdbgTransportTimeout,
 )
 
 
@@ -82,11 +83,11 @@ class RdbgTransport:
                     f"RDBG {command} returned HTTP {response.status_code}: {bounded}"
                 )
             return response_body
-        except httpx.ReadTimeout as error:
+        except httpx.TimeoutException as error:
             error_text = str(error)
-            if command == "pingDebugUIParams":
+            if command == "pingDebugUIParams" and isinstance(error, httpx.ReadTimeout):
                 return b""
-            raise RdbgTransportError(
+            raise RdbgTransportTimeout(
                 f"RDBG {command} transport failure: {error}"
             ) from error
         except httpx.HTTPError as error:

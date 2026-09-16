@@ -11,7 +11,12 @@ from uuid import uuid4
 import pandas as pd
 
 from onec_runtime.compact_table import decode_compact_table_payload
-from onec_runtime.errors import ProtocolError
+from onec_runtime.capture_evaluation import (
+    AdmissionEnvelopeV1,
+    CaptureEvaluationKind,
+    CaptureTransferPlan,
+)
+from onec_runtime.errors import CaptureValueCheckError, ProtocolError
 from onec_runtime.experiment import bsl_string_literal
 from onec_runtime.performance_profile import PhaseRecorder
 from onec_runtime.rdbg.models import CollectionRow
@@ -24,7 +29,6 @@ _HANDLE = re.compile(
 )
 _CONTEXT_KEY = re.compile(r"__onec_compact_table_[0-9a-f]{32}\Z")
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
-_IDENTIFIER = re.compile(r"[^\W\d]\w*\Z", re.UNICODE)
 _SCALAR_KINDS = frozenset(
     {"string", "nullable_string", "boolean", "integer", "number", "datetime", "uuid"}
 )
@@ -127,14 +131,37 @@ def build_compact_transfer_instruction(
     *,
     runtime_generation: int,
     context_generation: int,
-    columns: tuple[CompactColumn, ...] | None = None,
     max_rows: int | None = None,
     max_payload_bytes: int | None = None,
+    worker_type_registrations: tuple[str, ...] = (),
 ) -> str:
     if not _HANDLE.fullmatch(handle):
         raise ProtocolError(
             "table handle must be one direct or dotted persistent Context path"
         )
+    return _build_compact_transfer_instruction(
+        handle,
+        policy,
+        context_key,
+        runtime_generation=runtime_generation,
+        context_generation=context_generation,
+        max_rows=max_rows,
+        max_payload_bytes=max_payload_bytes,
+        worker_type_registrations=worker_type_registrations,
+    )
+
+
+def _build_compact_transfer_instruction(
+    table_expression: str,
+    policy: ReferencePolicy,
+    context_key: str,
+    *,
+    runtime_generation: int,
+    context_generation: int,
+    max_rows: int | None = None,
+    max_payload_bytes: int | None = None,
+    worker_type_registrations: tuple[str, ...] = (),
+) -> str:
     if not _CONTEXT_KEY.fullmatch(context_key):
         raise ProtocolError("compact table context key is invalid")
     if runtime_generation <= 0 or context_generation <= 0:
@@ -143,18 +170,18 @@ def build_compact_transfer_instruction(
     bounded_bytes = _optional_budget(max_payload_bytes, "table byte budget")
     default = _reference_mode(policy.refs)
     overrides = dict(policy.ref_columns or {})
-    if columns is not None:
-        return _build_specialized_compact_transfer_instruction(
-            handle,
-            policy,
-            context_key,
-            runtime_generation=runtime_generation,
-            context_generation=context_generation,
-            columns=columns,
-            max_rows=bounded_rows,
-            max_payload_bytes=bounded_bytes,
+    if any(not isinstance(registration, str) or not registration for registration in worker_type_registrations):
+        raise ProtocolError("table Worker type registrations are invalid")
+    lines = ["Попытка", "ТипыОбъектовWorker = Новый Массив;"]
+    for index, registration in enumerate(worker_type_registrations):
+        lines.extend(
+            (
+                f"ВременныйОбъектWorker{index} = ВнешниеОбработки.Создать("
+                f"{bsl_string_literal(registration)}, Ложь);",
+                f"ТипыОбъектовWorker.Добавить(ТипЗнч(ВременныйОбъектWorker{index}));",
+            )
         )
-    lines = ["РежимыСсылокМатериализации = Новый Соответствие;"]
+    lines.append("РежимыСсылокМатериализации = Новый Соответствие;")
     for column in sorted(overrides):
         if not isinstance(column, str) or not column:
             raise ProtocolError("table reference column name is invalid")
@@ -165,20 +192,27 @@ def build_compact_transfer_instruction(
         )
     lines.extend(
         [
-            "КомпактнаяМатериализация = "
+            "Материализация = "
             "RuntimeTableTransferServer.СериализоватьКомпактнуюТаблицу("
-            f"{handle}, {bsl_string_literal(default.value)}, "
+            f"{table_expression}, {bsl_string_literal(default.value)}, "
             "РежимыСсылокМатериализации, "
-            f"{bounded_rows}, {bounded_bytes});",
-            f"Контекст.Вставить({bsl_string_literal(context_key)}, "
-            "КомпактнаяМатериализация.Base64);",
-            "Результат = "
+            f"ТипыОбъектовWorker, {bounded_rows}, {bounded_bytes});",
+            "Если Не Материализация.Доступ Тогда",
+            '    Результат = "D|worker_generation_value";',
+            "Иначе",
+            f"    Контекст.Вставить({bsl_string_literal(context_key)}, "
+            "Материализация.Base64);",
+            "    Результат = \"R|\" + "
             f"Формат({runtime_generation}, \"ЧГ=0; ЧДЦ=0\") + \"|\" + "
             f"Формат({context_generation}, \"ЧГ=0; ЧДЦ=0\") + \"|\" + "
-            "Формат(КомпактнаяМатериализация.Размер, \"ЧГ=0; ЧДЦ=0\") + \"|\" + "
-            "КомпактнаяМатериализация.Хеш + \"|\" + "
-            "Формат(СтрДлина(КомпактнаяМатериализация.Base64), "
+            "Формат(Материализация.Размер, \"ЧГ=0; ЧДЦ=0\") + \"|\" + "
+            "Материализация.Хеш + \"|\" + "
+            "Формат(СтрДлина(Материализация.Base64), "
             "\"ЧГ=0; ЧДЦ=0\");",
+            "КонецЕсли;",
+            "Исключение",
+            '    Результат = "E|value_admission_failed";',
+            "КонецПопытки;",
         ]
     )
     return "\n".join(lines)
@@ -192,191 +226,6 @@ def _optional_budget(value: int | None, label: str) -> int:
     return value
 
 
-def _table_field(row_name: str, column_name: str) -> str:
-    if _IDENTIFIER.fullmatch(column_name):
-        return f"{row_name}.{column_name}"
-    return f"{row_name}[{bsl_string_literal(column_name)}]"
-
-
-def _metadata_lines(
-    context_key: str,
-    *,
-    runtime_generation: int,
-    context_generation: int,
-) -> list[str]:
-    return [
-        f"Контекст.Вставить({bsl_string_literal(context_key)}, "
-        "КомпактнаяМатериализация.Base64);",
-        "Результат = "
-        f"Формат({runtime_generation}, \"ЧГ=0; ЧДЦ=0\") + \"|\" + "
-        f"Формат({context_generation}, \"ЧГ=0; ЧДЦ=0\") + \"|\" + "
-        "Формат(КомпактнаяМатериализация.Размер, \"ЧГ=0; ЧДЦ=0\") + \"|\" + "
-        "КомпактнаяМатериализация.Хеш + \"|\" + "
-        "Формат(СтрДлина(КомпактнаяМатериализация.Base64), "
-        "\"ЧГ=0; ЧДЦ=0\");",
-    ]
-
-
-def _build_specialized_compact_transfer_instruction(
-    handle: str,
-    policy: ReferencePolicy,
-    context_key: str,
-    *,
-    runtime_generation: int,
-    context_generation: int,
-    columns: tuple[CompactColumn, ...],
-    max_rows: int,
-    max_payload_bytes: int,
-) -> str:
-    if not columns:
-        raise ProtocolError("compact table schema has no columns")
-    names = [column.name for column in columns]
-    if any(not name for name in names) or len(set(names)) != len(names):
-        raise ProtocolError("compact table column names are invalid")
-    default = _reference_mode(policy.refs)
-    overrides = dict(policy.ref_columns or {})
-    references = {column.name for column in columns if column.is_reference}
-    unknown = set(overrides) - references
-    if unknown:
-        raise ProtocolError("unknown reference column: " + ", ".join(sorted(unknown)))
-
-    effective_kinds: list[str] = []
-    reference_modes: dict[str, ReferenceMode] = {}
-    for column in columns:
-        if column.is_reference:
-            mode = _reference_mode(overrides.get(column.name, default))
-            effective_kinds.append(mode.value)
-            reference_modes[column.name] = mode
-        else:
-            if column.kind not in _SCALAR_KINDS:
-                raise ProtocolError(
-                    f"unsupported compact scalar kind for column {column.name}"
-                )
-            effective_kinds.append(column.kind)
-
-    lines = [
-        "СтрокиJSONL = Новый Массив;",
-        "КолонкиJSONL = Новый Массив;",
-        f"МаксимумСтрокМатериализации = {max_rows};",
-        f"МаксимумБайтМатериализации = {max_payload_bytes};",
-    ]
-    lines.extend(
-        f"КолонкиJSONL.Добавить({bsl_string_literal(name)});" for name in names
-    )
-    lines.append("ВидыJSONL = Новый Массив;")
-    lines.extend(
-        f"ВидыJSONL.Добавить({bsl_string_literal(kind)});"
-        for kind in effective_kinds
-    )
-    lines.append("РежимыСсылокJSONL = Новый Структура;")
-    lines.extend(
-        "РежимыСсылокJSONL.Вставить("
-        f"{bsl_string_literal(name)}, {bsl_string_literal(mode.value)});"
-        for name, mode in reference_modes.items()
-    )
-    lines.extend(
-        [
-            "СхемаJSONL = Новый Структура;",
-            'СхемаJSONL.Вставить("version", 1);',
-            'СхемаJSONL.Вставить("columns", КолонкиJSONL);',
-            'СхемаJSONL.Вставить("kinds", ВидыJSONL);',
-            'СхемаJSONL.Вставить("reference_modes", РежимыСсылокJSONL);',
-            "ЗаписьСхемыJSONL = Новый ЗаписьJSON;",
-            "ЗаписьСхемыJSONL.УстановитьСтроку("
-            "Новый ПараметрыЗаписиJSON(ПереносСтрокJSON.Нет));",
-            "ЗаписатьJSON(ЗаписьСхемыJSONL, СхемаJSONL);",
-            "СтрокиJSONL.Добавить(ЗаписьСхемыJSONL.Закрыть());",
-            "РазмерJSONL = ПолучитьДвоичныеДанныеИзСтроки(СтрокиJSONL[0] + "
-            "Символы.ПС, КодировкаТекста.UTF8, Ложь).Размер();",
-            "КоличествоСтрокJSONL = 0;",
-            "Если МаксимумБайтМатериализации > 0 И "
-            "РазмерJSONL > МаксимумБайтМатериализации Тогда",
-            '    ВызватьИсключение "Превышен лимит байтов компактной таблицы";',
-            "КонецЕсли;",
-            "ТаблицаМатериализации = RuntimeTableTransferServer."
-            f"ПодготовитьТабличноеЗначение({handle}, "
-            "МаксимумСтрокМатериализации);",
-            "Для Каждого СтрокаМатериализации Из ТаблицаМатериализации Цикл",
-            "    Если МаксимумСтрокМатериализации > 0 И "
-            "КоличествоСтрокJSONL >= МаксимумСтрокМатериализации Тогда",
-            '        ВызватьИсключение "Превышен лимит строк компактной таблицы";',
-            "    КонецЕсли;",
-            "    ЗначенияСтроки = Новый Массив;",
-        ]
-    )
-    for ordinal, column in enumerate(columns):
-        value = _table_field("СтрокаМатериализации", column.name)
-        if not column.is_reference:
-            encoded = (
-                f"XMLСтрока({value})"
-                if column.kind == "datetime"
-                else (
-                    f"?({value} = Неопределено Или {value} = NULL, "
-                    f"Неопределено, Строка({value}))"
-                )
-                if column.kind == "nullable_string"
-                else f"Строка({value})"
-                if column.kind == "uuid"
-                else value
-            )
-            lines.append(f"    ЗначенияСтроки.Добавить({encoded});")
-            continue
-        mode = reference_modes[column.name]
-        if mode is ReferenceMode.PRESENTATION:
-            encoded = f"?(ЗначениеЗаполнено({value}), Строка({value}), Неопределено)"
-            lines.append(f"    ЗначенияСтроки.Добавить({encoded});")
-        elif mode is ReferenceMode.UUID:
-            encoded = (
-                f"?(ЗначениеЗаполнено({value}), "
-                f"Строка({value}.УникальныйИдентификатор()), Неопределено)"
-            )
-            lines.append(f"    ЗначенияСтроки.Добавить({encoded});")
-        else:
-            temporary = f"ОбеФормыСсылки{ordinal}"
-            lines.extend(
-                [
-                    f"    Если ЗначениеЗаполнено({value}) Тогда",
-                    f"        {temporary} = Новый Массив;",
-                    f"        {temporary}.Добавить(Строка({value}));",
-                    f"        {temporary}.Добавить(Строка("
-                    f"{value}.УникальныйИдентификатор()));",
-                    "    Иначе",
-                    f"        {temporary} = Неопределено;",
-                    "    КонецЕсли;",
-                    f"    ЗначенияСтроки.Добавить({temporary});",
-                ]
-            )
-    lines.extend(
-        [
-            "    ЗаписьСтрокиJSONL = Новый ЗаписьJSON;",
-            "    ЗаписьСтрокиJSONL.УстановитьСтроку("
-            "Новый ПараметрыЗаписиJSON(ПереносСтрокJSON.Нет));",
-            "    ЗаписатьJSON(ЗаписьСтрокиJSONL, ЗначенияСтроки);",
-            "    СтрокаJSONL = ЗаписьСтрокиJSONL.Закрыть();",
-            "    РазмерСтрокиJSONL = ПолучитьДвоичныеДанныеИзСтроки("
-            "СтрокаJSONL + Символы.ПС, КодировкаТекста.UTF8, Ложь).Размер();",
-            "    Если МаксимумБайтМатериализации > 0 И "
-            "РазмерJSONL + РазмерСтрокиJSONL > МаксимумБайтМатериализации Тогда",
-            '        ВызватьИсключение "Превышен лимит байтов компактной таблицы";',
-            "    КонецЕсли;",
-            "    СтрокиJSONL.Добавить(СтрокаJSONL);",
-            "    РазмерJSONL = РазмерJSONL + РазмерСтрокиJSONL;",
-            "    КоличествоСтрокJSONL = КоличествоСтрокJSONL + 1;",
-            "КонецЦикла;",
-            "КомпактнаяМатериализация = RuntimeTableTransferServer."
-            "ЗавершитьКомпактнуюМатериализацию(СтрокиJSONL);",
-        ]
-    )
-    lines.extend(
-        _metadata_lines(
-            context_key,
-            runtime_generation=runtime_generation,
-            context_generation=context_generation,
-        )
-    )
-    return "\n".join(lines)
-
-
 class CompactRuntimeTableTransfer:
     def __init__(
         self,
@@ -386,19 +235,20 @@ class CompactRuntimeTableTransfer:
         runtime_generation: Callable[[], int],
         context_generation: int,
         context_cleaner: Callable[[str], None] | None = None,
-        schema_reader: Callable[[str], tuple[CompactColumn, ...] | None] | None = None,
         max_text_size: int = 100_000_000,
         max_payload_bytes: int = 75_000_000,
         max_rows: int | None = None,
         key_factory: Callable[[], str] | None = None,
         profiler: PhaseRecorder | None = None,
+        worker_type_registrations: Callable[[], tuple[str, ...]] | None = None,
+        capture_executor: Callable[[CaptureTransferPlan, CaptureEvaluationKind], bytes] | None = None,
     ) -> None:
+        self._capture_execute = capture_executor
         self._execute = instruction_executor
         self._read = context_reader
         self._runtime_generation = runtime_generation
         self._context_generation = context_generation
         self._clean = context_cleaner
-        self._schema_reader = schema_reader
         self._expected_runtime_generation = runtime_generation()
         self._max_text_size = max_text_size
         if max_payload_bytes <= 0:
@@ -409,6 +259,7 @@ class CompactRuntimeTableTransfer:
             lambda: "__onec_compact_table_" + uuid4().hex
         )
         self._profiler = profiler
+        self._worker_type_registrations = worker_type_registrations
 
     def _profile(self, phase: str, operation, **metadata):  # type: ignore[no-untyped-def]
         if self._profiler is None:
@@ -417,6 +268,22 @@ class CompactRuntimeTableTransfer:
 
     def to_df(self, handle: str, policy: ReferencePolicy) -> pd.DataFrame:
         payload = self.payload(handle, policy)
+        return self._build_dataframe(payload, policy)
+
+    def _to_df_trusted_expression(
+        self,
+        expression: str,
+        policy: ReferencePolicy,
+    ) -> pd.DataFrame:
+        """Materialize a descriptor already admitted by the runtime owner."""
+        payload = self._payload_trusted_expression(expression, policy)
+        return self._build_dataframe(payload, policy)
+
+    def _build_dataframe(
+        self,
+        payload: bytes,
+        policy: ReferencePolicy,
+    ) -> pd.DataFrame:
         return self._profile(
             "table.build_dataframe",
             lambda: decode_compact_table_payload(payload, policy),
@@ -424,77 +291,118 @@ class CompactRuntimeTableTransfer:
             item_count=lambda frame: len(frame.index),
         )
 
-    def payload(self, handle: str, policy: ReferencePolicy) -> bytes:
+    def prepare_payload(self, handle: str, policy: ReferencePolicy) -> CaptureTransferPlan:
+        return self._prepare_payload(handle, policy, trusted_expression=False)
+
+    def _prepare_trusted_expression_payload(
+        self,
+        expression: str,
+        policy: ReferencePolicy,
+    ) -> CaptureTransferPlan:
+        """Build a plan from a runtime-validated internal BSL expression."""
+        return self._prepare_payload(expression, policy, trusted_expression=True)
+
+    def _prepare_payload(
+        self,
+        table_source: str,
+        policy: ReferencePolicy,
+        *,
+        trusted_expression: bool,
+    ) -> CaptureTransferPlan:
         generation = self._runtime_generation()
         if generation != self._expected_runtime_generation:
             raise ProtocolError("table materializer runtime generation is stale")
         key = self._key_factory()
-        columns = self._profile(
-            "table.schema_read",
-            lambda: self._schema_reader(handle) if self._schema_reader else None,
+        builder = (
+            _build_compact_transfer_instruction
+            if trusted_expression
+            else build_compact_transfer_instruction
         )
-        source = build_compact_transfer_instruction(
-            handle,
+        source = builder(
+            table_source,
             policy,
             key,
             runtime_generation=generation,
             context_generation=self._context_generation,
-            columns=columns,
             max_rows=self._max_rows or None,
             max_payload_bytes=self._max_payload_bytes,
+            worker_type_registrations=(
+                ()
+                if self._worker_type_registrations is None
+                else self._worker_type_registrations()
+            ),
         )
-        metadata = self._profile(
-            "table.prepare_jsonl",
-            lambda: self._execute(source),
-            input_bytes=len(source.encode("utf-8")),
+
+        def decode(metadata: object, content: str) -> bytes:
+            byte_count, base64_count, payload_hash = self._validate_metadata(metadata, generation)
+            if len(content) != base64_count:
+                raise CaptureValueCheckError("CAPTURE value admission result is invalid")
+            try:
+                payload = self._profile(
+                    "table.decode_base64",
+                    lambda: b64decode("".join(content.split()), validate=True),
+                    input_bytes=len(content.encode("ascii")),
+                    output_bytes=len,
+                )
+            except (ValueError, binascii.Error) as error:
+                raise ProtocolError("compact table Base64 payload is invalid") from error
+            if len(payload) != byte_count or sha256(payload).hexdigest() != payload_hash:
+                raise CaptureValueCheckError("CAPTURE value payload integrity check failed")
+            return payload
+
+        def admit(metadata: object) -> object:
+            self._validate_metadata(metadata, generation)
+            return metadata
+
+        return CaptureTransferPlan(
+            source, key, f"Контекст.Удалить({bsl_string_literal(key)});\nРезультат = Истина;",
+            self._max_text_size, decode, admit,
         )
-        if not isinstance(metadata, str):
-            if self._clean is not None:
-                self._clean(key)
-            raise ProtocolError("compact table metadata is not a string")
-        fields = metadata.split("|")
-        if len(fields) != 5:
-            if self._clean is not None:
-                self._clean(key)
-            raise ProtocolError("compact table metadata field count is invalid")
-        try:
-            observed_runtime = int(fields[0])
-            observed_context = int(fields[1])
-            byte_count = int(fields[2])
-            base64_count = int(fields[4])
-        except ValueError as error:
-            if self._clean is not None:
-                self._clean(key)
-            raise ProtocolError("compact table metadata number is invalid") from error
-        payload_hash = fields[3]
+
+    def _validate_metadata(self, metadata: object, generation: int) -> tuple[int, int, str]:
+        observed = AdmissionEnvelopeV1.parse(
+            metadata,
+            max_payload_bytes=self._max_payload_bytes,
+            max_base64_chars=self._max_text_size,
+        )
         if (
-            observed_runtime != generation
-            or observed_context != self._context_generation
-            or byte_count <= 0
-            or byte_count > self._max_payload_bytes
-            or base64_count <= 0
-            or base64_count > self._max_text_size
-            or not _HASH.fullmatch(payload_hash)
+            observed.runtime_generation != generation
+            or observed.context_generation != self._context_generation
         ):
+            raise CaptureValueCheckError("CAPTURE value admission result is invalid")
+        return observed.payload_bytes, observed.base64_chars, observed.payload_sha256
+
+    def payload(self, handle: str, policy: ReferencePolicy) -> bytes:
+        plan = self.prepare_payload(handle, policy)
+        return self._execute_plan(plan)
+
+    def _payload_trusted_expression(
+        self,
+        expression: str,
+        policy: ReferencePolicy,
+    ) -> bytes:
+        """Transfer a descriptor already admitted by the runtime owner."""
+        plan = self._prepare_trusted_expression_payload(expression, policy)
+        return self._execute_plan(plan)
+
+    def _execute_plan(self, plan: CaptureTransferPlan) -> bytes:
+        if self._capture_execute is not None:
+            return self._capture_execute(
+                plan,
+                CaptureEvaluationKind.MATERIALIZATION_HELPER,
+            )
+        metadata = self._profile(
+            "table.prepare_jsonl", lambda: self._execute(plan.instruction),
+            input_bytes=len(plan.instruction.encode("utf-8")),
+        )
+        try:
+            self._validate_metadata(metadata, self._expected_runtime_generation)
+        except ProtocolError:
             if self._clean is not None:
-                self._clean(key)
-            raise ProtocolError("compact table metadata is invalid")
+                self._clean(plan.private_key)
+            raise
         content = self._profile(
-            "table.transfer_base64",
-            lambda: self._read(key, self._max_text_size),
+            "table.transfer_base64", lambda: self._read(plan.private_key, self._max_text_size),
             output_bytes=lambda value: len(value.encode("ascii")),
         )
-        if len(content) != base64_count:
-            raise ProtocolError("compact table metadata is invalid")
-        try:
-            payload = self._profile(
-                "table.decode_base64",
-                lambda: b64decode("".join(content.split()), validate=True),
-                input_bytes=len(content.encode("ascii")),
-                output_bytes=len,
-            )
-        except (ValueError, binascii.Error) as error:
-            raise ProtocolError("compact table Base64 payload is invalid") from error
-        if len(payload) != byte_count or sha256(payload).hexdigest() != payload_hash:
-            raise ProtocolError("compact table payload integrity check failed")
-        return payload
+        return plan.decode(metadata, content)

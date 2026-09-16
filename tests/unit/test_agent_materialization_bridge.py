@@ -55,7 +55,7 @@ class FakePayloadBackend:
     def namespace_snapshot(self) -> RuntimeNamespaceSnapshot:
         return RuntimeNamespaceSnapshot(7, 12, tuple(self.payloads))
 
-    def require_public_value_handle(self, handle: str) -> None:
+    def validate_value_reference(self, handle: str) -> None:
         del handle
 
     def materialization_kind(

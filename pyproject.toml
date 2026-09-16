@@ -45,6 +45,7 @@ onec-interactive-mcp = { workspace = true }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 markers = [
   "integration: requires locally installed 1C:Enterprise",
   "live_1c: requires an opt-in local 1C:Enterprise runtime and creates a temporary infobase",

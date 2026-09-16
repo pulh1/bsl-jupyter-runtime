@@ -1,0 +1,1 @@
+<mdclass:Configuration xmlns:mdclass="urn:synthetic" uuid="99999999-9999-9999-9999-999999999999"><name>Дополнение</name><containedObjects>CommonModule.Общий</containedObjects><containedObjects>Document.ПриемНаРаботу</containedObjects><commonModules>CommonModule.Общий</commonModules><commonModules>CommonModule.Другой</commonModules></mdclass:Configuration>

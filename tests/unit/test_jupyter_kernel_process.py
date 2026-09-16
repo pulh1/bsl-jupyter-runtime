@@ -31,7 +31,7 @@ class FailedRuntime:
         return RuntimeStatus(STATE, 1, 1, None)
     def namespace_snapshot(self):
         return RuntimeNamespaceSnapshot(1, 1, ())
-    def require_public_value_handle(self, handle):
+    def validate_value_reference(self, handle):
         raise AssertionError("unused")
 KIND = RuntimeReplyKind.CAPTURE_CELL if CAPTURE else RuntimeReplyKind.MAIN_COMPLETED
 STATE = OperationState.CAPTURED if CAPTURE else OperationState.FAILED
@@ -131,7 +131,7 @@ class StubRuntime:
         return RuntimeStatus(OperationState.COMPLETED, 1, 1, None)
     def namespace_snapshot(self):
         return RuntimeNamespaceSnapshot(1, 1, ("ГДФЛ",))
-    def require_public_value_handle(self, handle):
+    def validate_value_reference(self, handle):
         pass
 
 python_marker = {"alive": True}

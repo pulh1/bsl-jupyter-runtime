@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from base64 import b64encode
 from hashlib import sha256
+from inspect import signature
 import json
 
 import pytest
@@ -13,13 +14,41 @@ from onec_runtime.compact_table_backend import (
     infer_declared_compact_columns,
     infer_compact_columns,
 )
-from onec_runtime.errors import ProtocolError
+from onec_runtime.errors import (
+    CaptureValueAccessDeniedError,
+    CaptureValueCheckError,
+    ProtocolError,
+)
 from onec_runtime.performance_profile import PhaseRecorder
 from onec_runtime.rdbg.models import CollectionCell, CollectionRow
 from onec_runtime.table_materialization import ReferencePolicy
 
 
 KEY = "__onec_compact_table_0123456789abcdef0123456789abcdef"
+
+
+def test_capture_compact_plan_exists_before_creation_and_caller_does_not_clean():
+    seen = []
+    expected = payload()
+    encoded = b64encode(expected).decode("ascii")
+    def execute_plan(plan, evaluation_kind):
+        from onec_runtime.capture_evaluation import CaptureEvaluationKind
+
+        assert evaluation_kind is CaptureEvaluationKind.MATERIALIZATION_HELPER
+        seen.append(plan)
+        assert plan.private_key == KEY
+        assert KEY in plan.cleanup_instruction
+        assert "Результат = Истина;" in plan.cleanup_instruction
+        return plan.decode(f"R|3|5|{len(expected)}|{sha256(expected).hexdigest()}|{len(encoded)}", encoded)
+    transfer = CompactRuntimeTableTransfer(
+        lambda source: pytest.fail("caller dispatched CAPTURE"),
+        lambda key, maximum: pytest.fail("caller read CAPTURE"),
+        context_cleaner=lambda key: pytest.fail("caller cleaned CAPTURE"),
+        runtime_generation=lambda: 3, context_generation=5, key_factory=lambda: KEY,
+        capture_executor=execute_plan,
+    )
+    assert transfer.payload("Контекст.Таблица", ReferencePolicy(refs="both")) == expected
+    assert len(seen) == 1
 
 
 def payload() -> bytes:
@@ -58,6 +87,58 @@ def test_builds_one_compact_preparation_with_safe_reference_overrides() -> None:
     assert "RuntimeWorker" not in source
 
 
+def test_compact_instruction_builds_protocol_two_admission_before_publication() -> None:
+    source = build_compact_transfer_instruction(
+        "Контекст.Таблица",
+        ReferencePolicy(),
+        KEY,
+        runtime_generation=3,
+        context_generation=5,
+        worker_type_registrations=("Worker.Extension",),
+    )
+
+    assert 'ВнешниеОбработки.Создать("Worker.Extension", Ложь)' in source
+    assert source.index("ТипыОбъектовWorker") < source.index(
+        "RuntimeTableTransferServer.СериализоватьКомпактнуюТаблицу("
+    )
+    assert "ТипыОбъектовWorker" in source.split(
+        "RuntimeTableTransferServer.СериализоватьКомпактнуюТаблицу(", 1
+    )[1]
+    assert source.index("Если Не Материализация.Доступ Тогда") < source.index(
+        f'Контекст.Вставить("{KEY}"'
+    )
+    assert 'Результат = "D|worker_generation_value"' in source
+    assert 'Результат = "E|value_admission_failed"' in source
+    assert '"R|" + Формат(3, "ЧГ=0; ЧДЦ=0")' in source
+
+
+@pytest.mark.parametrize(
+    ("metadata", "error_type"),
+    [
+        ("D|worker_generation_value", CaptureValueAccessDeniedError),
+        ("E|value_admission_failed", CaptureValueCheckError),
+        ("3|5|33|" + "0" * 64 + "|44", CaptureValueCheckError),
+    ],
+)
+def test_nonready_or_predecessor_table_metadata_never_fetches_payload(
+    metadata: str, error_type: type[Exception]
+) -> None:
+    reads: list[str] = []
+    transfer = CompactRuntimeTableTransfer(
+        lambda _source: metadata,
+        lambda key, _maximum: reads.append(key) or "private-payload",
+        runtime_generation=lambda: 3,
+        context_generation=5,
+        key_factory=lambda: KEY,
+        context_cleaner=lambda _key: None,
+    )
+
+    with pytest.raises(error_type):
+        transfer.payload("Контекст.Таблица", ReferencePolicy())
+
+    assert reads == []
+
+
 def test_builds_compact_transfer_for_validated_tabular_section_path() -> None:
     source = build_compact_transfer_instruction(
         "Контекст.Документ.Товары",
@@ -76,6 +157,8 @@ def test_builds_compact_transfer_for_validated_tabular_section_path() -> None:
         "Контекст.Документ[0]",
         "Контекст.Документ.Товары()",
         "Контекст.Документ; Сообщить(1)",
+        "RuntimeKernelServer.ПолучитьВременнуюТаблицуОтладки("
+        "Контекст.КонтекстОтладки.Результат, \"Итоги\", 0, 10, Новый Массив)",
     ),
 )
 def test_rejects_executable_compact_table_path(handle: str) -> None:
@@ -96,13 +179,10 @@ def test_reads_one_scalar_and_verifies_compact_payload() -> None:
     reads: list[tuple[str, int]] = []
     transfer = CompactRuntimeTableTransfer(
         lambda source: calls.append(source)
-        or f"3|5|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}",
+        or f"R|3|5|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}",
         lambda key, maximum: reads.append((key, maximum)) or encoded,
         runtime_generation=lambda: 3,
         context_generation=5,
-        schema_reader=lambda handle: (
-            CompactColumn("Employee", "reference", is_reference=True),
-        ),
         key_factory=lambda: KEY,
     )
 
@@ -113,8 +193,8 @@ def test_reads_one_scalar_and_verifies_compact_payload() -> None:
 
     assert frame.shape == (1, 2)
     assert len(calls) == 1
-    assert "СериализоватьКомпактнуюТаблицу" not in calls[0]
-    assert "СтрокаМатериализации.Employee.УникальныйИдентификатор()" in calls[0]
+    assert "СериализоватьКомпактнуюТаблицу" in calls[0]
+    assert "СтрокаМатериализации.Employee.УникальныйИдентификатор()" not in calls[0]
     assert reads == [(KEY, 100_000_000)]
 
 
@@ -136,7 +216,7 @@ def test_to_df_keeps_unfilled_table_column_as_missing_values() -> None:
     calls: list[str] = []
     transfer = CompactRuntimeTableTransfer(
         lambda source: calls.append(source)
-        or f"3|5|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}",
+        or f"R|3|5|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}",
         lambda _key, _maximum: encoded,
         runtime_generation=lambda: 3,
         context_generation=5,
@@ -157,13 +237,10 @@ def test_rejects_payload_integrity_mismatch_after_atomic_take() -> None:
     encoded = b64encode(content).decode()
     reads: list[str] = []
     transfer = CompactRuntimeTableTransfer(
-        lambda _source: f"1|1|{len(content)}|{'0' * 64}|{len(encoded)}",
+        lambda _source: f"R|1|1|{len(content)}|{'0' * 64}|{len(encoded)}",
         lambda key, _maximum: reads.append(key) or encoded,
         runtime_generation=lambda: 1,
         context_generation=1,
-        schema_reader=lambda handle: (
-            CompactColumn("Employee", "reference", is_reference=True),
-        ),
         key_factory=lambda: KEY,
     )
 
@@ -178,77 +255,24 @@ def test_rejects_declared_payload_over_byte_budget_before_atomic_take() -> None:
     encoded = b64encode(content).decode()
     reads: list[str] = []
     transfer = CompactRuntimeTableTransfer(
-        lambda _source: f"1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}",
+        lambda _source: f"R|1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}",
         lambda key, _maximum: reads.append(key) or encoded,
         runtime_generation=lambda: 1,
         context_generation=1,
         context_cleaner=lambda _key: None,
-        schema_reader=lambda _handle: (
-            CompactColumn("Employee", "reference", is_reference=True),
-        ),
         max_payload_bytes=len(content) - 1,
         key_factory=lambda: KEY,
     )
 
-    with pytest.raises(ProtocolError, match="metadata"):
+    with pytest.raises(CaptureValueCheckError, match="CAPTURE value admission"):
         transfer.payload("Контекст.Таблица", ReferencePolicy())
 
     assert reads == []
 
 
-def test_specialized_instruction_keeps_scalar_conversion_out_of_row_dispatch() -> None:
-    source = build_compact_transfer_instruction(
-        "Контекст.Таблица",
-        ReferencePolicy(refs="uuid"),
-        KEY,
-        runtime_generation=3,
-        context_generation=5,
-        columns=(
-            CompactColumn("Employee", "reference", is_reference=True),
-            CompactColumn("Amount", "number", is_reference=False),
-            CompactColumn("Moment", "datetime", is_reference=False),
-        ),
-    )
-
-    assert "СериализоватьКомпактнуюТаблицу" not in source
-    assert "КомпактноеЗначение" not in source
-    assert "СтрокаМатериализации.Employee.УникальныйИдентификатор()" in source
-    assert "ЗначенияСтроки.Добавить(СтрокаМатериализации.Amount);" in source
-    assert "ЗначенияСтроки.Добавить(XMLСтрока(СтрокаМатериализации.Moment));" in source
-    assert (
-        "ТаблицаМатериализации = RuntimeTableTransferServer."
-        "ПодготовитьТабличноеЗначение(Контекст.Таблица, "
-        "МаксимумСтрокМатериализации);"
-    ) in source
-    assert source.count("Для Каждого СтрокаМатериализации Из ТаблицаМатериализации Цикл") == 1
-
-
-def test_specialized_instruction_enforces_row_and_byte_budgets_before_jsonl_append() -> None:
-    source = build_compact_transfer_instruction(
-        "Контекст.Таблица",
-        ReferencePolicy(refs="presentation"),
-        KEY,
-        runtime_generation=3,
-        context_generation=5,
-        columns=(CompactColumn("Amount", "number", is_reference=False),),
-        max_rows=12,
-        max_payload_bytes=4096,
-    )
-
-    assert "МаксимумСтрокМатериализации = 12;" in source
-    assert "МаксимумБайтМатериализации = 4096;" in source
-    assert (
-        "ПодготовитьТабличноеЗначение(Контекст.Таблица, "
-        "МаксимумСтрокМатериализации)"
-    ) in source
-    assert "КоличествоСтрокJSONL >= МаксимумСтрокМатериализации" in source
-    assert "РазмерJSONL + РазмерСтрокиJSONL > МаксимумБайтМатериализации" in source
-    assert source.index("КоличествоСтрокJSONL >= МаксимумСтрокМатериализации") < source.index(
-        "СтрокиJSONL.Добавить(СтрокаJSONL);"
-    )
-    assert source.index("РазмерJSONL + РазмерСтрокиJSONL > МаксимумБайтМатериализации") < source.index(
-        "СтрокиJSONL.Добавить(СтрокаJSONL);"
-    )
+def test_generic_table_transport_has_no_specialized_schema_compatibility_surface() -> None:
+    assert "columns" not in signature(build_compact_transfer_instruction).parameters
+    assert "schema_reader" not in signature(CompactRuntimeTableTransfer).parameters
 
 
 def test_generic_instruction_passes_budgets_to_server_serializer() -> None:
@@ -262,7 +286,7 @@ def test_generic_instruction_passes_budgets_to_server_serializer() -> None:
         max_payload_bytes=1024,
     )
 
-    assert 'РежимыСсылокМатериализации, 7, 1024);' in source
+    assert 'РежимыСсылокМатериализации, ТипыОбъектовWorker, 7, 1024);' in source
 
 
 def test_infers_one_stable_schema_from_a_small_frame_sample() -> None:
@@ -323,26 +347,6 @@ def test_infers_enumeration_as_presentation_without_a_fake_uuid_projection() -> 
     )
 
 
-def test_specialized_instruction_converts_enumeration_presentation_to_string() -> None:
-    source = build_compact_transfer_instruction(
-        "Контекст.Таблица",
-        ReferencePolicy(refs="both"),
-        KEY,
-        runtime_generation=3,
-        context_generation=5,
-        columns=(
-            CompactColumn("IncomeKind", "nullable_string", is_reference=False),
-        ),
-    )
-
-    assert (
-        "?(СтрокаМатериализации.IncomeKind = Неопределено Или "
-        "СтрокаМатериализации.IncomeKind = NULL, Неопределено, "
-        "Строка(СтрокаМатериализации.IncomeKind))"
-    ) in source
-    assert "ЗначенияСтроки.Добавить(СтрокаМатериализации.IncomeKind);" not in source
-
-
 def test_reads_declared_table_schema_without_sampling_values() -> None:
     rows = (
         CollectionRow(
@@ -390,14 +394,11 @@ def test_records_each_materialization_boundary_without_payload_values() -> None:
     recorder = PhaseRecorder()
     transfer = CompactRuntimeTableTransfer(
         lambda _source: (
-            f"3|5|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}"
+            f"R|3|5|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}"
         ),
         lambda _key, _maximum: encoded,
         runtime_generation=lambda: 3,
         context_generation=5,
-        schema_reader=lambda _handle: (
-            CompactColumn("Employee", "reference", is_reference=True),
-        ),
         key_factory=lambda: KEY,
         profiler=recorder,
     )
@@ -408,7 +409,6 @@ def test_records_each_materialization_boundary_without_payload_values() -> None:
     )
 
     assert [event.phase for event in recorder.events] == [
-        "table.schema_read",
         "table.prepare_jsonl",
         "table.transfer_base64",
         "table.decode_base64",

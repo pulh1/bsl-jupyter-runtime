@@ -276,8 +276,8 @@ def test_edt_invalid_identity_or_flags_fail_closed(tmp_path, replacement):
 def test_duplicate_identity_across_source_formats_is_rejected(tmp_path):
     add_metadata(tmp_path, "Модуль", server=True, client=False, global_module=False)
     add_edt_metadata(tmp_path, "МОДУЛЬ")
-    catalog = SessionCommonModuleCatalog(tmp_path, profile="server")
     with pytest.raises(ProtocolError, match="duplicate common module identity"):
+        catalog = SessionCommonModuleCatalog(tmp_path, profile="server")
         catalog.ensure_initialized()
 
 
@@ -350,3 +350,117 @@ def test_edt_rejects_windows_junctions_before_reading_metadata(tmp_path, monkeyp
     with pytest.raises(ProtocolError, match="source root is unsafe"):
         catalog = SessionCommonModuleCatalog(project, profile="server")
         catalog.ensure_modules(("Модуль",))
+
+@pytest.mark.parametrize('layout', ['designer', 'edt'])
+def test_hot_reload_catalog_and_capture_use_same_normalized_root(layout):
+    from tests.unit.test_configuration_source_layout import FIXTURES
+    import onec_runtime.capture_source as capture_source
+    configured = FIXTURES / f'{layout}_base'
+    hot_reload = SessionCommonModuleCatalog(configured, profile='server')
+    source = capture_source.CaptureSourceCatalog((capture_source.CaptureSourceConfig('demo', configured),))
+    assert hot_reload.source_root == source.bindings[0].normalized_root
+    assert hot_reload.ensure_modules(('Общий',)).require('Общий').canonical_name == 'Общий'
+
+
+def test_catalog_rejects_ambiguous_document_tree_even_if_common_modules_only_nested(tmp_path):
+    (tmp_path / 'Documents').mkdir()
+    (tmp_path / 'src' / 'CommonModules').mkdir(parents=True)
+    with pytest.raises(ProtocolError, match='ambiguous'):
+        SessionCommonModuleCatalog(tmp_path, profile='server')
+
+
+def test_worker_and_capture_cannot_select_alternate_layout_in_bound_tree(tmp_path):
+    import shutil
+    from tests.unit.test_configuration_source_layout import FIXTURES
+    from onec_runtime.capture_source import CommonModuleCaptureResolver
+    from onec_runtime.kernel import COMMON_MODULE_PROPERTY_ID
+    from uuid import UUID
+    root = tmp_path / 'project'
+    shutil.copytree(FIXTURES / 'designer_base', root)
+    module = root / 'CommonModules' / 'Общий'
+    (module / 'Общий.mdo').write_text('<CommonModule uuid="00000000-0000-0000-0000-000000000001"><name>Общий</name></CommonModule>', encoding='utf-8')
+    wrong = module / 'Module.bsl'
+    wrong.write_text('Процедура Выполнить()\n    Другое = 2;\nКонецПроцедуры', encoding='utf-8')
+    catalog = SessionCommonModuleCatalog(root, profile='server')
+    with pytest.raises(ProtocolError, match='path'):
+        catalog.read_worker_module_source(wrong)
+    location = CommonModuleCaptureResolver('demo', root).resolve_module_line('Общий', 2)
+    assert location.object_id == UUID('11111111-2222-3333-4444-555555555555')
+    assert location.property_id == UUID(COMMON_MODULE_PROPERTY_ID)
+
+
+@pytest.mark.parametrize('layout', ['designer', 'edt'])
+@pytest.mark.parametrize('same_name', [False, True])
+def test_catalog_admission_uses_only_selected_layout(tmp_path, layout, same_name):
+    import shutil
+    from uuid import UUID
+    from tests.unit.test_configuration_source_layout import FIXTURES
+    from tests.unit.test_capture_source_resolver import location
+    from onec_runtime.capture_source import CaptureSourceCatalog, CaptureSourceConfig
+    root = tmp_path / 'project'
+    shutil.copytree(FIXTURES / f'{layout}_base', root)
+    normalized = root / 'src' if layout == 'edt' else root
+    name = 'Общий' if same_name else 'ТолькоДругойФормат'
+    group = normalized / 'CommonModules'
+    folder = group / name
+    folder.mkdir(exist_ok=True)
+    object_id = UUID(int=42)
+    if layout == 'designer':
+        opposite = folder / f'{name}.mdo'
+        opposite.write_text(f'<CommonModule uuid="{object_id}"><name>{name}</name><server>true</server><clientManagedApplication>true</clientManagedApplication></CommonModule>', encoding='utf-8')
+        (folder / 'Module.bsl').write_text('Значение = 2;', encoding='utf-8')
+    else:
+        opposite = add_metadata(normalized, name, server=True, client=True, global_module=False)
+        opposite.write_text(opposite.read_text(encoding='utf-8').replace('<CommonModule>', f'<CommonModule uuid="{object_id}">'), encoding='utf-8')
+        (folder / 'Ext').mkdir(exist_ok=True)
+        (folder / 'Ext/Module.bsl').write_text('Значение = 2;', encoding='utf-8')
+    catalog = SessionCommonModuleCatalog(root, profile='server')
+    if same_name:
+        assert catalog.ensure_modules((name,)).require(name).scope == CommonModuleScope.SERVER
+    else:
+        assert catalog.resolve_candidates((name,)).modules == ()
+        with pytest.raises(ProtocolError, match='missing'):
+            catalog.ensure_modules((name,))
+    capture = CaptureSourceCatalog((CaptureSourceConfig('demo', root),))
+    assert capture.resolve_modules((location(object_id),))[0].reason == 'source_unavailable'
+    with pytest.raises(ProtocolError):
+        catalog._safe_metadata_path(opposite)
+
+
+@pytest.mark.parametrize('first_format', ['designer', 'edt'])
+@pytest.mark.parametrize('duplicate_name', ['ZDuplicate', 'ZDUPLICATE'])
+@pytest.mark.parametrize('admission', ['ensure_modules', 'resolve_candidates'])
+def test_legacy_collision_scan_covers_later_modules_in_both_discovery_orders(
+    tmp_path, monkeypatch, first_format, duplicate_name, admission,
+):
+    import os
+    from contextlib import contextmanager
+    if first_format == 'designer':
+        add_metadata(tmp_path, 'AFirst', server=True, client=False, global_module=False)
+    else:
+        add_edt_metadata(tmp_path, 'AFirst')
+    add_metadata(tmp_path, 'ZDuplicate', server=True, client=False, global_module=False)
+    add_edt_metadata(tmp_path, duplicate_name)
+    original_scan = os.scandir
+    yielded = []
+
+    @contextmanager
+    def ordered_scan(path):
+        with original_scan(path) as entries:
+            ordered = sorted(entries, key=lambda entry: entry.name.casefold())
+        def counted():
+            for entry in ordered:
+                yielded.append(entry.name)
+                yield entry
+        yield counted()
+
+    def forbidden_read(path):
+        raise AssertionError('collision discovery must not open metadata payloads')
+
+    monkeypatch.setattr(os, 'scandir', ordered_scan)
+    monkeypatch.setattr(Path, 'read_bytes', forbidden_read)
+    catalog = SessionCommonModuleCatalog(tmp_path, profile='server')
+    assert catalog._layout.layout.value == first_format
+    assert len(yielded) == 1  # Only layout discovery, not a startup metadata index.
+    with pytest.raises(ProtocolError, match='duplicate common module identity'):
+        getattr(catalog, admission)(('ZDuplicate',))

@@ -9,13 +9,19 @@ from onec_runtime_mcp.agent.observation import ManagerOrigin
 from onec_runtime_mcp.agent.runtime_backend import OnecRuntimeBackend
 from onec_runtime.session import RuntimeSession
 from onec_runtime_mcp.agent.runtime_session import AgentRuntimeSession
-from onec_runtime.prototype_runtime import OperationState, PrototypeRuntimeController
+from onec_runtime.prototype_runtime import (
+    OperationHandle,
+    OperationState,
+    PrototypeRuntimeController,
+)
 from onec_runtime.rdbg.models import (
     CollectionCell,
     CollectionRow,
     EvaluationResult,
     FrameVariable,
     ModuleLocation,
+    PendingEvaluation,
+    TargetId,
 )
 from onec_runtime.runtime_api import PrototypeRuntimeApi
 from onec_runtime.errors import ProtocolError
@@ -31,16 +37,15 @@ class StrictRdbgInspectionSession:
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, object]] = []
+        self.target_id = TargetId(uuid4(), uuid4(), 1)
+        self._pending: dict[int, tuple[PendingEvaluation, EvaluationResult]] = {}
 
     def evaluate(self, expression: str, *, stack_level: int, **_kwargs: object) -> EvaluationResult:
         self.calls.append(("evaluate", (expression, stack_level)))
         if expression == 'ТипЗнч(Query.Manager) = Тип("МенеджерВременныхТаблиц")':
             assert stack_level == 0
             return EvaluationResult(uuid4(), "Булево", "Истина", False)
-        assert stack_level == 2
-        assert "RuntimeKernelServer.СохранитьВременнуюТаблицуОтладки" in expression
-        assert "Query();" not in expression
-        return EvaluationResult(uuid4(), "Булево", "Истина", False)
+        raise AssertionError("projected table inspection must be one collection evaluation")
 
     def evaluate_collection(
         self, expression: str, *, start_index: int, page_size: int, stack_level: int, **_kwargs: object
@@ -48,17 +53,86 @@ class StrictRdbgInspectionSession:
         self.calls.append(("collection", (expression, start_index, page_size, stack_level)))
         assert expression.startswith((
             "RuntimeKernelServer.ПолучитьСхемуВременнойТаблицыОтладки(",
-            "RuntimeTableTransferServer.ПолучитьКомпактнуюСхему(Контекст.__onec_capture_table_",
+            "RuntimeTableTransferServer.ПолучитьКомпактнуюСхему("
+            "RuntimeKernelServer.ПолучитьВременнуюТаблицуОтладки(",
         ))
-        assert start_index == 0 and page_size == 64 and stack_level == 2
+        assert start_index == 0 and page_size == 101 and stack_level == 2
         row = CollectionRow(0, (CollectionCell("Имя", "Строка", '"Employee"', value_string="Employee"),))
         return EvaluationResult(uuid4(), "ТаблицаЗначений", "", False, collection_rows=(row,))
+
+    def start_evaluation(
+        self,
+        expression: str,
+        *,
+        stack_level: int,
+        timeout_s: float,
+        max_text_size: int = 307_200,
+        on_transport_dispatch=None,  # type: ignore[no-untyped-def]
+    ) -> PendingEvaluation:
+        if on_transport_dispatch is not None:
+            on_transport_dispatch()
+        result = self.evaluate(
+            expression,
+            stack_level=stack_level,
+            timeout_s=timeout_s,
+            max_text_size=max_text_size,
+        )
+        pending = PendingEvaluation(self.target_id, result.result_id, self)
+        self._pending[id(pending)] = (pending, result)
+        return pending
+
+    def start_collection_evaluation(
+        self,
+        expression: str,
+        *,
+        start_index: int,
+        page_size: int,
+        stack_level: int,
+        timeout_s: float,
+        max_text_size: int = 4096,
+        on_transport_dispatch=None,  # type: ignore[no-untyped-def]
+    ) -> PendingEvaluation:
+        if on_transport_dispatch is not None:
+            on_transport_dispatch()
+        result = self.evaluate_collection(
+            expression,
+            start_index=start_index,
+            page_size=page_size,
+            stack_level=stack_level,
+            timeout_s=timeout_s,
+            max_text_size=max_text_size,
+        )
+        pending = PendingEvaluation(self.target_id, result.result_id, self)
+        self._pending[id(pending)] = (pending, result)
+        return pending
+
+    def wait_evaluation_event(
+        self,
+        pending: PendingEvaluation,
+        *,
+        timeout_s: float,
+    ) -> EvaluationResult:
+        del timeout_s
+        stored, result = self._pending.pop(id(pending))
+        assert stored is pending
+        return result
+
+
+def mark_captured(
+    controller: PrototypeRuntimeController,
+    rdbg: StrictRdbgInspectionSession,
+) -> None:
+    controller.active_operation = OperationHandle(1, "", "")
+    controller._capture_target_id = rdbg.target_id
+    controller.stop_sequence = 1
+    controller.state = OperationState.CAPTURED
+    controller._replace_capture_evaluation_coordinator()
 
 
 def test_real_controller_api_session_backend_capture_metadata_path_is_bounded_and_opaque() -> None:
     rdbg = StrictRdbgInspectionSession()
     controller = PrototypeRuntimeController(rdbg, ModuleLocation("ExtensionModule", "", None, None, 1, "Runtime"))  # type: ignore[arg-type]
-    controller.state = OperationState.CAPTURED
+    mark_captured(controller, rdbg)
     controller.capture_frame_stack_level = 0
     controller.capture_kernel_stack_level = 2
     controller._capture_frame_variables = (
@@ -103,9 +177,10 @@ def test_real_controller_api_session_backend_capture_metadata_path_is_bounded_an
     )
     assert rdbg.calls[1][0] == "collection"
     assert "ПолучитьСхемуВременнойТаблицыОтладки" in rdbg.calls[1][1][0]
-    assert rdbg.calls[2][0] == "evaluate"
-    assert "СохранитьВременнуюТаблицуОтладки" in rdbg.calls[2][1][0]
-    assert rdbg.calls[2][1][1] == 2
+    assert rdbg.calls[2][0] == "collection"
+    assert "ПолучитьВременнуюТаблицуОтладки" in rdbg.calls[2][1][0]
+    assert "СохранитьВременнуюТаблицуОтладки" not in rdbg.calls[2][1][0]
+    assert rdbg.calls[2][1][3] == 2
     assert not any(call[0] == "local_variables" for call in rdbg.calls)
 
 
@@ -157,7 +232,7 @@ def test_successful_session_resume_notifies_the_exact_fence_but_failure_keeps_it
 def test_capture_table_selector_rejects_huge_position_before_rdbg_work() -> None:
     rdbg = StrictRdbgInspectionSession()
     controller = PrototypeRuntimeController(rdbg, ModuleLocation("ExtensionModule", "", None, None, 1, "Runtime"))  # type: ignore[arg-type]
-    controller.state = OperationState.CAPTURED
+    mark_captured(controller, rdbg)
     controller.capture_frame_stack_level = 0
     controller.capture_kernel_stack_level = 2
     controller._capture_frame_variables = (FrameVariable("Query", "Query", "<query>"),)

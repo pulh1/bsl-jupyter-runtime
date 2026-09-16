@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import pickle
 import re
+from threading import Event, Thread
 from uuid import UUID
 from weakref import ref
 
@@ -60,6 +61,208 @@ SOURCE = (
     "    Возврат 41;\n"
     "КонецФункции\n"
 )
+
+
+@pytest.mark.parametrize("action", ["prepare", "promote", "discard"])
+def test_target_remote_mutations_do_not_hold_target_or_host_lock(tmp_path, action):
+    artifacts = _generation_artifacts(tmp_path)[:2]
+    host = worker_universe.WorkerUniverseRegistry(runtime_generation=7, context_generation=3)
+    target = _UniverseTargetExecutor()
+    ownership = []
+
+    def execute(source):
+        ownership.append((registry._lock._is_owned(), host._lock._is_owned()))
+        return target(source)
+
+    registry = worker_universe.ServerWorkerUniverseRegistry(host, execute)
+    if action == "prepare":
+        registry.prepare(artifacts)
+    else:
+        candidate = host.prepare(artifacts)
+        target.acknowledge(candidate)
+        if action == "promote":
+            registry.promote(candidate)
+        else:
+            prepared = registry.prepare_root(candidate, transaction_id=UUID(int=9))
+            registry.discard_root(prepared)
+    assert ownership and not any(any(held) for held in ownership), ownership
+
+
+def test_root_transaction_validation_precedes_any_staging(tmp_path):
+    host = worker_universe.WorkerUniverseRegistry(runtime_generation=7, context_generation=3)
+    candidate = host.prepare(_generation_artifacts(tmp_path)[:2])
+    target = _UniverseTargetExecutor()
+    registry = worker_universe.ServerWorkerUniverseRegistry(host, target)
+    with pytest.raises(TypeError, match="transaction id"):
+        registry.prepare_root(candidate, transaction_id="invalid")
+    assert not target.calls
+    assert not registry._registrations
+
+
+def _mutation_registry(*, coordinated=False, remote=None):
+    calls, settlements = [], []
+    host = worker_universe.WorkerUniverseRegistry(runtime_generation=7, context_generation=3)
+    def execute(source):
+        assert not registry._lock._is_owned()
+        calls.append(source)
+        return remote(source) if remote is not None else "confirmed"
+    def submit(plan):
+        assert not registry._lock._is_owned()
+        try:
+            result = execute(plan.instruction)
+        except BaseException as error:
+            return plan.abort(error)
+        return plan.commit(result)
+    registry = worker_universe.ServerWorkerUniverseRegistry(
+        host, execute, mutation_executor=submit if coordinated else None,
+    )
+    plan = registry.reserve_mutation(
+        "original", commit=lambda result: settlements.append(("commit", result)),
+        abort=lambda error: settlements.append(("abort", type(error).__name__)),
+    )
+    return registry, plan, calls, settlements
+
+
+@pytest.mark.parametrize("coordinated", [False, True])
+@pytest.mark.parametrize("failed", [False, True])
+def test_worker_mutation_replay_cannot_dispatch_after_commit_or_abort(coordinated, failed):
+    def remote(source):
+        if failed:
+            raise OSError("synthetic dispatch failure")
+        return "confirmed"
+    registry, plan, calls, settlements = _mutation_registry(coordinated=coordinated, remote=remote)
+    registry.execute_mutation(plan)
+    with pytest.raises(ProtocolError):
+        registry.execute_mutation(plan)
+    assert calls == ["original"]
+    assert settlements == [("abort", "OSError") if failed else ("commit", "confirmed")]
+    assert not registry._mutations
+
+
+@pytest.mark.parametrize("coordinated", [False, True])
+@pytest.mark.parametrize("invalid", ["instruction", "reservation", "owner", "foreign", "teardown", "abandon"])
+def test_worker_mutation_invalid_plan_is_rejected_before_executor(coordinated, invalid):
+    registry, plan, calls, settlements = _mutation_registry(coordinated=coordinated)
+    other, other_plan, other_calls, _ = _mutation_registry(coordinated=coordinated)
+    attempted = plan
+    if invalid == "instruction":
+        attempted = replace(plan, instruction="forged")
+    elif invalid == "reservation":
+        attempted = replace(plan, reservation=replace(plan.reservation))
+    elif invalid == "owner":
+        attempted = replace(plan, owner=other)
+    elif invalid == "foreign":
+        attempted = other_plan
+    elif invalid == "teardown":
+        registry.teardown()
+    else:
+        registry.abandon_target()
+    with pytest.raises(ProtocolError):
+        registry.execute_mutation(attempted)
+    assert not calls and not other_calls
+    assert not settlements
+    if invalid not in {"teardown", "abandon"}:
+        registry.execute_mutation(plan)
+        assert calls == ["original"]
+        assert settlements == [("commit", "confirmed")]
+
+
+@pytest.mark.parametrize("coordinated", [False, True])
+def test_concurrent_worker_mutation_claim_has_one_remote_owner(coordinated):
+    entered, release, second_finished = Event(), Event(), Event()
+    errors = []
+    def remote(source):
+        entered.set()
+        assert release.wait(2)
+        return "confirmed"
+    registry, plan, calls, settlements = _mutation_registry(coordinated=coordinated, remote=remote)
+    def execute(*, second=False):
+        try:
+            registry.execute_mutation(plan)
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            if second:
+                second_finished.set()
+    first = Thread(target=execute)
+    second = Thread(target=lambda: execute(second=True))
+    first.start()
+    try:
+        assert entered.wait(1)
+        second.start()
+        assert second_finished.wait(0.5), "duplicate owner entered the blocked remote executor"
+        assert len(errors) == 1 and isinstance(errors[0], ProtocolError)
+    finally:
+        release.set()
+        first.join(2)
+        if second.ident is not None:
+            second.join(2)
+        assert not first.is_alive() and not second.is_alive()
+    assert calls == ["original"]
+    assert settlements == [("commit", "confirmed")]
+    assert not registry._mutations
+
+
+@pytest.mark.parametrize("unavailable", ["broken", "closed", "registry_broken"])
+def test_worker_mutation_reservation_rejects_unavailable_host(unavailable):
+    host = worker_universe.WorkerUniverseRegistry(runtime_generation=7, context_generation=3)
+    registry = worker_universe.ServerWorkerUniverseRegistry(host, lambda source: None)
+    if unavailable == 'broken':
+        host.mark_broken()
+    elif unavailable == 'closed':
+        host.teardown()
+    else:
+        registry._broken = True
+    with pytest.raises(ProtocolError, match='unavailable'):
+        registry.reserve_mutation('synthetic', commit=lambda result: result, abort=lambda error: None)
+    assert not registry._mutations and not registry._claimed_mutations
+
+
+@pytest.mark.parametrize("coordinated", [False, True])
+@pytest.mark.parametrize("unavailable", ["broken", "quarantined", "closed", "registry_broken"])
+def test_reserved_worker_swap_cannot_dispatch_to_unavailable_host(tmp_path, coordinated, unavailable):
+    host = worker_universe.WorkerUniverseRegistry(runtime_generation=7, context_generation=3)
+    artifacts = _generation_artifacts(tmp_path)
+    target = _UniverseTargetExecutor()
+    calls, submissions = [], []
+    def execute(source):
+        assert not registry._lock._is_owned() and not host._lock._is_owned()
+        calls.append(source)
+        return target(source)
+    registry = worker_universe.ServerWorkerUniverseRegistry(host, execute)
+    active = host.prepare(artifacts[:2])
+    target.acknowledge(active)
+    registry.promote(active)
+    pin = host.pin_active()
+    candidate = host.prepare((artifacts[0], artifacts[2]))
+    target.acknowledge(candidate)
+    prepared = registry.prepare_root(candidate, transaction_id=UUID(int=701))
+    mutation = registry.reserve_swap_root(prepared)
+    if unavailable == 'broken':
+        host.mark_broken(candidate)
+    elif unavailable == 'quarantined':
+        host.retain_outcome_unknown(pin)
+    elif unavailable == 'closed':
+        host.teardown()
+    else:
+        registry._broken = True
+    def submit(plan):
+        submissions.append(plan)
+        return plan.commit(execute(plan.instruction))
+    if coordinated:
+        registry._mutation_executor = submit
+    before = len(calls)
+    for _ in range(2):
+        with pytest.raises(ProtocolError, match='unavailable'):
+            registry.execute_mutation(mutation)
+    assert len(calls) == before and not submissions
+    # The unexecuted reservation stays owned locally, never claimed/committed.
+    assert registry._mutations == {mutation.reservation.token: mutation}
+    assert not registry._claimed_mutations
+    assert prepared.transaction_id in registry._prepared_roots
+    registry.abandon_target()
+    assert not registry._mutations and not registry._claimed_mutations
+    assert not registry._prepared_roots
 
 
 class _CountingArtifactBuilder:

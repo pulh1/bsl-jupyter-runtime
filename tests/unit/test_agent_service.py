@@ -95,7 +95,7 @@ class FakeRuntimeBackend:
     def namespace_snapshot(self) -> RuntimeNamespaceSnapshot:
         return RuntimeNamespaceSnapshot(1, 1, self.names)
 
-    def require_public_value_handle(self, handle: str) -> None:
+    def validate_value_reference(self, handle: str) -> None:
         self.guard_calls.append(handle)
         if handle in self.forbidden_handles:
             raise ProtocolError("Worker generation objects are not public values")

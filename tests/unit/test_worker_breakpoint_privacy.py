@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID
 
 from onec_runtime.privacy import public_artifact_value
@@ -59,3 +60,144 @@ def test_breakpoint_plan_repr_never_contains_private_locator(tmp_path: Path) -> 
     rendered = repr(plan)
     assert module.registration.exact_temp_storage_url not in rendered
     assert "location=<redacted>" in repr(coordinator.bindings_for_view(view)[0])
+
+
+def test_capture_value_snapshots_expose_only_normalized_public_fields() -> None:
+    from onec_runtime.capture_values import (
+        SafePathSegment,
+        SafeValuePath,
+        ValueNode,
+        ValuePage,
+        ValuePathSegmentKind,
+        ValueRoot,
+        ValueRootKind,
+        ValueShape,
+    )
+
+    secret = object()
+    path = SafeValuePath(
+        ValueRoot(ValueRootKind.CONTEXT),
+        (SafePathSegment(ValuePathSegmentKind.VARIABLE, "Данные"),),
+    )
+    node = ValueNode(
+        "Данные", "Структура", "2 elements", 2, True,
+        ValueShape.STRUCTURE, path,
+        _owner=secret,
+    )
+    page = ValuePage((node,), 1, None, SafeValuePath(path.root), "variables", 0, 20)
+
+    node_wire = public_artifact_value(node)
+    page_wire = public_artifact_value(page)
+    serialized = json.dumps((node_wire, page_wire), ensure_ascii=False, default=str)
+    assert set(node_wire) == {
+        "name", "type_name", "preview", "size", "expandable", "shape",
+        "path", "cycle",
+    }
+    assert set(page_wire) == {
+        "items", "total", "next_cursor", "path", "view", "start", "stop",
+    }
+    assert "object at" not in serialized
+    assert "_owner" not in serialized and "_lineage" not in serialized
+
+
+def test_attached_frame_and_live_descriptors_never_publish_inspection_capabilities() -> None:
+    from onec_runtime.capture_inspection import DebugFrame, StackPage
+    from onec_runtime.capture_values import (
+        CaptureValuePolicy, LocalCaptureValueAdapter, SafeValuePath, ValueNode,
+        ValueRoot, ValueRootKind, ValueShape,
+    )
+
+    secret_fence = object()
+    secret_callback = lambda *args: False
+    secret_backend = SimpleNamespace(private="PRIVATE_BACKEND_CAPABILITY")
+    adapter = LocalCaptureValueAdapter(
+        secret_backend, secret_fence,
+        policy=CaptureValuePolicy(),
+        resolve_parameters=secret_callback,
+    )
+    original = DebugFrame(
+        native_level=4, source="Common.Safe", line=12,
+        _resolved=SimpleNamespace(private="PRIVATE_SOURCE_PIN"),
+        _enricher=secret_callback,
+    )
+    frame = adapter.bind_frame(original)
+    stack = StackPage((frame,), 1, None, _enricher=secret_callback)
+    node = ValueNode(
+        "Запись", "Структура", "1 elements", 1, True, ValueShape.STRUCTURE,
+        SafeValuePath(ValueRoot(ValueRootKind.CONTEXT)), _owner=adapter,
+    )
+
+    converted = tuple(public_artifact_value(value) for value in (
+        frame, stack, adapter.context, adapter.context.variables, node.fields,
+    ))
+
+    def assert_public(value):
+        assert value is not adapter
+        assert value is not secret_backend
+        assert value is not secret_fence
+        assert value is not secret_callback
+        if isinstance(value, dict):
+            for key, child in value.items():
+                assert not key.startswith("_")
+                assert_public(child)
+        elif isinstance(value, (tuple, list)):
+            for child in value:
+                assert_public(child)
+        else:
+            assert value is None or isinstance(value, (str, int, bool, float))
+
+    assert_public(converted)
+    serialized = json.dumps(converted, ensure_ascii=False)
+    assert "PRIVATE_" not in serialized and "object at" not in serialized
+
+
+def test_current_capture_artifact_retains_no_live_control_plane(monkeypatch) -> None:
+    from dataclasses import fields
+
+    from test_capture_control_plane import _capture_runtime
+    from test_capture_evaluation_lifecycle import close_owner
+
+    api, controller, transport = _capture_runtime()
+    try:
+        capture = api.current_capture()
+        owner = api._capture_control_owner()
+        fence = owner._fence
+        callbacks = tuple(
+            getattr(capture, item.name)
+            for item in fields(capture)
+            if callable(getattr(capture, item.name))
+        )
+        calls = []
+
+        def forbidden(*args, **kwargs):
+            calls.append("live capture access")
+            raise AssertionError("artifact conversion must not read a live capture")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(api, "_capture_control_owner", forbidden)
+            patch.setattr(owner, "status", forbidden)
+            patch.setattr(owner, "wait", forbidden)
+            patch.setattr(type(capture), "__repr__", forbidden)
+            converted = public_artifact_value(capture)
+            assert converted == {"type": "CaptureView"}
+            serialized = json.dumps(converted, ensure_ascii=False, sort_keys=True)
+            assert len(serialized.encode("utf-8")) <= 64
+            assert public_artifact_value({"capture": capture}) == {"capture": converted}
+            controller.stop_sequence += 1
+            assert json.dumps(
+                public_artifact_value(capture), ensure_ascii=False, sort_keys=True,
+            ) == serialized
+            assert calls == []
+
+        assert all(
+            value is not private
+            for value in converted.values()
+            for private in (api, owner, fence, *callbacks)
+        )
+        for private in (repr(api), repr(owner), repr(fence), *(repr(cb) for cb in callbacks)):
+            assert private not in serialized
+        assert "function" not in serialized and "0x" not in serialized
+        assert "operation_id" not in serialized and "capture_generation" not in serialized
+        assert "stop_sequence" not in serialized
+    finally:
+        close_owner(controller, transport)

@@ -9,7 +9,8 @@ from dataclasses import dataclass, fields
 from onec_runtime.bsl import generated_semantic_parser as generated
 from onec_runtime.bsl.lexer import Token, tokenize
 from onec_runtime.bsl.parser_target import BslParseError, PythonParserTarget
-from onec_runtime.bsl.source_maps import SourceSpan, source_sha256
+from onec_runtime.bsl.source_maps import LineIndex, SourceSpan, source_sha256
+from onec_runtime.bsl.module_syntax import MethodSyntaxInfo, ModuleSyntaxIndex
 from onec_runtime.bsl.worker_preprocessor import select_server_effective_tokens
 from onec_runtime.bsl.worker_projection_model import (
     BareName,
@@ -429,7 +430,7 @@ def project_full_ast_module(
     *,
     parser_identity: tuple[str, str],
 ) -> ParsedModuleModel:
-    """Build the exact immutable Worker model without retaining AST or tokens."""
+    """Project Worker and shared syntax facts without retaining AST or tokens."""
     if not isinstance(root, generated.Module):
         raise TypeError("root must be a generated Module")
     if type(tokens) is not tuple:
@@ -451,14 +452,31 @@ def project_full_ast_module(
     token_starts = tuple(token.start for token in tokens)
     module_scope = _collect_scope_facts(module_roots)
     module_variables.update(module_scope.declared_names)
-    return ParsedModuleModel(
+    lines = LineIndex(source)
+    syntax_index = ModuleSyntaxIndex(
         source_sha256=source_sha256(source),
+        parser_identity=parser_identity,
+        methods=tuple(
+            MethodSyntaxInfo(
+                name=str(method.Declaration.Name),
+                span=method.span,
+                parameters=tuple(
+                    str(parameter.Name) for parameter in method.Declaration.Parameters.Items
+                ) if method.Declaration.Parameters is not None else (),
+                start_line=lines.offset_to_line_column(method.span.start)[0],
+                end_line=lines.offset_to_line_column(method.span.end - 1)[0],
+            ) for method in methods
+        ),
+    )
+    return ParsedModuleModel(
+        source_sha256=syntax_index.source_sha256,
         module_variables=tuple(sorted(module_variables)),
         module_bare_names=module_scope.bare_names,
         methods=tuple(
             _project_method(method, tokens, token_starts) for method in methods
         ),
         parser_identity=parser_identity,
+        syntax_index=syntax_index,
     )
 
 
@@ -479,7 +497,7 @@ def parse_full_ast_module(
     *,
     profiler: PhaseRecorder | None = None,
 ) -> ParsedModuleModel:
-    """Tokenize and parse once, then retain only the hot-reload module model."""
+    """Parse once and retain only the Worker model and shared syntax index."""
     tokens = tuple(tokenize(source))
     effective = select_server_effective_tokens(source, tokens)
     target = PythonParserTarget.from_generated()

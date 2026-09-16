@@ -20,13 +20,19 @@ from onec_runtime_mcp.agent.onec_values import OnecValueResolver
 from onec_runtime_mcp.agent.proxies import ProxyRealm, ProxyRegistry, ReleasedProxy
 from onec_runtime_mcp.agent.value_service import ValueService
 from onec_runtime.errors import ProtocolError
-from onec_runtime.prototype_runtime import OperationState, PrototypeRuntimeController
+from onec_runtime.prototype_runtime import (
+    OperationHandle,
+    OperationState,
+    PrototypeRuntimeController,
+)
 from onec_runtime.rdbg.models import (
     CollectionCell,
     CollectionRow,
     EvaluationResult,
     FrameVariable,
     ModuleLocation,
+    PendingEvaluation,
+    TargetId,
 )
 
 
@@ -50,6 +56,8 @@ class StrictCaptureRdbg:
     def __init__(self) -> None:
         self.evaluations: list[tuple[str, int]] = []
         self.collections: list[tuple[str, int, int, int]] = []
+        self.target_id = TargetId(uuid4(), uuid4(), 1)
+        self._pending: dict[int, tuple[PendingEvaluation, EvaluationResult]] = {}
 
     def evaluate(self, expression: str, *, stack_level: int, **_kwargs: object) -> EvaluationResult:
         self.evaluations.append((expression, stack_level))
@@ -71,13 +79,74 @@ class StrictCaptureRdbg:
         )
         return EvaluationResult(uuid4(), "ТаблицаЗначений", "", False, collection_rows=(row,))
 
+    def start_evaluation(
+        self,
+        expression: str,
+        *,
+        stack_level: int,
+        timeout_s: float,
+        max_text_size: int = 307_200,
+        on_transport_dispatch=None,  # type: ignore[no-untyped-def]
+    ) -> PendingEvaluation:
+        if on_transport_dispatch is not None:
+            on_transport_dispatch()
+        result = self.evaluate(
+            expression,
+            stack_level=stack_level,
+            timeout_s=timeout_s,
+            max_text_size=max_text_size,
+        )
+        pending = PendingEvaluation(self.target_id, result.result_id, self)
+        self._pending[id(pending)] = (pending, result)
+        return pending
+
+    def start_collection_evaluation(
+        self,
+        expression: str,
+        *,
+        start_index: int,
+        page_size: int,
+        stack_level: int,
+        timeout_s: float,
+        max_text_size: int = 4096,
+        on_transport_dispatch=None,  # type: ignore[no-untyped-def]
+    ) -> PendingEvaluation:
+        if on_transport_dispatch is not None:
+            on_transport_dispatch()
+        result = self.evaluate_collection(
+            expression,
+            start_index=start_index,
+            page_size=page_size,
+            stack_level=stack_level,
+            timeout_s=timeout_s,
+            max_text_size=max_text_size,
+        )
+        pending = PendingEvaluation(self.target_id, result.result_id, self)
+        self._pending[id(pending)] = (pending, result)
+        return pending
+
+    def wait_evaluation_event(
+        self,
+        pending: PendingEvaluation,
+        *,
+        timeout_s: float,
+    ) -> EvaluationResult:
+        del timeout_s
+        stored, result = self._pending.pop(id(pending))
+        assert stored is pending
+        return result
+
 
 def captured_controller(rdbg: StrictCaptureRdbg) -> tuple[PrototypeRuntimeController, str]:
     controller = PrototypeRuntimeController(
         rdbg,  # type: ignore[arg-type]
         ModuleLocation("ExtensionModule", "", None, None, 1, "Runtime"),
     )
+    controller.active_operation = OperationHandle(1, "", "")
+    controller._capture_target_id = rdbg.target_id
+    controller.stop_sequence = 1
     controller.state = OperationState.CAPTURED
+    controller._replace_capture_evaluation_coordinator()
     controller.capture_frame_stack_level = 0
     controller.capture_kernel_stack_level = 2
     controller._capture_frame_variables = (FrameVariable("Query", "Query", "<query>"),)
@@ -109,7 +178,7 @@ def test_production_inventory_reads_descriptor_columns_without_row_materializati
     expression, start_index, page_size, stack_level = rdbg.collections[0]
     assert expression.startswith("RuntimeKernelServer.ПолучитьСхемуВременнойТаблицыОтладки(")
     assert "ПолучитьДанные" not in expression
-    assert (start_index, page_size, stack_level) == (0, 64, 2)
+    assert (start_index, page_size, stack_level) == (0, 101, 2)
 
 
 def test_extension_separates_metadata_from_bounded_descriptor_data_result() -> None:
@@ -119,6 +188,9 @@ def test_extension_separates_metadata_from_bounded_descriptor_data_result() -> N
         "Функция ПолучитьСхемуВременнойТаблицыОтладки", 1
     )[1].split("КонецФункции", 1)[0]
     selection = source.split(
+        "Функция ПолучитьВременнуюТаблицуОтладки", 1
+    )[1].split("КонецФункции", 1)[0]
+    storage = source.split(
         "Функция СохранитьВременнуюТаблицуОтладки", 1
     )[1].split("КонецФункции", 1)[0]
 
@@ -134,6 +206,8 @@ def test_extension_separates_metadata_from_bounded_descriptor_data_result() -> N
     assert selection.index("ОписательТаблицы.ПолучитьДанные()") < selection.index(
         "РезультатДанных.Выбрать()"
     )
+    assert "ПолучитьВременнуюТаблицуОтладки(" in storage
+    assert "Контекст.Вставить(Ключ, Результат)" in storage
 
 
 class CacheBackend:
@@ -142,7 +216,7 @@ class CacheBackend:
     def __init__(self) -> None:
         self.table_calls = 0
 
-    def require_public_value_handle(self, handle: str) -> None:
+    def validate_value_reference(self, handle: str) -> None:
         del handle
 
     def frame_variables(self, capture, *, filters, cursor, limit):

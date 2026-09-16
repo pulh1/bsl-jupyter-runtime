@@ -58,6 +58,8 @@ from onec_runtime.session import (
     runtime_bootstrap_locations,
 )
 
+from onec_runtime.worker_universe import WorkerGenerationHandle
+
 WORKSPACE = Path(__file__).parents[2]
 RESOURCE_ROOT = WORKSPACE / "src" / "onec_runtime" / "resources" / "extension"
 MANIFEST = read_extension_manifest(RESOURCE_ROOT / "extension-manifest.json")
@@ -276,11 +278,19 @@ def _worker_unit(name: str) -> WorkerModuleUnit:
     )
 
 
+SESSION_WORKER_GENERATION = WorkerGenerationHandle(1, 1, 1, "a" * 64)
+
+
 class _SessionModuleRuntimeApi:
     def __init__(self) -> None:
         self.calls: list[tuple[tuple[WorkerModuleUnit, ...], object, object]] = []
         self.breakpoint_calls: list[tuple[SourceUnitRef, str, int]] = []
         self.released: list[object] = []
+        self.active_units: dict[str, WorkerModuleUnit] = {}
+
+    def confirmed_worker_module_units(self, handle: WorkerGenerationHandle) -> tuple[WorkerModuleUnit, ...]:
+        assert handle is SESSION_WORKER_GENERATION
+        return tuple(self.active_units.values())
 
     def load_worker_modules(
         self,
@@ -289,10 +299,11 @@ class _SessionModuleRuntimeApi:
         common_modules: object,
         breakpoint_policy: object = None,
         profiler: object = None,
-    ) -> str:
+    ) -> WorkerGenerationHandle:
         del breakpoint_policy
         self.calls.append((units, common_modules, profiler))
-        return "generation"
+        self.active_units.update((unit.logical_name.casefold(), unit) for unit in units)
+        return SESSION_WORKER_GENERATION
 
     def add_worker_breakpoint(
         self, source_unit: SourceUnitRef, canonical_module: str, line: int,
@@ -302,6 +313,9 @@ class _SessionModuleRuntimeApi:
 
     def release_worker_generation(self, handle: object) -> None:
         self.released.append(handle)
+
+    def owns_debug_ui_stream(self) -> bool:
+        return False
 
 
 class _IdleRdbg:
@@ -346,7 +360,7 @@ def test_runtime_session_forwards_the_cold_catalog_manager_to_the_runtime_api(
         assert catalog.initialized is False
 
         units = (_worker_unit("НовыйА"), _worker_unit("НовыйБ"))
-        assert session.load_worker_modules(units) == "generation"
+        assert session.load_worker_modules(units) == SESSION_WORKER_GENERATION
 
         assert catalog.initialized is False
         assert len(api.calls) == 1
@@ -367,13 +381,13 @@ def test_load_worker_module_from_designer_path_reloads_saved_source(
         replace(session_config(tmp_path), source_root=source_root)
     )
     try:
-        assert session.load_worker_module(str(module)) == "generation"
+        assert session.load_worker_module(str(module)) == SESSION_WORKER_GENERATION
         first = api.calls[0][0][0]
         assert first.logical_name == "МодульА"
         assert first.mapped_source.text == module.read_bytes().decode("utf-8-sig")
 
         module.write_text('Функция Версия() Экспорт\n    Возврат "вторая";\nКонецФункции\n', encoding="utf-8")
-        assert session.load_worker_module(module.relative_to(source_root)) == "generation"
+        assert session.load_worker_module(module.relative_to(source_root)) == SESSION_WORKER_GENERATION
         second = api.calls[1][0][0]
         assert second.revision > first.revision
         assert second.mapped_source.text == module.read_bytes().decode("utf-8-sig")

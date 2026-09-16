@@ -72,8 +72,8 @@ def test_dump_fingerprint_separates_permanent_identity_from_exact_artifact(
     dump = write_dump_fixture(
         tmp_path,
         extension_name="OnecInteractiveRuntime",
-        artifact_version="0.1.0",
-        protocol_version="1",
+        artifact_version="0.1.3",
+        protocol_version="2",
     )
 
     fingerprints = fingerprint_extension_dump(dump)
@@ -82,7 +82,7 @@ def test_dump_fingerprint_separates_permanent_identity_from_exact_artifact(
     assert fingerprints.identity.extension_name == "OnecInteractiveRuntime"
     assert fingerprints.identity.purpose == "AddOn"
     assert fingerprints.artifact.language_bound_by_name is False
-    assert fingerprints.artifact.protocol_version == "1"
+    assert fingerprints.artifact.protocol_version == "2"
     assert fingerprints.artifact.metadata
     assert fingerprints.artifact.source_sha256 == tuple(
         sorted(fingerprints.artifact.source_sha256)
@@ -198,6 +198,42 @@ def test_dump_fingerprint_normalizes_bsl_line_endings(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
+    "relative",
+    [
+        Path("CommonModules/RuntimeTableTransferServer/Ext/Module.bsl"),
+        Path("CommonModules/RuntimeValueTransferServer/Ext/Module.bsl"),
+    ],
+)
+def test_dump_fingerprint_binds_each_protocol_serializer(
+    tmp_path: Path, relative: Path
+) -> None:
+    dump = write_dump_fixture(tmp_path)
+    before = fingerprint_extension_dump(dump)
+    module = dump / relative
+    module.write_text(
+        module.read_text(encoding="utf-8-sig") + "\n// incompatible serializer change\n",
+        encoding="utf-8-sig",
+        newline="",
+    )
+
+    after = fingerprint_extension_dump(dump)
+
+    assert after.artifact.source_sha256 != before.artifact.source_sha256
+    assert after.artifact_sha256 != before.artifact_sha256
+
+
+def test_manifest_parser_rejects_predecessor_protocol_one(tmp_path: Path) -> None:
+    path = write_manifest_fixture(
+        tmp_path,
+        cfe_sha256="0" * 64,
+        protocol_version="1",
+    )
+
+    with pytest.raises(ExtensionBundleError, match="protocol 2"):
+        read_extension_manifest(path)
+
+
+@pytest.mark.parametrize(
     ("property_name", "value", "message"),
     [
         ("ConfigurationExtensionPurpose", "Customization", "purpose"),
@@ -297,7 +333,7 @@ def test_dump_fingerprint_rejects_handshake_disagreement(tmp_path: Path) -> None
     source = server.read_text(encoding="utf-8-sig")
     server.write_text(
         source.replace(
-            'ВерсияПротоколаRuntime = "1";', 'ВерсияПротоколаRuntime = "2";'
+            'ВерсияПротоколаRuntime = "2";', 'ВерсияПротоколаRuntime = "1";'
         ),
         encoding="utf-8-sig",
     )

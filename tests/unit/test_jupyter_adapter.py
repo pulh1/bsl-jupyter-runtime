@@ -19,6 +19,23 @@ from onec_runtime_jupyter.extension import (
     _display_reply,
     install_runtime,
     load_ipython_extension,
+    unload_ipython_extension,
+)
+from onec_runtime.capture_evaluation import (
+    CaptureEvaluationKind,
+    CapturePhase,
+    CaptureStatus,
+)
+from onec_runtime.errors import CaptureEvaluationPendingError
+from onec_runtime.capture_inspection import DebugFrame, StackPage
+from onec_runtime.capture_values import (
+    DeniedValueNode,
+    SafeValuePath,
+    ValueNode,
+    ValuePage,
+    ValueRoot,
+    ValueRootKind,
+    ValueShape,
 )
 from onec_runtime.prototype_runtime import OperationState
 from onec_runtime.runtime_api import (
@@ -92,7 +109,7 @@ class FakeRuntime:
 
         return RuntimeNamespaceSnapshot(1, 1, ("ГДФЛ",))
 
-    def require_public_value_handle(self, handle: str) -> None:
+    def validate_value_reference(self, handle: str) -> None:
         del handle
 
 
@@ -398,6 +415,215 @@ def test_bsl_magic_passes_visible_cell_and_returns_stable_mime_bundle() -> None:
     assert bundle[MACHINE_MIME_TYPE] == displayed.payload
     assert "application/json" not in bundle
     assert "CAPTURED" in bundle["text/plain"]
+
+
+def test_bsl_magic_renders_acknowledged_user_evaluation_pending_as_safe_mime_bundle() -> None:
+    """VS Code receives this display through the ordinary Jupyter MIME path."""
+
+    shell = FakeShell()
+    runtime = FakeRuntime()
+    runtime._poisoned_error = None  # type: ignore[attr-defined]
+    evaluation_id = "capture-eval-v1-a4f1d86e1e1d4d45b0948e021f669d1f"
+    guidance = "runtime.current_capture().wait(timeout_s=10)"
+    source = (
+        "СекретныйИсточник = worker://private-handle; "
+        "result_id=private-result; generation=987; url=https://private.invalid"
+    )
+    dispatches = 0
+
+    def pending(
+        sent: str,
+        *,
+        source_unit: SourceUnitRef,
+    ) -> RuntimeReply:
+        nonlocal dispatches
+        dispatches += 1
+        runtime.sources.append(sent)
+        runtime.source_units.append(source_unit)
+        raise CaptureEvaluationPendingError(
+            evaluation_id,
+            CaptureEvaluationKind.USER_BSL,
+        )
+
+    runtime.execute_bsl = pending  # type: ignore[method-assign]
+    install_runtime(shell, runtime)
+
+    displayed = OnecRuntimeMagics(shell).bsl("", source)  # type: ignore[arg-type]
+
+    assert displayed is not None
+    bundle = displayed._repr_mimebundle_()
+    assert bundle["text/plain"] == (
+        f"evaluation_id={evaluation_id}\n"
+        "evaluation_kind=user_bsl\n"
+        + guidance
+    )
+    assert bundle["text/html"] == (
+        f"<pre>evaluation_id={evaluation_id}\n"
+        "evaluation_kind=user_bsl\n"
+        + guidance
+        + "</pre>"
+    )
+    assert bundle[MACHINE_MIME_TYPE] == {
+        "evaluation_id": evaluation_id,
+        "evaluation_kind": "user_bsl",
+        "guidance": guidance,
+    }
+    rendered = json.dumps(bundle, ensure_ascii=False)
+    for secret in (
+        "СекретныйИсточник",
+        "worker://private-handle",
+        "private-result",
+        "generation=987",
+        "https://private.invalid",
+    ):
+        assert secret not in rendered
+    assert dispatches == 1
+    assert runtime._poisoned_error is None  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    (
+        "untrusted_evaluation_id",
+        "untrusted_evaluation_kind",
+        "expected_evaluation_id",
+        "expected_evaluation_kind",
+        "secret",
+    ),
+    (
+        (
+            "malformed-private-receipt",
+            CaptureEvaluationKind.USER_BSL,
+            "<unavailable>",
+            "user_bsl",
+            "malformed-private-receipt",
+        ),
+        (
+            "https://private.invalid/evaluation",
+            CaptureEvaluationKind.USER_BSL,
+            "<unavailable>",
+            "user_bsl",
+            "private.invalid",
+        ),
+        (
+            "worker://private-handle",
+            CaptureEvaluationKind.USER_BSL,
+            "<unavailable>",
+            "user_bsl",
+            "private-handle",
+        ),
+        (
+            "generation=987-private",
+            CaptureEvaluationKind.USER_BSL,
+            "<unavailable>",
+            "user_bsl",
+            "987-private",
+        ),
+        (
+            "result_id=private-result",
+            CaptureEvaluationKind.USER_BSL,
+            "<unavailable>",
+            "user_bsl",
+            "private-result",
+        ),
+        (
+            "\x1b[31mprivate-control",
+            CaptureEvaluationKind.USER_BSL,
+            "<unavailable>",
+            "user_bsl",
+            "private-control",
+        ),
+        (
+            "overlong-private-" + "a" * 300,
+            CaptureEvaluationKind.USER_BSL,
+            "<unavailable>",
+            "user_bsl",
+            "overlong-private",
+        ),
+        (
+            # RDBG expressionResultID values are UUIDs, never public receipts.
+            "a4f1d86e-1e1d-4d45-b094-8e021f669d1f",
+            CaptureEvaluationKind.USER_BSL,
+            "<unavailable>",
+            "user_bsl",
+            "a4f1d86e-1e1d-4d45-b094-8e021f669d1f",
+        ),
+        (
+            "capture-eval-v1-a4f1d86e1e1d4d45b0948e021f669d1f",
+            "worker://private-kind",
+            "capture-eval-v1-a4f1d86e1e1d4d45b0948e021f669d1f",
+            "unknown",
+            "private-kind",
+        ),
+    ),
+    ids=(
+        "malformed-id",
+        "url-id",
+        "handle-id",
+        "generation-id",
+        "result-id",
+        "control-id",
+        "overlong-id",
+        "rdbg-expression-result-id",
+        "untrusted-kind",
+    ),
+)
+def test_bsl_magic_pending_receipt_redacts_untrusted_exception_fields(
+    untrusted_evaluation_id: str,
+    untrusted_evaluation_kind: object,
+    expected_evaluation_id: str,
+    expected_evaluation_kind: str,
+    secret: str,
+) -> None:
+    """The Jupyter and VS Code MIME bundle never reflects exception fields."""
+
+    shell = FakeShell()
+    runtime = FakeRuntime()
+    receipt = CaptureEvaluationPendingError(
+        untrusted_evaluation_id,
+        CaptureEvaluationKind.USER_BSL,
+    )
+    receipt.evaluation_kind = untrusted_evaluation_kind  # type: ignore[assignment]
+
+    def pending(
+        _source: str,
+        *,
+        source_unit: SourceUnitRef,
+    ) -> RuntimeReply:
+        del source_unit
+        raise receipt
+
+    runtime.execute_bsl = pending  # type: ignore[method-assign]
+    install_runtime(shell, runtime)
+
+    displayed = OnecRuntimeMagics(shell).bsl(  # type: ignore[arg-type]
+        "", "РезультатИнструкции = 904;"
+    )
+
+    assert displayed is not None
+    bundle = displayed._repr_mimebundle_()
+    guidance = "runtime.current_capture().wait(timeout_s=10)"
+    expected_text = (
+        f"evaluation_id={expected_evaluation_id}\n"
+        f"evaluation_kind={expected_evaluation_kind}\n"
+        + guidance
+    )
+    assert bundle["text/plain"] == expected_text
+    assert bundle["text/html"] == (
+        "<pre>"
+        + expected_text.replace("<", "&lt;").replace(">", "&gt;")
+        + "</pre>"
+    )
+    assert bundle[MACHINE_MIME_TYPE] == {
+        "evaluation_id": expected_evaluation_id,
+        "evaluation_kind": expected_evaluation_kind,
+        "guidance": guidance,
+    }
+    for rendered in (
+        bundle["text/plain"],
+        bundle["text/html"],
+        json.dumps(bundle[MACHINE_MIME_TYPE], ensure_ascii=False),
+    ):
+        assert secret not in rendered
 
 
 def test_presentation_mode_prints_bsl_messages_without_visible_json(
@@ -1007,3 +1233,88 @@ def test_extension_registers_magics() -> None:
     load_ipython_extension(shell)  # type: ignore[arg-type]
 
     assert isinstance(shell.registered, OnecRuntimeMagics)
+
+
+class _FakeTypeFormatter:
+    def __init__(self) -> None:
+        self.type_printers: dict[type[object], object] = {}
+        self.deferred_printers: dict[tuple[str, str], object] = {}
+
+    def for_type(self, value_type: type[object], formatter: object) -> object | None:
+        previous = self.type_printers.get(value_type)
+        key = (value_type.__module__, value_type.__name__)
+        if previous is None and key in self.deferred_printers:
+            previous = self.deferred_printers.pop(key)
+            self.type_printers[value_type] = previous
+        self.type_printers[value_type] = formatter
+        return previous
+
+    def pop(self, value_type: type[object]) -> object:
+        if value_type in self.type_printers:
+            return self.type_printers.pop(value_type)
+        return self.deferred_printers.pop(
+            (value_type.__module__, value_type.__name__)
+        )
+
+    def for_type_by_name(
+        self,
+        module: str,
+        name: str,
+        formatter: object,
+    ) -> object | None:
+        previous = self.deferred_printers.get((module, name))
+        self.deferred_printers[(module, name)] = formatter
+        return previous
+
+
+class _FakeDisplayFormatter:
+    def __init__(self) -> None:
+        self.formatters = {
+            "text/plain": _FakeTypeFormatter(),
+            "text/html": _FakeTypeFormatter(),
+        }
+
+
+def test_extension_registers_capture_snapshot_formatters_without_global_alias() -> None:
+    shell = FakeShell()
+    shell.display_formatter = _FakeDisplayFormatter()  # type: ignore[attr-defined]
+    plain = shell.display_formatter.formatters["text/plain"]  # type: ignore[attr-defined]
+    html = shell.display_formatter.formatters["text/html"]  # type: ignore[attr-defined]
+    deferred_key = (StackPage.__module__, StackPage.__name__)
+    previous_plain = object()
+    previous_html = object()
+    plain.for_type_by_name(*deferred_key, previous_plain)
+    html.for_type_by_name(*deferred_key, previous_html)
+
+    load_ipython_extension(shell)  # type: ignore[arg-type]
+
+    expected = {
+        CaptureStatus, StackPage, DebugFrame, ValuePage, ValueNode, DeniedValueNode,
+    }
+    assert expected <= plain.type_printers.keys()
+    assert expected <= html.type_printers.keys()
+    assert deferred_key not in plain.deferred_printers
+    assert deferred_key not in html.deferred_printers
+    assert "capture" not in shell.user_ns
+
+    status = CaptureStatus(7, 2, 1, CapturePhase.PAUSED)
+
+    class Printer:
+        def __init__(self) -> None:
+            self.value = ""
+
+        def text(self, value: str) -> None:
+            self.value += value
+
+    printer = Printer()
+    plain.type_printers[CaptureStatus](status, printer, False)
+    rich = html.type_printers[CaptureStatus](status)
+    assert printer.value.startswith("CAPTURE: paused")
+    assert rich.startswith('<section class="onec-capture onec-capture-status">')
+
+    unload_ipython_extension(shell)  # type: ignore[arg-type]
+
+    assert not (expected & plain.type_printers.keys())
+    assert not (expected & html.type_printers.keys())
+    assert plain.deferred_printers[deferred_key] is previous_plain
+    assert html.deferred_printers[deferred_key] is previous_html

@@ -33,7 +33,7 @@ class StrictFrameBackend:
     def __init__(self) -> None:
         self.calls: list[tuple[object, ...]] = []
 
-    def require_public_value_handle(self, handle: str) -> None:
+    def validate_value_reference(self, handle: str) -> None:
         del handle
 
     def frame_variables(self, capture, *, filters, cursor, limit):
@@ -171,7 +171,7 @@ def test_frame_batch_privacy_failure_publishes_nothing(tmp_path) -> None:
         if handle == "worker-root":
             raise ProtocolError("Worker generation objects are not public values")
 
-    backend.require_public_value_handle = require_public  # type: ignore[method-assign]
+    backend.validate_value_reference = require_public  # type: ignore[method-assign]
     before = _publication_state(service, registry)
 
     with pytest.raises(
@@ -411,7 +411,7 @@ def test_manager_batch_privacy_failure_rolls_back_earlier_manager(tmp_path) -> N
             raise ProtocolError("Worker generation objects are not public values")
 
     backend.resolve_manager_origin = resolve_manager  # type: ignore[method-assign]
-    backend.require_public_value_handle = require_public  # type: ignore[method-assign]
+    backend.validate_value_reference = require_public  # type: ignore[method-assign]
     plan = ObservationPlan(
         (
             ObservationItem(
@@ -477,7 +477,7 @@ def test_table_batch_privacy_failure_rolls_back_earlier_table_proxy(tmp_path) ->
         if handle == "worker-export":
             raise ProtocolError("Worker generation objects are not public values")
 
-    backend.require_public_value_handle = require_public  # type: ignore[method-assign]
+    backend.validate_value_reference = require_public  # type: ignore[method-assign]
     table_plan = ObservationPlan((ObservationItem(
         "staff", ObservationSource(
             ObservationSourceKind.TEMPORARY_TABLE,

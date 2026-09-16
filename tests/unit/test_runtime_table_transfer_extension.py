@@ -127,6 +127,97 @@ def test_compact_serializer_passes_row_budget_into_query_normalization() -> None
     )
 
 
+def test_compact_serializer_admits_root_and_cells_before_type_or_payload() -> None:
+    source = SERVICE_MODULE.read_text(encoding="utf-8-sig")
+    serializer = source.split(
+        "Функция СериализоватьКомпактнуюТаблицу", 1
+    )[1].split("КонецФункции", 1)[0]
+    classifier = source.split(
+        "Функция ОпределитьКомпактнуюСхемуКолонок", 1
+    )[1].split("КонецФункции", 1)[0]
+
+    assert (
+        "(Знач Таблица, РежимСсылок, РежимыСсылокКолонок, "
+        "ТипыОбъектовWorker, МаксимумСтрок = 0, МаксимумБайт = 0) Экспорт"
+    ) in serializer
+    assert serializer.index("ЭтоПриватноеЗначениеWorker(Таблица") < serializer.index(
+        "ПодготовитьТабличноеЗначение(Таблица"
+    )
+    assert (
+        "ОпределитьКомпактнуюСхемуКолонок(Таблица, ТипыОбъектовWorker, "
+        "МаксимумСтрок)" in serializer
+    )
+    assert classifier.index("ЭтоПриватноеЗначениеWorker(") < classifier.index(
+        "КомпактныйВидЗначения("
+    )
+    assert "Если СхемаКолонок = Неопределено Тогда" in serializer
+    assert serializer.index("ЭтоПриватноеЗначениеWorker(ЗначениеЯчейки") < serializer.index(
+        "КомпактноеЗначение(ЗначениеЯчейки"
+    )
+    assert serializer.index("Если ОтказДоступа Тогда") < serializer.index(
+        "ЗавершитьКомпактнуюМатериализацию"
+    )
+
+
+def test_compact_serializer_success_has_the_same_explicit_access_contract_as_denial() -> None:
+    source = SERVICE_MODULE.read_text(encoding="utf-8-sig")
+    finalizer = source.split("Функция ЗавершитьКомпактнуюМатериализацию", 1)[1].split(
+        "КонецФункции", 1
+    )[0]
+
+    assert 'Результат.Вставить("Доступ", Истина);' in finalizer
+    assert finalizer.index('Результат.Вставить("Доступ", Истина);') < finalizer.index(
+        'Результат.Вставить("Base64",'
+    )
+
+
+def test_generic_compact_serializer_uses_declared_schema_before_observed_values() -> None:
+    source = SERVICE_MODULE.read_text(encoding="utf-8-sig")
+    classifier = source.split("Функция ОпределитьКомпактнуюСхемуКолонок", 1)[1].split(
+        "КонецФункции", 1
+    )[0]
+
+    assert "ОпределитьОбъявленныйКомпактныйВид(Колонка.ТипЗначения)" in classifier
+    assert classifier.index("ОпределитьОбъявленныйКомпактныйВид(") < classifier.index(
+        "Для Каждого СтрокаТаблицы Из Таблица"
+    )
+
+
+def test_compact_schema_classifier_never_reads_past_the_bounded_row_page() -> None:
+    """A sentinel after the page must be unreachable for ValueTable and query input."""
+    source = SERVICE_MODULE.read_text(encoding="utf-8-sig")
+    serializer = source.split("Функция СериализоватьКомпактнуюТаблицу", 1)[1].split(
+        "КонецФункции", 1
+    )[0]
+    classifier = source.split("Функция ОпределитьКомпактнуюСхемуКолонок", 1)[1].split(
+        "КонецФункции", 1
+    )[0]
+
+    assert "ОпределитьКомпактнуюСхемуКолонок(Таблица, ТипыОбъектовWorker, МаксимумСтрок)" in serializer
+    assert "(Таблица, ТипыОбъектовWorker, МаксимумСтрок)" in classifier
+    row_guard = classifier.index("КоличествоПроверенныхСтрок >= МаксимумСтрок")
+    cell_read = classifier.index("ЗначениеЯчейки = СтрокаТаблицы[Колонка.Имя]")
+    assert row_guard < cell_read
+
+    class SentinelRow:
+        def __getitem__(self, column: str) -> str:
+            raise AssertionError(f"classifier touched row outside its page: {column}")
+
+    def bounded_classifier_reads(rows: list[object], maximum_rows: int) -> list[object]:
+        """The BSL loop's guard must run before its cell access."""
+        inspected = 0
+        observed: list[object] = []
+        for row in rows:
+            if inspected >= maximum_rows:
+                break
+            observed.append(row["Колонка"])  # type: ignore[index]
+            inspected += 1
+        return observed
+
+    page = [{"Колонка": "first"}, {"Колонка": "second"}, SentinelRow()]
+    assert bounded_classifier_reads(page, 2) == ["first", "second"]
+
+
 def test_compact_serializer_checks_budgets_before_base64_construction() -> None:
     source = SERVICE_MODULE.read_text(encoding="utf-8-sig")
     serializer = source.split(
@@ -168,7 +259,10 @@ def test_compact_serializer_classifies_columns_once_before_full_row_loop() -> No
         "КонецФункции", 1
     )[0]
 
-    assert "ОпределитьКомпактнуюСхемуКолонок(Таблица)" in serializer
+    assert (
+        "ОпределитьКомпактнуюСхемуКолонок(Таблица, ТипыОбъектовWorker, "
+        "МаксимумСтрок)" in serializer
+    )
     assert "КомпактныйВидЗначения(СтрокаТаблицы" not in serializer
     assert "КомпактноеЗначение(" in serializer
     assert "СсылочныеКолонки[ИндексКолонки]" in serializer

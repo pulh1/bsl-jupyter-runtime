@@ -2253,7 +2253,7 @@ class AgentWorkspaceService:
                     manager.manager_id,
                     fence=fence,
                 )
-                runtime.backend.require_public_value_handle(manager_handle)
+                runtime.backend.validate_value_reference(manager_handle)
                 proxy = self._proxy_registry.register_frame(
                     qualified_name=f"capture.{fence.capture_intent_id}.{manager.manager_id}",
                     type_name="МенеджерВременныхТаблиц", runtime_id=runtime.runtime_id,
@@ -3002,7 +3002,7 @@ class AgentWorkspaceService:
             return
         snapshot = backend.namespace_snapshot()
         for name in snapshot.names:
-            backend.require_public_value_handle(f"Контекст.{name}")
+            backend.validate_value_reference(f"Контекст.{name}")
         provenance = ProxyProvenance(
             "runtime-admission",
             1,

@@ -47,7 +47,7 @@ class OnecValueBackend(Protocol):
 
     def namespace_snapshot(self) -> RuntimeNamespaceSnapshot: ...
 
-    def require_public_value_handle(self, handle: str) -> None: ...
+    def validate_value_reference(self, handle: str) -> str: ...
 
     def materialize_value(self, handle: str, **options: object) -> object: ...
 
@@ -105,7 +105,7 @@ def publish_onec_bindings(
     ):
         raise ProtocolError("published binding is absent from runtime namespace")
     for name in selected_names:
-        backend.require_public_value_handle(f"Контекст.{name}")
+        backend.validate_value_reference(f"Контекст.{name}")
     return registry.register_context_batch(
         tuple(
             {
@@ -167,7 +167,7 @@ class OnecValueResolver:
             raise ValueError("child name must be one BSL identifier")
         parent, handle = self._validated(proxy)
         child_handle = f"{handle}.{name_or_index}"
-        self._backend.require_public_value_handle(child_handle)
+        self._backend.validate_value_reference(child_handle)
         provenance = parent.provenance
         return self._registry.register_context(
             qualified_name=f"{parent.qualified_name}.{name_or_index}",
@@ -353,7 +353,7 @@ class OnecValueResolver:
             handle = self._registry.resolver_handle(descriptor.proxy_id)
             if not isinstance(handle, str) or not handle:
                 raise ProtocolError("frame proxy has no opaque resolver handle")
-            self._backend.require_public_value_handle(handle)
+            self._backend.validate_value_reference(handle)
             return descriptor, handle
         if descriptor.lifetime is not ProxyLifetime.CONTEXT:
             raise ProtocolError("proxy is not a persistent or captured 1C value")
@@ -372,7 +372,7 @@ class OnecValueResolver:
         handle = self._registry.resolver_handle(descriptor.proxy_id)
         if not isinstance(handle, str) or not handle.startswith("Контекст."):
             raise ProtocolError("1C proxy has no symbolic context handle")
-        self._backend.require_public_value_handle(handle)
+        self._backend.validate_value_reference(handle)
         return descriptor, handle
 
     @staticmethod

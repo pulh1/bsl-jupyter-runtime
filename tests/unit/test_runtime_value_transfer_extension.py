@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 from xml.etree import ElementTree
 
 from onec_runtime.bsl import SemanticNotebookLowerer
 from onec_runtime.bsl.parser_target import PythonParserTarget
+from onec_runtime.compact_table_backend import build_compact_transfer_instruction
+from onec_runtime.table_materialization import ReferencePolicy
+from onec_runtime.value_materialization import MaterializationOptions
+from onec_runtime.value_transfer_backend import build_value_transfer_instruction
 
 
 WORKSPACE = Path(__file__).resolve().parents[2]
@@ -49,9 +54,66 @@ def test_value_transfer_module_parses_and_exports_only_public_boundary() -> None
 
     assert set(binding.exported_method_names) == {
         "ПолучитьИменаСвойствДляПодсказки",
+        "ПолучитьДопущенныеИменаСвойствДляПодсказки",
+        "СериализоватьДопущенныеИменаСвойствДляПодсказки",
         "ПолучитьВидМатериализации",
+        "ДопуститьЗначение",
         "СериализоватьЗначение",
+        "СпроецироватьЗначенияИнспекции",
     }
+
+
+def test_value_inspection_projector_is_a_closed_inline_admission_protocol() -> None:
+    """The checked-in helper is the production boundary used by context views."""
+    source = MODULE.read_text(encoding="utf-8-sig")
+    def function(name: str) -> str:
+        start = source.index("Функция " + name)
+        end = source.index("КонецФункции", start)
+        return source[start:end]
+
+    projector = function("СпроецироватьЗначенияИнспекции")
+    resolver = function("РазрешитьПутьИнспекции")
+    entry = function("ЗаписьЗначенияИнспекции")
+    names = function("СтраницаИменПроекцииИнспекции")
+
+    assert "ДопуститьЗначение" in projector
+    assert "Доступ" in projector
+    assert "ЗавершитьДокументИнспекции" in projector
+    assert "МаксимумБайт" in projector
+    assert projector.index("ДопуститьЗначение(Корни") < projector.index(
+        "РазрешитьПутьИнспекции"
+    )
+    assert resolver.index("ДопуститьЗначение(ТекущееЗначение") < resolver.index(
+        "ТипЗнч(ТекущееЗначение)"
+    )
+    assert entry.index("ДопуститьЗначение(Значение") < entry.index(
+        "ОписаниеЗначенияИнспекции"
+    )
+    assert 'Новый Структура("name,denied", Имя, Истина)' in entry
+    assert "ЭтоСтрокаТаблицыИнспекции" in projector
+    assert "Значение.Колонки.Количество() >= ЛимитКолонок" in names
+
+
+def test_value_inspection_projector_marks_cycles_only_after_admission() -> None:
+    """A cyclic container is public metadata but cannot be expanded again."""
+    source = MODULE.read_text(encoding="utf-8-sig")
+
+    def function(name: str) -> str:
+        start = source.index("Функция " + name)
+        end = source.index("КонецФункции", start)
+        return source[start:end]
+
+    projector = function("СпроецироватьЗначенияИнспекции")
+    resolver = function("РазрешитьПутьИнспекции")
+    entry = function("ЗаписьЗначенияИнспекции")
+
+    assert "Разрешение.Предки.Добавить(Значение)" in projector
+    assert '"Доступ,Значение,Имя,Предки"' in resolver
+    assert "ЭтоЦиклИнспекции" in entry
+    assert entry.index("ДопуститьЗначение(Значение") < entry.index(
+        "ЭтоЦиклИнспекции"
+    )
+    assert 'Результат.Вставить("cycle", ОбнаруженЦикл)' in entry
 
 
 def test_value_encoder_has_explicit_recursive_adapters_and_limits() -> None:
@@ -74,6 +136,139 @@ def test_value_encoder_has_explicit_recursive_adapters_and_limits() -> None:
     assert 'СоздатьОшибку("cycle"' in source
     assert 'СоздатьОшибку("unsupported"' in source
     assert "ПолучитьОбъект()" not in source
+
+
+def test_value_serializer_admits_root_and_each_descendant_before_encoding() -> None:
+    source = MODULE.read_text(encoding="utf-8-sig")
+    serializer = source.split("Функция СериализоватьЗначение", 1)[1].split(
+        "КонецФункции", 1
+    )[0]
+    encoder = source.split("Функция КодироватьЗначение", 1)[1].split(
+        "КонецФункции", 1
+    )[0]
+
+    assert (
+        "(Значение, РежимСсылок, МаксимальнаяГлубина, МаксимумЭлементов, "
+        "МаксимумБайт, ТипыОбъектовWorker) Экспорт"
+    ) in serializer
+    assert 'КонтекстСериализации.Вставить("ОтказДоступа", Ложь)' in serializer
+    assert serializer.index("КодироватьЗначение(") < serializer.index(
+        "Base64БезРазрывов"
+    )
+    assert "Если КонтекстСериализации.ОтказДоступа Тогда" in serializer
+    assert encoder.index("ЭтоПриватноеЗначениеWorker(") < encoder.index(
+        "ТипЗнч(Значение)"
+    )
+    assert 'КонтекстСериализации.ОтказДоступа = Истина' in encoder
+    assert "Функция ЭтоПриватноеЗначениеWorker" in source
+    assert 'Свойство("ManifestSha256")' in source
+    assert 'Свойство("Modules")' in source
+    assert 'Свойство("Exports")' in source
+
+
+def test_completion_schema_helper_admits_before_reading_target_field_names() -> None:
+    """Completion's one target instruction cannot inspect a denied root."""
+    source = MODULE.read_text(encoding="utf-8-sig")
+    helper = source.split(
+        "Функция ПолучитьДопущенныеИменаСвойствДляПодсказки", 1
+    )[1].split("КонецФункции", 1)[0]
+
+    admission = helper.index("Если Не ДопуститьЗначение(")
+    denied = helper.index('Состояние = "D|worker_generation_value"')
+    field_read = helper.index("ПолучитьИменаСвойствДляПодсказки(")
+    assert admission < denied < field_read
+
+    scalar = source.split(
+        "Функция СериализоватьДопущенныеИменаСвойствДляПодсказки", 1
+    )[1].split("КонецФункции", 1)[0]
+    assert scalar.index("ПолучитьДопущенныеИменаСвойствДляПодсказки(") < scalar.index(
+        "Для Каждого СтрокаПодсказки"
+    )
+    assert 'Результат = "C" + Символы.Таб' in scalar
+
+
+def test_value_serializer_success_has_the_same_explicit_access_contract_as_denial() -> None:
+    """A generated protocol-2 branch may read only an explicitly present field."""
+    source = MODULE.read_text(encoding="utf-8-sig")
+    serializer = source.split("Функция СериализоватьЗначение", 1)[1].split(
+        "КонецФункции", 1
+    )[0]
+
+    success = serializer.split("Результат = Новый Структура;", 1)[1].split(
+        "Возврат Результат;", 1
+    )[0]
+
+    assert 'Результат.Вставить("Доступ", Истина);' in success
+    assert success.index('Результат.Вставить("Доступ", Истина);') < success.index(
+        'Результат.Вставить("Base64",'
+    )
+
+
+def _interpret_bsl_success_structure(function_source: str) -> dict[str, object]:
+    """Faithfully model the BSL ``Структура.Вставить`` success branch.
+
+    Designer verifies syntax only.  This minimal target-side interpreter follows
+    the actual BSL success construction, so a missing ``Доступ`` behaves exactly
+    as it does on 1C: the generated instruction raises while reading it.
+    """
+    success = function_source.split("Результат = Новый Структура;", 1)[1].split(
+        "Возврат Результат;", 1
+    )[0]
+    result: dict[str, object] = {}
+    for name, expression in re.findall(
+        r'Результат\.Вставить\("([^"]+)",\s*([^;]+)\);', success
+    ):
+        result[name] = expression == "Истина"
+    return result
+
+
+def _execute_generated_success_branch(
+    instruction: str,
+    materialization: dict[str, object],
+    *,
+    variable: str,
+) -> str:
+    """Execute the only contract-relevant generated BSL branch."""
+    assert f"Если Не {variable}.Доступ Тогда" in instruction
+    if materialization["Доступ"] is not True:
+        return "D|worker_generation_value"
+    for field in ("Base64", "Размер", "Хеш"):
+        materialization[field]
+    return "R|1|1|1|" + "a" * 64 + "|4"
+
+
+def test_bsl_success_structures_execute_the_generated_protocol_two_r_branch() -> None:
+    value_source = MODULE.read_text(encoding="utf-8-sig")
+    value_serializer = value_source.split("Функция СериализоватьЗначение", 1)[1].split(
+        "КонецФункции", 1
+    )[0]
+    table_source = (
+        EXTENSION / "CommonModules" / "RuntimeTableTransferServer" / "Ext" / "Module.bsl"
+    ).read_text(encoding="utf-8-sig")
+    table_finalizer = table_source.split(
+        "Функция ЗавершитьКомпактнуюМатериализацию", 1
+    )[1].split("КонецФункции", 1)[0]
+
+    value_success = _interpret_bsl_success_structure(value_serializer)
+    table_success = _interpret_bsl_success_structure(table_finalizer)
+    for materialization in (value_success, table_success):
+        materialization.update({"Base64": "e30=", "Размер": 2, "Хеш": "a" * 64})
+
+    value_instruction = build_value_transfer_instruction(
+        "Контекст.Данные", MaterializationOptions(), "__onec_value_" + "a" * 32,
+        runtime_generation=1, context_generation=1,
+    )
+    table_instruction = build_compact_transfer_instruction(
+        "Контекст.Таблица", ReferencePolicy(), "__onec_compact_table_" + "b" * 32,
+        runtime_generation=1, context_generation=1,
+    )
+
+    assert _execute_generated_success_branch(
+        value_instruction, value_success, variable="МатериализацияЗначения"
+    ).startswith("R|")
+    assert _execute_generated_success_branch(
+        table_instruction, table_success, variable="Материализация"
+    ).startswith("R|")
 
 
 def test_object_adapter_reads_metadata_attributes_but_not_section_rows() -> None:
