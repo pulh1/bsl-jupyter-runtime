@@ -155,6 +155,7 @@ class ControlledCaptureSession(ScriptedSession):
             for key in (
                 "__onec_compact_table_",
                 "__onec_materialization_",
+                "__onec_capture_table_",
                 "__onec_projection_",
                 "__onec_value_",
             )
@@ -1468,41 +1469,189 @@ def test_temporary_table_schema_rejects_overwide_late_result_without_exposure() 
         close_owner(controller, session)
 
 
-def test_projected_temporary_table_schema_is_a_second_owned_inspection() -> None:
+def _projection_cleanup_expressions(
+    session: ControlledCaptureSession,
+) -> list[str]:
+    return [
+        value[0]
+        for method, value in session.calls
+        if method == "start_evaluation"
+        and isinstance(value, tuple)
+        and "УдалитьМатериализациюИзКонтекста" in value[0]
+        and "__onec_capture_table_" in value[0]
+    ]
+
+
+@pytest.mark.parametrize("boundary", ("creation", "schema"))
+@pytest.mark.parametrize("detachment", ("timeout", "interrupt"))
+def test_detached_projected_table_cleans_late_projection_before_paused(
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+    detachment: str,
+) -> None:
     private_name = "PRIVATE_PROJECTED_COLUMN"
-    session = ControlledCaptureSession(auto_helpers=True)
-    controller = captured_controller(session, command_timeout_s=0.02)
+    session = ControlledCaptureSession(auto_helpers=boundary == "schema")
+    controller = captured_controller(
+        session,
+        command_timeout_s=0.02 if detachment == "timeout" else 1,
+    )
+    original_ticket_wait = CaptureEvaluationTicket.wait_initiator
+
+    def interrupt_at_boundary(
+        ticket: CaptureEvaluationTicket,
+        timeout_s: float | None = None,
+    ) -> object:
+        assert session.accepted.wait(1)
+        owner = ticket._coordinator
+        original_condition_wait = owner._condition.wait
+
+        def interrupt_wait(timeout: float | None = None) -> bool:
+            at_boundary = (
+                boundary == "creation"
+                or len(session.collection_starts) == 1
+            )
+            if at_boundary:
+                raise KeyboardInterrupt
+            interval = 0.005 if timeout is None else min(timeout, 0.005)
+            return original_condition_wait(interval)
+
+        monkeypatch.setattr(owner._condition, "wait", interrupt_wait)
+        try:
+            return original_ticket_wait(ticket, timeout_s)
+        finally:
+            monkeypatch.setattr(owner._condition, "wait", original_condition_wait)
+
     try:
-        with pytest.raises(CaptureEvaluationPendingError) as caught:
-            inspect_temporary_table(controller)
+        if detachment == "interrupt":
+            monkeypatch.setattr(
+                CaptureEvaluationTicket,
+                "wait_initiator",
+                interrupt_at_boundary,
+            )
+            with pytest.raises(KeyboardInterrupt):
+                inspect_temporary_table(controller)
+            evaluation_id = capture_probe(controller).status().pending_evaluation_id
+        else:
+            with pytest.raises(CaptureEvaluationPendingError) as caught:
+                inspect_temporary_table(controller)
+            evaluation_id = caught.value.evaluation_id
 
-        status = capture_probe(controller).status()
-        assert caught.value.evaluation_kind is CaptureEvaluationKind.INSPECTION
-        assert status.phase is CapturePhase.EVALUATING
-        assert status.pending_evaluation_id == caught.value.evaluation_id
-        assert session.direct_collection_calls == 0
-        assert session.capture_start_count == 2
-        assert len(session.collection_starts) == 1
-        expression, start, size, max_text, stack_level = session.collection_starts[0]
-        assert expression.startswith(
-            "RuntimeTableTransferServer.ПолучитьКомпактнуюСхему("
-            "Контекст.__onec_capture_table_"
-        )
-        assert (start, size, max_text, stack_level) == (0, 101, 4096, 2)
+        assert evaluation_id is not None
+        assert capture_probe(controller).status().phase is CapturePhase.EVALUATING
+        assert controller._capture_value_paths == {}
+        if boundary == "creation":
+            session.complete()
+        else:
+            session.complete_collection((private_name,))
 
-        with pytest.raises(CaptureBusyError):
-            inspect_temporary_table(controller)
-        assert session.capture_start_count == 2
+        expected_steps = 2 if boundary == "creation" else 3
+        eventually(lambda: session.capture_start_count == expected_steps)
+        assert len(_projection_cleanup_expressions(session)) == 1
+        assert controller._capture_value_paths == {}
+        assert capture_probe(controller).status().phase is CapturePhase.EVALUATING
+        assert controller.state.value == "evaluating_capture"
 
-        session.complete_collection((private_name,))
-        outcome = capture_probe(controller).wait(caught.value.evaluation_id, timeout_s=1)
+        session.complete(type_name="Булево", presentation="Истина")
+        outcome = capture_probe(controller).wait(evaluation_id, timeout_s=1)
 
         assert outcome.state is CaptureEvaluationState.COMPLETED
         assert outcome.result is None
         assert private_name not in repr(outcome)
-        assert session.capture_start_count == 2
+        assert controller._capture_value_paths == {}
+        assert len(_projection_cleanup_expressions(session)) == 1
+        assert session.capture_start_count == expected_steps
         assert controller.state.value == "captured"
     finally:
+        close_owner(controller, session)
+
+
+def test_attached_projected_table_transfers_cleanup_ownership_to_live_handle() -> None:
+    private_name = "PROJECTED_COLUMN"
+    session = ControlledCaptureSession(auto_helpers=True)
+    controller = captured_controller(session, command_timeout_s=1)
+    replies: Queue[object] = Queue()
+    failures: Queue[BaseException] = Queue()
+
+    def inspect() -> None:
+        try:
+            replies.put(inspect_temporary_table(controller))
+        except BaseException as error:
+            failures.put(error)
+
+    caller = Thread(target=inspect, name="projected-table-attached")
+    try:
+        caller.start()
+        eventually(lambda: len(session.collection_starts) == 1)
+        session.complete_collection((private_name,))
+        caller.join(1)
+
+        assert not caller.is_alive()
+        assert failures.empty()
+        reply = replies.get_nowait()
+        item = reply["items"][0]  # type: ignore[index]
+        handle = item["handle"]
+        assert item["schema"] == (private_name,)
+        assert controller.capture_value_handle(handle).startswith(
+            "Контекст.__onec_capture_table_"
+        )
+        assert len(controller._capture_value_paths) == 1
+        assert _projection_cleanup_expressions(session) == []
+        assert session.capture_start_count == 2
+    finally:
+        close_owner(controller, session)
+
+
+def test_projected_table_delivery_commit_wins_timeout_without_leaking_handle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private_name = "PROJECTED_COLUMN"
+    session = ControlledCaptureSession(auto_helpers=True)
+    controller = captured_controller(session, command_timeout_s=0.02)
+    original_completion = controller._complete_capture_lifecycle
+    completion_entered = Event()
+    release_completion = Event()
+    replies: Queue[object] = Queue()
+    failures: Queue[BaseException] = Queue()
+
+    def blocked_completion(value: object, error: BaseException | None) -> object:
+        if session.collection_starts:
+            completion_entered.set()
+            assert release_completion.wait(1)
+        return original_completion(value, error)
+
+    def inspect() -> None:
+        try:
+            replies.put(inspect_temporary_table(controller))
+        except BaseException as error:
+            failures.put(error)
+
+    monkeypatch.setattr(controller, "_complete_capture_lifecycle", blocked_completion)
+    caller = Thread(target=inspect, name="projected-table-delivery-race")
+    try:
+        caller.start()
+        eventually(lambda: len(session.collection_starts) == 1)
+        session.complete_collection((private_name,))
+        assert completion_entered.wait(1)
+        sleep(0.05)
+
+        assert caller.is_alive(), "committed delivery detached at its expired deadline"
+        assert len(controller._capture_value_paths) == 1
+        assert _projection_cleanup_expressions(session) == []
+
+        release_completion.set()
+        caller.join(1)
+        assert not caller.is_alive()
+        assert failures.empty()
+        reply = replies.get_nowait()
+        handle = reply["items"][0]["handle"]  # type: ignore[index]
+        assert controller.capture_value_handle(handle).startswith(
+            "Контекст.__onec_capture_table_"
+        )
+        assert len(controller._capture_value_paths) == 1
+        assert _projection_cleanup_expressions(session) == []
+    finally:
+        release_completion.set()
+        caller.join(1)
         close_owner(controller, session)
 
 
