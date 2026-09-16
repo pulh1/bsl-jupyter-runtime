@@ -60,6 +60,7 @@ from onec_runtime.errors import (
     CaptureRecoveryRequiredError,
     ProtocolError,
     RdbgTransportError,
+    UnexpectedStop,
 )
 from onec_runtime.fault_injection import (
     CloseTransportAt,
@@ -835,6 +836,109 @@ def test_completion_fields_use_bounded_schema_helper_in_capture_kernel_frame() -
         "RuntimeValueTransferServer.ПолучитьДопущенныеИменаСвойствДляПодсказки(Контекст.Данные, Истина, \"\")",
         0, 129, 2,
     )) in session.calls
+
+
+def _completion_lifecycle_snapshot(
+    controller, session: ScriptedSession,  # type: ignore[no-untyped-def]
+) -> tuple[object, ...]:
+    """State which a ready scalar inspection has no authority to mutate."""
+    return (
+        controller.operation_id,
+        controller.state,
+        controller.active_operation,
+        controller.registry,
+        id(controller.registry),
+        tuple(controller.stop_history),
+        tuple(controller.write_journal),
+        tuple(controller.breakpoint_workspaces),
+        controller._breakpoint_workspace,
+        controller.breakpoint_workspace_owner.confirmed_snapshot,
+        tuple(controller.journal.events),
+        controller.journal.pending_count,
+        controller.continue_sent,
+        session.continue_count,
+    )
+
+
+def test_ready_completion_inspection_does_not_start_or_mutate_main_lifecycle() -> None:
+    """A real controller must evaluate the bounded scalar without a new MAIN."""
+    completion_wire = '"C\t3\nR\t\nR\tНомер\nR\tНазвание"'
+
+    class CompletionSession(ScriptedSession):
+        def evaluate(self, expression: str, **kwargs: object) -> EvaluationResult:
+            if expression.startswith(
+                "RuntimeValueTransferServer.СериализоватьДопущенныеИменаСвойствДляПодсказки("
+            ):
+                self.calls.append(("evaluate", expression))
+                return evaluation("Строка", completion_wire)
+            return super().evaluate(expression, **kwargs)  # type: ignore[arg-type]
+
+    session = CompletionSession(
+        (SERVICE, SERVICE),
+        main_results=(evaluation("Строка", '"baseline"'), evaluation("Строка", completion_wire)),
+    )
+    controller = runtime_module().PrototypeRuntimeController(session, SERVICE)
+    controller.execute_system_main('Результат = "baseline";')
+    api = PrototypeRuntimeApi(controller)
+    api._namespace_names = ("Данные",)
+    before = _completion_lifecycle_snapshot(controller, session)
+
+    assert api.completion_fields("Контекст.Данные") == ("Номер", "Название")
+
+    assert _completion_lifecycle_snapshot(controller, session) == before
+    inspections = [
+        value for name, value in session.calls
+        if name == "evaluate"
+        and isinstance(value, str)
+        and value.startswith(
+            "RuntimeValueTransferServer.СериализоватьДопущенныеИменаСвойствДляПодсказки("
+        )
+    ]
+    assert len(inspections) == 1
+
+
+def test_ready_completion_unexpected_stop_cannot_partially_mutate_main_lifecycle() -> None:
+    """The immediate inspection leaves ready state intact if RDBG interrupts it."""
+    completion_wire = '"C\t3\nR\t\nR\tНомер\nR\tНазвание"'
+
+    class UnexpectedCompletionSession(ScriptedSession):
+        def evaluate(self, expression: str, **kwargs: object) -> EvaluationResult:
+            if (
+                expression == "Результат"
+                or expression.startswith(
+                    "RuntimeValueTransferServer.СериализоватьДопущенныеИменаСвойствДляПодсказки("
+                )
+            ):
+                raise UnexpectedStop("synthetic completion stop")
+            return super().evaluate(expression, **kwargs)  # type: ignore[arg-type]
+
+    session = UnexpectedCompletionSession(
+        (SERVICE, SERVICE),
+        main_results=(evaluation("Строка", '"baseline"'), evaluation("Строка", completion_wire)),
+    )
+    controller = runtime_module().PrototypeRuntimeController(session, SERVICE)
+    # Build a real ready controller before arming the exceptional completion probe.
+    session.main_results.clear()
+    session.main_results.append(evaluation("Строка", '"baseline"'))
+    original_evaluate = session.evaluate
+
+    # The initial MAIN needs its normal result; only completion reads must stop.
+    def initial_result(expression: str, **kwargs: object) -> EvaluationResult:
+        if expression == "Результат":
+            return evaluation("Строка", '"baseline"')
+        return original_evaluate(expression, **kwargs)
+
+    session.evaluate = initial_result  # type: ignore[method-assign]
+    controller.execute_system_main('Результат = "baseline";')
+    session.evaluate = original_evaluate  # type: ignore[method-assign]
+    api = PrototypeRuntimeApi(controller)
+    api._namespace_names = ("Данные",)
+    before = _completion_lifecycle_snapshot(controller, session)
+
+    with pytest.raises(UnexpectedStop):
+        api.completion_fields("Контекст.Данные")
+
+    assert _completion_lifecycle_snapshot(controller, session) == before
 
 
 def workspace_calls(session: ScriptedSession) -> list[tuple[ModuleLocation, ...]]:
