@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from threading import RLock
 from types import SimpleNamespace
 
@@ -26,6 +27,7 @@ class FakeRuntimeApi:
         self.calls: list[tuple[str, str, object, dict[str, object]]] = []
         self.guard_calls: list[str] = []
         self.forbidden_handles: set[str] = set()
+        self.capture_handoff_factories: list[object] = []
         self.handle = WorkerGenerationHandle(1, 1, 1, "a" * 64)
         self.active_units: dict[str, WorkerModuleUnit] = {}
 
@@ -38,6 +40,16 @@ class FakeRuntimeApi:
             )
         ):
             raise ProtocolError("Worker generation objects are not public values")
+
+    @contextmanager
+    def capture_session_caller_handoff(self, factory):  # type: ignore[no-untyped-def]
+        self.capture_handoff_factories.append(factory)
+        with factory():
+            yield
+
+    def materialize_table(self, handle: str, **options: object) -> object:
+        self.calls.append(("materialize_table", handle, None, options))
+        return "table"
 
     def materialize_value(self, handle: str, **options: object) -> object:
         self.calls.append(("materialize_value", handle, None, options))
@@ -54,6 +66,22 @@ class FakeRuntimeApi:
     ) -> object:
         self.calls.append(("project_to_df", handle, selection, options))
         return "frame"
+
+    def materialization_kind(self, handle: str, **options: object) -> str:
+        self.calls.append(("materialization_kind", handle, None, options))
+        return "table"
+
+    def materialize_value_payload(self, handle: str, **options: object) -> bytes:
+        self.calls.append(("materialize_value_payload", handle, None, options))
+        return b"value"
+
+    def materialize_table_payload(self, handle: str, **options: object) -> bytes:
+        self.calls.append(("materialize_table_payload", handle, None, options))
+        return b"table"
+
+    def project_value_payload(self, handle: str, **options: object) -> tuple[str, bytes]:
+        self.calls.append(("project_value_payload", handle, None, options))
+        return "value", b"projection"
 
     def load_worker_modules(
         self,
@@ -125,6 +153,76 @@ def test_runtime_session_exposes_value_proxy_materialization_surface() -> None:
     assert api.calls[0][1] == "Контекст.Счетчик"
     assert api.calls[1][2] == {"offset": 0, "limit": 2}
     assert api.calls[2][2] == {"offset": 0, "limit": 2}
+    assert len(api.capture_handoff_factories) == 3
+
+
+@pytest.mark.parametrize(
+    ("route", "invoke"),
+    (
+        ("to_df", lambda session: session.to_df("Контекст.Таблица")),
+        (
+            "project_to_df",
+            lambda session: session.project_to_df(
+                "Контекст.Таблица", {"offset": 0, "limit": 1}
+            ),
+        ),
+        ("materialize", lambda session: session.materialize("Контекст.Значение")),
+        (
+            "materialize_value",
+            lambda session: session.materialize_value("Контекст.Значение"),
+        ),
+        (
+            "project_value",
+            lambda session: session.project_value(
+                "Контекст.Значение", {"offset": 0, "limit": 1}
+            ),
+        ),
+        (
+            "materialization_kind",
+            lambda session: session.materialization_kind("Контекст.Таблица"),
+        ),
+        (
+            "materialize_value_payload",
+            lambda session: session.materialize_value_payload("Контекст.Значение"),
+        ),
+        (
+            "materialize_table_payload",
+            lambda session: session.materialize_table_payload("Контекст.Таблица"),
+        ),
+        (
+            "project_value_payload",
+            lambda session: session.project_value_payload(
+                "Контекст.Значение",
+                SimpleNamespace(
+                    kind=SimpleNamespace(value="slice"),
+                    offset=0,
+                    limit=1,
+                    columns=(),
+                    names=(),
+                ),
+            ),
+        ),
+    ),
+)
+def test_every_session_materialization_route_binds_capture_waiter(
+    route: str,
+    invoke,
+) -> None:  # type: ignore[no-untyped-def]
+    api = FakeRuntimeApi()
+    session = _session(api)
+
+    invoke(session)
+
+    expected_call = {
+        "to_df": "materialize_table",
+        "materialize": "materialize_value",
+        "materialize_value": "materialize_value",
+    }.get(route, route)
+    assert [call[0] for call in api.calls] == [expected_call]
+    assert len(api.capture_handoff_factories) == 1
+    # The synthetic API enters the callback immediately, proving the Session
+    # operation lock is restored before the public call returns.
+    session.validate_value_reference("Контекст.ПовторнаяПроверка")
 
 
 def test_runtime_session_forwards_worker_universe_descriptors() -> None:

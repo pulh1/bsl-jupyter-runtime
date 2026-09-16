@@ -6605,7 +6605,16 @@ class PrototypeRuntimeApi:
         if not callable(bind):
             yield
             return
-        with bind(self._capture_owner_handoff):
+        @contextmanager
+        def release_waiters() -> Iterator[None]:
+            # Preserve the capture handoff nesting used by resume: the
+            # Session lock returns before the API writer, after the
+            # coordinator wait has finished or detached.
+            with self._capture_owner_handoff():
+                with self._capture_session_waiter_handoff():
+                    yield
+
+        with bind(release_waiters):
             yield
 
     @contextmanager

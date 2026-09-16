@@ -1250,6 +1250,14 @@ class RuntimeSession:
         finally:
             self._operation_lock.acquire()
 
+    @contextmanager
+    def _capture_materialization_caller_handoff(self) -> Iterator[None]:
+        """Let the coordinator wait without retaining the Session operation lock."""
+        with self.runtime_api.capture_session_caller_handoff(
+            self._release_operation_lock_for_capture_wait
+        ):
+            yield
+
     def configure_capture_source(
         self, project: str, source_root: Path | str, *,
         layer: SourceLayer | str = SourceLayer.AUTO,
@@ -2055,14 +2063,15 @@ class RuntimeSession:
     ) -> pd.DataFrame:
         with self._operation_lock:
             self.validate_value_reference(handle)
-            return self.runtime_api.materialize_table(
-                handle,
-                refs=refs,
-                ref_columns=ref_columns,
-                uuid_suffix=uuid_suffix,
-                chunk_size=chunk_size or self.config.chunk_size,
-                profiler=profiler,
-            )
+            with self._capture_materialization_caller_handoff():
+                return self.runtime_api.materialize_table(
+                    handle,
+                    refs=refs,
+                    ref_columns=ref_columns,
+                    uuid_suffix=uuid_suffix,
+                    chunk_size=chunk_size or self.config.chunk_size,
+                    profiler=profiler,
+                )
 
     def project_to_df(
         self,
@@ -2073,7 +2082,8 @@ class RuntimeSession:
         """Materialize a bounded table projection for a frontend value proxy."""
         with self._operation_lock:
             self.validate_value_reference(handle)
-            return self.runtime_api.project_to_df(handle, selection, **options)
+            with self._capture_materialization_caller_handoff():
+                return self.runtime_api.project_to_df(handle, selection, **options)
 
     def materialize(
         self,
@@ -2103,10 +2113,11 @@ class RuntimeSession:
             }
             if timeout_s is not None:
                 options["timeout_s"] = timeout_s
-            return self.runtime_api.materialize_value(
-                handle,
-                **options,
-            )
+            with self._capture_materialization_caller_handoff():
+                return self.runtime_api.materialize_value(
+                    handle,
+                    **options,
+                )
 
     def materialize_value(self, handle: str, **options: object) -> object:
         """Expose recursive materialization under the frontend proxy contract."""
@@ -2121,39 +2132,46 @@ class RuntimeSession:
         """Materialize a bounded recursive projection for a frontend proxy."""
         with self._operation_lock:
             self.validate_value_reference(handle)
-            return self.runtime_api.project_value(handle, selection, **options)
+            with self._capture_materialization_caller_handoff():
+                return self.runtime_api.project_value(handle, selection, **options)
 
     def materialization_kind(
         self, handle: str, *, timeout_s: float | None = None
     ) -> str:
         with self._operation_lock:
             self.validate_value_reference(handle)
-            if timeout_s is None:
-                return self.runtime_api.materialization_kind(handle)
-            return self.runtime_api.materialization_kind(handle, timeout_s=timeout_s)
+            with self._capture_materialization_caller_handoff():
+                if timeout_s is None:
+                    return self.runtime_api.materialization_kind(handle)
+                return self.runtime_api.materialization_kind(
+                    handle, timeout_s=timeout_s
+                )
 
     def materialize_value_payload(self, handle: str, **options: object) -> bytes:
         with self._operation_lock:
             self.validate_value_reference(handle)
-            return self.runtime_api.materialize_value_payload(handle, **options)
+            with self._capture_materialization_caller_handoff():
+                return self.runtime_api.materialize_value_payload(handle, **options)
 
     def materialize_table_payload(self, handle: str, **options: object) -> bytes:
         with self._operation_lock:
             self.validate_value_reference(handle)
-            return self.runtime_api.materialize_table_payload(handle, **options)
+            with self._capture_materialization_caller_handoff():
+                return self.runtime_api.materialize_table_payload(handle, **options)
 
     def project_value_payload(self, handle: str, selection, **options: object):  # type: ignore[no-untyped-def]
         with self._operation_lock:
             self.validate_value_reference(handle)
-            return self.runtime_api.project_value_payload(
-                handle,
-                kind=selection.kind.value,
-                offset=selection.offset,
-                limit=selection.limit,
-                columns=selection.columns,
-                names=selection.names,
-                **options,
-            )
+            with self._capture_materialization_caller_handoff():
+                return self.runtime_api.project_value_payload(
+                    handle,
+                    kind=selection.kind.value,
+                    offset=selection.offset,
+                    limit=selection.limit,
+                    columns=selection.columns,
+                    names=selection.names,
+                    **options,
+                )
 
     def validate_value_reference(self, handle: str) -> str:
         with self._operation_lock:

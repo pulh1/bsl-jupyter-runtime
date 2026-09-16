@@ -35,6 +35,7 @@ from onec_runtime.capture_evaluation import (
 )
 from onec_runtime.errors import (
     CaptureBusyError,
+    CaptureEvaluationPendingError,
     CaptureOutcomeUnknownError,
     CaptureRecoveryRequiredError,
     NoActiveCaptureError,
@@ -1528,7 +1529,6 @@ def test_session_proxy_materialization_releases_operation_lock_after_ack() -> No
         first_thread.join(_JOIN_TIMEOUT_S)
         assert first_done.is_set()
         assert len(first_errors) == 1
-        from onec_runtime.errors import CaptureEvaluationPendingError
         assert isinstance(first_errors[0], CaptureEvaluationPendingError)
     finally:
         if transport.capture_pending is not None:
@@ -1537,6 +1537,47 @@ def test_session_proxy_materialization_releases_operation_lock_after_ack() -> No
         second_thread.join(_JOIN_TIMEOUT_S)
         assert not first_thread.is_alive(), "first Session caller leaked"
         assert not second_thread.is_alive(), "second Session caller leaked"
+        close_owner(controller, transport)
+
+
+def test_session_proxy_materialization_restores_operation_lock_after_interrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Session callback unwinds a detached coordinator waiter safely."""
+    api, controller, transport = _capture_runtime(timeout_s=1)
+    runtime = _materialization_runtime_session(api)
+    api._namespace_names = ("Таблица",)
+    proxy = OnecValueProxy(
+        runtime,
+        "Таблица",
+        runtime_generation=controller.runtime_generation,
+        context_generation=1,
+    )
+
+    def interrupt_after_ack(
+        _ticket: CaptureEvaluationTicket,
+        timeout_s: float | None = None,
+    ) -> object:
+        del timeout_s
+        assert transport.accepted.wait(1)
+        raise KeyboardInterrupt
+
+    try:
+        monkeypatch.setattr(CaptureEvaluationTicket, "wait_initiator", interrupt_after_ack)
+        with pytest.raises(KeyboardInterrupt):
+            proxy.to_df()
+
+        # The exception left the caller, but the Session lock was reacquired
+        # before that return.  Do not use an API call here: while the capture
+        # remains pending every data-plane operation must instead be busy.
+        assert runtime._operation_lock.acquire(blocking=False)
+        runtime._operation_lock.release()
+        status = runtime.current_capture().status()
+        assert status.phase is CapturePhase.EVALUATING
+        assert transport.capture_start_count == 1
+    finally:
+        if transport.capture_pending is not None:
+            transport.complete()
         close_owner(controller, transport)
 
 
