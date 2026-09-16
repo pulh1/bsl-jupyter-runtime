@@ -653,6 +653,8 @@ class RuntimeController(Protocol):
 
     def execute_system_main(self, source: str) -> MainCompletion: ...
 
+    def execute_system_inspection(self, expression: str) -> object: ...
+
     def execute_system_capture(
         self,
         source: str,
@@ -1609,15 +1611,19 @@ class PrototypeRuntimeApi:
             }:
                 raise ProtocolError("Completion root is not in the current namespace")
             safe_handle = self._validate_value_reference_locked(handle)
+            expression = self._completion_fields_expression(
+                safe_handle,
+                table_row=table_row,
+                worker_type_registrations=self._worker_type_registrations(),
+            )
             with self._remaining_command_timeout():
-                wire = self._execute_worker_instruction(
-                    self._completion_fields_instruction(
-                        safe_handle,
-                        table_row=table_row,
-                        worker_type_registrations=self._worker_type_registrations(),
-                    ),
-                    evaluation_kind=CaptureEvaluationKind.INSPECTION,
-                )
+                if self._controller.state is OperationState.CAPTURED:
+                    wire = self._execute_worker_instruction(
+                        "Результат = " + expression + ";",
+                        evaluation_kind=CaptureEvaluationKind.INSPECTION,
+                    )
+                else:
+                    wire = self._controller.execute_system_inspection(expression)
             return self._parse_completion_fields_wire(wire)
 
     @staticmethod
@@ -1628,6 +1634,20 @@ class PrototypeRuntimeApi:
         worker_type_registrations: tuple[str, ...],
     ) -> str:
         """Read the admitted bounded schema inside one generated instruction."""
+        return "Результат = " + PrototypeRuntimeApi._completion_fields_expression(
+            handle,
+            table_row=table_row,
+            worker_type_registrations=worker_type_registrations,
+        ) + ";"
+
+    @staticmethod
+    def _completion_fields_expression(
+        handle: str,
+        *,
+        table_row: bool,
+        worker_type_registrations: tuple[str, ...],
+    ) -> str:
+        """Build the one admitted scalar target expression for completion."""
         if (
             type(worker_type_registrations) is not tuple
             or any(
@@ -1639,20 +1659,14 @@ class PrototypeRuntimeApi:
             )
         ):
             raise ProtocolError("Completion Worker type registrations are invalid")
-        return "\n".join((
-            "СхемаПодсказки = RuntimeValueTransferServer."
-            "ПолучитьДопущенныеИменаСвойствДляПодсказки("
+        return (
+            "RuntimeValueTransferServer."
+            "СериализоватьДопущенныеИменаСвойствДляПодсказки("
             + handle
             + (", Истина, " if table_row else ", Ложь, ")
             + bsl_string_literal("\n".join(worker_type_registrations))
-            + ");",
-            'Результат = "C" + Символы.Таб + Формат('
-            'СхемаПодсказки.Количество(), "ЧГ=0; ЧДЦ=0");',
-            "Для Каждого СтрокаПодсказки Из СхемаПодсказки Цикл",
-            "    Результат = Результат + Символы.ПС + СтрокаПодсказки.Состояние + "
-            "Символы.Таб + СтрокаПодсказки.Имя;",
-            "КонецЦикла;",
-        ))
+            + ")"
+        )
 
     @staticmethod
     def _parse_completion_fields_wire(wire: object) -> tuple[str, ...]:

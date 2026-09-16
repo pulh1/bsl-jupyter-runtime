@@ -1310,6 +1310,37 @@ class PrototypeRuntimeController:
             raise ProtocolError("System MAIN stopped outside the service boundary")
         return result
 
+    def execute_system_inspection(self, expression: str) -> object:
+        """Evaluate one trusted scalar inspection without creating a MAIN operation."""
+        self._require_state(
+            OperationState.IDLE,
+            OperationState.COMPLETED,
+            OperationState.FAILED,
+        )
+        if (
+            not isinstance(expression, str)
+            or not expression.startswith(
+                "RuntimeValueTransferServer."
+                "СериализоватьДопущенныеИменаСвойствДляПодсказки("
+            )
+            or not expression.endswith(")")
+        ):
+            raise ProtocolError("System inspection expression is invalid")
+        result = self.session.evaluate(
+            expression,
+            timeout_s=self.command_timeout_s,
+            # Marker plus 128 identifiers of 128 Unicode code points fits
+            # below this bound even with a four-byte UTF-8 representation.
+            max_text_size=75_000,
+            stack_level=0,
+        )
+        if result.error_occurred:
+            raise BslExecutionError(result.error_text)
+        value = evaluation_to_python(result)
+        if not isinstance(value, str):
+            raise ProtocolError("System inspection did not return scalar text")
+        return value
+
     def _execute_main(
         self,
         visible_source: str,

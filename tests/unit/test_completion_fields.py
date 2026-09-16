@@ -16,7 +16,7 @@ from onec_runtime.errors import (
     CaptureValueCheckError,
     ProtocolError,
 )
-from onec_runtime.prototype_runtime import MainCompletion, OperationHandle, OperationState
+from onec_runtime.prototype_runtime import OperationState
 from onec_runtime.runtime_api import PrototypeRuntimeApi
 from onec_runtime.session import RuntimeSession
 
@@ -39,7 +39,7 @@ class Controller:
         self.collection_size_override = None
         self.collection_row_limit = None
 
-    def execute_system_main(self, source):
+    def execute_system_inspection(self, source):
         self.admission_sources.append(source)
         self.calls.append((source, self.command_timeout_s))
         self.target_requests.append(("completion", source))
@@ -61,7 +61,7 @@ class Controller:
             f"C\t{declared_size}",
             *(f"{outcome}\t{name}" for outcome, name in rows),
         ))
-        return MainCompletion(OperationHandle(self.operation_id, source, source), wire, "", True)
+        return wire
 
 
 def _captured_completion_runtime(
@@ -120,7 +120,7 @@ def test_captured_session_completion_returns_admitted_schema_in_one_inspection()
         assert controller.breakpoint_workspaces[-1].phase == "full-restore"
         sources = [call[1][0] for call in session.calls if call[0] == "start_evaluation"]
         assert len(sources) == 1
-        assert "ПолучитьДопущенныеИменаСвойствДляПодсказки(" in sources[0]
+        assert "СериализоватьДопущенныеИменаСвойствДляПодсказки(" in sources[0]
         assert "ДопуститьЗначение(" not in sources[0]
         assert "evaluate_collection" not in sources[0]
     finally:
@@ -272,7 +272,7 @@ def test_completion_reads_only_current_schema_without_inferencing_value_types():
     controller = Controller()
     api = PrototypeRuntimeApi(controller)
     assert api.completion_fields("Контекст.Данные", table_row=True) == ("Номер", "Название")
-    assert "ПолучитьДопущенныеИменаСвойствДляПодсказки(Контекст.Данные, Истина" in controller.calls[0][0]
+    assert "СериализоватьДопущенныеИменаСвойствДляПодсказки(Контекст.Данные, Истина" in controller.calls[0][0]
     assert 0 < controller.calls[0][1] <= 1.0
     assert controller.command_timeout_s == 30.0
     assert controller.operation_id == 7
