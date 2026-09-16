@@ -2130,10 +2130,10 @@ def test_public_logical_breakpoint_mutations_install_then_commit(
         api.worker_breakpoint_status(UUID(int=999))
 
 
-def test_public_breakpoint_mutation_is_busy_during_capture_evaluation_stop() -> None:
+def test_public_breakpoint_mutation_is_busy_during_capture_evaluation() -> None:
     controller = FakeController()
     _attach_breakpoint_workspace(controller)
-    controller.state = OperationState.CAPTURE_DEBUG_STOPPED
+    controller.state = OperationState.EVALUATING_CAPTURE
     api = PrototypeRuntimeApi(controller)
     source_unit = SourceUnitRef(
         SourceUnitKind.MODULE,
@@ -5958,145 +5958,6 @@ def test_pre_dispatch_debug_resume_preserves_original_pin_until_terminal_reply(
 
     controller.resume_debug_stop = complete_debug_resume  # type: ignore[method-assign]
     assert api.resume_debug_stop().kind is RuntimeReplyKind.MAIN_COMPLETED
-    assert api.operation_worker_generation is None
-
-
-def test_pre_dispatch_capture_debug_resume_preserves_both_pins(
-    tmp_path: Path,
-) -> None:
-    """A paused CAPTURE evaluation and its original MAIN both survive local failure."""
-    catalog = _common_module_catalog("МодульА")
-    module_g17 = _worker_module_unit("МодульА", 17, catalog)
-    module_g18 = _worker_module_unit("МодульА", 18, catalog)
-    packer = _notebook_worker_builder(tmp_path)
-
-    class CaptureDebugController(_PinnedOperationController):
-        def execute_mapped_capture(
-            self, visible: str, mapped: object, **kwargs: object
-        ) -> DebugStop:
-            dispatch = kwargs.get("on_transport_dispatch")
-            if callable(dispatch):
-                dispatch()
-            self.state = OperationState.CAPTURE_DEBUG_STOPPED
-            return DebugStop(
-                OperationHandle(self.operation_id, visible, mapped.text),  # type: ignore[attr-defined]
-                StopEvent(TARGET, LOCATION, "callStackFormed"),
-                StopReason.USER_BREAKPOINT,
-            )
-
-        def resume_debug_stop(self, **_kwargs: object) -> CaptureCellResult:
-            raise RuntimeError("planned local capture debug resume failure")
-
-    controller = CaptureDebugController()
-    api = PrototypeRuntimeApi(
-        controller,
-        notebook_worker_builder=packer,
-        worker_module_builder=WorkerModuleArtifactBuilder(
-            packer,
-            cache=WorkerModuleArtifactCache(),
-            packer_version="worker-epf-v1",
-            target_profile=catalog.profile,
-        ),
-        worker_instruction_executor=_UniverseInstructionExecutor(),
-    )
-    g17 = api.load_worker_modules((module_g17,), common_modules=catalog)
-    assert api.execute_bsl("Результат = Capture();").kind is RuntimeReplyKind.CAPTURED
-    original_pin = api._operation_generation_pin
-    assert original_pin is not None and original_pin.handle is g17
-    g18 = api.load_worker_modules((module_g18,), common_modules=catalog)
-    prepared = api.prepare_capture_hypothesis("Результат = МодульА.Версия();")
-    assert (
-        api.execute_prepared_capture_hypothesis(prepared).kind
-        is RuntimeReplyKind.DEBUG_STOPPED
-    )
-    evaluation_pin = api._evaluation_generation_pin
-    assert evaluation_pin is not None and evaluation_pin.handle is g18
-
-    with pytest.raises(RuntimeError, match="local capture debug resume failure"):
-        api.resume_debug_stop()
-
-    assert api._poisoned_error is None
-    assert api._operation_generation_pin is original_pin
-    assert api._evaluation_generation_pin is evaluation_pin
-
-    def finish_capture_evaluation(**kwargs: object) -> CaptureCellResult:
-        dispatch = kwargs.get("on_transport_dispatch")
-        if callable(dispatch):
-            dispatch()
-        controller.state = OperationState.CAPTURED
-        return CaptureCellResult(controller.operation_id, "visible", "lowered", 1)
-
-    controller.resume_debug_stop = finish_capture_evaluation  # type: ignore[method-assign]
-    assert api.resume_debug_stop().kind is RuntimeReplyKind.CAPTURE_CELL
-    assert api._evaluation_generation_pin is None
-    assert api._operation_generation_pin is original_pin
-    assert api.resume_capture().kind is RuntimeReplyKind.MAIN_COMPLETED
-    assert api.operation_worker_generation is None
-
-
-def test_capture_debug_terminal_bsl_error_still_becomes_failed_capture_cell(
-    tmp_path: Path,
-) -> None:
-    """A terminal CAPTURE evaluation failure is trusted only after CAPTURED."""
-    catalog = _common_module_catalog("МодульА")
-    module_g17 = _worker_module_unit("МодульА", 17, catalog)
-    module_g18 = _worker_module_unit("МодульА", 18, catalog)
-    packer = _notebook_worker_builder(tmp_path)
-
-    class CaptureDebugController(_PinnedOperationController):
-        def execute_mapped_capture(
-            self, visible: str, mapped: object, **kwargs: object
-        ) -> DebugStop:
-            dispatch = kwargs.get("on_transport_dispatch")
-            if callable(dispatch):
-                dispatch()
-            self.state = OperationState.CAPTURE_DEBUG_STOPPED
-            return DebugStop(
-                OperationHandle(self.operation_id, visible, mapped.text),  # type: ignore[attr-defined]
-                StopEvent(TARGET, LOCATION, "callStackFormed"),
-                StopReason.USER_BREAKPOINT,
-            )
-
-        def resume_debug_stop(self, **kwargs: object) -> CaptureCellResult:
-            dispatch = kwargs.get("on_transport_dispatch")
-            if callable(dispatch):
-                dispatch()
-            self.state = OperationState.CAPTURED
-            raise BslExecutionError("planned terminal capture evaluation failure")
-
-    controller = CaptureDebugController()
-    api = PrototypeRuntimeApi(
-        controller,
-        notebook_worker_builder=packer,
-        worker_module_builder=WorkerModuleArtifactBuilder(
-            packer,
-            cache=WorkerModuleArtifactCache(),
-            packer_version="worker-epf-v1",
-            target_profile=catalog.profile,
-        ),
-        worker_instruction_executor=_UniverseInstructionExecutor(),
-    )
-    g17 = api.load_worker_modules((module_g17,), common_modules=catalog)
-    assert api.execute_bsl("Результат = Capture();").kind is RuntimeReplyKind.CAPTURED
-    original_pin = api._operation_generation_pin
-    assert original_pin is not None and original_pin.handle is g17
-    g18 = api.load_worker_modules((module_g18,), common_modules=catalog)
-    prepared = api.prepare_capture_hypothesis("Результат = МодульА.Версия();")
-    assert (
-        api.execute_prepared_capture_hypothesis(prepared).kind
-        is RuntimeReplyKind.DEBUG_STOPPED
-    )
-    assert api._evaluation_generation_pin is not None
-    assert api._evaluation_generation_pin.handle is g18
-
-    failed = api.resume_debug_stop()
-
-    assert failed.kind is RuntimeReplyKind.CAPTURE_CELL
-    assert failed.succeeded is False
-    assert api._evaluation_generation_pin is None
-    assert api._operation_generation_pin is original_pin
-    assert api.operation_worker_generation is g17
-    assert api.resume_capture().kind is RuntimeReplyKind.MAIN_COMPLETED
     assert api.operation_worker_generation is None
 
 

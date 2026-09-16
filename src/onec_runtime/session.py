@@ -1776,7 +1776,6 @@ class RuntimeSession:
             reply = self.runtime_api.resume_debug_stop(timeout_s=timeout_s)
             if active is None or reply.state in {
                 OperationState.CAPTURED,
-                OperationState.CAPTURE_DEBUG_STOPPED,
                 OperationState.DEBUG_STOPPED,
             }:
                 return reply

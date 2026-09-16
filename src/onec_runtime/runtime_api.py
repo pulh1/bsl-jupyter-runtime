@@ -3239,13 +3239,6 @@ class PrototypeRuntimeApi:
             # Publication may already have quarantined the universe. Its
             # leases remain owned until teardown; release cannot be trusted.
             return
-        if (
-            not outcome_unknown
-            and reply is not None
-            and reply.kind is RuntimeReplyKind.DEBUG_STOPPED
-            and self._controller.state is OperationState.CAPTURE_DEBUG_STOPPED
-        ):
-            return
         dispose = self._detach_capture_evaluation_pin_locked()
         dispose("quarantine" if outcome_unknown else "release")
 
@@ -3961,14 +3954,8 @@ class PrototypeRuntimeApi:
             return self._resume_debug_stop_locked()
 
     def _resume_debug_stop_locked(self) -> RuntimeReply:
-        if self._controller.state not in {
-            OperationState.DEBUG_STOPPED,
-            OperationState.CAPTURE_DEBUG_STOPPED,
-        }:
-            raise ProtocolError(
-                "Resume requires a debug_stopped or capture_debug_stopped runtime"
-            )
-        capture_evaluation = self._controller.state is OperationState.CAPTURE_DEBUG_STOPPED
+        if self._controller.state is not OperationState.DEBUG_STOPPED:
+            raise ProtocolError("Resume requires a debug_stopped runtime")
         reply: RuntimeReply | None = None
         resume_dispatched = False
 
@@ -3977,37 +3964,16 @@ class PrototypeRuntimeApi:
             resume_dispatched = True
 
         self._require_operation_pin_dispatch_fence_locked(
-            self._evaluation_generation_pin if capture_evaluation else self._operation_generation_pin,
+            self._operation_generation_pin,
             mode=LoweringMode.CAPTURE,
-            capture_evaluation=capture_evaluation,
             require_active=False,
         )
         try:
-            try:
-                reply = self._reply(
-                    self._controller.resume_debug_stop(
-                        on_transport_dispatch=mark_debug_resume_dispatched,
-                    )
+            reply = self._reply(
+                self._controller.resume_debug_stop(
+                    on_transport_dispatch=mark_debug_resume_dispatched,
                 )
-            except BslExecutionError as error:
-                if not (
-                    capture_evaluation
-                    and self._controller.state is OperationState.CAPTURED
-                ):
-                    raise
-                diagnostic = self._worker_runtime_diagnostic(
-                    str(error),
-                    error.diagnostic,
-                )
-                reply = RuntimeReply(
-                    RuntimeReplyKind.CAPTURE_CELL,
-                    self._controller.operation_id,
-                    self._controller.state,
-                    error=_BSL_EXECUTION_FAILURE_SUMMARY,
-                    succeeded=False,
-                    messages=error.messages,
-                    diagnostic=diagnostic,
-                )
+            )
             self._finalize_pending_namespace(reply)
             return reply
         finally:
@@ -4016,16 +3982,10 @@ class PrototypeRuntimeApi:
             # nothing about whether that operation completed; retain its exact
             # pin until a known reply or an outcome-unknown dispatch result.
             if reply is not None or resume_dispatched:
-                if capture_evaluation:
-                    self._finish_capture_evaluation_pin_locked(
-                        reply=reply,
-                        outcome_unknown=resume_dispatched and reply is None,
-                    )
-                else:
-                    self._finalize_active_operation_pin_locked(
-                        reply=reply,
-                        outcome_unknown=resume_dispatched and reply is None,
-                    )
+                self._finalize_active_operation_pin_locked(
+                    reply=reply,
+                    outcome_unknown=resume_dispatched and reply is None,
+                )
 
     def resume_capture(
         self,
@@ -4183,10 +4143,6 @@ class PrototypeRuntimeApi:
                         "Dirty capture roots cannot be used at a user breakpoint"
                     )
                 return self._resume_debug_stop_locked()
-            if self._controller.state is OperationState.CAPTURE_DEBUG_STOPPED:
-                raise ProtocolError(
-                    "Pending CAPTURE evaluation requires resume_debug_stop"
-                )
             raise ProtocolError(
                 "Resume requires captured or debug_stopped runtime; current state "
                 f"is {self._controller.state.value}"
@@ -7002,23 +6958,14 @@ class PrototypeRuntimeApi:
                 messages=result.messages,
             )
         mapped_stop: RuntimeDebugStop | None = None
-        pin = (
-            self._evaluation_generation_pin
-            if self._controller.state is OperationState.CAPTURE_DEBUG_STOPPED
-            else self._operation_generation_pin
-        )
+        pin = self._operation_generation_pin
         if pin is not None:
             view = self._worker_universe._operation_debug_view(pin)
             mapped_stop = map_worker_stop(
                 result.stop,
                 operation_id=result.operation.operation_id,
                 view=view,
-                origin=(
-                    "capture_evaluation"
-                    if self._controller.state
-                    is OperationState.CAPTURE_DEBUG_STOPPED
-                    else "main"
-                ),
+                origin="main",
                 bindings=self._worker_breakpoints.bindings_for_view(view),
                 reason=result.reason,
             )

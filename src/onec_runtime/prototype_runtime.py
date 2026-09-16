@@ -241,7 +241,6 @@ class OperationState(Enum):
     MAIN_PENDING = "main_pending"
     CAPTURED = "captured"
     EVALUATING_CAPTURE = "evaluating_capture"
-    CAPTURE_DEBUG_STOPPED = "capture_debug_stopped"
     DEBUG_STOPPED = "debug_stopped"
     FLUSHING = "flushing"
     PARTIAL_WRITEBACK_FAILURE = "partial_writeback_failure"
@@ -299,19 +298,6 @@ class DebugStop:
     operation: OperationHandle
     stop: StopEvent
     reason: StopReason
-
-
-@dataclass(frozen=True, slots=True)
-class _PendingCaptureEvaluation:
-    pending: PendingEvaluation
-    operation: OperationHandle
-    visible_source: str = field(repr=False)
-    lowered_source: str = field(repr=False)
-    executed_source: MappedSource = field(repr=False)
-    visible_source_context: VisibleSourceContext | None = field(repr=False)
-    messages_intercepted: int
-    message_collector_key: str
-    cell_fields: Mapping[str, object] = field(repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -524,7 +510,6 @@ class PrototypeRuntimeController:
         self.write_journal: list[RootWriteRecord] = []
         self.stop_history: list[ClassifiedStop] = []
         self.last_debug_stop: DebugStop | None = None
-        self.pending_capture_evaluation: _PendingCaptureEvaluation | None = None
         self._capture_evaluation_coordinator: CaptureEvaluationCoordinator | None = None
         self._capture_shutdown_transport_invalidated = False
         self._capture_owned_submission: _CaptureOwnedSubmission | None = None
@@ -684,7 +669,6 @@ class PrototypeRuntimeController:
         value: object,
         error: BaseException | None,
     ) -> object:
-        self.pending_capture_evaluation = None
         self.last_debug_stop = None
         if isinstance(error, StaleCaptureError):
             self.state = OperationState.LOST
@@ -1492,31 +1476,12 @@ class PrototypeRuntimeController:
                 status = owner.status(owner._fence)
                 if status.phase is CapturePhase.RECOVERY_REQUIRED:
                     raise CaptureRecoveryRequiredError(status.failure)
-        self._require_state(
-            OperationState.DEBUG_STOPPED,
-            OperationState.CAPTURE_DEBUG_STOPPED,
-        )
+        self._require_state(OperationState.DEBUG_STOPPED)
         if (
             self.last_debug_stop is None
             or self.last_debug_stop.reason is not StopReason.USER_BREAKPOINT
         ):
             raise ProtocolError("Only an explicit user breakpoint can be resumed")
-        if self.state is OperationState.CAPTURE_DEBUG_STOPPED:
-            capture = self.pending_capture_evaluation
-            if capture is None:
-                raise ProtocolError("CAPTURE debug stop has no pending evaluation")
-            if on_transport_dispatch is not None:
-                on_transport_dispatch()
-            self.session.continue_evaluation(
-                capture.pending,
-                self.last_debug_stop.stop,
-            )
-            self.state = OperationState.EVALUATING_CAPTURE
-            event = self.session.wait_evaluation_event(
-                capture.pending,
-                timeout_s=self.command_timeout_s,
-            )
-            return self._handle_capture_evaluation_event(capture, event)
         self.state = OperationState.MAIN_PENDING
         if on_transport_dispatch is not None:
             on_transport_dispatch()
@@ -3343,85 +3308,6 @@ class PrototypeRuntimeController:
                 and evaluation_kind is not CaptureEvaluationKind.USER_BSL
             ),
         )  # type: ignore[return-value]
-
-    def _handle_capture_evaluation_event(
-        self,
-        capture: _PendingCaptureEvaluation,
-        event: EvaluationResult | StopEvent,
-    ) -> CaptureCellResult | DebugStop:
-        if self.pending_capture_evaluation is not capture:
-            raise ProtocolError("Pending CAPTURE evaluation identity changed")
-        if isinstance(event, StopEvent):
-            classified = classify_stop(
-                event,
-                self.registry,
-                worker_locations=(
-                    self.breakpoint_workspace_owner.confirmed_snapshot.worker_slots
-                ),
-            )
-            self.stop_history.append(classified)
-            debug_stop = DebugStop(capture.operation, event, classified.reason)
-            self.last_debug_stop = debug_stop
-            self.state = OperationState.CAPTURE_DEBUG_STOPPED
-            return debug_stop
-        try:
-            try:
-                self._set_workspace("full-restore", self.registry.full_locations)
-            except BaseException as restore_error:
-                self.state = OperationState.BREAKPOINT_RESTORE_FAILURE
-                raise BreakpointRestoreError(
-                    "Failed to restore full breakpoint workspace"
-                ) from restore_error
-            self.state = OperationState.CAPTURED
-            self.pending_capture_evaluation = None
-            self.last_debug_stop = None
-            if event.error_occurred:
-                messages = self._take_capture_cell_messages(
-                    capture.message_collector_key
-                    if capture.messages_intercepted
-                    else ""
-                )
-                diagnostic = _safe_platform_diagnostic(
-                    event.error_text,
-                    capture.executed_source,
-                    visible_source_context=capture.visible_source_context,
-                )
-                raise BslExecutionError(
-                    event.error_text,
-                    messages=messages,
-                    diagnostic=diagnostic,
-                )
-            value = evaluation_to_python(event)
-            messages = self._take_capture_cell_messages(
-                capture.message_collector_key
-                if capture.messages_intercepted
-                else ""
-            )
-            cell = CaptureCellResult(
-                capture.operation.operation_id,
-                capture.visible_source,
-                capture.lowered_source,
-                value,
-                messages,
-            )
-        except BaseException as error:
-            self._record(
-                "write-journal.jsonl",
-                "cell_failed",
-                **capture.cell_fields,
-                state_after=self.state.value,
-                error_type=type(error).__name__,
-            )
-            self._flush_journal()
-            raise
-        self._record(
-            "write-journal.jsonl",
-            "cell_completed",
-            **capture.cell_fields,
-            state_after=self.state.value,
-        )
-        self._flush_journal()
-        return cell
 
     def resume(
         self,
