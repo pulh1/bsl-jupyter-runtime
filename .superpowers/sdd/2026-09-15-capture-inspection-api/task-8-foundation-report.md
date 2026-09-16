@@ -256,3 +256,36 @@ expanded RuntimeSession/coordinator/Jupyter/MCP suite passed `673 passed` in
 packages/jupyter/src packages/mcp/src` and `git diff --check` pass.
 The final unit suite passed `4565 passed, 58 skipped` in 252.29 seconds, with
 only the existing Windows ZMQ Proactor warning.
+
+## Final Task 8 pre-submit handoff correction
+
+- The controller now adopts the `CaptureEvaluationTicket` while the initiating
+  Session operation lock and Runtime API writer are still owned.  The composed
+  helper handoff begins only after successful `submit_evaluation()` and wraps
+  only `ticket.wait_initiator()`.  A `return_ticket` caller never enters the
+  handoff.
+- The Task 7 submit/adoption `BaseException` path remains around the unchanged
+  adoption operation.  It still inspects coordinator state and restores the
+  controller to `CAPTURED` only when no record was adopted; an adopted record
+  remains coordinator-owned for normal late-result handling.
+- The Session-backed production regression places a barrier directly in
+  `CaptureEvaluationCoordinator.submit_evaluation()`.  Before the barrier is
+  released, neither the Session lock nor API writer is acquirable and a second
+  `OnecValueProxy.to_df()` cannot cross admission.  After release, the first
+  request has an active `MATERIALIZATION_HELPER` ticket and exactly one
+  dispatch; the second caller promptly receives `CaptureBusyError` while the
+  first remains in the owned wait.  It therefore detects a handoff moved ahead
+  of ticket adoption as well as a missing handoff around the wait.
+
+RED `9ec1c71` establishes the pre-submit barrier failure. GREEN `d1612a1`
+separates submit/adoption from the coordinator wait in the common controller
+path, covering every helper/materialization route without a compatibility
+layer. No BSL module changed; the protocol-2/artifact-0.1.3 CFE and four-source
+manifest remain unchanged.
+
+The exact barrier, ACK/withheld, interrupt, and Session-route set passed
+`18 passed` in 3.62 seconds. The expanded lifecycle/runtime/Jupyter/MCP suite
+passed `674 passed` in 45.77 seconds. The final unit suite passed `4566
+passed, 58 skipped` in 252.71 seconds, with only the existing Windows ZMQ
+Proactor warning. `python -m compileall -q src/onec_runtime
+packages/jupyter/src packages/mcp/src` and `git diff --check` pass.
