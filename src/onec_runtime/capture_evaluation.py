@@ -14,6 +14,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import StrEnum
 from math import isfinite
+import re
 from threading import Condition, Lock, Thread, current_thread
 from time import monotonic
 from typing import TypeVar
@@ -53,6 +54,29 @@ MAX_CAPTURE_IDENTIFIER_CODEPOINTS = 256
 MAX_ADMISSION_ENVELOPE_BYTES = 192
 MAX_ADMISSION_GENERATION = 2**63 - 1
 _MESSAGE_TRUNCATION_NOTE = "Messages truncated to the first 100 entries."
+_PUBLIC_EVALUATION_ID_PREFIX = "capture-eval-v1-"
+_PUBLIC_EVALUATION_ID_PATTERN = re.compile(
+    r"\Acapture-eval-v1-[0-9a-f]{32}\Z"
+)
+
+
+def is_public_capture_evaluation_id(value: object) -> bool:
+    """Whether ``value`` has the public coordinator receipt grammar.
+
+    RDBG expression-result IDs are UUIDs, while Worker and value-transfer
+    handles use private grammars. The public namespace is deliberately tagged,
+    so a frontend can reject those private identifiers by validating this
+    exact grammar.
+    """
+
+    return (
+        type(value) is str
+        and _PUBLIC_EVALUATION_ID_PATTERN.fullmatch(value) is not None
+    )
+
+
+def _new_public_capture_evaluation_id() -> str:
+    return _PUBLIC_EVALUATION_ID_PREFIX + uuid4().hex
 
 
 @dataclass(frozen=True, slots=True)
@@ -578,6 +602,7 @@ __all__ = [
     "MAX_CAPTURE_MESSAGES",
     "MAX_CAPTURE_TIMING_COUNT",
     "MAX_CAPTURE_TIMING_MS",
+    "is_public_capture_evaluation_id",
     "CaptureEvaluationKind",
     "CaptureEvaluationOutcome",
     "CaptureEvaluationState",
@@ -893,7 +918,7 @@ class CaptureEvaluationRequest:
 @dataclass(slots=True, repr=False)
 class _CaptureEvaluationRecord:
     request: CaptureEvaluationRequest
-    evaluation_id: str = field(default_factory=lambda: uuid4().hex)
+    evaluation_id: str = field(default_factory=_new_public_capture_evaluation_id)
     created: float = field(default_factory=monotonic)
     created_at_utc: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     offsets: dict[str, int] = field(default_factory=dict)

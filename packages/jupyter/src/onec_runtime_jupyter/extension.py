@@ -10,7 +10,7 @@ import re
 from shlex import split
 from threading import Lock
 from typing import Any, Protocol, cast
-from uuid import UUID, uuid4
+from uuid import uuid4
 import weakref
 
 from IPython.core.error import UsageError
@@ -23,7 +23,10 @@ from onec_runtime.runtime_contracts import (
     sanitize_normalized_diagnostic,
 )
 from onec_runtime.bsl import SourceUnitKind, SourceUnitRef, source_sha256
-from onec_runtime.capture_evaluation import CaptureEvaluationKind
+from onec_runtime.capture_evaluation import (
+    CaptureEvaluationKind,
+    is_public_capture_evaluation_id,
+)
 from onec_runtime.errors import CaptureEvaluationPendingError, ProtocolError
 from onec_runtime.runtime_api import (
     MAX_PROJECTION_POSITION,
@@ -51,10 +54,6 @@ _PRESENTATION_REASON_LIMIT = 512
 _PENDING_EVALUATION_ID_UNAVAILABLE = "<unavailable>"
 _PENDING_EVALUATION_KIND_UNKNOWN = "unknown"
 _PENDING_WAIT_GUIDANCE = "runtime.current_capture().wait(timeout_s=10)"
-_PENDING_EVALUATION_ID_PATTERN = re.compile(
-    r"(?:[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
-    r"[0-9a-f]{4}-[0-9a-f]{12})\Z"
-)
 _PLATFORM_LOCATION_PREFIX = re.compile(
     r"^\{[^{}\r\n]{1,512}\([0-9]{1,10}(?:\s*,\s*[0-9]{1,10})?\)\}:\s*"
 )
@@ -730,15 +729,9 @@ def _display_pending_evaluation(
 def _safe_pending_evaluation_id(value: object) -> str:
     """Return the only public receipt grammar emitted by the coordinator."""
 
-    if (
-        type(value) is not str
-        or _PENDING_EVALUATION_ID_PATTERN.fullmatch(value) is None
-    ):
-        return _PENDING_EVALUATION_ID_UNAVAILABLE
-    try:
-        return UUID(value).hex
-    except ValueError:
-        return _PENDING_EVALUATION_ID_UNAVAILABLE
+    if is_public_capture_evaluation_id(value):
+        return value
+    return _PENDING_EVALUATION_ID_UNAVAILABLE
 
 
 def _safe_pending_evaluation_kind(value: object) -> str:
