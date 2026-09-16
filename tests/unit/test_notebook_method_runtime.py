@@ -4,11 +4,14 @@ Only the external debugger session and target artifact transport are scripted.
 """
 from pathlib import Path
 import re
+from threading import Event, RLock, Thread, current_thread
 
 import pytest
 
 from onec_runtime.errors import (
     BslExecutionError,
+    CaptureBusyError,
+    CaptureEvaluationPendingError,
     CaptureOutcomeUnknownError,
     CaptureRecoveryRequiredError,
     ProtocolError,
@@ -18,10 +21,22 @@ from onec_runtime.runtime_api import PrototypeRuntimeApi
 from onec_runtime.bsl.source_maps import SourceUnitKind, SourceUnitRef, source_sha256
 from onec_runtime.worker_universe import WorkerModuleArtifactBuilder, WorkerModuleArtifactCache
 
-from test_prototype_runtime import ScriptedSession, SERVICE, CAPTURE_A, CAPTURE_B, USER, evaluation
+from test_prototype_runtime import (
+    CAPTURE_A,
+    CAPTURE_B,
+    SERVICE,
+    USER,
+    ScriptedSession,
+    captured_controller,
+    evaluation,
+)
 from test_runtime_api import (
     _notebook_worker_builder, _UniverseInstructionExecutor,
     _SemanticSnapshotFailureTarget, _common_module_catalog, _worker_module_unit,
+)
+from test_capture_evaluation_lifecycle import (
+    ControlledCaptureSession,
+    close_owner,
 )
 
 
@@ -63,6 +78,198 @@ def runtime(tmp_path: Path, *, target=None, captured=False):
         user_breakpoints=(USER,) if captured else (),
     )
     return api, controller, session
+
+
+class _NotebookShell:
+    def __init__(self) -> None:
+        self.user_ns: dict[str, object] = {}
+
+
+def _session_backed_notebook_runtime(
+    api: PrototypeRuntimeApi,
+):  # type: ignore[no-untyped-def]
+    from onec_runtime.session import RuntimeSession
+
+    runtime = object.__new__(RuntimeSession)
+    runtime.runtime_api = api
+    runtime._operation_lock = RLock()
+    runtime._closed = False
+    return runtime
+
+
+def test_jupyter_magic_pending_user_bsl_detaches_core_ticket_and_keeps_controls_available(
+    tmp_path: Path,
+) -> None:
+    """The notebook waiter must not retain either Session/API writer lock."""
+
+    from onec_runtime.capture_evaluation import CaptureEvaluationState, CapturePhase
+    from onec_runtime_jupyter.extension import (
+        MACHINE_MIME_TYPE,
+        OnecRuntimeMagics,
+        install_runtime,
+    )
+
+    session = ControlledCaptureSession()
+    controller = captured_controller(session, command_timeout_s=0.2)
+    api = PrototypeRuntimeApi(
+        controller,
+        notebook_worker_builder=_notebook_worker_builder(tmp_path),
+    )
+    runtime = _session_backed_notebook_runtime(api)
+    shell = _NotebookShell()
+    install_runtime(shell, runtime)
+    magic = OnecRuntimeMagics(shell)  # type: ignore[arg-type]
+    result: list[object] = []
+    errors: list[BaseException] = []
+    finished = Event()
+
+    def execute() -> None:
+        try:
+            result.append(magic.bsl("", "РезультатИнструкции = 901;"))
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            finished.set()
+
+    initiator = Thread(target=execute, name="jupyter-user-bsl-initiator")
+    contender_done = Event()
+    contender_errors: list[BaseException] = []
+
+    def contend() -> None:
+        try:
+            runtime.execute_bsl("РезультатИнструкции = 902;")
+        except BaseException as error:
+            contender_errors.append(error)
+        finally:
+            contender_done.set()
+
+    contender = Thread(target=contend, name="jupyter-user-bsl-contender")
+    try:
+        initiator.start()
+        assert session.accepted.wait(1), "user BSL evaluation was not acknowledged"
+        capture = runtime.current_capture()
+        status = capture.status()
+        assert status.phase is CapturePhase.EVALUATING
+        assert status.evaluation_kind.value == "user_bsl"
+        assert capture.wait(timeout_s=0).state is CaptureEvaluationState.PENDING
+
+        contender.start()
+        assert contender_done.wait(0.1), (
+            "Session/API writer lock stayed with waiter"
+        )
+        assert len(contender_errors) == 1
+        assert isinstance(contender_errors[0], CaptureBusyError)
+        assert session.capture_start_count == 1
+
+        assert finished.wait(1), "notebook command deadline did not detach waiter"
+        assert errors == []
+        assert len(result) == 1 and result[0] is not None
+        bundle = result[0]._repr_mimebundle_()  # type: ignore[union-attr]
+        assert (
+            bundle[MACHINE_MIME_TYPE]["evaluation_id"]
+            == status.pending_evaluation_id
+        )  # type: ignore[index]
+        assert (
+            bundle[MACHINE_MIME_TYPE]["evaluation_kind"] == "user_bsl"
+        )  # type: ignore[index]
+        assert api._poisoned_error is None
+        assert session.capture_start_count == 1
+
+        session.complete()
+        outcome = capture.wait(
+            timeout_s=1,
+            evaluation_id=status.pending_evaluation_id,
+        )
+        assert outcome.state is CaptureEvaluationState.COMPLETED
+        assert outcome.evaluation_id == status.pending_evaluation_id
+        assert session.capture_start_count == 1
+    finally:
+        if session.capture_pending is not None:
+            session.complete()
+        initiator.join(1)
+        contender.join(1)
+        close_owner(controller, session)
+
+
+def test_jupyter_magic_keyboard_interrupt_detaches_core_ticket_and_keeps_late_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from onec_runtime.capture_evaluation import (
+        CaptureEvaluationState,
+        CaptureEvaluationTicket,
+        CapturePhase,
+    )
+    from onec_runtime_jupyter.extension import OnecRuntimeMagics, install_runtime
+
+    session = ControlledCaptureSession()
+    controller = captured_controller(session, command_timeout_s=1)
+    api = PrototypeRuntimeApi(
+        controller,
+        notebook_worker_builder=_notebook_worker_builder(tmp_path),
+    )
+    runtime = _session_backed_notebook_runtime(api)
+    shell = _NotebookShell()
+    install_runtime(shell, runtime)
+    magic = OnecRuntimeMagics(shell)  # type: ignore[arg-type]
+    caller = current_thread()
+    original_wait = CaptureEvaluationTicket.wait_initiator
+
+    def interrupting_wait(
+        ticket: CaptureEvaluationTicket,
+        timeout_s: float | None = None,
+    ) -> object:
+        assert session.accepted.wait(1)
+        owner = ticket._coordinator
+        original_condition_wait = owner._condition.wait
+
+        def interrupt_after_acknowledgement(
+            wait_timeout: float | None = None,
+        ) -> bool:
+            if current_thread() is caller:
+                raise KeyboardInterrupt
+            return original_condition_wait(wait_timeout)
+
+        monkeypatch.setattr(
+            owner._condition,
+            "wait",
+            interrupt_after_acknowledgement,
+        )
+        try:
+            return original_wait(ticket, timeout_s)
+        finally:
+            monkeypatch.setattr(owner._condition, "wait", original_condition_wait)
+
+    monkeypatch.setattr(
+        CaptureEvaluationTicket,
+        "wait_initiator",
+        interrupting_wait,
+    )
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            magic.bsl("", "РезультатИнструкции = 903;")
+
+        capture = runtime.current_capture()
+        status = capture.status()
+        assert status.phase is CapturePhase.EVALUATING
+        assert status.evaluation_kind.value == "user_bsl"
+        assert status.evaluation_timing is not None
+        assert status.evaluation_timing.initiating_waiter_detached_ms is not None
+        assert api._poisoned_error is None
+        assert session.capture_start_count == 1
+
+        session.complete()
+        outcome = capture.wait(
+            timeout_s=1,
+            evaluation_id=status.pending_evaluation_id,
+        )
+        assert outcome.state is CaptureEvaluationState.COMPLETED
+        assert outcome.evaluation_id == status.pending_evaluation_id
+        assert session.capture_start_count == 1
+    finally:
+        if session.capture_pending is not None:
+            session.complete()
+        close_owner(controller, session)
 
 
 def paths(api):

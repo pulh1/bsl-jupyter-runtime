@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, is_dataclass
 from enum import Enum
+from html import escape
 from inspect import Parameter, signature
 import json
 import keyword
@@ -22,7 +23,8 @@ from onec_runtime.runtime_contracts import (
     sanitize_normalized_diagnostic,
 )
 from onec_runtime.bsl import SourceUnitKind, SourceUnitRef, source_sha256
-from onec_runtime.errors import ProtocolError
+from onec_runtime.capture_evaluation import CaptureEvaluationKind
+from onec_runtime.errors import CaptureEvaluationPendingError, ProtocolError
 from onec_runtime.runtime_api import (
     MAX_PROJECTION_POSITION,
     RuntimeNamespaceSnapshot,
@@ -46,6 +48,8 @@ _NAMESPACE_BRIDGE_NAME = "_onec_runtime_bsl_bridge"
 _SOURCE_SESSION_NAME = "_onec_runtime_source_session"
 _DIAGNOSTIC_EXCERPT_LIMIT = 512
 _PRESENTATION_REASON_LIMIT = 512
+_PENDING_EVALUATION_ID_LIMIT = 256
+_PENDING_WAIT_GUIDANCE = "runtime.current_capture().wait(timeout_s=10)"
 _PLATFORM_LOCATION_PREFIX = re.compile(
     r"^\{[^{}\r\n]{1,512}\([0-9]{1,10}(?:\s*,\s*[0-9]{1,10})?\)\}:\s*"
 )
@@ -102,6 +106,7 @@ class NotebookDisplay:
     text: str
     payload: dict[str, object]
     diagnostic: bool = False
+    html: str | None = None
 
     def __repr__(self) -> str:
         return self.text
@@ -116,6 +121,8 @@ class NotebookDisplay:
             "text/plain": self.text,
             MACHINE_MIME_TYPE: self.payload,
         }
+        if self.html is not None:
+            bundle["text/html"] = self.html
         if self.diagnostic:
             bundle["application/json"] = self.payload
         return bundle
@@ -569,14 +576,17 @@ class OnecRuntimeMagics(Magics):
                 provenance.append(value)
 
         execute = runtime.execute_bsl
-        if _accepts_keyword(execute, "on_execution_provenance"):
-            reply = cast(Any, execute)(
-                cell,
-                source_unit=source_unit,
-                on_execution_provenance=capture,
-            )
-        else:
-            reply = execute(cell, source_unit=source_unit)
+        try:
+            if _accepts_keyword(execute, "on_execution_provenance"):
+                reply = cast(Any, execute)(
+                    cell,
+                    source_unit=source_unit,
+                    on_execution_provenance=capture,
+                )
+            else:
+                reply = execute(cell, source_unit=source_unit)
+        except CaptureEvaluationPendingError as error:
+            return _display_pending_evaluation(error)
         return self._finish_reply(
             reply,
             visible_source=cell,
@@ -681,6 +691,46 @@ class OnecRuntimeMagics(Magics):
             )
             raise BslCellError(summary) from None
         return displayed
+
+
+def _display_pending_evaluation(
+    error: CaptureEvaluationPendingError,
+) -> NotebookDisplay:
+    """Render the safe ticket receipt without inspecting live runtime state."""
+
+    evaluation_id = _safe_pending_evaluation_id(
+        getattr(error, "evaluation_id", None)
+    )
+    kind = getattr(error, "evaluation_kind", None)
+    evaluation_kind = (
+        kind.value if isinstance(kind, CaptureEvaluationKind) else "unknown"
+    )
+    text = "\n".join(
+        (
+            f"evaluation_id={evaluation_id}",
+            f"evaluation_kind={evaluation_kind}",
+            _PENDING_WAIT_GUIDANCE,
+        )
+    )
+    return NotebookDisplay(
+        text,
+        {
+            "evaluation_id": evaluation_id,
+            "evaluation_kind": evaluation_kind,
+            "guidance": _PENDING_WAIT_GUIDANCE,
+        },
+        html="<pre>" + escape(text) + "</pre>",
+    )
+
+
+def _safe_pending_evaluation_id(value: object) -> str:
+    if type(value) is not str:
+        return "<unknown>"
+    cleaned = "".join(
+        character if character.isprintable() else " "
+        for character in value[:_PENDING_EVALUATION_ID_LIMIT]
+    )
+    return " ".join(cleaned.split()) or "<unknown>"
 
 
 def load_ipython_extension(ipython: InteractiveShell) -> None:

@@ -21,7 +21,12 @@ from onec_runtime_jupyter.extension import (
     load_ipython_extension,
     unload_ipython_extension,
 )
-from onec_runtime.capture_evaluation import CapturePhase, CaptureStatus
+from onec_runtime.capture_evaluation import (
+    CaptureEvaluationKind,
+    CapturePhase,
+    CaptureStatus,
+)
+from onec_runtime.errors import CaptureEvaluationPendingError
 from onec_runtime.capture_inspection import DebugFrame, StackPage
 from onec_runtime.capture_values import (
     DeniedValueNode,
@@ -410,6 +415,70 @@ def test_bsl_magic_passes_visible_cell_and_returns_stable_mime_bundle() -> None:
     assert bundle[MACHINE_MIME_TYPE] == displayed.payload
     assert "application/json" not in bundle
     assert "CAPTURED" in bundle["text/plain"]
+
+
+def test_bsl_magic_renders_acknowledged_user_evaluation_pending_as_safe_mime_bundle() -> None:
+    """VS Code receives this display through the ordinary Jupyter MIME path."""
+
+    shell = FakeShell()
+    runtime = FakeRuntime()
+    runtime._poisoned_error = None  # type: ignore[attr-defined]
+    evaluation_id = "eval-<safe>"
+    guidance = "runtime.current_capture().wait(timeout_s=10)"
+    source = (
+        "СекретныйИсточник = worker://private-handle; "
+        "result_id=private-result; generation=987; url=https://private.invalid"
+    )
+    dispatches = 0
+
+    def pending(
+        sent: str,
+        *,
+        source_unit: SourceUnitRef,
+    ) -> RuntimeReply:
+        nonlocal dispatches
+        dispatches += 1
+        runtime.sources.append(sent)
+        runtime.source_units.append(source_unit)
+        raise CaptureEvaluationPendingError(
+            evaluation_id,
+            CaptureEvaluationKind.USER_BSL,
+        )
+
+    runtime.execute_bsl = pending  # type: ignore[method-assign]
+    install_runtime(shell, runtime)
+
+    displayed = OnecRuntimeMagics(shell).bsl("", source)  # type: ignore[arg-type]
+
+    assert displayed is not None
+    bundle = displayed._repr_mimebundle_()
+    assert bundle["text/plain"] == (
+        "evaluation_id=eval-<safe>\n"
+        "evaluation_kind=user_bsl\n"
+        + guidance
+    )
+    assert bundle["text/html"] == (
+        "<pre>evaluation_id=eval-&lt;safe&gt;\n"
+        "evaluation_kind=user_bsl\n"
+        + guidance
+        + "</pre>"
+    )
+    assert bundle[MACHINE_MIME_TYPE] == {
+        "evaluation_id": evaluation_id,
+        "evaluation_kind": "user_bsl",
+        "guidance": guidance,
+    }
+    rendered = json.dumps(bundle, ensure_ascii=False)
+    for secret in (
+        "СекретныйИсточник",
+        "worker://private-handle",
+        "private-result",
+        "generation=987",
+        "https://private.invalid",
+    ):
+        assert secret not in rendered
+    assert dispatches == 1
+    assert runtime._poisoned_error is None  # type: ignore[attr-defined]
 
 
 def test_presentation_mode_prints_bsl_messages_without_visible_json(
