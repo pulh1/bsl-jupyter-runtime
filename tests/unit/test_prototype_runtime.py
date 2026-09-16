@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 from threading import Event, RLock
+from time import monotonic, sleep
 from uuid import UUID, uuid4
 
 from mcp.client import Client
@@ -56,6 +57,8 @@ from onec_runtime.bsl import (
 from onec_runtime.session import RuntimeSession, _ActiveCaptureTicket
 from onec_runtime_mcp.agent.runtime_session import AgentRuntimeSession
 from onec_runtime.errors import (
+    BslExecutionError,
+    CaptureInspectionTimeout,
     CaptureOutcomeUnknownError,
     CaptureRecoveryRequiredError,
     ProtocolError,
@@ -82,7 +85,8 @@ from onec_runtime.rdbg.models import (
     TargetId,
 )
 from onec_runtime.rdbg.reconnect import ReconnectedSession
-from onec_runtime.rdbg.xml_codec import RDBG_NS, parse_ping_events
+from onec_runtime.rdbg.session import RdbgSession, SessionState
+from onec_runtime.rdbg.xml_codec import BASE_NS, CALC_NS, RDBG_NS, parse_ping_events
 from onec_runtime.recovery import (
     RecoveryIdentityEvidence,
     RecoveryOutcome,
@@ -860,6 +864,49 @@ def _completion_lifecycle_snapshot(
     )
 
 
+class _CompletionRdbgTransport:
+    """Small real-RDBG transport fixture for ready scalar inspection."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.responses: dict[str, deque[bytes]] = {}
+
+    def enqueue(self, command: str, *responses: bytes) -> None:
+        self.responses.setdefault(command, deque()).extend(responses)
+
+    def request(self, command: str, _payload: bytes = b"", **_kwargs: object) -> bytes:
+        self.calls.append(command)
+        queue = self.responses.get(command)
+        return queue.popleft() if queue else b""
+
+
+def _ready_completion_rdbg(transport: _CompletionRdbgTransport) -> RdbgSession:
+    session = RdbgSession(transport, SERVICE)  # type: ignore[arg-type]
+    target = DebugTarget(TARGET, "ServerEmulation", "stopped")
+    session.target = target
+    session.attached_targets[TARGET.id] = target
+    session.state = SessionState.READY
+    return session
+
+
+def _completion_stop_payload(location: ModuleLocation = USER) -> bytes:
+    return f"""<response xmlns=\"{RDBG_NS}\"><result><cmdID>callStackFormed</cmdID>
+      <targetID xmlns=\"{BASE_NS}\"><id>{TARGET.id}</id><infoBaseAlias>{TARGET.infobase_alias}</infoBaseAlias></targetID>
+      <callStack><moduleID><type>{location.module_type}</type>
+      <extensionName>{location.extension_name}</extensionName><objectID>{location.object_id}</objectID>
+      <propertyID>{location.property_id}</propertyID></moduleID><lineNo>{location.line}</lineNo>
+      </callStack></result></response>""".encode()
+
+
+def _completion_result_payload(result_id: UUID, wire: str) -> bytes:
+    encoded = b64encode(wire.encode("utf-8")).decode("ascii")
+    return f"""<response xmlns=\"{RDBG_NS}\"><result><cmdID>exprEvaluated</cmdID>
+      <evalExprResBaseData><expressionResultID xmlns=\"{CALC_NS}\">{result_id}</expressionResultID>
+      <resultValueInfo xmlns=\"{CALC_NS}\"><typeName>Строка</typeName>
+      <valueString>{encoded}</valueString></resultValueInfo><errorOccurred>false</errorOccurred>
+      </evalExprResBaseData></result></response>""".encode()
+
+
 def test_ready_completion_inspection_does_not_start_or_mutate_main_lifecycle() -> None:
     """A real controller must evaluate the bounded scalar without a new MAIN."""
     completion_wire = '"C\t3\nR\t\nR\tНомер\nR\tНазвание"'
@@ -897,48 +944,100 @@ def test_ready_completion_inspection_does_not_start_or_mutate_main_lifecycle() -
     assert len(inspections) == 1
 
 
-def test_ready_completion_unexpected_stop_cannot_partially_mutate_main_lifecycle() -> None:
-    """The immediate inspection leaves ready state intact if RDBG interrupts it."""
+def test_ready_completion_stop_resumes_and_drains_the_real_rdbg_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break: `evaluate()` leaks this exact capability after the first stop."""
     completion_wire = '"C\t3\nR\t\nR\tНомер\nR\tНазвание"'
-
-    class UnexpectedCompletionSession(ScriptedSession):
-        def evaluate(self, expression: str, **kwargs: object) -> EvaluationResult:
-            if (
-                expression == "Результат"
-                or expression.startswith(
-                    "RuntimeValueTransferServer.СериализоватьДопущенныеИменаСвойствДляПодсказки("
-                )
-            ):
-                raise UnexpectedStop("synthetic completion stop")
-            return super().evaluate(expression, **kwargs)  # type: ignore[arg-type]
-
-    session = UnexpectedCompletionSession(
-        (SERVICE, SERVICE),
-        main_results=(evaluation("Строка", '"baseline"'), evaluation("Строка", completion_wire)),
+    result_id = UUID("f1000000-0000-0000-0000-000000000001")
+    transport = _CompletionRdbgTransport()
+    transport.enqueue("evalExpr", b"")
+    transport.enqueue(
+        "pingDebugUIParams",
+        _completion_stop_payload(),
+        _completion_result_payload(result_id, completion_wire[1:-1]),
     )
-    controller = runtime_module().PrototypeRuntimeController(session, SERVICE)
-    # Build a real ready controller before arming the exceptional completion probe.
-    session.main_results.clear()
-    session.main_results.append(evaluation("Строка", '"baseline"'))
-    original_evaluate = session.evaluate
-
-    # The initial MAIN needs its normal result; only completion reads must stop.
-    def initial_result(expression: str, **kwargs: object) -> EvaluationResult:
-        if expression == "Результат":
-            return evaluation("Строка", '"baseline"')
-        return original_evaluate(expression, **kwargs)
-
-    session.evaluate = initial_result  # type: ignore[method-assign]
-    controller.execute_system_main('Результат = "baseline";')
-    session.evaluate = original_evaluate  # type: ignore[method-assign]
+    session = _ready_completion_rdbg(transport)
+    monkeypatch.setattr("onec_runtime.rdbg.session.uuid4", lambda: result_id)
+    runtime = runtime_module()
+    controller = runtime.PrototypeRuntimeController(session, SERVICE)
+    controller.state = runtime.OperationState.COMPLETED
+    controller.operation_id = 7
     api = PrototypeRuntimeApi(controller)
     api._namespace_names = ("Данные",)
-    before = _completion_lifecycle_snapshot(controller, session)
+    before = (
+        controller.operation_id,
+        controller.state,
+        controller.active_operation,
+        controller.registry,
+        tuple(controller.stop_history),
+        tuple(controller.write_journal),
+        tuple(controller.journal.events),
+        controller.breakpoint_workspace_owner.confirmed_snapshot.effective_locations,
+    )
 
-    with pytest.raises(UnexpectedStop):
-        api.completion_fields("Контекст.Данные")
+    assert api.completion_fields("Контекст.Данные") == ("Номер", "Название")
 
-    assert _completion_lifecycle_snapshot(controller, session) == before
+    assert (
+        controller.operation_id,
+        controller.state,
+        controller.active_operation,
+        controller.registry,
+        tuple(controller.stop_history),
+        tuple(controller.write_journal),
+        tuple(controller.journal.events),
+        controller.breakpoint_workspace_owner.confirmed_snapshot.effective_locations,
+    ) == before
+    assert transport.calls.count("evalExpr") == 1
+    assert transport.calls.count("step") == 1
+    assert not session._pending_evaluation_states
+    assert session.state is SessionState.READY
+
+
+def test_ready_completion_timeout_retains_a_real_rdbg_owner_until_late_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break: an acknowledged timeout must not leave RDBG silently wedged."""
+    completion_wire = "C\t3\nR\t\nR\tНомер\nR\tНазвание"
+    first_id = UUID("f2000000-0000-0000-0000-000000000001")
+    second_id = UUID("f2000000-0000-0000-0000-000000000002")
+    generated_ids = iter((first_id, second_id))
+    transport = _CompletionRdbgTransport()
+    transport.enqueue("evalExpr", b"")
+    session = _ready_completion_rdbg(transport)
+    monkeypatch.setattr("onec_runtime.rdbg.session.uuid4", lambda: next(generated_ids))
+    controller = runtime_module().PrototypeRuntimeController(
+        session, SERVICE, command_timeout_s=0.025,
+    )
+    state = runtime_module().OperationState
+    controller.state = state.COMPLETED
+    controller.operation_id = 7
+    api = PrototypeRuntimeApi(controller)
+    api._namespace_names = ("Данные",)
+
+    with pytest.raises(CaptureInspectionTimeout):
+        api.completion_fields("Контекст.Данные", timeout_s=0.025)
+
+    assert controller.state is state.RECOVERING
+    assert api.status().state is state.RECOVERING
+    assert transport.calls.count("evalExpr") == 1
+    assert len(session._pending_evaluation_states) == 1
+    with pytest.raises(ProtocolError):
+        api.completion_fields("Контекст.Данные", timeout_s=0.025)
+    with pytest.raises(ProtocolError):
+        controller.execute_system_main("Результат = 1;")
+    assert transport.calls.count("evalExpr") == 1
+
+    transport.enqueue("pingDebugUIParams", _completion_result_payload(first_id, completion_wire))
+    deadline = monotonic() + 1.0
+    while controller.state is state.RECOVERING and monotonic() < deadline:
+        sleep(0.005)
+
+    assert controller.state is state.COMPLETED
+    assert not session._pending_evaluation_states
+    transport.enqueue("evalExpr", _completion_result_payload(second_id, completion_wire))
+    assert api.completion_fields("Контекст.Данные") == ("Номер", "Название")
+    assert transport.calls.count("evalExpr") == 2
 
 
 def workspace_calls(session: ScriptedSession) -> list[tuple[ModuleLocation, ...]]:
