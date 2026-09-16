@@ -139,3 +139,57 @@ full unit: 4512 passed, 58 skipped, 1 known Windows Proactor/pyzmq warning
 python -m compileall -q src/onec_runtime packages/jupyter/src packages/mcp/src: exit 0
 git diff --check f6df29d..HEAD: exit 0
 ```
+
+## Admission-transaction remediation — 2026-09-16
+
+The updated independent Sol xhigh review found a second interruption window:
+`CaptureEvaluationCoordinator.submit_resume()` called the controller `admit`
+closure, which changed `CAPTURED` to `RESUMING`, before it published the active
+resume record or handoff receipt.  A `KeyboardInterrupt` or timeout at that
+return boundary could therefore leave the controller resuming while the
+coordinator still reported paused, with no Session/MCP owner able to observe or
+finish the operation.
+
+### RED and GREEN commits
+
+- `8a0d981` — `test: cover interrupted capture resume admission`
+- `f66eab5` — `test: cover transactional capture resume admission`
+- `12d9cbb` — `fix: make capture resume admission transactional`
+
+The deterministic regression uses `sys.settrace` at the real controller
+`admit` closure return, immediately after its state assignment.  It covers both
+RuntimeApi and Session entry points and both `KeyboardInterrupt` and
+`TimeoutError`.  Each accepted interruption leaves one detached coordinator
+owner, preserves the Session/MCP fence, rejects a duplicate resume while work
+is active, sends exactly one `Continue`, and retires the Session ticket and
+listener exactly once at terminal delivery.
+
+Admission is now a two-stage transaction.  A side-effect-free controller
+preflight occurs before coordinator ownership.  The coordinator then publishes
+the active record, ticket/receipt, and `RESUMING` phase under its condition
+before committing the controller's local `RESUMING` state.  The defined order
+is RuntimeApi single-writer admission, coordinator condition, then controller
+local state commit.  If that final commit is interrupted, the already-published
+owner is detached and completes the accepted operation; no user hook or remote
+dispatch falls inside this state/receipt window.  Preflight failure leaves the
+controller captured, the coordinator paused, and no active record, Session
+ticket, root export, or `Continue`; a subsequent retry succeeds.
+
+### Admission-remediation verification
+
+```text
+selected test-only RED baseline: 6 expected failures
+admission exact (including earlier receipt rows): 8 passed
+admission exact repeated: 10/10 invocations passed (6 rows each)
+resume lifecycle: 28 passed
+full Jupyter session shutdown: 59 passed, 1 known Windows Proactor/pyzmq warning
+MCP capture group: 87 passed
+prototype/RuntimeApi/Jupyter-adapter/control-plane focused group: 529 passed
+full unit: 4518 passed, 58 skipped, 1 known Windows Proactor/pyzmq warning
+python -m compileall -q src/onec_runtime packages/jupyter/src packages/mcp/src: exit 0
+git diff --check f0a328b..HEAD: exit 0
+git diff --check f6df29d..HEAD: exit 0
+```
+
+No live 1C qualification was run; this evidence uses unit and scripted
+transport coverage.
