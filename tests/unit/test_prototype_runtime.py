@@ -58,7 +58,7 @@ from onec_runtime.session import RuntimeSession, _ActiveCaptureTicket
 from onec_runtime_mcp.agent.runtime_session import AgentRuntimeSession
 from onec_runtime.errors import (
     BslExecutionError,
-    CaptureInspectionTimeout,
+    CaptureEvaluationPendingError,
     CaptureOutcomeUnknownError,
     CaptureRecoveryRequiredError,
     ProtocolError,
@@ -1015,13 +1015,18 @@ def test_ready_completion_timeout_retains_a_real_rdbg_owner_until_late_result(
     api = PrototypeRuntimeApi(controller)
     api._namespace_names = ("Данные",)
 
-    with pytest.raises(CaptureInspectionTimeout):
+    with pytest.raises(CaptureEvaluationPendingError) as pending:
         api.completion_fields("Контекст.Данные", timeout_s=0.025)
 
+    assert pending.value.evaluation_kind is CaptureEvaluationKind.INSPECTION
+    assert pending.value.evaluation_id != str(first_id)
     assert controller.state is state.RECOVERING
     assert api.status().state is state.RECOVERING
     assert transport.calls.count("evalExpr") == 1
     assert len(session._pending_evaluation_states) == 1
+    owner = controller.ready_inspection_evaluation_owner()
+    assert owner is not None and owner._active is not None
+    assert owner._active.initiator_attached is False
     with pytest.raises(ProtocolError):
         api.completion_fields("Контекст.Данные", timeout_s=0.025)
     with pytest.raises(ProtocolError):
@@ -1038,6 +1043,100 @@ def test_ready_completion_timeout_retains_a_real_rdbg_owner_until_late_result(
     transport.enqueue("evalExpr", _completion_result_payload(second_id, completion_wire))
     assert api.completion_fields("Контекст.Данные") == ("Номер", "Название")
     assert transport.calls.count("evalExpr") == 2
+
+
+def test_shutdown_joins_and_finalizes_each_controller_owned_evaluation_owner() -> None:
+    """Break: short-circuiting the first join strands the second owner."""
+    calls: list[tuple[str, str, bool | None]] = []
+
+    class Owner:
+        def __init__(self, name: str, joined: bool) -> None:
+            self.name = name
+            self.joined = joined
+
+        def begin_close(self) -> None:
+            calls.append(("begin", self.name, None))
+
+        def join(self, _timeout_s: float) -> bool:
+            calls.append(("join", self.name, None))
+            return self.joined
+
+        def finish_close(self, terminated: bool) -> None:
+            calls.append(("finish", self.name, terminated))
+
+    class InspectionSession(ScriptedSession):
+        def __init__(self) -> None:
+            super().__init__(())
+
+    runtime = runtime_module()
+    session = InspectionSession()
+    controller = runtime.PrototypeRuntimeController(session, SERVICE)
+    first = Owner("capture", False)
+    second = Owner("ready", True)
+    controller._capture_evaluation_coordinator = first  # type: ignore[assignment]
+    controller._ready_inspection_evaluation_coordinator = second  # type: ignore[assignment]
+
+    assert controller.shutdown_capture_evaluation() is False
+
+    assert calls == [
+        ("begin", "capture", None),
+        ("begin", "ready", None),
+        ("join", "capture", None),
+        ("join", "ready", None),
+        ("finish", "capture", False),
+        ("finish", "ready", True),
+    ]
+
+
+def test_ready_inspection_pending_owner_is_closed_through_runtime_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runtime API close must supervise a non-CAPTURE event-stream owner."""
+    result_id = UUID("f4000000-0000-0000-0000-000000000001")
+    transport = _CompletionRdbgTransport()
+    transport.enqueue("evalExpr", b"")
+    session = _ready_completion_rdbg(transport)
+    monkeypatch.setattr("onec_runtime.rdbg.session.uuid4", lambda: result_id)
+    runtime = runtime_module()
+    controller = runtime.PrototypeRuntimeController(
+        session, SERVICE, command_timeout_s=0.025,
+    )
+    controller.state = runtime.OperationState.COMPLETED
+    api = PrototypeRuntimeApi(controller)
+    api._namespace_names = ("Данные",)
+
+    with pytest.raises(CaptureEvaluationPendingError):
+        api.completion_fields("Контекст.Данные", timeout_s=0.025)
+
+    assert api._close_capture_control_plane() is True
+    assert session.target is None
+
+
+def test_ready_completion_bsl_failure_does_not_mutate_main_lifecycle() -> None:
+    """A confirmed immediate inspection failure preserves the ready operation."""
+
+    class FailingCompletionSession(ScriptedSession):
+        def evaluate(self, expression: str, **kwargs: object) -> EvaluationResult:
+            if expression.startswith(
+                "RuntimeValueTransferServer.СериализоватьДопущенныеИменаСвойствДляПодсказки("
+            ):
+                self.calls.append(("evaluate", expression))
+                return evaluation("Ошибка", "", error="synthetic completion failure")
+            return super().evaluate(expression, **kwargs)  # type: ignore[arg-type]
+
+    session = FailingCompletionSession(
+        (SERVICE,), main_results=(evaluation("Строка", '"baseline"'),)
+    )
+    controller = runtime_module().PrototypeRuntimeController(session, SERVICE)
+    controller.execute_system_main('Результат = "baseline";')
+    api = PrototypeRuntimeApi(controller)
+    api._namespace_names = ("Данные",)
+    before = _completion_lifecycle_snapshot(controller, session)
+
+    with pytest.raises(BslExecutionError):
+        api.completion_fields("Контекст.Данные")
+
+    assert _completion_lifecycle_snapshot(controller, session) == before
 
 
 def workspace_calls(session: ScriptedSession) -> list[tuple[ModuleLocation, ...]]:

@@ -21,7 +21,7 @@ from onec_runtime.runtime_api import PrototypeRuntimeApi
 from onec_runtime.session import RuntimeSession
 
 from test_capture_evaluation_lifecycle import ControlledCaptureSession, close_owner
-from test_prototype_runtime import captured_controller
+from test_prototype_runtime import SERVICE, captured_controller
 
 
 class Controller:
@@ -390,3 +390,58 @@ def test_session_completion_does_not_wait_for_another_operation():
         release.set()
         thread.join(2)
     assert session.completion_fields("Контекст.Данные") == ("Номер", "Название")
+
+
+def test_ready_completion_releases_session_and_api_locks_while_ticket_waits() -> None:
+    """A ready inspection adopts before the handoff, then waits lock-free."""
+    session = ControlledCaptureSession()
+    controller_module = __import__(
+        "onec_runtime.prototype_runtime", fromlist=("PrototypeRuntimeController",)
+    )
+    controller = controller_module.PrototypeRuntimeController(
+        session, SERVICE, command_timeout_s=1.0,
+    )
+    controller.state = OperationState.COMPLETED
+    api = PrototypeRuntimeApi(controller)
+    api._namespace_names = ("Данные",)
+    runtime = object.__new__(RuntimeSession)
+    runtime.runtime_api = api
+    runtime._operation_lock = RLock()
+    runtime._closed = False
+    fields: list[tuple[str, ...]] = []
+    errors: list[BaseException] = []
+
+    def complete() -> None:
+        try:
+            fields.append(runtime.completion_fields("Контекст.Данные", timeout_s=1.0))
+        except BaseException as error:
+            errors.append(error)
+
+    caller = Thread(target=complete, name="ready-session-completion-waiter")
+    try:
+        caller.start()
+        assert session.accepted.wait(1), "ready inspection was not acknowledged"
+        assert session.polling.wait(1), "ready inspection was not polled"
+
+        # The coordinator owns the acknowledged request now. The original
+        # caller must no longer block control-plane work on either outer lock.
+        assert runtime._operation_lock.acquire(blocking=False)
+        runtime._operation_lock.release()
+        assert api._lock.acquire(blocking=False)
+        api._lock.release()
+        assert runtime.status().state is OperationState.RECOVERING
+        with pytest.raises(ProtocolError):
+            runtime.completion_fields("Контекст.Данные", timeout_s=0.1)
+        assert session.capture_start_count == 1
+
+        session.complete(_completion_wire(), type_name="Строка")
+        caller.join(1)
+        assert not caller.is_alive()
+        assert fields == [("Номер", "Название")]
+        assert errors == []
+        assert controller.state is OperationState.COMPLETED
+    finally:
+        if session.capture_pending is not None:
+            session.complete(_completion_wire(), type_name="Строка")
+        caller.join(1)
+        close_owner(controller, session)
