@@ -139,13 +139,21 @@ class ControlledCaptureSession(ScriptedSession):
             raise AssertionError("controller redispatched while one capability was pending")
         pending = PendingEvaluation(TARGET, uuid4(), self._controlled_owner)
         self.capture_pending = pending
+        # CAPTURE helper sources are now correctly executed through the live
+        # current-capture wrapper too.  Classify cleanup by its operation,
+        # before looking for the common wrapper call, so the fake continues to
+        # model a completed helper rather than a second user evaluation.
         self._pending_role = (
             "messages"
             if "ЗабратьСообщенияЯчейкиИзКонтекста" in expression
             else (
-                "evaluation"
-                if "ВыполнитьКод" in expression
-                else "helper"
+                "helper"
+                if "Контекст.Удалить(" in expression and "__onec_" in expression
+                else (
+                    "evaluation"
+                    if "ВыполнитьКод" in expression
+                    else "helper"
+                )
             )
         )
         if self._pending_role == "evaluation":

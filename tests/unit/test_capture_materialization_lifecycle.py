@@ -12,6 +12,8 @@ from onec_runtime.capture_evaluation import (
 from onec_runtime.errors import (
     CaptureBusyError,
     CaptureEvaluationPendingError,
+    CaptureOutcomeUnknownError,
+    CaptureRecoveryRequiredError,
     CaptureValueAccessDeniedError,
     CaptureValueCheckError,
 )
@@ -98,7 +100,7 @@ def test_proxy_table_materialization_detaches_one_composite_capture_helper() -> 
             for call in session.calls
             if call[0] == "start_evaluation"
         ][-1]
-        assert "Контекст.Удалить(\"__onec_compact_table_" in cleanup_source
+        assert "Контекст.Удалить(\"\"__onec_compact_table_" in cleanup_source
         assert controller.state is OperationState.CAPTURED
     finally:
         if session.capture_pending is not None:
@@ -134,6 +136,7 @@ def test_table_admission_rejects_before_private_payload_transfer(
     try:
         caller.start()
         assert session.accepted.wait(1), "materialization was not acknowledged"
+        assert session.polling.wait(1), "materialization was not polling"
         session.auto_helpers = True
         session.complete(envelope, type_name="Строка")
         caller.join(1)
@@ -145,7 +148,91 @@ def test_table_admission_rejects_before_private_payload_transfer(
         sources = [call[1][0] for call in session.calls if call[0] == "start_evaluation"]
         assert len(sources) == 2
         assert all("ЗабратьКомпактнуюМатериализациюИзКонтекста" not in source for source in sources)
-        assert "Контекст.Удалить(\"__onec_compact_table_" in sources[-1]
+        assert "Контекст.Удалить(\"\"__onec_compact_table_" in sources[-1]
+    finally:
+        if session.capture_pending is not None:
+            session.complete()
+        caller.join(1)
+        close_owner(controller, session)
+
+
+def test_table_bsl_failure_is_a_value_check_before_payload_read() -> None:
+    session = ControlledCaptureSession()
+    controller = captured_controller(session, command_timeout_s=1)
+    api = PrototypeRuntimeApi(controller)
+    proxy = _table_proxy(api, runtime_generation=controller.runtime_generation)
+    errors: list[BaseException] = []
+
+    def materialize() -> None:
+        try:
+            proxy.to_df()
+        except BaseException as error:
+            errors.append(error)
+
+    caller = Thread(target=materialize, name="materialization-bsl-failure")
+    try:
+        caller.start()
+        assert session.accepted.wait(1)
+        assert session.polling.wait(1)
+        session.auto_helpers = True
+        session.complete("private platform failure", type_name="Ошибка", error="private")
+        caller.join(1)
+
+        assert len(errors) == 1
+        assert isinstance(errors[0], CaptureValueCheckError)
+        _eventually(lambda: api.current_capture().status().phase is CapturePhase.PAUSED)
+        sources = [call[1][0] for call in session.calls if call[0] == "start_evaluation"]
+        assert len(sources) == 2
+        assert all("ЗабратьКомпактнуюМатериализациюИзКонтекста" not in source for source in sources)
+    finally:
+        if session.capture_pending is not None:
+            session.complete()
+        caller.join(1)
+        close_owner(controller, session)
+
+
+def test_table_dispatch_uncertainty_is_not_a_worker_error() -> None:
+    session = ControlledCaptureSession(dispatch_error=OSError("transport lost"))
+    controller = captured_controller(session, command_timeout_s=1)
+    api = PrototypeRuntimeApi(controller)
+    proxy = _table_proxy(api, runtime_generation=controller.runtime_generation)
+    try:
+        with pytest.raises(CaptureOutcomeUnknownError):
+            proxy.to_df()
+        status = api.current_capture().status()
+        assert status.phase is CapturePhase.OUTCOME_UNKNOWN
+        assert status.evaluation_kind is None
+        assert session.capture_start_count == 1
+    finally:
+        close_owner(controller, session)
+
+
+def test_table_cleanup_uncertainty_requires_recovery() -> None:
+    session = ControlledCaptureSession()
+    controller = captured_controller(session, command_timeout_s=1)
+    api = PrototypeRuntimeApi(controller)
+    proxy = _table_proxy(api, runtime_generation=controller.runtime_generation)
+    errors: list[BaseException] = []
+
+    def materialize() -> None:
+        try:
+            proxy.to_df()
+        except BaseException as error:
+            errors.append(error)
+
+    caller = Thread(target=materialize, name="materialization-cleanup-uncertain")
+    try:
+        caller.start()
+        assert session.accepted.wait(1)
+        session.auto_helpers = True
+        session.dispatch_error = OSError("cleanup transport lost")
+        session.complete("R|1|1|1|" + "a" * 64 + "|4", type_name="Строка")
+        caller.join(1)
+
+        assert len(errors) == 1
+        assert isinstance(errors[0], CaptureRecoveryRequiredError)
+        assert api.current_capture().status().phase is CapturePhase.RECOVERY_REQUIRED
+        assert session.capture_start_count == 2
     finally:
         if session.capture_pending is not None:
             session.complete()
