@@ -144,3 +144,80 @@ The final direct harness suite completed with `131 passed, 8 skipped` in 2.80
 seconds. The broader affected unit suite completed with `571 passed` in 36.76
 seconds. `python -m compileall -q src/onec_runtime packages/jupyter
 packages/mcp` and `git diff --check` pass after the final change.
+
+## Task 8 lifecycle completion
+
+- `OnecValueProxy.to_df()` transfers a prebuilt `CaptureTransferPlan` through
+  the controller-owned coordinator. Its first value-consuming generated BSL
+  branch admits the root before it may serialize or publish a temporary
+  context value. The coordinator owns the acknowledged capability, pin and
+  cleanup lease; a caller deadline detaches without fetching or decoding the
+  private payload.
+- The lifecycle regressions cover pending, busy-without-redispatch, denied and
+  malformed admission, confirmed BSL failure, dispatch uncertainty and cleanup
+  dispatch uncertainty. They assert the public typed outcomes
+  `CaptureEvaluationPendingError`, `CaptureBusyError`,
+  `CaptureValueAccessDeniedError`, `CaptureValueCheckError`,
+  `CaptureOutcomeUnknownError`, and `CaptureRecoveryRequiredError` rather
+  than a Worker-object error.
+- Recursive `materialize_value()` and generic `project_value()` now each send
+  one dynamic instruction. It performs `ДопуститьЗначение`, then determines
+  the server route, serializes the table or recursive value, and only then
+  writes the sealed payload. Python identifies that route only from the
+  integrity-checked payload header; it does not perform a target-side
+  guard-then-use route query. Captured calls use explicit
+  `MATERIALIZATION_HELPER` or `INSPECTION` coordinator records.
+- Completion remains a single bounded consumer-owned collection request whose
+  server helper admits before enumerating names. Its 129-row closed page keeps
+  the admission marker plus all 128 permitted names.
+
+No 1C module changed in this lifecycle pass, so the checked-in protocol-2,
+artifact-0.1.3 CFE and four-source manifest remain the matching Designer-built
+bundle recorded above.
+
+## Lifecycle validation
+
+- RED `5780fca` adds recursive materialization and projection regressions that
+  fail when a separate public route request is made. GREEN `fd18e93` makes
+  both paths composite and updates every affected fake to supply only the
+  sealed result envelope.
+- `uv run python -m pytest tests/unit/test_runtime_api.py
+  tests/unit/test_capture_materialization_lifecycle.py
+  tests/unit/test_jupyter_value_proxy.py tests/unit/test_completion_fields.py
+  tests/unit/test_prototype_runtime.py -q` completed with `334 passed` in
+  8.31 seconds.
+- The focused composite set completed with `240 passed` in 6.70 seconds;
+  the dynamic source parser check wrapped both generated instructions in a
+  BSL procedure and passed the pinned parser.
+- `python -m compileall -q src/onec_runtime packages/jupyter/src
+  packages/mcp/src` and `git diff --check` pass.
+
+## Lifecycle completion follow-up
+
+- The capture-transfer controller now shields the debugger workspace before
+  its one composite materialization request and restores the full workspace
+  after the confirmed remote result, before admission policy or any optional
+  payload continuation. A restore failure therefore reports
+  `CaptureRecoveryRequiredError` and cannot trigger a payload fetch or a
+  second materialization dispatch.
+- Table and recursive value materialization both have coordinator lifecycle
+  regressions: acknowledged pending receipt, explicit
+  `MATERIALIZATION_HELPER` status, a second call rejected as
+  `CaptureBusyError` without redispatch, and a late sealed result cleaned by
+  the owner with no payload fetch/decode. The table route also proves an
+  interrupted initiating waiter detaches on `KeyboardInterrupt` and does not
+  cancel the owner cleanup.
+- RED `fbee17f` demonstrated that a confirmed table envelope could reach its
+  continuation without a transfer workspace restore. GREEN `a10dd68` adds
+  the controller-owned shield/restore contract to the first transfer step.
+  `065212f` records the direct interrupt regression and `7b1b2b6` updates
+  the test transport to distinguish a user cell's message-key cleanup from a
+  transfer cleanup. The latter also updates stale state-store expectations to
+  sole protocol `2`.
+
+The materialization lifecycle/restore exact suite passed `15 passed` in 2.18
+seconds. The expanded coordinator/runtime/backend suite passed `477 passed`
+in 10.94 seconds. Jupyter/value routes passed `51 passed` in 25.61 seconds;
+the MCP minimum passed `23 passed` in 2.94 seconds. The final full unit suite
+passed `4554 passed, 58 skipped` in 249.59 seconds (one existing Windows ZMQ
+Proactor warning).
