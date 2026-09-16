@@ -41,6 +41,7 @@ from onec_runtime.bsl import (
 )
 from onec_runtime.bsl.diagnostics import (
     DiagnosticStage,
+    ErrorTraceFrameOrigin,
     MappingConfidence,
     parse_platform_diagnostic,
 )
@@ -71,6 +72,7 @@ from onec_runtime.worker_universe import (
     WorkerUniverseManifest,
     registration_name as worker_registration_name,
 )
+from onec_runtime_jupyter.extension import NotebookDisplayConfig, _display_reply
 
 
 MODULE_A = "JupyterBslFixtureCallerServer"
@@ -1832,6 +1834,136 @@ def test_compile_and_runtime_diagnostics_are_mapped_from_real_1c(
             (b_frame.lowered_location.line, None),
             (a_frame.lowered_location.line, None),
         )
+
+
+@pytest.mark.integration
+@pytest.mark.live_1c
+@pytest.mark.timeout(600)
+def test_main_and_capture_error_traces_use_live_operation_maps(
+    tmp_path: Path,
+) -> None:
+    """A real failed cell must map MAIN and pinned Worker frames independently."""
+    contract = worker_universe_source_contract()
+    with _fresh_live_harness(tmp_path, emit_evidence=False) as harness:
+        harness.session.load_worker_modules(contract.g17_units)
+        source = f"Результат = {MODULE_A}.АварияA();"
+        unit = SourceUnitRef(
+            SourceUnitKind.NOTEBOOK_CELL,
+            "live-error-main",
+            1,
+            source_sha256(source),
+        )
+
+        main_provenance = []
+        failed_main = harness.session.execute_bsl(
+            source,
+            source_unit=unit,
+            on_execution_provenance=main_provenance.append,
+        )
+
+        assert failed_main.kind is RuntimeReplyKind.MAIN_COMPLETED
+        assert failed_main.succeeded is False
+        assert failed_main.diagnostic is not None
+        main_frames = failed_main.diagnostic.frames
+        assert [frame.logical_name for frame in main_frames if frame.origin is ErrorTraceFrameOrigin.WORKER_ARTIFACT] == [
+            MODULE_B,
+            MODULE_A,
+        ]
+        assert any(
+            frame.origin is ErrorTraceFrameOrigin.EXECUTED_ARTIFACT
+            and frame.mapping_confidence is MappingConfidence.UNKNOWN
+            and frame.platform_location.module_name is None
+            for frame in main_frames
+        )
+        assert main_frames[-1].origin is ErrorTraceFrameOrigin.NATIVE_MODULE
+        assert len(main_provenance) == 1
+        main_display = _display_reply(
+            failed_main,
+            NotebookDisplayConfig.presentation(),
+            visible_source=source,
+            source_unit=unit,
+            execution_provenance=main_provenance[0],
+        )
+        assert "Стек (1С):" in main_display.text
+        assert MODULE_A in main_display.text
+        assert MODULE_B in main_display.text
+
+        direct_source = 'ВызватьИсключение "live-direct-main";'
+        direct_unit = SourceUnitRef(
+            SourceUnitKind.NOTEBOOK_CELL,
+            "live-error-direct",
+            1,
+            source_sha256(direct_source),
+        )
+        failed_direct = harness.session.execute_bsl(
+            direct_source,
+            source_unit=direct_unit,
+        )
+        assert failed_direct.kind is RuntimeReplyKind.MAIN_COMPLETED
+        assert failed_direct.succeeded is False
+        assert failed_direct.diagnostic is not None
+        assert any(
+            frame.origin is ErrorTraceFrameOrigin.EXECUTED_ARTIFACT
+            and frame.mapping_confidence is MappingConfidence.EXACT
+            and frame.source_unit == direct_unit
+            for frame in failed_direct.diagnostic.frames
+        )
+        direct_display = _display_reply(
+            failed_direct,
+            NotebookDisplayConfig.presentation(),
+            visible_source=direct_source,
+            source_unit=direct_unit,
+        )
+        assert "Ячейка BSL (строка 1" in direct_display.text
+        assert "live-direct-main" in direct_display.text
+
+        _enter_synthetic_capture(harness)
+        capture_source = f"РезультатИнструкции = {MODULE_A}.АварияA();"
+        capture_unit = SourceUnitRef(
+            SourceUnitKind.NOTEBOOK_CELL,
+            "live-error-capture",
+            1,
+            source_sha256(capture_source),
+        )
+        failed_capture = harness.session.execute_bsl(
+            capture_source,
+            source_unit=capture_unit,
+        )
+
+        assert failed_capture.kind is RuntimeReplyKind.CAPTURE_CELL
+        assert failed_capture.succeeded is False
+        assert failed_capture.diagnostic is not None
+        capture_frames = failed_capture.diagnostic.frames
+        assert len(capture_frames) == len(
+            parse_platform_diagnostic(
+                failed_capture.diagnostic.platform_diagnostic or ""
+            ).frames
+        )
+        assert capture_frames[0].origin is ErrorTraceFrameOrigin.WORKER_ARTIFACT
+        assert capture_frames[0].logical_name == MODULE_B
+        assert capture_frames[0].mapping_confidence is MappingConfidence.EXACT
+
+        direct_capture_source = "РезультатИнструкции = 1 / 0;"
+        direct_capture_unit = SourceUnitRef(
+            SourceUnitKind.NOTEBOOK_CELL,
+            "live-error-capture-direct",
+            1,
+            source_sha256(direct_capture_source),
+        )
+        direct_capture = harness.session.execute_bsl(
+            direct_capture_source,
+            source_unit=direct_capture_unit,
+        )
+        assert direct_capture.kind is RuntimeReplyKind.CAPTURE_CELL
+        assert direct_capture.succeeded is False
+        assert direct_capture.diagnostic is not None
+        assert any(
+            frame.origin is ErrorTraceFrameOrigin.EXECUTED_ARTIFACT
+            and frame.mapping_confidence is MappingConfidence.EXACT
+            and frame.source_unit == direct_capture_unit
+            for frame in direct_capture.diagnostic.frames
+        )
+        assert harness.session.resume_capture().succeeded is True
 
 
 @pytest.mark.integration

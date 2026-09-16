@@ -54,7 +54,6 @@ from onec_runtime.capture_source import SourceVersionRef
 from onec_runtime.bsl import (
     DiagnosticStage,
     LoweringMode,
-    MappingConfidence,
     NormalizedDiagnostic,
     ParsedModuleModel,
     ResolvedModulePlan,
@@ -7040,7 +7039,6 @@ class PrototypeRuntimeApi:
                 and current.source_map_sha256 == executed.source_map_sha256
                 and any(
                     frame.origin is ErrorTraceFrameOrigin.EXECUTED_ARTIFACT
-                    and frame.mapping_confidence is not MappingConfidence.UNKNOWN
                     for frame in current.frames
                 )
             ):

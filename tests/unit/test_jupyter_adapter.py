@@ -11,6 +11,7 @@ from IPython.utils.capture import capture_output
 
 import onec_runtime.privacy as privacy
 from onec_runtime_jupyter import BslCellError
+from onec_runtime_jupyter.diagnostic_sources import DiagnosticSourceFiles
 from onec_runtime_mcp.agent.contracts import OperationExecutionProvenance
 from onec_runtime_jupyter.extension import (
     MACHINE_MIME_TYPE,
@@ -45,6 +46,7 @@ from onec_runtime.runtime_api import (
 )
 from onec_runtime.bsl import (
     DiagnosticStage,
+    MappingConfidence,
     SourceArtifactKind,
     SourceSpan,
     SourceTransformBuilder,
@@ -55,6 +57,11 @@ from onec_runtime.bsl import (
     parse_platform_diagnostic,
     remap_platform_diagnostic,
     source_sha256,
+)
+from onec_runtime.bsl.diagnostics import (
+    ErrorTraceFrameOrigin,
+    WorkerDiagnosticArtifact,
+    normalize_platform_diagnostic_trace,
 )
 
 
@@ -264,8 +271,14 @@ def test_failed_reply_is_an_ipython_error_with_safe_rich_diagnostics(
             captured.outputs[0].data, ensure_ascii=False
         ) + repr(result.error_in_exec)
         assert "RAW platform" not in rendered
-        assert "private-connection" not in rendered
-        assert "9182" not in rendered
+        machine = json.dumps(payload, ensure_ascii=False)
+        assert "private-connection" not in machine
+        assert "9182" not in machine
+        assert "private-connection" not in repr(result.error_in_exec)
+        if normalized and magic.startswith("%%bsl"):
+            assert "private-connection" in rendered
+        else:
+            assert "private-connection" not in rendered
     finally:
         InteractiveShell.clear_instance()
 
@@ -400,6 +413,125 @@ def test_issued_origin_does_not_override_current_cell_text_hash_guard() -> None:
     )
     assert displayed.payload["diagnostic"] == {}
     assert "source_unit" not in displayed.payload
+
+
+def test_presentation_does_not_bypass_rejected_diagnostic_origin() -> None:
+    reply, source = _failed_reply_with_exact_diagnostic()
+    unit = reply.diagnostic.source_unit
+    displayed = _display_reply(
+        reply,
+        NotebookDisplayConfig.presentation(),
+        visible_source=source + "\n",
+        source_unit=unit,
+        known_source_unit=unit,
+    )
+
+    assert displayed.payload["diagnostic"] == {}
+    assert reply.diagnostic.platform_diagnostic not in displayed.text
+    assert displayed.html is None
+
+
+def test_presentation_admits_worker_first_trace_from_current_cell_request() -> None:
+    source = "Результат = Сервис.Ошибка();"
+    unit = SourceUnitRef(
+        SourceUnitKind.NOTEBOOK_CELL, "worker-first-cell", 1, source_sha256(source)
+    )
+    executed = mapped_visible_source(source, unit)
+    worker_source = "Функция Ошибка() Экспорт\nВызватьИсключение \"тест\";\nКонецФункции"
+    worker_unit = SourceUnitRef(
+        SourceUnitKind.MODULE, "Сервис", 1, source_sha256(worker_source)
+    )
+    builder = SourceTransformBuilder(mapped_visible_source(worker_source, worker_unit))
+    builder.copy(SourceSpan(0, len(worker_source)))
+    worker_map = builder.build(SourceArtifactKind.WORKER_PROJECTION)
+    registration = "OnecRuntime_bbbbbbbb_bbbbbbbbbbbbbbbb"
+    manifest = "c" * 64
+    artifact = WorkerDiagnosticArtifact(
+        logical_name="Сервис",
+        revision=1,
+        artifact_sha256="b" * 64,
+        registration_name=registration,
+        manifest_sha256=manifest,
+        source_map_sha256=worker_map.source_map_sha256,
+        mapped_source=worker_map,
+        visible_source_context=VisibleSourceContext({worker_unit: worker_source}),
+    )
+    diagnostic = normalize_platform_diagnostic_trace(
+        parse_platform_diagnostic(
+            "Ошибка 1С\n"
+            f"{{ВнешняяОбработка.{registration}.МодульОбъекта(2,1)}}: "
+            "ВызватьИсключение \"тест\";\n"
+            "{(1)}: Результат = Сервис.Ошибка();"
+        ),
+        stage=DiagnosticStage.EXECUTION,
+        executed=executed,
+        visible_source_context=VisibleSourceContext({unit: source}),
+        pinned_manifest_sha256=manifest,
+        pinned_artifacts=(artifact,),
+    )
+    assert diagnostic.source_unit == worker_unit
+    assert diagnostic.frames[0].origin is ErrorTraceFrameOrigin.WORKER_ARTIFACT
+    reply = RuntimeReply(
+        RuntimeReplyKind.MAIN_COMPLETED, 12, OperationState.FAILED,
+        succeeded=False, diagnostic=diagnostic,
+    )
+    provenance = OperationExecutionProvenance(
+        visible_source_sha256=unit.source_sha256,
+        executed_source_sha256=executed.artifact.source_sha256,
+        source_map_sha256=executed.source_map_sha256,
+        mode="main",
+    )
+
+    displayed = _display_reply(
+        reply,
+        NotebookDisplayConfig.presentation(),
+        visible_source=source,
+        source_unit=unit,
+        execution_provenance=provenance,
+    )
+
+    assert displayed.payload["diagnostic"] == {}
+    assert "Стек (1С):" in displayed.text
+    assert "Сервис (строка 2" in displayed.text
+
+
+def test_presentation_rejects_unlocated_trace_with_wrong_artifact_identity() -> None:
+    source = "Результат = 1;"
+    unit = SourceUnitRef(
+        SourceUnitKind.NOTEBOOK_CELL, "unitless-stale", 1, source_sha256(source)
+    )
+    executed = mapped_visible_source(source, unit)
+    diagnostic = normalize_platform_diagnostic_trace(
+        parse_platform_diagnostic("Чужая ошибка 1С"),
+        stage=DiagnosticStage.EXECUTION,
+        executed=executed,
+    )
+    assert diagnostic.source_unit is None
+    stale = replace(
+        diagnostic,
+        execution_artifact_sha256="f" * 64,
+        source_map_sha256="e" * 64,
+    )
+    reply = RuntimeReply(
+        RuntimeReplyKind.MAIN_COMPLETED, 12, OperationState.FAILED,
+        succeeded=False, diagnostic=stale,
+    )
+    provenance = OperationExecutionProvenance(
+        visible_source_sha256=unit.source_sha256,
+        executed_source_sha256=executed.artifact.source_sha256,
+        source_map_sha256=executed.source_map_sha256,
+        mode="main",
+    )
+
+    displayed = _display_reply(
+        reply,
+        NotebookDisplayConfig.presentation(),
+        visible_source=source,
+        source_unit=unit,
+        execution_provenance=provenance,
+    )
+
+    assert "Чужая ошибка 1С" not in displayed.text
 
 
 def test_bsl_magic_passes_visible_cell_and_returns_stable_mime_bundle() -> None:
@@ -694,7 +826,7 @@ def test_presentation_mode_suppresses_worker_loaded_status() -> None:
         ),
     ],
 )
-def test_presentation_mode_omits_nested_platform_cause(stage, platform_text, expected):
+def test_presentation_mode_shows_nested_platform_cause(stage, platform_text, expected):
     source = "Элемент.Записать();"
     unit = SourceUnitRef(
         SourceUnitKind.NOTEBOOK_CELL, "nested-error", 1, source_sha256(source),
@@ -713,11 +845,12 @@ def test_presentation_mode_omits_nested_platform_cause(stage, platform_text, exp
         visible_source=source, source_unit=unit,
     )
 
-    assert expected not in displayed.text
+    assert expected in displayed.text
     assert "строка 1" in displayed.text
+    assert expected not in json.dumps(displayed.payload, ensure_ascii=False)
 
 
-def test_presentation_mode_omits_unlocated_platform_cause():
+def test_presentation_mode_shows_unlocated_platform_cause_without_location():
     source = "Элемент.Записать();"
     unit = SourceUnitRef(
         SourceUnitKind.NOTEBOOK_CELL, "unlocated-write", 1, source_sha256(source),
@@ -748,8 +881,434 @@ def test_presentation_mode_omits_unlocated_platform_cause():
         execution_provenance=provenance,
     )
 
-    assert "Не заполнено обязательное поле Наименование" not in displayed.text
+    assert "Не заполнено обязательное поле Наименование" in displayed.text
     assert "строка" not in displayed.text
+    assert "Не заполнено обязательное поле Наименование" not in json.dumps(
+        displayed.payload, ensure_ascii=False
+    )
+
+
+def test_presentation_renders_full_cause_chain_and_mixed_stack() -> None:
+    """Break caught: notebook hides the reasons and native frames supplied by 1C."""
+    source = "Результат = 1 / 0;"
+    unit = SourceUnitRef(
+        SourceUnitKind.NOTEBOOK_CELL, "trace-cell", 1, source_sha256(source)
+    )
+    raw = (
+        "Error getting value of context attribute\n"
+        "{<Неизвестный модуль>(1,1)}: Результат = 1 / 0;\n"
+        "Reason:\n"
+        "Attempt to obtain an uninitialized value\n"
+        "{ОбщийМодуль.Сервис.Модуль(7)}: Возврат Значение;"
+    )
+    diagnostic = remap_platform_diagnostic(
+        parse_platform_diagnostic(raw),
+        mapped_visible_source(source, unit),
+        stage=DiagnosticStage.EXECUTION,
+        visible_source_context=VisibleSourceContext({unit: source}),
+    )
+    reply = RuntimeReply(
+        RuntimeReplyKind.MAIN_COMPLETED,
+        12,
+        OperationState.FAILED,
+        succeeded=False,
+        error="untrusted RuntimeReply error fallback",
+        diagnostic=diagnostic,
+    )
+
+    displayed = _display_reply(
+        reply,
+        NotebookDisplayConfig.presentation(),
+        visible_source=source,
+        source_unit=unit,
+        execution_provenance=OperationExecutionProvenance(
+            visible_source_sha256=unit.source_sha256,
+            executed_source_sha256=diagnostic.execution_artifact_sha256,
+            source_map_sha256=diagnostic.source_map_sha256,
+            mode="main",
+        ),
+    )
+
+    assert "Error getting value of context attribute" in displayed.text
+    assert "Attempt to obtain an uninitialized value" in displayed.text
+    assert "Стек" in displayed.text
+    assert "ОбщийМодуль.Сервис.Модуль (строка 7)" in displayed.text
+    assert "Результат = 1 / 0;" in displayed.text
+    assert "untrusted RuntimeReply error fallback" not in displayed.text
+    assert displayed.html is not None
+    assert "Error getting value" not in json.dumps(displayed.payload)
+
+
+def test_error_trace_html_is_escaped() -> None:
+    raw = "Ошибка <script>alert(1)</script>\n{ОбщийМодуль.Сервис.Модуль(7)}: Код()"
+    reply = RuntimeReply(
+        RuntimeReplyKind.MAIN_COMPLETED,
+        12,
+        OperationState.FAILED,
+        succeeded=False,
+        diagnostic=normalize_platform_diagnostic_trace(
+            parse_platform_diagnostic(raw), stage=DiagnosticStage.EXECUTION
+        ),
+    )
+
+    displayed = _display_reply(reply, NotebookDisplayConfig.presentation())
+
+    assert "<script>" in displayed.text
+    assert displayed.html is not None
+    assert "<script>" not in displayed.html
+    assert "&lt;script&gt;" in displayed.html
+
+
+def test_presentation_retains_unclassified_1c_diagnostic_text() -> None:
+    raw = (
+        "Ошибка 1С\n"
+        "{ОбщийМодуль.Сервис.Модуль(7)}: Вызов();\n"
+        "[ОшибкаВоВремяВыполненияВстроенногоЯзыка]\n"
+        "Platform-specific diagnostic note"
+    )
+    reply = RuntimeReply(
+        RuntimeReplyKind.MAIN_COMPLETED,
+        12,
+        OperationState.FAILED,
+        succeeded=False,
+        diagnostic=normalize_platform_diagnostic_trace(
+            parse_platform_diagnostic(raw), stage=DiagnosticStage.EXECUTION
+        ),
+    )
+
+    displayed = _display_reply(reply, NotebookDisplayConfig.presentation())
+
+    assert "Стек (1С):" in displayed.text
+    assert "Platform-specific diagnostic note" in displayed.text
+    assert "[ОшибкаВоВремяВыполненияВстроенногоЯзыка]" in displayed.text
+    assert raw not in json.dumps(displayed.payload, ensure_ascii=False)
+
+
+def test_presentation_marks_truncated_platform_diagnostic() -> None:
+    diagnostic = normalize_platform_diagnostic_trace(
+        parse_platform_diagnostic("Ошибка 1С"), stage=DiagnosticStage.EXECUTION
+    )
+    reply = RuntimeReply(
+        RuntimeReplyKind.MAIN_COMPLETED,
+        12,
+        OperationState.FAILED,
+        succeeded=False,
+        diagnostic=replace(diagnostic, platform_diagnostic_truncated=True),
+    )
+
+    displayed = _display_reply(reply, NotebookDisplayConfig.presentation())
+
+    assert "сообщение 1С обрезано" in displayed.text
+
+
+def test_presentation_distinguishes_extension_native_frame() -> None:
+    diagnostic = normalize_platform_diagnostic_trace(
+        parse_platform_diagnostic(
+            "Ошибка 1С\n{FixtureExtension ОбщийМодуль.Сервис.Модуль(7)}: Код();"
+        ),
+        stage=DiagnosticStage.EXECUTION,
+    )
+    reply = RuntimeReply(
+        RuntimeReplyKind.MAIN_COMPLETED,
+        12,
+        OperationState.FAILED,
+        succeeded=False,
+        diagnostic=diagnostic,
+    )
+
+    displayed = _display_reply(reply, NotebookDisplayConfig.presentation())
+
+    assert "FixtureExtension: ОбщийМодуль.Сервис.Модуль (строка 7)" in displayed.text
+
+
+def test_presentation_marks_derived_cell_frame_as_approximate() -> None:
+    source = "Результат = Сервис.Вызвать();"
+    unit = SourceUnitRef(
+        SourceUnitKind.NOTEBOOK_CELL, "derived-cell", 1, source_sha256(source)
+    )
+    builder = SourceTransformBuilder(mapped_visible_source(source, unit))
+    builder.derived(
+        "Результат = __Generated();", SourceSpan(0, len(source)), "call_rewrite"
+    )
+    executed = builder.build(SourceArtifactKind.EXECUTED_BSL)
+    diagnostic = normalize_platform_diagnostic_trace(
+        parse_platform_diagnostic(
+            "Ошибка 1С\n{<Неизвестный модуль>(1,1)}: Результат = __Generated();"
+        ),
+        stage=DiagnosticStage.EXECUTION,
+        executed=executed,
+        visible_source_context=VisibleSourceContext({unit: source}),
+    )
+    assert diagnostic.frames[0].mapping_confidence is MappingConfidence.NEAREST
+    assert diagnostic.frames[0].source_unit == unit
+    assert privacy.diagnostic_to_public_wire(diagnostic)
+    provenance = OperationExecutionProvenance(
+        visible_source_sha256=unit.source_sha256,
+        executed_source_sha256=diagnostic.execution_artifact_sha256,
+        source_map_sha256=diagnostic.source_map_sha256,
+        mode="main",
+    )
+    reply = RuntimeReply(
+        RuntimeReplyKind.MAIN_COMPLETED,
+        12,
+        OperationState.FAILED,
+        succeeded=False,
+        diagnostic=diagnostic,
+    )
+
+    displayed = _display_reply(
+        reply,
+        NotebookDisplayConfig.presentation(),
+        visible_source=source,
+        source_unit=unit,
+        execution_provenance=provenance,
+    )
+
+    assert "Ячейка BSL — сгенерированный код" in displayed.text
+    assert "ориентир: ячейка BSL, строка 1 (приблизительно)" in displayed.text
+    assert "фрагмент 1С: Результат = __Generated();" in displayed.text
+
+
+def test_error_renderer_failure_does_not_replace_runtime_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reply = RuntimeReply(
+        RuntimeReplyKind.MAIN_COMPLETED,
+        12,
+        OperationState.FAILED,
+        succeeded=False,
+        diagnostic=normalize_platform_diagnostic_trace(
+            parse_platform_diagnostic("Ошибка 1С"), stage=DiagnosticStage.EXECUTION
+        ),
+    )
+
+    def fail_renderer(*args: object, **kwargs: object) -> None:
+        raise KeyboardInterrupt("diagnostic renderer failed")
+
+    monkeypatch.setattr("onec_runtime_jupyter.extension.render_error_trace", fail_renderer)
+    displayed = _display_reply(reply, NotebookDisplayConfig.presentation())
+
+    assert "Ошибка" in displayed.text
+    assert displayed.payload["succeeded"] is False
+
+
+def test_success_does_not_invoke_error_renderer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reply = RuntimeReply(
+        RuntimeReplyKind.CAPTURED,
+        12,
+        OperationState.CAPTURED,
+        stop_sequence=1,
+    )
+
+    def fail_renderer(*args: object, **kwargs: object) -> None:
+        raise AssertionError("success must not render diagnostics")
+
+    monkeypatch.setattr("onec_runtime_jupyter.extension.render_error_trace", fail_renderer)
+    displayed = _display_reply(reply, NotebookDisplayConfig.presentation())
+
+    assert displayed.payload["succeeded"] is True
+
+
+def test_failed_cell_publishes_full_trace_once_with_short_ipython_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: the full platform trace is duplicated in IPython traceback."""
+    shell = FakeShell()
+    runtime = FakeRuntime()
+
+    def fail(
+        source: str,
+        *,
+        source_unit: SourceUnitRef,
+        on_execution_provenance: object = None,
+    ) -> RuntimeReply:
+        diagnostic = remap_platform_diagnostic(
+            parse_platform_diagnostic(
+                "Failure from 1C\n{<Неизвестный модуль>(1,1)}: statement"
+            ),
+            mapped_visible_source(source, source_unit),
+            stage=DiagnosticStage.EXECUTION,
+            visible_source_context=VisibleSourceContext({source_unit: source}),
+        )
+        if callable(on_execution_provenance):
+            on_execution_provenance(
+                OperationExecutionProvenance(
+                    visible_source_sha256=source_unit.source_sha256,
+                    executed_source_sha256=diagnostic.execution_artifact_sha256,
+                    source_map_sha256=diagnostic.source_map_sha256,
+                    mode="main",
+                )
+            )
+        return RuntimeReply(
+            RuntimeReplyKind.MAIN_COMPLETED, 13, OperationState.FAILED,
+            succeeded=False, diagnostic=diagnostic,
+        )
+
+    runtime.execute_bsl = fail  # type: ignore[method-assign]
+    install_runtime(shell, runtime)
+    published = []
+    monkeypatch.setattr("onec_runtime_jupyter.extension.display", published.append)
+
+    with pytest.raises(BslCellError) as caught:
+        OnecRuntimeMagics(shell).bsl("", "Результат = 1;")  # type: ignore[arg-type]
+
+    assert len(published) == 1
+    assert "Failure from 1C" in published[0].text
+    assert "Failure from 1C" not in str(caught.value)
+    assert "BSL" in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("module_name", "relative", "metadata"),
+    (
+        (
+            "ОбщийМодуль.Сервис.Модуль",
+            "CommonModules/Сервис/Ext/Module.bsl",
+            "CommonModules/Сервис.xml",
+        ),
+        (
+            "Справочник.Идентификаторы.МодульМенеджера",
+            "Catalogs/Идентификаторы/Ext/ManagerModule.bsl",
+            "Catalogs/Идентификаторы.xml",
+        ),
+        (
+            "Документ.ПриемНаРаботу.Форма.ФормаСписка.Форма",
+            "Documents/ПриемНаРаботу/Forms/ФормаСписка/Ext/Form/Module.bsl",
+            "Documents/ПриемНаРаботу/Forms/ФормаСписка.xml",
+        ),
+    ),
+)
+@pytest.mark.parametrize("root_slot", ("session", "capture", "active_capture"))
+@pytest.mark.parametrize("with_metadata", (True, False))
+def test_presentation_adds_optional_native_file_hint_from_source_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    module_name: str,
+    relative: str,
+    metadata: str,
+    root_slot: str,
+    with_metadata: bool,
+) -> None:
+    """Break caught: configured source_root cannot locate a native 1C frame."""
+    root = tmp_path / "source"
+    root.mkdir()
+    (root / "Configuration.xml").write_text(
+        '<MetaDataObject><Configuration uuid="00000000-0000-0000-0000-000000000001">'
+        "<Properties><Name>Test</Name></Properties></Configuration></MetaDataObject>",
+        encoding="utf-8",
+    )
+    file = root / relative
+    file.parent.mkdir(parents=True)
+    file.write_text("Возврат Значение;", encoding="utf-8")
+    metadata_file = root / metadata
+    metadata_file.parent.mkdir(parents=True, exist_ok=True)
+    if with_metadata:
+        metadata_file.write_text("<Metadata/>", encoding="utf-8")
+    runtime = FakeRuntime()
+    runtime.config = SimpleNamespace(
+        source_root=root if root_slot == "session" else None,
+        capture_source=(
+            SimpleNamespace(source_root=root) if root_slot == "capture" else None
+        ),
+    )
+    if root_slot == "active_capture":
+        runtime._capture_source_resolver = SimpleNamespace(source_root=root)
+
+    def fail(
+        _source: str,
+        *,
+        source_unit: SourceUnitRef,
+        on_execution_provenance: object = None,
+    ) -> RuntimeReply:
+        executed = mapped_visible_source(_source, source_unit)
+        diagnostic = normalize_platform_diagnostic_trace(
+            parse_platform_diagnostic(
+                f"Ошибка 1С\n{{{module_name}(7)}}: Возврат Значение;"
+            ),
+            stage=DiagnosticStage.EXECUTION,
+            executed=executed,
+            visible_source_context=VisibleSourceContext({source_unit: _source}),
+        )
+        if callable(on_execution_provenance):
+            on_execution_provenance(
+                OperationExecutionProvenance(
+                    visible_source_sha256=source_unit.source_sha256,
+                    executed_source_sha256=diagnostic.execution_artifact_sha256,
+                    source_map_sha256=diagnostic.source_map_sha256,
+                    mode=("capture" if root_slot == "active_capture" else "main"),
+                )
+            )
+        return RuntimeReply(
+            (
+                RuntimeReplyKind.CAPTURE_CELL
+                if root_slot == "active_capture"
+                else RuntimeReplyKind.MAIN_COMPLETED
+            ),
+            14,
+            OperationState.FAILED,
+            succeeded=False, diagnostic=diagnostic,
+        )
+
+    runtime.execute_bsl = fail  # type: ignore[method-assign]
+    shell = FakeShell()
+    install_runtime(shell, runtime)
+    published = []
+    monkeypatch.setattr("onec_runtime_jupyter.extension.display", published.append)
+
+    with pytest.raises(BslCellError):
+        OnecRuntimeMagics(shell).bsl("", "Результат = 1;")  # type: ignore[arg-type]
+
+    assert len(published) == 1
+    displayed = published[0]
+    if with_metadata:
+        assert f"файл: {relative}" in displayed.text
+    else:
+        assert f"файл: {relative}" not in displayed.text
+    assert "фрагмент 1С: Возврат Значение;" in displayed.text
+    assert str(root) not in displayed.text
+    assert relative not in json.dumps(displayed.payload, ensure_ascii=False)
+
+
+@pytest.mark.parametrize("with_configuration", (True, False))
+def test_worker_file_hint_requires_matching_visible_source(
+    tmp_path: Path, with_configuration: bool
+) -> None:
+    root = tmp_path / "source"
+    root.mkdir()
+    if with_configuration:
+        (root / "Configuration.xml").write_text(
+            '<MetaDataObject><Configuration uuid="00000000-0000-0000-0000-000000000001">'
+            "<Properties><Name>Test</Name></Properties></Configuration></MetaDataObject>",
+            encoding="utf-8",
+        )
+    module = root / "CommonModules" / "Сервис" / "Ext" / "Module.bsl"
+    module.parent.mkdir(parents=True)
+    metadata = root / "CommonModules" / "Сервис.xml"
+    metadata.write_text("<Metadata/>", encoding="utf-8")
+    source = "Возврат Значение;"
+    module.write_text(source, encoding="utf-8")
+    unit = SourceUnitRef(
+        SourceUnitKind.MODULE, "Сервис", 1, source_sha256(source)
+    )
+    diagnostic = normalize_platform_diagnostic_trace(
+        parse_platform_diagnostic(
+            "Ошибка 1С\n{ОбщийМодуль.Сервис.Модуль(1)}: Возврат Значение;"
+        ),
+        stage=DiagnosticStage.EXECUTION,
+    )
+    frame = replace(
+        diagnostic.frames[0],
+        origin=ErrorTraceFrameOrigin.WORKER_ARTIFACT,
+        logical_name="Сервис",
+        source_unit=unit,
+    )
+    files = DiagnosticSourceFiles(root)
+
+    assert files.hint(frame) == "CommonModules/Сервис/Ext/Module.bsl"
+    module.write_text("Возврат ДругоеЗначение;", encoding="utf-8")
+    assert files.hint(frame) is None
 
 
 def test_diagnostic_mode_keeps_visible_structured_json() -> None:

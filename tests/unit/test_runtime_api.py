@@ -651,6 +651,62 @@ def test_main_first_reply_keeps_main_primary_when_worker_follows() -> None:
     assert reply.diagnostic.frames[1].mapping_confidence is MappingConfidence.EXACT
 
 
+def test_worker_first_reply_keeps_unmappable_executed_line_frame() -> None:
+    """Break caught: a mixed generated line still belongs to the failed MAIN."""
+    source = "Результат = МодульА.Вызвать();"
+    unit = SourceUnitRef(
+        SourceUnitKind.NOTEBOOK_CELL, "mixed-main-line", 1, source_sha256(source)
+    )
+    builder = SourceTransformBuilder(mapped_visible_source(source, unit))
+    prefix_end = source.index("МодульА")
+    suffix_start = source.index(";")
+    builder.copy(SourceSpan(0, prefix_end))
+    builder.derived(
+        '__OnecPinnedWorkerGeneration.Modules.Получить("МодульА").Вызвать()',
+        SourceSpan(prefix_end, suffix_start),
+        "worker_call",
+    )
+    builder.copy(SourceSpan(suffix_start, len(source)))
+    executed = builder.build(SourceArtifactKind.EXECUTED_BSL)
+    context = VisibleSourceContext({unit: source})
+    _source, _unused, _context, artifact, _message = _mixed_error_evidence()
+    message = (
+        "{ВнешняяОбработка."
+        f"{artifact.registration_name}.МодульОбъекта(2)}}: worker\n"
+        "{(1)}: generated call"
+    )
+    api = PrototypeRuntimeApi(FakeController())
+    api._operation_generation_pin = SimpleNamespace(
+        handle=SimpleNamespace(manifest_sha256=artifact.manifest_sha256)
+    )
+    api._worker_generation_diagnostics[artifact.manifest_sha256] = (artifact,)
+    current = remap_platform_diagnostic(
+        parse_platform_diagnostic(message),
+        executed,
+        stage=DiagnosticStage.EXECUTION,
+        visible_source_context=context,
+    )
+    assert current.frames[1].origin is ErrorTraceFrameOrigin.EXECUTED_ARTIFACT
+    assert current.frames[1].mapping_confidence is MappingConfidence.UNKNOWN
+    operation = OperationHandle(
+        11, source, executed.text,
+        executed_source=executed,
+        visible_source_context=context,
+    )
+
+    reply = api._reply(
+        MainCompletion(operation, None, message, False, diagnostic=current)
+    )
+
+    assert reply.diagnostic is not None
+    assert [frame.origin for frame in reply.diagnostic.frames] == [
+        ErrorTraceFrameOrigin.WORKER_ARTIFACT,
+        ErrorTraceFrameOrigin.EXECUTED_ARTIFACT,
+    ]
+    assert reply.diagnostic.frames[0].mapping_confidence is MappingConfidence.EXACT
+    assert reply.diagnostic.frames[1].mapping_confidence is MappingConfidence.UNKNOWN
+
+
 def test_successful_main_reply_never_calls_diagnostic_enrichment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
