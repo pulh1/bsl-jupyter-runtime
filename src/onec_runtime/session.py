@@ -2200,9 +2200,10 @@ class RuntimeSession:
         try:
             if self._closed:
                 raise ProtocolError("Runtime session is closed")
-            return self.runtime_api.completion_fields(
-                handle, table_row=table_row, timeout_s=timeout_s
-            )
+            with self._capture_materialization_caller_handoff():
+                return self.runtime_api.completion_fields(
+                    handle, table_row=table_row, timeout_s=timeout_s
+                )
         finally:
             self._operation_lock.release()
 

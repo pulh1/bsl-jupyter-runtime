@@ -54,6 +54,7 @@ from onec_runtime.capture_evaluation import (
     CaptureResumeTicket,
     CaptureStepContext,
     CaptureTransferPlan,
+    _CaptureSubmission,
 )
 from onec_runtime.capture_value_protocol import (
     CaptureValueInspectionEnvelope,
@@ -512,6 +513,9 @@ class PrototypeRuntimeController:
         self.last_debug_stop: DebugStop | None = None
         self._capture_evaluation_coordinator: CaptureEvaluationCoordinator | None = None
         self._capture_shutdown_transport_invalidated = False
+        self._ready_inspection_evaluation_coordinator: CaptureEvaluationCoordinator | None = None
+        self._ready_inspection_previous_state: OperationState | None = None
+        self._ready_inspection_shutdown_transport_invalidated = False
         self._capture_owned_submission: _CaptureOwnedSubmission | None = None
         self._capture_helper_handoffs = local()
         self.breakpoint_workspaces: list[BreakpointWorkspaceEvent] = []
@@ -579,6 +583,72 @@ class PrototypeRuntimeController:
             raise ProtocolError("CAPTURE evaluation coordinator is unavailable")
         return owner
 
+    def ready_inspection_evaluation_owner(
+        self,
+    ) -> CaptureEvaluationCoordinator | None:
+        """Expose only the bounded-close owner, never a public capture view."""
+        return self._ready_inspection_evaluation_coordinator
+
+    def _ready_inspection_evaluation_owner(self) -> CaptureEvaluationCoordinator:
+        owner = self._ready_inspection_evaluation_coordinator
+        if owner is not None:
+            return owner
+        fence = CaptureFence(
+            0,
+            self.runtime_generation,
+            0,
+            identity=self.session,
+        )
+        owner = CaptureEvaluationCoordinator(
+            fence,
+            poll_interval_s=min(0.1, self.command_timeout_s),
+            # Ready inspection has no MAIN/capture journal authority.  The
+            # owner still keeps its private event ordering, but it cannot add
+            # lifecycle history to the completed operation it merely reads.
+            journal=RecoveryJournal(),
+        )
+        self._ready_inspection_evaluation_coordinator = owner
+        self._ready_inspection_shutdown_transport_invalidated = False
+        return owner
+
+    def _set_ready_inspection_workspace(self, *, shielded: bool) -> None:
+        """Install a temporary private workspace without changing MAIN history."""
+        if shielded:
+            captures = self.registry.captures
+            ordinary_users = self.registry.users
+        else:
+            locations = self.registry.full_locations
+            ordinary_users = tuple(
+                location
+                for location in locations[1:]
+                if location in self.registry.users
+            )
+            captures = tuple(
+                location
+                for location in locations[1:]
+                if location not in ordinary_users
+            )
+        try:
+            confirmed = self.breakpoint_workspace_owner.confirmed_snapshot
+            effective = (
+                (self.service_location,)
+                + (() if shielded else captures)
+                + ordinary_users
+                + confirmed.worker_slots
+            )
+            if effective == confirmed.effective_locations:
+                return
+            desired = self.breakpoint_workspace_owner.prepare(
+                captures=captures,
+                ordinary_users=ordinary_users,
+                worker_slots=confirmed.worker_slots,
+                shielded=shielded,
+            )
+            self.breakpoint_workspace_owner.install(desired)
+        except BreakpointWorkspaceOutcomeUnknown:
+            self.state = OperationState.RECOVERING
+            raise
+
     def _require_capture_evaluation_admission(self) -> None:
         if self.state is OperationState.CAPTURED:
             return
@@ -617,6 +687,7 @@ class PrototypeRuntimeController:
         pre_dispatch_cleanup: Callable[[], None] | None = None,
         on_transport_dispatch: Callable[[], None] | None = None,
         restore: Callable[[], None] | None = None,
+        resume_stops: bool = False,
     ) -> CaptureRemoteStep:
         def dispatch(dispatch_entered: Callable[[], None]) -> PendingEvaluation:
             prepared = False
@@ -671,6 +742,7 @@ class PrototypeRuntimeController:
             dispatch,
             poll,
             restore if restore is not None else lambda: None,
+            self.session.continue_evaluation if resume_stops else None,
         )
 
     def _complete_capture_lifecycle(
@@ -827,23 +899,39 @@ class PrototypeRuntimeController:
         self._clear_capture_inspection()
 
     def shutdown_capture_evaluation(self) -> bool:
-        """Stop and classify the CAPTURE owner within the command deadline."""
-        owner = self._capture_evaluation_coordinator
-        if owner is None:
+        """Stop every controller-owned RDBG evaluation owner within the deadline."""
+        owners = tuple(
+            owner
+            for owner in (
+                self._capture_evaluation_coordinator,
+                self._ready_inspection_evaluation_coordinator,
+            )
+            if owner is not None
+        )
+        if not owners:
             return True
-        owner.begin_close()
+        for owner in owners:
+            owner.begin_close()
         invalidation_error: BaseException | None = None
-        if not self._capture_shutdown_transport_invalidated:
+        if not (
+            self._capture_shutdown_transport_invalidated
+            or self._ready_inspection_shutdown_transport_invalidated
+        ):
             self._capture_shutdown_transport_invalidated = True
+            self._ready_inspection_shutdown_transport_invalidated = True
             try:
                 self.session.invalidate()
             except BaseException as error:
                 invalidation_error = error
-        stopped = owner.join(min(1.0, self.command_timeout_s))
-        owner.finish_close(stopped)
+        outcomes = tuple(
+            (owner, owner.join(min(1.0, self.command_timeout_s)))
+            for owner in owners
+        )
+        for owner, terminated in outcomes:
+            owner.finish_close(terminated)
         if invalidation_error is not None:
             raise invalidation_error
-        return stopped
+        return all(terminated for _, terminated in outcomes)
 
     def _capture_command_deadline(self, timeout_s: float | None) -> float:
         selected = self.command_timeout_s if timeout_s is None else timeout_s
@@ -1309,6 +1397,115 @@ class PrototypeRuntimeController:
         if not isinstance(result, MainCompletion):
             raise ProtocolError("System MAIN stopped outside the service boundary")
         return result
+
+    def execute_system_inspection(self, expression: str) -> object:
+        """Evaluate one trusted scalar inspection without creating a MAIN operation.
+
+        A ready-state inspection is still an asynchronous RDBG evaluation.  Its
+        coordinator therefore owns the pending capability after the initiating
+        caller times out or is interrupted, rather than using ``evaluate()``
+        and losing that capability on a stop or interval expiry.
+        """
+        self._require_state(
+            OperationState.IDLE,
+            OperationState.COMPLETED,
+            OperationState.FAILED,
+        )
+        if (
+            not isinstance(expression, str)
+            or not expression.startswith(
+                "RuntimeValueTransferServer."
+                "СериализоватьДопущенныеИменаСвойствДляПодсказки("
+            )
+            or not expression.endswith(")")
+        ):
+            raise ProtocolError("System inspection expression is invalid")
+        previous_state = self.state
+        owner = self._ready_inspection_evaluation_owner()
+
+        def shield_workspace() -> None:
+            self._set_ready_inspection_workspace(shielded=True)
+
+        def restore_workspace() -> None:
+            self._set_ready_inspection_workspace(shielded=False)
+
+        def accept_scalar(result: EvaluationResult) -> object:
+            if result.error_occurred:
+                raise BslExecutionError(result.error_text)
+            value = evaluation_to_python(result)
+            if not isinstance(value, str):
+                raise ProtocolError("System inspection did not return scalar text")
+            return value
+
+        def complete(
+            value: object,
+            error: BaseException | None,
+        ) -> object:
+            if self._ready_inspection_previous_state is not previous_state:
+                self.state = OperationState.RECOVERING
+                return value
+            self._ready_inspection_previous_state = None
+            if isinstance(
+                error,
+                (
+                    CaptureOutcomeUnknownError,
+                    CaptureRecoveryRequiredError,
+                    StaleCaptureError,
+                ),
+            ):
+                self.state = OperationState.RECOVERING
+            else:
+                self.state = previous_state
+            return value
+
+        step = self._capture_remote_step(
+            expression,
+            stack_level=0,
+            max_text_size=75_000,
+            timeout_s=self.command_timeout_s,
+            before_dispatch=shield_workspace,
+            pre_dispatch_cleanup=restore_workspace,
+            restore=restore_workspace,
+            resume_stops=True,
+        )
+        self._ready_inspection_previous_state = previous_state
+        # This state is the public admission fence for an accepted but
+        # detached inspection record.  It prevents status and data-plane
+        # callers from treating the controller as ready while RDBG owns one
+        # pending capability.
+        self.state = OperationState.RECOVERING
+        request = CaptureEvaluationRequest(
+            owner._fence,
+            CaptureEvaluationKind.INSPECTION,
+            step.dispatch,
+            step.poll,
+            accept_scalar,
+            restore=step.restore,
+            resume_stop=step.resume_stop,
+            completion=complete,
+        )
+        # The receipt survives an interruption after coordinator adoption but
+        # before Python assigns the ordinary ticket result.  It gives the
+        # event-stream worker sole ownership on every unwind path.
+        submission = _CaptureSubmission()
+        try:
+            ticket = submission.submit(owner.submit_evaluation, request=request)
+            factory = getattr(self._capture_helper_handoffs, "factory", None)
+            if callable(factory):
+                # RuntimeApi binds this only after the ticket was adopted under
+                # its writer (and, when present, RuntimeSession's operation
+                # lock). Do not expose a pre-submit window where a competing
+                # request can observe neither a lock nor a busy record.
+                with factory():
+                    return ticket.wait_initiator(self.command_timeout_s)
+            return ticket.wait_initiator(self.command_timeout_s)
+        except BaseException:
+            if submission.ticket is None:
+                self._ready_inspection_previous_state = None
+                self.state = previous_state
+            else:
+                submission.detach_initiator()
+            raise
 
     def _execute_main(
         self,

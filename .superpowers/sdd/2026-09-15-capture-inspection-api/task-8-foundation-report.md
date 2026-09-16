@@ -289,3 +289,156 @@ passed `674 passed` in 45.77 seconds. The final unit suite passed `4566
 passed, 58 skipped` in 252.71 seconds, with only the existing Windows ZMQ
 Proactor warning. `python -m compileall -q src/onec_runtime
 packages/jupyter/src packages/mcp/src` and `git diff --check` pass.
+
+## Completion inspection lifecycle ownership
+
+`RuntimeSession.completion_fields()` now binds the existing composed capture
+handoff while it owns its operation lock. `PrototypeRuntimeApi.completion_fields()`
+validates the local Context path under the data-plane writer, then submits one
+`INSPECTION` instruction through `_execute_worker_instruction`. In a captured
+runtime that is a coordinator-owned `execute_system_capture` request: ticket
+submission and adoption occur while the Session and API locks remain held; the
+composed handoff encloses only the initiator ticket wait.
+
+The generated BSL calls
+`RuntimeValueTransferServer.ПолучитьДопущенныеИменаСвойствДляПодсказки` and
+serializes its bounded marker-plus-names table into a scalar `C<TAB>count`
+contract. The parser requires the declared count, one root marker, and at most
+128 unique identifiers. This preserves all 128 names and turns a truncated or
+malformed reply into `ProtocolError`. The server helper's own source contract
+admits the root before it enumerates names, so no denied root reaches a schema
+or field read. The former `RuntimeController.inspect_completion_fields` and
+its direct caller-thread `evaluate_collection` implementation were removed;
+there is no compatibility adapter.
+
+The captured RuntimeSession regressions cover a ready inspection, confirmed
+D/E admission outcomes, malformed reply, confirmed BSL error, dispatch
+uncertainty, restoration failure, caller deadline, and `KeyboardInterrupt`.
+For an acknowledged withheld result they assert one `INSPECTION` record and
+capability, a shielded workspace, accessible `status`/`current_capture`/`wait`,
+a prompt second-call `CaptureBusyError` without redispatch, and a late result's
+single full workspace restoration. The interruption case proves the operation
+lock is reacquired while the coordinator retains the pending inspection.
+The generated instruction is parsed by the pinned BSL parser; the extension
+source contract proves helper admission precedes its field-name read.
+
+RED `6179224` makes a real Session completion wait for an owned inspection
+instead of accepting a direct collection call. GREEN `be2f526` provides the
+coordinator route, scalar wire parser, Session handoff, and outcome matrix.
+No BSL module changed in this correction, so the checked-in Designer-built CFE,
+sole protocol `2`, artifact `0.1.3`, and four-source manifest remain unchanged.
+
+The exact completion/control-plane suite passed `25 passed` in 2.61 seconds.
+The expanded completion/coordinator/runtime/Jupyter/MCP suite passed `599
+passed` in 46.26 seconds. The final full unit suite passed `4576 passed, 58
+skipped` in 258.08 seconds, with only the existing Windows ZMQ Proactor
+warning. `uv run python -m compileall -q src/onec_runtime packages/jupyter/src
+packages/mcp/src`, `git diff --check`, and the no-`inspect_completion_fields`
+source check pass.
+
+## Ready-state completion lifecycle correction
+
+A non-CAPTURE `completion_fields()` call previously reached
+`_execute_worker_instruction()` and therefore `execute_system_main()`. That
+created a new MAIN operation for a read-only schema request, changing the
+operation id, state, active operation, registry, histories, workspace,
+journal, and continue count.
+
+The controller now owns `execute_system_inspection()`: it accepts only the
+trusted bounded completion scalar expression, evaluates it directly through
+RDBG, and returns only scalar text. It does not allocate an operation, change
+the registry or workspace, write the recovery journal, or continue the target.
+A confirmed target failure remains `BslExecutionError`; an unexpected RDBG stop
+propagates without partially changing the prior ready lifecycle. CAPTURE keeps
+the coordinator-owned `INSPECTION` ticket path unchanged.
+
+Both branches execute the same server expression,
+`RuntimeValueTransferServer.СериализоватьДопущенныеИменаСвойствДляПодсказки`.
+The new bounded server serializer calls the existing root-admitting schema
+helper before iterating names and emits the checked scalar `C<TAB>count`
+format. The direct scalar evaluation allows 75,000 bytes, covering the marker
+and 128 maximum-length Unicode identifiers. No collection API or standalone
+completion guard was restored.
+
+The real `PrototypeRuntimeController` regressions establish a completed MAIN
+before inspection, then prove a successful scalar read leaves operation id,
+state, active operation, registry identity, histories, workspace, journal, and
+continue count unchanged. A synthetic `UnexpectedStop` and a confirmed BSL
+error each preserve the same snapshot. The generated expression is parsed by
+the pinned BSL parser and the server source test proves admission occurs before
+field enumeration.
+
+RED `187c688` demonstrates the second-MAIN mutation. GREEN `7f8c2fd` adds the
+immediate controller route, scalar extension function, fixture updates, and a
+Designer-rebuilt bundle. The checked-in CFE was rebuilt with Designer 8.3.27.2170:
+21,951 bytes, SHA-256
+`0b0a871ba44dc0250abe2d5bafc62b38060ef9a61cace94a1330d9dbe20ce924`.
+The regenerated manifest matches the canonical four-source fingerprint and
+retains sole protocol `2` and artifact `0.1.3`; `ConfigDumpInfo` did not change.
+
+The final focused completion/controller/extension suite passed `82 passed` in
+2.66 seconds. The expanded completion/coordinator/runtime/Jupyter/MCP/bundle
+suite passed `657 passed` in 46.61 seconds. The final full unit suite passed
+`4579 passed, 58 skipped` in 251.16 seconds, with only the existing Windows ZMQ
+Proactor warning. `uv run python -m compileall -q src/onec_runtime
+packages/jupyter/src packages/mcp/src`, `git diff --check`, and the manifest
+fingerprint/protocol/artifact verification pass.
+
+## Ready-inspection retained-owner correction
+
+A ready/non-CAPTURE `completion_fields()` inspection cannot use
+`RdbgSession.evaluate()`: when RDBG reports a stop or the initiator’s deadline
+expires, that convenience API has already registered a `PendingEvaluation` but
+does not expose it to a controller owner. The result can wedge the RDBG session
+on a hidden pending capability.
+
+`PrototypeRuntimeController.execute_system_inspection()` now creates a private
+controller-owned `CaptureEvaluationCoordinator` record with evaluation kind
+`INSPECTION`. It submits through `start_evaluation()`, polls the exact returned
+capability, resumes a `StopEvent` through `continue_evaluation()`, and restores
+the temporary workspace before it publishes the outcome. The private owner
+keeps polling and cleans up after a caller deadline or `KeyboardInterrupt`.
+Its state fence is `RECOVERING`, so a subsequent completion or MAIN dispatch is
+rejected without another target request; late completion restores the prior
+ready state. The ticket exposes only the coordinator’s safe logical evaluation
+ID, never the RDBG UUID. An acknowledged deadline is therefore
+`CaptureEvaluationPendingError(…, INSPECTION)`, not
+`CaptureInspectionTimeout`.
+
+The record is adopted while the RuntimeSession operation lock and RuntimeApi
+writer remain held. Only `ticket.wait_initiator()` runs under the existing
+composed caller handoff, which releases the API writer and Session lock and
+reacquires them in the existing order. The submit path uses the Task-7
+`_CaptureSubmission` receipt, so an exception between record adoption and a
+normal ticket return detaches the vanished initiator while the event-stream
+owner remains sole consumer. The controller’s bounded shutdown joins every
+owned coordinator without short-circuiting and calls `finish_close()` with each
+owner’s individual join result.
+
+RED commits: `7df4b0b`, `ff84a4f`, and `2679fef`. GREEN:
+`6e784ef`. The regressions include real `RdbgSession` stop/resume and withheld
+result paths, safe pending-ID verification, late-result recovery, owner close,
+a two-owner shutdown join, the ready Session/API lock-contention probe, and a
+post-adoption exception. The latter proves the active record has a detached
+initiator, one dispatch, and no second completion dispatch.
+
+Fresh validation:
+
+- exact ready lock/adoption regressions: `2 passed`;
+- completion plus prototype runtime: `126 passed`;
+- coordinator/control/runtime API: `419 passed`;
+- Session/proxy/resume: `47 passed`;
+- Jupyter completion/adapter/value/display: `154 passed`; Jupyter shutdown:
+  `59 passed` (existing IPython/Windows Proactor warnings);
+- MCP/runtime-backend: `107 passed`; transfer/control surface: `196 passed`;
+  extension bundle/source: `184 passed, 1 skipped`;
+- `uv run python -m pytest tests/unit -q`: `4584 passed, 58 skipped` in
+  261.13s (the known IPython virtualenv and Windows ZMQ Proactor warnings);
+- `uv run python -m compileall -q src/onec_runtime packages/jupyter/src
+  packages/mcp/src` and `git diff --check` passed.
+
+No BSL, CFE, manifest, protocol, or artifact source was changed in this
+correction. The checked-in Designer-built bundle remains the matching
+protocol-`2` / artifact-`0.1.3` bundle with the existing four-source
+fingerprint; this is a core Python lifecycle change, not live 1C
+qualification.

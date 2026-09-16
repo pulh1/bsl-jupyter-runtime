@@ -1,14 +1,29 @@
 from threading import RLock, Thread, Event
+from time import monotonic, sleep
 from types import SimpleNamespace
-from uuid import UUID
 
 import pytest
 
-from onec_runtime.errors import CaptureValueAccessDeniedError, CaptureValueCheckError, ProtocolError
-from onec_runtime.prototype_runtime import MainCompletion, OperationHandle, OperationState
-from onec_runtime.rdbg.models import CollectionCell, CollectionRow, EvaluationResult
+from onec_runtime.capture_evaluation import (
+    CaptureEvaluationCoordinator,
+    CaptureEvaluationKind,
+    CaptureEvaluationTicket,
+    CapturePhase,
+)
+from onec_runtime.errors import (
+    BslExecutionError,
+    CaptureOutcomeUnknownError,
+    CaptureRecoveryRequiredError,
+    CaptureValueAccessDeniedError,
+    CaptureValueCheckError,
+    ProtocolError,
+)
+from onec_runtime.prototype_runtime import OperationState
 from onec_runtime.runtime_api import PrototypeRuntimeApi
 from onec_runtime.session import RuntimeSession
+
+from test_capture_evaluation_lifecycle import ControlledCaptureSession, close_owner
+from test_prototype_runtime import SERVICE, captured_controller
 
 
 class Controller:
@@ -26,46 +41,241 @@ class Controller:
         self.collection_size_override = None
         self.collection_row_limit = None
 
-    def execute_system_main(self, source):
+    def execute_system_inspection(self, source):
         self.admission_sources.append(source)
-        self.target_requests.append(("precursor", source))
-        return MainCompletion(OperationHandle(self.operation_id, source, source), "value", "", True)
-
-    def inspect_completion_fields(self, handle, *, table_row, worker_type_registrations=()):
-        self.calls.append((handle, table_row, self.command_timeout_s, worker_type_registrations))
-        self.target_requests.append(("completion", handle))
-        if self.admission_outcome != "R":
-            return EvaluationResult(
-                UUID(int=1), "ТаблицаЗначений", "", False,
-                collection_size=1,
-                collection_rows=(CollectionRow(0, (
-                    CollectionCell("Состояние", "Строка", "", value_string=self.admission_outcome),
-                    CollectionCell("Имя", "Строка", "", value_string=""),
-                )),),
-            )
-        rows = (CollectionRow(0, (
-            CollectionCell("Состояние", "Строка", "", value_string="R"),
-            CollectionCell("Имя", "Строка", "", value_string=""),
-        )),) + tuple(CollectionRow(index + 1, (
-            CollectionCell("Состояние", "Строка", "", value_string="R"),
-            CollectionCell("Имя", "Строка", "", value_string=name),
-        )) for index, name in enumerate(self.fields))
+        self.calls.append((source, self.command_timeout_s))
+        self.target_requests.append(("completion", source))
+        rows = (
+            (self.admission_outcome, "")
+            if self.admission_outcome != "R"
+            else ("R", "")
+        ,) + (() if self.admission_outcome != "R" else tuple(
+            ("R", name) for name in self.fields
+        ))
+        declared_size = (
+            len(rows)
+            if self.collection_size_override is None
+            else self.collection_size_override
+        )
         if self.collection_row_limit is not None:
             rows = rows[:self.collection_row_limit]
-        return EvaluationResult(
-            UUID(int=1), "ТаблицаЗначений", "", False,
-            collection_size=(len(self.fields) + 1 if self.collection_size_override is None
-                             else self.collection_size_override),
-            collection_rows=rows,
-        )
+        wire = "\n".join((
+            f"C\t{declared_size}",
+            *(f"{outcome}\t{name}" for outcome, name in rows),
+        ))
+        return wire
+
+
+def _captured_completion_runtime(
+    session: ControlledCaptureSession,
+) -> tuple[RuntimeSession, PrototypeRuntimeApi, object]:
+    controller = captured_controller(session, command_timeout_s=1)
+    api = PrototypeRuntimeApi(controller)
+    api._namespace_names = ("Данные",)
+    runtime = object.__new__(RuntimeSession)
+    runtime.runtime_api = api
+    runtime._operation_lock = RLock()
+    runtime._closed = False
+    return runtime, api, controller
+
+
+def _completion_wire(
+    names: tuple[str, ...] = ("Номер", "Название"),
+    *,
+    outcome: str = "R",
+) -> str:
+    rows = ((outcome, ""),) if outcome != "R" else (
+        ("R", ""), *(("R", name) for name in names)
+    )
+    payload = "\n".join((
+        f"C\t{len(rows)}",
+        *(f"{state}\t{name}" for state, name in rows),
+    ))
+    return '"' + payload + '"'
+
+
+def test_captured_session_completion_returns_admitted_schema_in_one_inspection() -> None:
+    session = ControlledCaptureSession()
+    runtime, api, controller = _captured_completion_runtime(session)
+    fields: list[tuple[str, ...]] = []
+    errors: list[BaseException] = []
+
+    def complete() -> None:
+        try:
+            fields.append(runtime.completion_fields("Контекст.Данные"))
+        except BaseException as error:
+            errors.append(error)
+
+    caller = Thread(target=complete, name="captured-session-completion-ready")
+    try:
+        caller.start()
+        assert session.accepted.wait(1), "completion was not acknowledged"
+        assert session.polling.wait(1), "completion was not polled"
+        session.complete(_completion_wire(), type_name="Строка")
+        caller.join(1)
+
+        assert not caller.is_alive()
+        assert fields == [("Номер", "Название")]
+        assert errors == []
+        assert api.current_capture().status().phase is CapturePhase.PAUSED
+        assert controller.state is OperationState.CAPTURED
+        assert controller.breakpoint_workspaces[-1].phase == "full-restore"
+        sources = [call[1][0] for call in session.calls if call[0] == "start_evaluation"]
+        assert len(sources) == 1
+        assert "СериализоватьДопущенныеИменаСвойствДляПодсказки(" in sources[0]
+        assert "ДопуститьЗначение(" not in sources[0]
+        assert "evaluate_collection" not in sources[0]
+    finally:
+        if session.capture_pending is not None:
+            session.complete()
+        caller.join(1)
+        close_owner(controller, session)
+
+
+def test_captured_session_completion_interrupt_detaches_only_the_waiter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An interrupted completion caller leaves its owned inspection observable."""
+    session = ControlledCaptureSession()
+    runtime, api, controller = _captured_completion_runtime(session)
+
+    def interrupt_after_ack(
+        _ticket: CaptureEvaluationTicket,
+        timeout_s: float | None = None,
+    ) -> object:
+        del timeout_s
+        assert session.accepted.wait(1), "completion was not acknowledged"
+        raise KeyboardInterrupt
+
+    try:
+        monkeypatch.setattr(CaptureEvaluationTicket, "wait_initiator", interrupt_after_ack)
+        with pytest.raises(KeyboardInterrupt):
+            runtime.completion_fields("Контекст.Данные")
+
+        assert runtime._operation_lock.acquire(blocking=False)
+        runtime._operation_lock.release()
+        status = runtime.current_capture().status()
+        assert status.phase is CapturePhase.EVALUATING
+        assert status.evaluation_kind is CaptureEvaluationKind.INSPECTION
+        assert status.pending_evaluation_id is not None
+        assert session.capture_start_count == 1
+
+        session.complete(_completion_wire(), type_name="Строка")
+        assert api.current_capture().wait(
+            timeout_s=1, evaluation_id=status.pending_evaluation_id
+        ).state.value == "completed"
+    finally:
+        if session.capture_pending is not None:
+            session.complete()
+        close_owner(controller, session)
+
+
+@pytest.mark.parametrize(
+    ("presentation", "type_name", "error", "expected"),
+    (
+        (
+            _completion_wire(outcome="D|worker_generation_value"),
+            "Строка",
+            "",
+            CaptureValueAccessDeniedError,
+        ),
+        (
+            _completion_wire(outcome="E|value_admission_failed"),
+            "Строка",
+            "",
+            CaptureValueCheckError,
+        ),
+        ("\"not a completion envelope\"", "Строка", "", ProtocolError),
+        ("private platform failure", "Ошибка", "private", BslExecutionError),
+    ),
+    ids=("denied", "admission_failure", "invalid", "bsl_failure"),
+)
+def test_captured_session_completion_classifies_confirmed_outcomes(
+    presentation: str,
+    type_name: str,
+    error: str,
+    expected: type[BaseException],
+) -> None:
+    session = ControlledCaptureSession()
+    runtime, api, controller = _captured_completion_runtime(session)
+    errors: list[BaseException] = []
+
+    def complete() -> None:
+        try:
+            runtime.completion_fields("Контекст.Данные")
+        except BaseException as caught:
+            errors.append(caught)
+
+    caller = Thread(target=complete, name="captured-session-completion-outcome")
+    try:
+        caller.start()
+        assert session.accepted.wait(1)
+        session.complete(presentation, type_name=type_name, error=error)
+        caller.join(1)
+
+        assert not caller.is_alive()
+        assert len(errors) == 1
+        assert isinstance(errors[0], expected)
+        assert api.current_capture().status().phase is CapturePhase.PAUSED
+        assert controller.state is OperationState.CAPTURED
+        assert session.capture_start_count == 1
+    finally:
+        if session.capture_pending is not None:
+            session.complete()
+        caller.join(1)
+        close_owner(controller, session)
+
+
+def test_captured_session_completion_dispatch_uncertainty_is_not_a_worker_error() -> None:
+    session = ControlledCaptureSession(dispatch_error=OSError("transport lost"))
+    runtime, api, controller = _captured_completion_runtime(session)
+    try:
+        with pytest.raises(CaptureOutcomeUnknownError):
+            runtime.completion_fields("Контекст.Данные")
+        status = api.current_capture().status()
+        assert status.phase is CapturePhase.OUTCOME_UNKNOWN
+        assert status.evaluation_kind is None
+        assert session.capture_start_count == 1
+    finally:
+        close_owner(controller, session)
+
+
+def test_captured_session_completion_restore_failure_requires_recovery() -> None:
+    session = ControlledCaptureSession(fail_workspace_on_call=3)
+    runtime, api, controller = _captured_completion_runtime(session)
+    errors: list[BaseException] = []
+
+    def complete() -> None:
+        try:
+            runtime.completion_fields("Контекст.Данные")
+        except BaseException as caught:
+            errors.append(caught)
+
+    caller = Thread(target=complete, name="captured-session-completion-restore")
+    try:
+        caller.start()
+        assert session.accepted.wait(1)
+        session.complete(_completion_wire(), type_name="Строка")
+        caller.join(1)
+
+        assert not caller.is_alive()
+        assert len(errors) == 1
+        assert isinstance(errors[0], CaptureRecoveryRequiredError)
+        assert api.current_capture().status().phase is CapturePhase.RECOVERY_REQUIRED
+        assert session.capture_start_count == 1
+    finally:
+        if session.capture_pending is not None:
+            session.complete()
+        caller.join(1)
+        close_owner(controller, session)
 
 
 def test_completion_reads_only_current_schema_without_inferencing_value_types():
     controller = Controller()
     api = PrototypeRuntimeApi(controller)
     assert api.completion_fields("Контекст.Данные", table_row=True) == ("Номер", "Название")
-    assert controller.calls[0][:2] == ("Контекст.Данные", True)
-    assert 0 < controller.calls[0][2] <= 1.0
+    assert "СериализоватьДопущенныеИменаСвойствДляПодсказки(Контекст.Данные, Истина" in controller.calls[0][0]
+    assert 0 < controller.calls[0][1] <= 1.0
     assert controller.command_timeout_s == 30.0
     assert controller.operation_id == 7
     controller.fields = ("ОбновленнаяКолонка",)
@@ -110,8 +320,8 @@ def test_completion_is_one_consumer_owned_admission_and_schema_request():
     controller.state = OperationState.FAILED
     assert api.completion_fields("Контекст.Данные") == ("Номер", "Название")
     assert controller.state is OperationState.FAILED and controller.operation_id == 7
-    assert controller.target_requests == [("completion", "Контекст.Данные")]
-    assert controller.calls[-1][-1] == ()
+    assert [request[0] for request in controller.target_requests] == ["completion"]
+    assert "ДопущенныеИменаСвойств" in controller.calls[-1][0]
 
 
 def test_completion_preserves_the_marker_and_all_128_admitted_names():
@@ -145,7 +355,7 @@ def test_completion_denial_or_failure_has_no_second_schema_target_read(outcome, 
     with pytest.raises(error_type):
         PrototypeRuntimeApi(controller).completion_fields("Контекст.Данные")
 
-    assert controller.target_requests == [("completion", "Контекст.Данные")]
+    assert [request[0] for request in controller.target_requests] == ["completion"]
 
 
 def test_admission_closed_api_and_quarantined_capture_refuse_inspection():
@@ -182,3 +392,116 @@ def test_session_completion_does_not_wait_for_another_operation():
         release.set()
         thread.join(2)
     assert session.completion_fields("Контекст.Данные") == ("Номер", "Название")
+
+
+def test_ready_completion_releases_session_and_api_locks_while_ticket_waits() -> None:
+    """A ready inspection adopts before the handoff, then waits lock-free."""
+    session = ControlledCaptureSession()
+    controller_module = __import__(
+        "onec_runtime.prototype_runtime", fromlist=("PrototypeRuntimeController",)
+    )
+    controller = controller_module.PrototypeRuntimeController(
+        session, SERVICE, command_timeout_s=1.0,
+    )
+    controller.state = OperationState.COMPLETED
+    api = PrototypeRuntimeApi(controller)
+    api._namespace_names = ("Данные",)
+    runtime = object.__new__(RuntimeSession)
+    runtime.runtime_api = api
+    runtime._operation_lock = RLock()
+    runtime._closed = False
+    fields: list[tuple[str, ...]] = []
+    errors: list[BaseException] = []
+
+    def complete() -> None:
+        try:
+            fields.append(runtime.completion_fields("Контекст.Данные", timeout_s=1.0))
+        except BaseException as error:
+            errors.append(error)
+
+    caller = Thread(target=complete, name="ready-session-completion-waiter")
+    try:
+        caller.start()
+        assert session.accepted.wait(1), "ready inspection was not acknowledged"
+        assert session.polling.wait(1), "ready inspection was not polled"
+
+        # The coordinator owns the acknowledged request now. The original
+        # caller must no longer block control-plane work on either outer lock.
+        assert runtime._operation_lock.acquire(blocking=False)
+        runtime._operation_lock.release()
+        assert api._lock.acquire(blocking=False)
+        api._lock.release()
+        assert runtime.status().state is OperationState.RECOVERING
+        with pytest.raises(ProtocolError):
+            runtime.completion_fields("Контекст.Данные", timeout_s=0.1)
+        assert session.capture_start_count == 1
+
+        session.complete(_completion_wire(), type_name="Строка")
+        caller.join(1)
+        assert not caller.is_alive()
+        assert fields == [("Номер", "Название")]
+        assert errors == []
+        assert controller.state is OperationState.COMPLETED
+    finally:
+        if session.capture_pending is not None:
+            session.complete(_completion_wire(), type_name="Строка")
+        caller.join(1)
+        close_owner(controller, session)
+
+
+def test_ready_completion_submit_interruption_detaches_adopted_ticket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exception after adoption leaves the event owner as sole consumer."""
+    session = ControlledCaptureSession()
+    controller_module = __import__(
+        "onec_runtime.prototype_runtime", fromlist=("PrototypeRuntimeController",)
+    )
+    controller = controller_module.PrototypeRuntimeController(
+        session, SERVICE, command_timeout_s=1.0,
+    )
+    controller.state = OperationState.COMPLETED
+    api = PrototypeRuntimeApi(controller)
+    api._namespace_names = ("Данные",)
+    runtime = object.__new__(RuntimeSession)
+    runtime.runtime_api = api
+    runtime._operation_lock = RLock()
+    runtime._closed = False
+    original_submit = CaptureEvaluationCoordinator.submit_evaluation
+
+    def interrupt_after_adoption(
+        owner: CaptureEvaluationCoordinator,
+        request: object,
+    ) -> CaptureEvaluationTicket:
+        ticket = original_submit(owner, request)  # type: ignore[arg-type]
+        raise RuntimeError("planned submit-return interruption")
+
+    monkeypatch.setattr(
+        CaptureEvaluationCoordinator,
+        "submit_evaluation",
+        interrupt_after_adoption,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="planned submit-return interruption"):
+            runtime.completion_fields("Контекст.Данные", timeout_s=1.0)
+
+        assert session.accepted.wait(1)
+        owner = controller.ready_inspection_evaluation_owner()
+        assert owner is not None and owner._active is not None
+        assert owner._active.initiator_attached is False
+        assert controller.state is OperationState.RECOVERING
+        assert runtime._operation_lock.acquire(blocking=False)
+        runtime._operation_lock.release()
+        with pytest.raises(ProtocolError):
+            runtime.completion_fields("Контекст.Данные", timeout_s=0.1)
+        assert session.capture_start_count == 1
+
+        session.complete(_completion_wire(), type_name="Строка")
+        deadline = monotonic() + 1.0
+        while controller.state is OperationState.RECOVERING and monotonic() < deadline:
+            sleep(0.005)
+        assert controller.state is OperationState.COMPLETED
+    finally:
+        if session.capture_pending is not None:
+            session.complete(_completion_wire(), type_name="Строка")
+        close_owner(controller, session)

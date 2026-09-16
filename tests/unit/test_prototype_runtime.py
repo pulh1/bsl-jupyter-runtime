@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 from threading import Event, RLock
+from time import monotonic, sleep
 from uuid import UUID, uuid4
 
 from mcp.client import Client
@@ -56,10 +57,13 @@ from onec_runtime.bsl import (
 from onec_runtime.session import RuntimeSession, _ActiveCaptureTicket
 from onec_runtime_mcp.agent.runtime_session import AgentRuntimeSession
 from onec_runtime.errors import (
+    BslExecutionError,
+    CaptureEvaluationPendingError,
     CaptureOutcomeUnknownError,
     CaptureRecoveryRequiredError,
     ProtocolError,
     RdbgTransportError,
+    UnexpectedStop,
 )
 from onec_runtime.fault_injection import (
     CloseTransportAt,
@@ -81,7 +85,8 @@ from onec_runtime.rdbg.models import (
     TargetId,
 )
 from onec_runtime.rdbg.reconnect import ReconnectedSession
-from onec_runtime.rdbg.xml_codec import RDBG_NS, parse_ping_events
+from onec_runtime.rdbg.session import RdbgSession, SessionState
+from onec_runtime.rdbg.xml_codec import BASE_NS, CALC_NS, RDBG_NS, parse_ping_events
 from onec_runtime.recovery import (
     RecoveryIdentityEvidence,
     RecoveryOutcome,
@@ -835,6 +840,303 @@ def test_completion_fields_use_bounded_schema_helper_in_capture_kernel_frame() -
         "RuntimeValueTransferServer.ПолучитьДопущенныеИменаСвойствДляПодсказки(Контекст.Данные, Истина, \"\")",
         0, 129, 2,
     )) in session.calls
+
+
+def _completion_lifecycle_snapshot(
+    controller, session: ScriptedSession,  # type: ignore[no-untyped-def]
+) -> tuple[object, ...]:
+    """State which a ready scalar inspection has no authority to mutate."""
+    return (
+        controller.operation_id,
+        controller.state,
+        controller.active_operation,
+        controller.registry,
+        id(controller.registry),
+        tuple(controller.stop_history),
+        tuple(controller.write_journal),
+        tuple(controller.breakpoint_workspaces),
+        controller._breakpoint_workspace,
+        controller.breakpoint_workspace_owner.confirmed_snapshot,
+        tuple(controller.journal.events),
+        controller.journal.pending_count,
+        controller.continue_sent,
+        session.continue_count,
+    )
+
+
+class _CompletionRdbgTransport:
+    """Small real-RDBG transport fixture for ready scalar inspection."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.responses: dict[str, deque[bytes]] = {}
+
+    def enqueue(self, command: str, *responses: bytes) -> None:
+        self.responses.setdefault(command, deque()).extend(responses)
+
+    def request(self, command: str, _payload: bytes = b"", **_kwargs: object) -> bytes:
+        self.calls.append(command)
+        queue = self.responses.get(command)
+        return queue.popleft() if queue else b""
+
+
+def _ready_completion_rdbg(transport: _CompletionRdbgTransport) -> RdbgSession:
+    session = RdbgSession(transport, SERVICE)  # type: ignore[arg-type]
+    target = DebugTarget(TARGET, "ServerEmulation", "stopped")
+    session.target = target
+    session.attached_targets[TARGET.id] = target
+    session.state = SessionState.READY
+    return session
+
+
+def _completion_stop_payload(location: ModuleLocation = USER) -> bytes:
+    return f"""<response xmlns=\"{RDBG_NS}\"><result><cmdID>callStackFormed</cmdID>
+      <targetID xmlns=\"{BASE_NS}\"><id>{TARGET.id}</id><infoBaseAlias>{TARGET.infobase_alias}</infoBaseAlias></targetID>
+      <callStack><moduleID><type>{location.module_type}</type>
+      <extensionName>{location.extension_name}</extensionName><objectID>{location.object_id}</objectID>
+      <propertyID>{location.property_id}</propertyID></moduleID><lineNo>{location.line}</lineNo>
+      </callStack></result></response>""".encode()
+
+
+def _completion_result_payload(result_id: UUID, wire: str) -> bytes:
+    encoded = b64encode(wire.encode("utf-8")).decode("ascii")
+    return f"""<response xmlns=\"{RDBG_NS}\"><result><cmdID>exprEvaluated</cmdID>
+      <evalExprResBaseData><expressionResultID xmlns=\"{CALC_NS}\">{result_id}</expressionResultID>
+      <resultValueInfo xmlns=\"{CALC_NS}\"><typeName>Строка</typeName>
+      <valueString>{encoded}</valueString></resultValueInfo><errorOccurred>false</errorOccurred>
+      </evalExprResBaseData></result></response>""".encode()
+
+
+def test_ready_completion_inspection_does_not_start_or_mutate_main_lifecycle() -> None:
+    """A real controller must evaluate the bounded scalar without a new MAIN."""
+    completion_wire = '"C\t3\nR\t\nR\tНомер\nR\tНазвание"'
+
+    class CompletionSession(ScriptedSession):
+        def evaluate(self, expression: str, **kwargs: object) -> EvaluationResult:
+            if expression.startswith(
+                "RuntimeValueTransferServer.СериализоватьДопущенныеИменаСвойствДляПодсказки("
+            ):
+                self.calls.append(("evaluate", expression))
+                return evaluation("Строка", completion_wire)
+            return super().evaluate(expression, **kwargs)  # type: ignore[arg-type]
+
+    session = CompletionSession(
+        (SERVICE, SERVICE),
+        main_results=(evaluation("Строка", '"baseline"'), evaluation("Строка", completion_wire)),
+    )
+    controller = runtime_module().PrototypeRuntimeController(session, SERVICE)
+    controller.execute_system_main('Результат = "baseline";')
+    api = PrototypeRuntimeApi(controller)
+    api._namespace_names = ("Данные",)
+    before = _completion_lifecycle_snapshot(controller, session)
+
+    assert api.completion_fields("Контекст.Данные") == ("Номер", "Название")
+
+    assert _completion_lifecycle_snapshot(controller, session) == before
+    inspections = [
+        value for name, value in session.calls
+        if name == "evaluate"
+        and isinstance(value, str)
+        and value.startswith(
+            "RuntimeValueTransferServer.СериализоватьДопущенныеИменаСвойствДляПодсказки("
+        )
+    ]
+    assert len(inspections) == 1
+
+
+def test_ready_completion_stop_resumes_and_drains_the_real_rdbg_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break: `evaluate()` leaks this exact capability after the first stop."""
+    completion_wire = '"C\t3\nR\t\nR\tНомер\nR\tНазвание"'
+    result_id = UUID("f1000000-0000-0000-0000-000000000001")
+    transport = _CompletionRdbgTransport()
+    transport.enqueue("evalExpr", b"")
+    transport.enqueue(
+        "pingDebugUIParams",
+        _completion_stop_payload(),
+        _completion_result_payload(result_id, completion_wire[1:-1]),
+    )
+    session = _ready_completion_rdbg(transport)
+    monkeypatch.setattr("onec_runtime.rdbg.session.uuid4", lambda: result_id)
+    runtime = runtime_module()
+    controller = runtime.PrototypeRuntimeController(session, SERVICE)
+    controller.state = runtime.OperationState.COMPLETED
+    controller.operation_id = 7
+    api = PrototypeRuntimeApi(controller)
+    api._namespace_names = ("Данные",)
+    before = (
+        controller.operation_id,
+        controller.state,
+        controller.active_operation,
+        controller.registry,
+        tuple(controller.stop_history),
+        tuple(controller.write_journal),
+        tuple(controller.journal.events),
+        controller.breakpoint_workspace_owner.confirmed_snapshot.effective_locations,
+    )
+
+    assert api.completion_fields("Контекст.Данные") == ("Номер", "Название")
+
+    assert (
+        controller.operation_id,
+        controller.state,
+        controller.active_operation,
+        controller.registry,
+        tuple(controller.stop_history),
+        tuple(controller.write_journal),
+        tuple(controller.journal.events),
+        controller.breakpoint_workspace_owner.confirmed_snapshot.effective_locations,
+    ) == before
+    assert transport.calls.count("evalExpr") == 1
+    assert transport.calls.count("step") == 1
+    assert not session._pending_evaluation_states
+    assert session.state is SessionState.READY
+
+
+def test_ready_completion_timeout_retains_a_real_rdbg_owner_until_late_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break: an acknowledged timeout must not leave RDBG silently wedged."""
+    completion_wire = "C\t3\nR\t\nR\tНомер\nR\tНазвание"
+    first_id = UUID("f2000000-0000-0000-0000-000000000001")
+    second_id = UUID("f2000000-0000-0000-0000-000000000002")
+    generated_ids = iter((first_id, second_id))
+    transport = _CompletionRdbgTransport()
+    transport.enqueue("evalExpr", b"")
+    session = _ready_completion_rdbg(transport)
+    monkeypatch.setattr("onec_runtime.rdbg.session.uuid4", lambda: next(generated_ids))
+    controller = runtime_module().PrototypeRuntimeController(
+        session, SERVICE, command_timeout_s=0.025,
+    )
+    state = runtime_module().OperationState
+    controller.state = state.COMPLETED
+    controller.operation_id = 7
+    api = PrototypeRuntimeApi(controller)
+    api._namespace_names = ("Данные",)
+
+    with pytest.raises(CaptureEvaluationPendingError) as pending:
+        api.completion_fields("Контекст.Данные", timeout_s=0.025)
+
+    assert pending.value.evaluation_kind is CaptureEvaluationKind.INSPECTION
+    assert pending.value.evaluation_id != str(first_id)
+    assert controller.state is state.RECOVERING
+    assert api.status().state is state.RECOVERING
+    assert transport.calls.count("evalExpr") == 1
+    assert len(session._pending_evaluation_states) == 1
+    owner = controller.ready_inspection_evaluation_owner()
+    assert owner is not None and owner._active is not None
+    assert owner._active.initiator_attached is False
+    with pytest.raises(ProtocolError):
+        api.completion_fields("Контекст.Данные", timeout_s=0.025)
+    with pytest.raises(ProtocolError):
+        controller.execute_system_main("Результат = 1;")
+    assert transport.calls.count("evalExpr") == 1
+
+    transport.enqueue("pingDebugUIParams", _completion_result_payload(first_id, completion_wire))
+    deadline = monotonic() + 1.0
+    while controller.state is state.RECOVERING and monotonic() < deadline:
+        sleep(0.005)
+
+    assert controller.state is state.COMPLETED
+    assert not session._pending_evaluation_states
+    transport.enqueue("evalExpr", _completion_result_payload(second_id, completion_wire))
+    assert api.completion_fields("Контекст.Данные") == ("Номер", "Название")
+    assert transport.calls.count("evalExpr") == 2
+
+
+def test_shutdown_joins_and_finalizes_each_controller_owned_evaluation_owner() -> None:
+    """Break: short-circuiting the first join strands the second owner."""
+    calls: list[tuple[str, str, bool | None]] = []
+
+    class Owner:
+        def __init__(self, name: str, joined: bool) -> None:
+            self.name = name
+            self.joined = joined
+
+        def begin_close(self) -> None:
+            calls.append(("begin", self.name, None))
+
+        def join(self, _timeout_s: float) -> bool:
+            calls.append(("join", self.name, None))
+            return self.joined
+
+        def finish_close(self, terminated: bool) -> None:
+            calls.append(("finish", self.name, terminated))
+
+    class InspectionSession(ScriptedSession):
+        def __init__(self) -> None:
+            super().__init__(())
+
+    runtime = runtime_module()
+    session = InspectionSession()
+    controller = runtime.PrototypeRuntimeController(session, SERVICE)
+    first = Owner("capture", False)
+    second = Owner("ready", True)
+    controller._capture_evaluation_coordinator = first  # type: ignore[assignment]
+    controller._ready_inspection_evaluation_coordinator = second  # type: ignore[assignment]
+
+    assert controller.shutdown_capture_evaluation() is False
+
+    assert calls == [
+        ("begin", "capture", None),
+        ("begin", "ready", None),
+        ("join", "capture", None),
+        ("join", "ready", None),
+        ("finish", "capture", False),
+        ("finish", "ready", True),
+    ]
+
+
+def test_ready_inspection_pending_owner_is_closed_through_runtime_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runtime API close must supervise a non-CAPTURE event-stream owner."""
+    result_id = UUID("f4000000-0000-0000-0000-000000000001")
+    transport = _CompletionRdbgTransport()
+    transport.enqueue("evalExpr", b"")
+    session = _ready_completion_rdbg(transport)
+    monkeypatch.setattr("onec_runtime.rdbg.session.uuid4", lambda: result_id)
+    runtime = runtime_module()
+    controller = runtime.PrototypeRuntimeController(
+        session, SERVICE, command_timeout_s=0.025,
+    )
+    controller.state = runtime.OperationState.COMPLETED
+    api = PrototypeRuntimeApi(controller)
+    api._namespace_names = ("Данные",)
+
+    with pytest.raises(CaptureEvaluationPendingError):
+        api.completion_fields("Контекст.Данные", timeout_s=0.025)
+
+    assert api._close_capture_control_plane() is True
+    assert session.target is None
+
+
+def test_ready_completion_bsl_failure_does_not_mutate_main_lifecycle() -> None:
+    """A confirmed immediate inspection failure preserves the ready operation."""
+
+    class FailingCompletionSession(ScriptedSession):
+        def evaluate(self, expression: str, **kwargs: object) -> EvaluationResult:
+            if expression.startswith(
+                "RuntimeValueTransferServer.СериализоватьДопущенныеИменаСвойствДляПодсказки("
+            ):
+                self.calls.append(("evaluate", expression))
+                return evaluation("Ошибка", "", error="synthetic completion failure")
+            return super().evaluate(expression, **kwargs)  # type: ignore[arg-type]
+
+    session = FailingCompletionSession(
+        (SERVICE,), main_results=(evaluation("Строка", '"baseline"'),)
+    )
+    controller = runtime_module().PrototypeRuntimeController(session, SERVICE)
+    controller.execute_system_main('Результат = "baseline";')
+    api = PrototypeRuntimeApi(controller)
+    api._namespace_names = ("Данные",)
+    before = _completion_lifecycle_snapshot(controller, session)
+
+    with pytest.raises(BslExecutionError):
+        api.completion_fields("Контекст.Данные")
+
+    assert _completion_lifecycle_snapshot(controller, session) == before
 
 
 def workspace_calls(session: ScriptedSession) -> list[tuple[ModuleLocation, ...]]:

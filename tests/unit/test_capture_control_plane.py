@@ -1677,6 +1677,95 @@ def test_session_proxy_materialization_restores_operation_lock_after_interrupt(
         close_owner(controller, transport)
 
 
+def test_session_completion_uses_one_owned_inspection_ticket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Completion submits an admitted INSPECTION request before it may wait."""
+    api, controller, transport = _capture_runtime(timeout_s=0.5)
+    runtime = _materialization_runtime_session(api)
+    api._namespace_names = ("Данные",)
+    first_errors: list[BaseException] = []
+    second_errors: list[BaseException] = []
+    first_done = Event()
+    second_done = Event()
+    second_started = False
+
+    def forbid_direct_collection(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("completion used direct evaluate_collection")
+
+    def first() -> None:
+        try:
+            runtime.completion_fields("Контекст.Данные")
+        except BaseException as error:
+            first_errors.append(error)
+        finally:
+            first_done.set()
+
+    def second() -> None:
+        try:
+            runtime.completion_fields("Контекст.Данные")
+        except BaseException as error:
+            second_errors.append(error)
+        finally:
+            second_done.set()
+
+    first_thread = Thread(target=first, name="session-completion-first")
+    second_thread = Thread(target=second, name="session-completion-second")
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(transport, "evaluate_collection", forbid_direct_collection)
+            first_thread.start()
+            assert transport.accepted.wait(1), "completion did not submit an inspection"
+
+            second_started = True
+            second_thread.start()
+            assert second_done.wait(0.1), "second completion waited for the deadline"
+            assert len(second_errors) == 1
+            assert isinstance(second_errors[0], CaptureBusyError)
+            status = runtime.current_capture().status()
+            observed = runtime.current_capture().wait(timeout_s=0)
+            assert status.phase is CapturePhase.EVALUATING
+            assert status.evaluation_kind is CaptureEvaluationKind.INSPECTION
+            assert status.pending_evaluation_id is not None
+            assert observed.state is CaptureEvaluationState.PENDING
+            assert transport.capture_start_count == 1
+            assert transport.capture_pending is not None
+            assert controller.breakpoint_workspace_owner.confirmed_snapshot.shielded
+            assert not first_done.is_set()
+
+            first_thread.join(_JOIN_TIMEOUT_S)
+            assert first_done.is_set()
+            assert len(first_errors) == 1
+            assert isinstance(first_errors[0], CaptureEvaluationPendingError)
+
+            transport.complete(
+                '"C\t3\nR\t\nR\tНомер\nR\tНазвание"',
+                type_name="Строка",
+            )
+            _eventually(
+                lambda: runtime.current_capture().status().phase is CapturePhase.PAUSED
+            )
+            settled = runtime.current_capture().wait(
+                timeout_s=1,
+                evaluation_id=status.pending_evaluation_id,
+            )
+            assert settled.state is CaptureEvaluationState.COMPLETED
+            assert controller.state is OperationState.CAPTURED
+            assert controller.breakpoint_workspaces[-1].phase == "full-restore"
+            assert not controller.breakpoint_workspace_owner.confirmed_snapshot.shielded
+            assert transport.capture_start_count == 1
+    finally:
+        if transport.capture_pending is not None:
+            transport.complete()
+        first_thread.join(_JOIN_TIMEOUT_S)
+        if second_started:
+            second_thread.join(_JOIN_TIMEOUT_S)
+        assert not first_thread.is_alive(), "first completion caller leaked"
+        if second_started:
+            assert not second_thread.is_alive(), "second completion caller leaked"
+        close_owner(controller, transport)
+
+
 @pytest.mark.parametrize(
     "endpoint",
     (

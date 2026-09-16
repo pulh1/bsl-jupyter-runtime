@@ -608,14 +608,6 @@ class RuntimeController(Protocol):
     operation_id: int
     state: OperationState
 
-    def inspect_completion_fields(
-        self,
-        handle: str,
-        *,
-        table_row: bool,
-        worker_type_registrations: tuple[str, ...],
-    ) -> EvaluationResult: ...
-
     def execute_main(
         self,
         source: str,
@@ -660,6 +652,12 @@ class RuntimeController(Protocol):
     ) -> CaptureCellResult | CaptureEvaluationTicket: ...
 
     def execute_system_main(self, source: str) -> MainCompletion: ...
+
+    def execute_system_inspection(self, expression: str) -> object: ...
+
+    def ready_inspection_evaluation_owner(
+        self,
+    ) -> CaptureEvaluationCoordinator | None: ...
 
     def execute_system_capture(
         self,
@@ -1552,6 +1550,10 @@ class PrototypeRuntimeApi:
         owner = getattr(self._controller, "_capture_evaluation_coordinator", None)
         return owner if isinstance(owner, CaptureEvaluationCoordinator) else None
 
+    def _ready_inspection_control_owner(self) -> CaptureEvaluationCoordinator | None:
+        owner = self._controller.ready_inspection_evaluation_owner()
+        return owner if isinstance(owner, CaptureEvaluationCoordinator) else None
+
     def _require_capture_data_plane_admission(self) -> None:
         owner = self._capture_control_owner()
         if owner is None:
@@ -1616,50 +1618,111 @@ class PrototypeRuntimeApi:
                 name.casefold() for name in self._namespace_names
             }:
                 raise ProtocolError("Completion root is not in the current namespace")
-            self._validate_value_reference_locked(handle)
+            safe_handle = self._validate_value_reference_locked(handle)
+            expression = self._completion_fields_expression(
+                safe_handle,
+                table_row=table_row,
+                worker_type_registrations=self._worker_type_registrations(),
+            )
             with self._remaining_command_timeout():
-                result = self._controller.inspect_completion_fields(
-                    handle,
-                    table_row=table_row,
-                    worker_type_registrations=self._worker_type_registrations(),
-                )
-            if (
-                result.error_occurred
-                or type(result.collection_size) is not int
-                or not 1 <= result.collection_size <= 129
-                or len(result.collection_rows) != result.collection_size
-            ):
-                raise ProtocolError("Invalid completion field schema")
-            names: list[str] = []
-            seen: set[str] = set()
-            for index, row in enumerate(result.collection_rows):
-                if (
-                    len(row.cells) != 2
-                    or row.cells[0].name != "Состояние"
-                    or row.cells[1].name != "Имя"
-                ):
-                    raise ProtocolError("Invalid completion field schema")
-                outcome = row.cells[0].value_string
-                if outcome == AdmissionEnvelopeV1.denied():
-                    raise CaptureValueAccessDeniedError(
-                        "Worker generation objects are not public values"
+                if self._controller.state is OperationState.CAPTURED:
+                    wire = self._execute_worker_instruction(
+                        "Результат = " + expression + ";",
+                        evaluation_kind=CaptureEvaluationKind.INSPECTION,
                     )
-                if outcome == AdmissionEnvelopeV1.failed():
-                    raise CaptureValueCheckError("CAPTURE value admission failed")
-                if outcome != "R":
+                else:
+                    # The controller adopts its ready-inspection ticket before
+                    # this handoff can release either outer writer.  Once the
+                    # ticket owns the pending capability, status/control-plane
+                    # callers must not wait behind the initiating caller.
+                    with self._capture_helper_writer_handoff():
+                        wire = self._controller.execute_system_inspection(expression)
+            return self._parse_completion_fields_wire(wire)
+
+    @staticmethod
+    def _completion_fields_instruction(
+        handle: str,
+        *,
+        table_row: bool,
+        worker_type_registrations: tuple[str, ...],
+    ) -> str:
+        """Read the admitted bounded schema inside one generated instruction."""
+        return "Результат = " + PrototypeRuntimeApi._completion_fields_expression(
+            handle,
+            table_row=table_row,
+            worker_type_registrations=worker_type_registrations,
+        ) + ";"
+
+    @staticmethod
+    def _completion_fields_expression(
+        handle: str,
+        *,
+        table_row: bool,
+        worker_type_registrations: tuple[str, ...],
+    ) -> str:
+        """Build the one admitted scalar target expression for completion."""
+        if (
+            type(worker_type_registrations) is not tuple
+            or any(
+                not isinstance(registration, str)
+                or not registration
+                or "\n" in registration
+                or "\r" in registration
+                for registration in worker_type_registrations
+            )
+        ):
+            raise ProtocolError("Completion Worker type registrations are invalid")
+        return (
+            "RuntimeValueTransferServer."
+            "СериализоватьДопущенныеИменаСвойствДляПодсказки("
+            + handle
+            + (", Истина, " if table_row else ", Ложь, ")
+            + bsl_string_literal("\n".join(worker_type_registrations))
+            + ")"
+        )
+
+    @staticmethod
+    def _parse_completion_fields_wire(wire: object) -> tuple[str, ...]:
+        if not isinstance(wire, str):
+            raise ProtocolError("Invalid completion field schema")
+        rows = wire.splitlines()
+        if not 2 <= len(rows) <= 130:
+            raise ProtocolError("Invalid completion field schema")
+        header_kind, header_separator, declared_size = rows[0].partition("\t")
+        if (
+            header_kind != "C"
+            or not header_separator
+            or re.fullmatch(r"[1-9]\d*", declared_size) is None
+        ):
+            raise ProtocolError("Invalid completion field schema")
+        row_count = int(declared_size)
+        if not 1 <= row_count <= 129 or len(rows) - 1 != row_count:
+            raise ProtocolError("Invalid completion field schema")
+        names: list[str] = []
+        seen: set[str] = set()
+        for index, row in enumerate(rows[1:]):
+            outcome, separator, name = row.partition("\t")
+            if not separator:
+                raise ProtocolError("Invalid completion field schema")
+            if outcome == AdmissionEnvelopeV1.denied():
+                raise CaptureValueAccessDeniedError(
+                    "Worker generation objects are not public values"
+                )
+            if outcome == AdmissionEnvelopeV1.failed():
+                raise CaptureValueCheckError("CAPTURE value admission failed")
+            if outcome != "R":
+                raise ProtocolError("Invalid completion admission result")
+            if index == 0:
+                if name != "":
                     raise ProtocolError("Invalid completion admission result")
-                name = row.cells[1].value_string
-                if index == 0:
-                    if name != "":
-                        raise ProtocolError("Invalid completion admission result")
-                    continue
-                if (not isinstance(name, str) or len(name) > 128
-                        or not re.fullmatch(r"[^\W\d]\w*", name)
-                        or name.casefold() in seen):
-                    raise ProtocolError("Invalid completion field name")
-                seen.add(name.casefold())
-                names.append(name)
-            return tuple(names)
+                continue
+            if (len(name) > 128
+                    or not re.fullmatch(r"[^\W\d]\w*", name)
+                    or name.casefold() in seen):
+                raise ProtocolError("Invalid completion field name")
+            seen.add(name.casefold())
+            names.append(name)
+        return tuple(names)
 
     def continuation_admission_is_uncertain(self) -> bool:
         """Report only whether a failed paused admission is safe to restore."""
@@ -5230,29 +5293,34 @@ class PrototypeRuntimeApi:
         if self._capture_shutdown_finished:
             return self._capture_shutdown_termination_proven
         owner = self._capture_control_owner()
-        if owner is None:
+        ready_owner = self._ready_inspection_control_owner()
+        if owner is None and ready_owner is None:
             self._capture_shutdown_finished = True
             self._capture_shutdown_termination_proven = True
             return True
-        shutdown = getattr(self._controller, "shutdown_capture_evaluation", None)
-        if callable(shutdown):
-            stopped = shutdown()
+        if ready_owner is not None:
+            stopped = self._controller.shutdown_capture_evaluation()
         else:
-            owner.begin_close()
-            session = getattr(self._controller, "session", None)
-            invalidate = getattr(session, "invalidate", None)
-            if callable(invalidate):
-                invalidate()
-            timeout_s = getattr(self._controller, "command_timeout_s", 1.0)
-            if (
-                isinstance(timeout_s, bool)
-                or not isinstance(timeout_s, (int, float))
-                or not isfinite(float(timeout_s))
-                or float(timeout_s) <= 0
-            ):
-                timeout_s = 1.0
-            stopped = owner.join(min(1.0, float(timeout_s)))
-            owner.finish_close(stopped)
+            shutdown = getattr(self._controller, "shutdown_capture_evaluation", None)
+            if callable(shutdown):
+                stopped = shutdown()
+            else:
+                assert owner is not None
+                owner.begin_close()
+                session = getattr(self._controller, "session", None)
+                invalidate = getattr(session, "invalidate", None)
+                if callable(invalidate):
+                    invalidate()
+                timeout_s = getattr(self._controller, "command_timeout_s", 1.0)
+                if (
+                    isinstance(timeout_s, bool)
+                    or not isinstance(timeout_s, (int, float))
+                    or not isfinite(float(timeout_s))
+                    or float(timeout_s) <= 0
+                ):
+                    timeout_s = 1.0
+                stopped = owner.join(min(1.0, float(timeout_s)))
+                owner.finish_close(stopped)
         self._capture_shutdown_finished = True
         self._capture_shutdown_termination_proven = bool(stopped)
         return self._capture_shutdown_termination_proven

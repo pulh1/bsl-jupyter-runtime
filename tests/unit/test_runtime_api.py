@@ -1713,6 +1713,9 @@ class FakeController:
     def clear_capture_worker_generation_pin_for_resume(self, _context: object) -> None:
         self.clear_capture_worker_generation_pin()
 
+    def ready_inspection_evaluation_owner(self) -> None:
+        return None
+
     def _worker_universe_result(self, source: str) -> object:
         import re
 

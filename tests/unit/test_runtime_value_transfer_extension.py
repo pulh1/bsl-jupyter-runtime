@@ -55,6 +55,7 @@ def test_value_transfer_module_parses_and_exports_only_public_boundary() -> None
     assert set(binding.exported_method_names) == {
         "ПолучитьИменаСвойствДляПодсказки",
         "ПолучитьДопущенныеИменаСвойствДляПодсказки",
+        "СериализоватьДопущенныеИменаСвойствДляПодсказки",
         "ПолучитьВидМатериализации",
         "ДопуститьЗначение",
         "СериализоватьЗначение",
@@ -163,6 +164,27 @@ def test_value_serializer_admits_root_and_each_descendant_before_encoding() -> N
     assert 'Свойство("ManifestSha256")' in source
     assert 'Свойство("Modules")' in source
     assert 'Свойство("Exports")' in source
+
+
+def test_completion_schema_helper_admits_before_reading_target_field_names() -> None:
+    """Completion's one target instruction cannot inspect a denied root."""
+    source = MODULE.read_text(encoding="utf-8-sig")
+    helper = source.split(
+        "Функция ПолучитьДопущенныеИменаСвойствДляПодсказки", 1
+    )[1].split("КонецФункции", 1)[0]
+
+    admission = helper.index("Если Не ДопуститьЗначение(")
+    denied = helper.index('Состояние = "D|worker_generation_value"')
+    field_read = helper.index("ПолучитьИменаСвойствДляПодсказки(")
+    assert admission < denied < field_read
+
+    scalar = source.split(
+        "Функция СериализоватьДопущенныеИменаСвойствДляПодсказки", 1
+    )[1].split("КонецФункции", 1)[0]
+    assert scalar.index("ПолучитьДопущенныеИменаСвойствДляПодсказки(") < scalar.index(
+        "Для Каждого СтрокаПодсказки"
+    )
+    assert 'Результат = "C" + Символы.Таб' in scalar
 
 
 def test_value_serializer_success_has_the_same_explicit_access_contract_as_denial() -> None:
