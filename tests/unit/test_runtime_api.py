@@ -4125,6 +4125,69 @@ def test_api_routes_table_materialize_to_existing_dataframe_transport() -> None:
     assert len(controller.main_sources) == 2
 
 
+def test_api_materialize_value_uses_one_admitted_dynamic_route_request() -> None:
+    controller = FakeController()
+    api = PrototypeRuntimeApi(controller)
+    controller.worker_results.clear()
+    content = json.dumps(
+        {
+            "version": 1,
+            "root": {"t": "array", "v": [{"t": "number", "v": "5"}]},
+        },
+        separators=(",", ":"),
+    ).encode()
+    encoded = b64encode(content).decode()
+    controller.context_value = encoded
+    controller.worker_results.append(
+        f"R|1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}"
+    )
+
+    assert api.materialize_value(
+        "Контекст.Данные", max_depth=7, max_items=99, max_bytes=4096
+    ) == [5]
+
+    assert len(controller.main_sources) == 1
+    source = controller.main_sources[0]
+    assert source.index("RuntimeValueTransferServer.ДопуститьЗначение(") < source.index(
+        "ПолучитьВидМатериализации(Контекст.Данные)"
+    )
+    assert "СериализоватьКомпактнуюТаблицу(" in source
+    assert "СериализоватьЗначение(Контекст.Данные" in source
+    assert source.index("ПолучитьВидМатериализации") < source.index("Контекст.Вставить")
+
+
+def test_api_project_value_uses_one_admitted_dynamic_route_request() -> None:
+    controller = FakeController()
+    api = PrototypeRuntimeApi(controller)
+    controller.worker_results.clear()
+    content = json.dumps(
+        {
+            "version": 1,
+            "root": {"t": "array", "v": [{"t": "number", "v": "5"}]},
+        },
+        separators=(",", ":"),
+    ).encode()
+    encoded = b64encode(content).decode()
+    controller.context_value = encoded
+    controller.worker_results.append(
+        f"R|1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}"
+    )
+
+    assert api.project_value(
+        "Контекст.Данные", {"offset": 0, "limit": 1}, max_items=9, max_bytes=4096
+    ) == [5]
+
+    assert len(controller.main_sources) == 1
+    source = controller.main_sources[0]
+    assert source.index("RuntimeValueTransferServer.ДопуститьЗначение(") < source.index(
+        "ПолучитьВидМатериализации(Контекст.Данные)"
+    )
+    assert "Если ВидМатериализации = \"table\" Тогда" in source
+    assert "RuntimeTableTransferServer.СериализоватьКомпактнуюТаблицу(" in source
+    assert "RuntimeValueTransferServer.СериализоватьЗначение(" in source
+    assert source.index("ПолучитьВидМатериализации") < source.index("Контекст.Вставить")
+
+
 class _RuntimeApiPreviewBackend:
     runtime_id = "runtime-preview"
     is_closed = False
