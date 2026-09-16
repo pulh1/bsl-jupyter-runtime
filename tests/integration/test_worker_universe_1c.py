@@ -331,10 +331,11 @@ def _platform_executable_identities(
 
 
 def _platform_prerequisites(
+    *, live_flag: str = _LIVE_FLAG,
 ) -> tuple[Path, tuple[PlatformExecutableIdentity, ...]]:
-    if os.environ.get(_LIVE_FLAG) != "1":
+    if os.environ.get(live_flag) != "1":
         pytest.skip(
-            f"set {_LIVE_FLAG}=1 for the fresh temporary-infobase Worker universe gate"
+            f"set {live_flag}=1 for the fresh temporary-infobase live gate"
         )
     configured = Path(
         os.environ.get("ONEC_PLATFORM_BIN", str(_EXPECTED_PLATFORM))
@@ -452,8 +453,11 @@ class LiveWorkerUniverseHarness:
 @contextmanager
 def _fresh_live_harness(
     tmp_path: Path,
+    *,
+    live_flag: str = _LIVE_FLAG,
+    emit_evidence: bool = True,
 ) -> Iterator[LiveWorkerUniverseHarness]:
-    platform, executable_identities = _platform_prerequisites()
+    platform, executable_identities = _platform_prerequisites(live_flag=live_flag)
     owned_root = tmp_path / "task9-live-owned"
     assert owned_root.resolve().parent == tmp_path.resolve()
     assert not owned_root.exists()
@@ -670,41 +674,44 @@ def _fresh_live_harness(
             phase_seconds["cleanup.owned_root_remove"] = (
                 perf_counter() - cleanup_started
             )
-        evidence = {
-            "cleanup": cleanup,
-            "fixture": {
-                "extension_name": FIXTURE_EXTENSION_NAME,
-                "source_sha256": fixture_sha256,
-            },
-            "outcome": (
-                "PASS"
-                if active_error is None and not cleanup_errors
-                else "FAIL"
-            ),
-            "phase_seconds": dict(sorted(phase_seconds.items())),
-            "processes": sorted(process_evidence, key=lambda item: str(item["role"])),
-            "platform": [
-                {
-                    "filename": item.filename,
-                    "product_version": item.product_version,
-                    "sha256": item.sha256,
-                }
-                for item in executable_identities
-            ],
-            "schema": "onec-task9-live-evidence-v1",
-            "started_at": started_at,
-            "target": target_evidence,
-        }
-        print(
-            "TASK9_LIVE_EVIDENCE="
-            + json.dumps(
-                evidence,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-            flush=True,
-        )
+        if emit_evidence:
+            evidence = {
+                "cleanup": cleanup,
+                "fixture": {
+                    "extension_name": FIXTURE_EXTENSION_NAME,
+                    "source_sha256": fixture_sha256,
+                },
+                "outcome": (
+                    "PASS"
+                    if active_error is None and not cleanup_errors
+                    else "FAIL"
+                ),
+                "phase_seconds": dict(sorted(phase_seconds.items())),
+                "processes": sorted(
+                    process_evidence, key=lambda item: str(item["role"])
+                ),
+                "platform": [
+                    {
+                        "filename": item.filename,
+                        "product_version": item.product_version,
+                        "sha256": item.sha256,
+                    }
+                    for item in executable_identities
+                ],
+                "schema": "onec-task9-live-evidence-v1",
+                "started_at": started_at,
+                "target": target_evidence,
+            }
+            print(
+                "TASK9_LIVE_EVIDENCE="
+                + json.dumps(
+                    evidence,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                flush=True,
+            )
         if cleanup_errors:
             failures: list[BaseException] = []
             if active_error is not None:
