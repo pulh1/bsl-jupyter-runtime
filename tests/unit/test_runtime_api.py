@@ -3894,27 +3894,25 @@ def test_api_materializes_table_without_active_worker() -> None:
 
 def _capture_table_descriptor(
     *,
+    root: str = "Результат",
     fields: tuple[str, ...] = ("Manager",),
     columns: tuple[str, ...] = ("Amount",),
     table: str = "Totals",
     offset: int = 0,
     limit: int = 10,
 ) -> str:
-    manager = ".".join(("Context", "DebugContext", "Result", *fields))
+    manager = ".".join(("Контекст", "КонтекстОтладки", root, *fields))
     selected = (
         "New Array"
         if not columns
         else 'StrSplit("' + ",".join(columns) + '", ",")'
     )
-    # Production descriptors use Russian BSL identifiers. Keep the helper
-    # readable in these tests and translate only the fixed grammar tokens.
     return (
         "RuntimeKernelServer.GetDebugTemporaryTable("
         f'{manager}, "{table}", {offset}, {limit}, {selected})'
     ).replace("GetDebugTemporaryTable", "ПолучитьВременнуюТаблицуОтладки").replace(
-        "Context.DebugContext.Result",
-        "Контекст.КонтекстОтладки.Результат",
-    ).replace("New Array", "Новый Массив").replace("StrSplit", "СтрРазделить")
+        "New Array", "Новый Массив"
+    ).replace("StrSplit", "СтрРазделить")
 
 
 class _DeferredCaptureTableController(FakeController):
@@ -5958,6 +5956,32 @@ def test_capture_projection_descriptor_accepts_maximum_bounded_selection() -> No
     )
     assert len(descriptor) > 4096
     assert PrototypeRuntimeApi._capture_projection_expression(descriptor) == descriptor
+
+
+@pytest.mark.parametrize(
+    "descriptor",
+    (
+        _capture_table_descriptor(
+            columns=tuple(f"Column{index}" for index in range(101)),
+        ),
+        _capture_table_descriptor(root="R" * 257),
+        _capture_table_descriptor(fields=("F" * 257,)),
+        _capture_table_descriptor(table="T" * 257),
+        _capture_table_descriptor(columns=("C" * 257,)),
+    ),
+    ids=(
+        "101-columns",
+        "257-codepoint-manager-root",
+        "257-codepoint-manager-field",
+        "257-codepoint-table",
+        "257-codepoint-column",
+    ),
+)
+def test_capture_projection_descriptor_rejects_values_beyond_producer_contract(
+    descriptor: str,
+) -> None:
+    with pytest.raises(ProtocolError, match="descriptor"):
+        PrototypeRuntimeApi._capture_projection_expression(descriptor)
 
 
 def test_session_delegates_single_local_reference_validation() -> None:
