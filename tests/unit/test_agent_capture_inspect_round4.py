@@ -188,6 +188,9 @@ def test_extension_separates_metadata_from_bounded_descriptor_data_result() -> N
         "Функция ПолучитьСхемуВременнойТаблицыОтладки", 1
     )[1].split("КонецФункции", 1)[0]
     selection = source.split(
+        "Функция ПолучитьВременнуюТаблицуОтладки", 1
+    )[1].split("КонецФункции", 1)[0]
+    storage = source.split(
         "Функция СохранитьВременнуюТаблицуОтладки", 1
     )[1].split("КонецФункции", 1)[0]
 
@@ -203,6 +206,8 @@ def test_extension_separates_metadata_from_bounded_descriptor_data_result() -> N
     assert selection.index("ОписательТаблицы.ПолучитьДанные()") < selection.index(
         "РезультатДанных.Выбрать()"
     )
+    assert "ПолучитьВременнуюТаблицуОтладки(" in storage
+    assert "Контекст.Вставить(Ключ, Результат)" in storage
 
 
 class CacheBackend:

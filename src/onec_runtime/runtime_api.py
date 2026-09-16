@@ -6324,10 +6324,40 @@ class PrototypeRuntimeApi:
 
     def _resolve_value_handle_locked(self, handle: str) -> str:
         safe_handle = self._validate_value_reference_locked(handle)
-        if handle.startswith("capture_table_"):
+        if (
+            handle.startswith("capture_table_")
+            and not handle.startswith("capture_table_metadata_")
+        ):
             self._require_capture_inspection_available()
-            return validate_value_handle(self._controller.capture_value_handle(handle))
+            return self._capture_projection_expression(
+                self._controller.capture_value_handle(handle)
+            )
         return safe_handle
+
+    @staticmethod
+    def _capture_projection_expression(value: object) -> str:
+        if not isinstance(value, str) or len(value) > 4096:
+            raise ProtocolError("capture table projection descriptor is invalid")
+        identifier = r"[^\W\d]\w*"
+        match = re.fullmatch(
+            r"RuntimeKernelServer\.ПолучитьВременнуюТаблицуОтладки\("
+            r"Контекст\.КонтекстОтладки\."
+            + identifier
+            + r"(?:\." + identifier + r"){0,7}, \""
+            + identifier
+            + r"\", (?P<offset>\d{1,8}), (?P<limit>\d{1,3}), "
+            + r"(?:Новый Массив|СтрРазделить\(\""
+            + identifier
+            + r"(?:," + identifier + r")*\", \",\"\))\)",
+            value,
+        )
+        if match is None:
+            raise ProtocolError("capture table projection descriptor is invalid")
+        offset = int(match.group("offset"))
+        limit = int(match.group("limit"))
+        if not 1 <= limit <= 100 or offset + limit > MAX_PROJECTION_POSITION:
+            raise ProtocolError("capture table projection descriptor is invalid")
+        return value
 
     def validate_value_reference(self, handle: str) -> str:
         """Validate a proxy reference locally without target-side value policy."""
@@ -6356,7 +6386,16 @@ class PrototypeRuntimeApi:
             # be published as a bounded-table descriptor; _resolve_value_handle_locked
             # later rejects materialization through capture_value_handle.
             return handle
-        if handle.startswith(("capture_table_", "capture_manager_")):
+        if handle.startswith("capture_table_"):
+            self._require_capture_inspection_available()
+            self._capture_projection_expression(
+                self._controller.capture_value_handle(handle)
+            )
+            # Validation preserves the opaque public reference. Resolution
+            # expands this trusted controller-owned descriptor only inside a
+            # bounded runtime instruction.
+            safe_handle = handle
+        elif handle.startswith("capture_manager_"):
             self._require_capture_inspection_available()
             safe_handle = validate_value_handle(
                 self._controller.capture_value_handle(handle)

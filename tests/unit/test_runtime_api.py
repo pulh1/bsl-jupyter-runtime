@@ -5800,6 +5800,33 @@ def test_local_reference_validation_rejects_reserved_or_malformed_handle_before_
     assert target.sources == []
 
 
+@pytest.mark.parametrize(
+    "descriptor",
+    (
+        "RuntimeKernelServer.ПолучитьВременнуюТаблицуОтладки("
+        "Контекст.КонтекстОтладки.Значение, \"Итоги\", 0, 0, Новый Массив)",
+        "RuntimeKernelServer.ПолучитьВременнуюТаблицуОтладки("
+        "Контекст.КонтекстОтладки.Значение, \"Итоги\", 0, 101, Новый Массив)",
+        "RuntimeKernelServer.ПолучитьВременнуюТаблицуОтладки("
+        "Контекст.КонтекстОтладки.Значение, \"Итоги\", 0, 10, Новый Массив); Результат = 1",
+    ),
+)
+def test_capture_projection_descriptor_rejects_unbounded_or_injected_source(
+    descriptor: str,
+) -> None:
+    with pytest.raises(ProtocolError, match="descriptor"):
+        PrototypeRuntimeApi._capture_projection_expression(descriptor)
+
+
+def test_capture_projection_descriptor_accepts_only_bounded_generated_grammar() -> None:
+    descriptor = (
+        "RuntimeKernelServer.ПолучитьВременнуюТаблицуОтладки("
+        "Контекст.КонтекстОтладки.Значение.Менеджер, \"Итоги\", 2, 3, "
+        "СтрРазделить(\"Сумма,Количество\", \",\"))"
+    )
+    assert PrototypeRuntimeApi._capture_projection_expression(descriptor) == descriptor
+
+
 def test_session_delegates_single_local_reference_validation() -> None:
     target = _UniverseInstructionExecutor()
     api = PrototypeRuntimeApi(

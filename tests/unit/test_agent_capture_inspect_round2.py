@@ -45,10 +45,7 @@ class StrictRdbgInspectionSession:
         if expression == 'ТипЗнч(Query.Manager) = Тип("МенеджерВременныхТаблиц")':
             assert stack_level == 0
             return EvaluationResult(uuid4(), "Булево", "Истина", False)
-        assert stack_level == 2
-        assert "RuntimeKernelServer.СохранитьВременнуюТаблицуОтладки" in expression
-        assert "Query();" not in expression
-        return EvaluationResult(uuid4(), "Булево", "Истина", False)
+        raise AssertionError("projected table inspection must be one collection evaluation")
 
     def evaluate_collection(
         self, expression: str, *, start_index: int, page_size: int, stack_level: int, **_kwargs: object
@@ -56,7 +53,8 @@ class StrictRdbgInspectionSession:
         self.calls.append(("collection", (expression, start_index, page_size, stack_level)))
         assert expression.startswith((
             "RuntimeKernelServer.ПолучитьСхемуВременнойТаблицыОтладки(",
-            "RuntimeTableTransferServer.ПолучитьКомпактнуюСхему(Контекст.__onec_capture_table_",
+            "RuntimeTableTransferServer.ПолучитьКомпактнуюСхему("
+            "RuntimeKernelServer.ПолучитьВременнуюТаблицуОтладки(",
         ))
         assert start_index == 0 and page_size == 101 and stack_level == 2
         row = CollectionRow(0, (CollectionCell("Имя", "Строка", '"Employee"', value_string="Employee"),))
@@ -179,9 +177,10 @@ def test_real_controller_api_session_backend_capture_metadata_path_is_bounded_an
     )
     assert rdbg.calls[1][0] == "collection"
     assert "ПолучитьСхемуВременнойТаблицыОтладки" in rdbg.calls[1][1][0]
-    assert rdbg.calls[2][0] == "evaluate"
-    assert "СохранитьВременнуюТаблицуОтладки" in rdbg.calls[2][1][0]
-    assert rdbg.calls[2][1][1] == 2
+    assert rdbg.calls[2][0] == "collection"
+    assert "ПолучитьВременнуюТаблицуОтладки" in rdbg.calls[2][1][0]
+    assert "СохранитьВременнуюТаблицуОтладки" not in rdbg.calls[2][1][0]
+    assert rdbg.calls[2][1][3] == 2
     assert not any(call[0] == "local_variables" for call in rdbg.calls)
 
 

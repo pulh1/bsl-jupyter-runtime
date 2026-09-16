@@ -25,7 +25,7 @@ def test_extension_uses_named_temporary_table_lookup_for_both_descriptor_paths()
     """Break caught: live temporary-table collections have Найти, not Получить."""
     source = KERNEL_MODULE.read_text(encoding="utf-8-sig")
     metadata = _function_body(source, "ПолучитьСхемуВременнойТаблицыОтладки")
-    selection = _function_body(source, "СохранитьВременнуюТаблицуОтладки")
+    selection = _function_body(source, "ПолучитьВременнуюТаблицуОтладки")
 
     assert "Менеджер.Таблицы.Получить(" not in metadata + selection
 

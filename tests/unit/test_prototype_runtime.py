@@ -1308,9 +1308,7 @@ def test_runtime_api_preparation_quarantine_clears_controller_inspection_without
 
 
 def test_capture_selection_passes_one_remaining_deadline_to_each_rdbg_command() -> None:
-    # Break caught: the native selection helper used RDBG's default 30 seconds
-    # and the following schema read received a fresh timeout, allowing N times
-    # the observation budget.
+    # The side-effect-free projection and schema share one bounded RDBG call.
     class TimeoutSession(ScriptedSession):
         def __init__(self) -> None:
             super().__init__((CAPTURE_A, SERVICE))
@@ -1364,9 +1362,8 @@ def test_capture_selection_passes_one_remaining_deadline_to_each_rdbg_command() 
         timeout_s=1.5,
     )
 
-    assert len(session.capture_timeouts) == 2
+    assert len(session.capture_timeouts) == 1
     assert all(0 < timeout <= 1.5 for timeout in session.capture_timeouts)
-    assert session.capture_timeouts[1] <= session.capture_timeouts[0]
     assert session.continue_count == continue_count
 
 
@@ -1755,6 +1752,7 @@ def test_unselected_preview_uses_one_native_selection_and_one_transfer_through_f
 
         def evaluate_collection(self, expression: str, **kwargs: object) -> EvaluationResult:
             if "ПолучитьСхемуВременнойТаблицыОтладки" in expression:
+                self.calls.append(("evaluate_collection", expression))
                 row = CollectionRow(
                     0,
                     (
@@ -1775,6 +1773,8 @@ def test_unselected_preview_uses_one_native_selection_and_one_transfer_through_f
                     collection_rows=(row,),
                 )
             if "ПолучитьКомпактнуюСхему" in expression:
+                self.calls.append(("evaluate_collection", expression))
+                self.selection_timeouts.append(float(kwargs["timeout_s"]))
                 return EvaluationResult(
                     uuid4(),
                     "Массив",
@@ -1898,18 +1898,24 @@ def test_unselected_preview_uses_one_native_selection_and_one_transfer_through_f
             rdbg.calls,
         )
         assert response.value.outputs["preview"].bounded_preview is not None
-        native_selections = [
+        native_schemas = [
             value
             for name, value in rdbg.calls
-            if name == "evaluate" and "СохранитьВременнуюТаблицуОтладки" in str(value)
+            if name == "evaluate_collection"
+            and "ПолучитьВременнуюТаблицуОтладки" in str(value)
         ]
         transfers = [
             value
             for name, value in rdbg.calls
             if name == "evaluate" and "СериализоватьКомпактнуюТаблицу" in str(value)
         ]
-        assert len(native_selections) == 1
+        assert len(native_schemas) == 1
         assert len(transfers) == 1
+        assert "ПолучитьВременнуюТаблицуОтладки" in str(transfers[0])
+        assert not any(
+            "СохранитьВременнуюТаблицуОтладки" in str(value)
+            for _name, value in rdbg.calls
+        )
         assert len(rdbg.selection_timeouts) == 1
         assert 0 < rdbg.selection_timeouts[0] <= 5.0
         assert rdbg.continue_count == 1

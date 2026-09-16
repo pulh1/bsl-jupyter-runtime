@@ -1325,13 +1325,6 @@ def inspect_temporary_table(controller):  # type: ignore[no-untyped-def]
             "Неопределено",
             False,
         ),
-        (
-            inspect_temporary_table,
-            CaptureEvaluationKind.INSPECTION,
-            "Булево",
-            "Истина",
-            False,
-        ),
     ],
 )
 def test_controller_owned_internal_evaluations_use_explicit_kind_and_same_owner(
@@ -1469,7 +1462,7 @@ def test_temporary_table_schema_rejects_overwide_late_result_without_exposure() 
         close_owner(controller, session)
 
 
-def _projection_cleanup_expressions(
+def _projected_table_expressions(
     session: ControlledCaptureSession,
 ) -> list[str]:
     return [
@@ -1477,20 +1470,17 @@ def _projection_cleanup_expressions(
         for method, value in session.calls
         if method == "start_evaluation"
         and isinstance(value, tuple)
-        and "УдалитьМатериализациюИзКонтекста" in value[0]
-        and "__onec_capture_table_" in value[0]
+        and "ВременнуюТаблицуОтладки" in value[0]
     ]
 
 
-@pytest.mark.parametrize("boundary", ("creation", "schema"))
 @pytest.mark.parametrize("detachment", ("timeout", "interrupt"))
-def test_detached_projected_table_cleans_late_projection_before_paused(
+def test_detached_projected_table_has_no_server_projection_to_clean(
     monkeypatch: pytest.MonkeyPatch,
-    boundary: str,
     detachment: str,
 ) -> None:
     private_name = "PRIVATE_PROJECTED_COLUMN"
-    session = ControlledCaptureSession(auto_helpers=boundary == "schema")
+    session = ControlledCaptureSession()
     controller = captured_controller(
         session,
         command_timeout_s=0.02 if detachment == "timeout" else 1,
@@ -1506,14 +1496,8 @@ def test_detached_projected_table_cleans_late_projection_before_paused(
         original_condition_wait = owner._condition.wait
 
         def interrupt_wait(timeout: float | None = None) -> bool:
-            at_boundary = (
-                boundary == "creation"
-                or len(session.collection_starts) == 1
-            )
-            if at_boundary:
-                raise KeyboardInterrupt
-            interval = 0.005 if timeout is None else min(timeout, 0.005)
-            return original_condition_wait(interval)
+            del timeout
+            raise KeyboardInterrupt
 
         monkeypatch.setattr(owner._condition, "wait", interrupt_wait)
         try:
@@ -1537,35 +1521,34 @@ def test_detached_projected_table_cleans_late_projection_before_paused(
             evaluation_id = caught.value.evaluation_id
 
         assert evaluation_id is not None
-        assert capture_probe(controller).status().phase is CapturePhase.EVALUATING
+        status = capture_probe(controller).status()
+        assert status.phase is CapturePhase.EVALUATING
+        assert status.evaluation_kind is CaptureEvaluationKind.INSPECTION
         assert controller._capture_value_paths == {}
-        if boundary == "creation":
-            session.complete()
-        else:
-            session.complete_collection((private_name,))
+        assert session.capture_start_count == 1
+        assert len(session.collection_starts) == 1
+        expression = session.collection_starts[0][0]
+        assert expression.startswith(
+            "RuntimeTableTransferServer.ПолучитьКомпактнуюСхему("
+            "RuntimeKernelServer.ПолучитьВременнуюТаблицуОтладки("
+        )
+        assert "СохранитьВременнуюТаблицуОтладки" not in expression
 
-        expected_steps = 2 if boundary == "creation" else 3
-        eventually(lambda: session.capture_start_count == expected_steps)
-        assert len(_projection_cleanup_expressions(session)) == 1
-        assert controller._capture_value_paths == {}
-        assert capture_probe(controller).status().phase is CapturePhase.EVALUATING
-        assert controller.state.value == "evaluating_capture"
-
-        session.complete(type_name="Булево", presentation="Истина")
+        session.complete_collection((private_name,))
         outcome = capture_probe(controller).wait(evaluation_id, timeout_s=1)
 
         assert outcome.state is CaptureEvaluationState.COMPLETED
         assert outcome.result is None
         assert private_name not in repr(outcome)
         assert controller._capture_value_paths == {}
-        assert len(_projection_cleanup_expressions(session)) == 1
-        assert session.capture_start_count == expected_steps
+        assert session.capture_start_count == 1
+        assert _projected_table_expressions(session) == [expression]
         assert controller.state.value == "captured"
     finally:
         close_owner(controller, session)
 
 
-def test_attached_projected_table_transfers_cleanup_ownership_to_live_handle() -> None:
+def test_attached_projected_table_publishes_deferred_bounded_descriptor() -> None:
     private_name = "PROJECTED_COLUMN"
     session = ControlledCaptureSession(auto_helpers=True)
     controller = captured_controller(session, command_timeout_s=1)
@@ -1592,16 +1575,57 @@ def test_attached_projected_table_transfers_cleanup_ownership_to_live_handle() -
         handle = item["handle"]
         assert item["schema"] == (private_name,)
         assert controller.capture_value_handle(handle).startswith(
-            "Контекст.__onec_capture_table_"
+            "RuntimeKernelServer.ПолучитьВременнуюТаблицуОтладки("
         )
         assert len(controller._capture_value_paths) == 1
-        assert _projection_cleanup_expressions(session) == []
-        assert session.capture_start_count == 2
+        assert session.capture_start_count == 1
+        assert all(
+            "СохранитьВременнуюТаблицуОтладки" not in expression
+            for expression in _projected_table_expressions(session)
+        )
     finally:
         close_owner(controller, session)
 
 
-def test_projected_table_delivery_commit_wins_timeout_without_leaking_handle(
+def test_projected_table_error_cannot_publish_or_leak_projection() -> None:
+    session = ControlledCaptureSession()
+    controller = captured_controller(session, command_timeout_s=1)
+    failures: Queue[BaseException] = Queue()
+
+    def inspect() -> None:
+        try:
+            inspect_temporary_table(controller)
+        except BaseException as error:
+            failures.put(error)
+
+    caller = Thread(target=inspect, name="projected-table-schema-error")
+    try:
+        caller.start()
+        eventually(lambda: len(session.collection_starts) == 1)
+        status = capture_probe(controller).status()
+        assert status.pending_evaluation_id is not None
+        session.complete(type_name="Ошибка", error="private projection failure")
+        caller.join(1)
+        assert not caller.is_alive()
+        assert not failures.empty()
+        outcome = capture_probe(controller).wait(
+            status.pending_evaluation_id,
+            timeout_s=1,
+        )
+        assert outcome.state is CaptureEvaluationState.FAILED
+        assert controller._capture_value_paths == {}
+        assert session.capture_start_count == 1
+        assert all(
+            "СохранитьВременнуюТаблицуОтладки" not in expression
+            for expression in _projected_table_expressions(session)
+        )
+        assert controller.state.value == "captured"
+    finally:
+        caller.join(1)
+        close_owner(controller, session)
+
+
+def test_projected_table_delivery_timeout_leaves_no_target_or_local_handle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     private_name = "PROJECTED_COLUMN"
@@ -1610,7 +1634,6 @@ def test_projected_table_delivery_commit_wins_timeout_without_leaking_handle(
     original_completion = controller._complete_capture_lifecycle
     completion_entered = Event()
     release_completion = Event()
-    replies: Queue[object] = Queue()
     failures: Queue[BaseException] = Queue()
 
     def blocked_completion(value: object, error: BaseException | None) -> object:
@@ -1621,7 +1644,7 @@ def test_projected_table_delivery_commit_wins_timeout_without_leaking_handle(
 
     def inspect() -> None:
         try:
-            replies.put(inspect_temporary_table(controller))
+            inspect_temporary_table(controller)
         except BaseException as error:
             failures.put(error)
 
@@ -1634,25 +1657,98 @@ def test_projected_table_delivery_commit_wins_timeout_without_leaking_handle(
         assert completion_entered.wait(1)
         sleep(0.05)
 
-        assert caller.is_alive(), "committed delivery detached at its expired deadline"
-        assert len(controller._capture_value_paths) == 1
-        assert _projection_cleanup_expressions(session) == []
+        assert not caller.is_alive()
+        assert isinstance(failures.get_nowait(), CaptureEvaluationPendingError)
+        assert controller._capture_value_paths == {}
+        assert session.capture_start_count == 1
+        assert all(
+            "СохранитьВременнуюТаблицуОтладки" not in expression
+            for expression in _projected_table_expressions(session)
+        )
 
         release_completion.set()
-        caller.join(1)
-        assert not caller.is_alive()
-        assert failures.empty()
-        reply = replies.get_nowait()
-        handle = reply["items"][0]["handle"]  # type: ignore[index]
-        assert controller.capture_value_handle(handle).startswith(
-            "Контекст.__onec_capture_table_"
+        outcome = capture_probe(controller).wait(
+            capture_probe(controller).status().pending_evaluation_id,
+            timeout_s=1,
         )
-        assert len(controller._capture_value_paths) == 1
-        assert _projection_cleanup_expressions(session) == []
+        assert outcome.state is CaptureEvaluationState.COMPLETED
+        assert controller._capture_value_paths == {}
     finally:
         release_completion.set()
         caller.join(1)
         close_owner(controller, session)
+
+
+def test_projected_table_local_publication_failure_has_no_target_projection() -> None:
+    class RejectingHandleMap(dict[str, str]):
+        def __setitem__(self, key: str, value: str) -> None:
+            del key, value
+            raise RuntimeError("synthetic local publication failure")
+
+    session = ControlledCaptureSession()
+    controller = captured_controller(session, command_timeout_s=1)
+    controller._capture_value_paths = RejectingHandleMap()
+    failures: Queue[BaseException] = Queue()
+
+    def inspect() -> None:
+        try:
+            inspect_temporary_table(controller)
+        except BaseException as error:
+            failures.put(error)
+
+    caller = Thread(target=inspect, name="projected-table-local-failure")
+    try:
+        caller.start()
+        eventually(lambda: len(session.collection_starts) == 1)
+        session.complete_collection(("PROJECTED_COLUMN",))
+        caller.join(1)
+
+        assert not caller.is_alive()
+        assert isinstance(failures.get_nowait(), RuntimeError)
+        assert controller._capture_value_paths == {}
+        assert session.capture_start_count == 1
+        assert all(
+            "СохранитьВременнуюТаблицуОтладки" not in expression
+            for expression in _projected_table_expressions(session)
+        )
+    finally:
+        close_owner(controller, session)
+
+
+def test_projected_table_shutdown_has_no_target_projection() -> None:
+    session = ControlledCaptureSession()
+    controller = captured_controller(session, command_timeout_s=1)
+    failures: Queue[BaseException] = Queue()
+
+    def inspect() -> None:
+        try:
+            inspect_temporary_table(controller)
+        except BaseException as error:
+            failures.put(error)
+
+    caller = Thread(target=inspect, name="projected-table-shutdown")
+    probe = capture_probe(controller)
+    closed = False
+    try:
+        caller.start()
+        eventually(lambda: len(session.collection_starts) == 1)
+        probe.owner.begin_close()
+        session.poll_error = TargetLost("synthetic shutdown")
+        assert probe.owner.join(1)
+        closed = True
+        caller.join(1)
+
+        assert not caller.is_alive()
+        assert not failures.empty()
+        assert controller._capture_value_paths == {}
+        assert session.capture_start_count == 1
+        assert all(
+            "СохранитьВременнуюТаблицуОтладки" not in expression
+            for expression in _projected_table_expressions(session)
+        )
+    finally:
+        if not closed:
+            close_owner(controller, session)
 
 
 def _direct_session_evaluation_methods() -> set[str]:

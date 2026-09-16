@@ -2683,42 +2683,30 @@ class PrototypeRuntimeController:
                 "total": 1,
                 "next_cursor": None,
             }
-        context_key = "__onec_capture_table_" + uuid4().hex
         columns_expression = (
             "Новый Массив"
             if not columns
             else "СтрРазделить(" + bsl_string_literal(",".join(columns)) + ", \",\")"
         )
-        expression = (
-            "RuntimeKernelServer.СохранитьВременнуюТаблицуОтладки(Контекст, "
+        # Keep the bounded projection as a trusted local descriptor. The
+        # target constructs it only inside the later owned inspection or
+        # materialization instruction, so an abandoned schema result cannot
+        # leave an unreachable value in server Context.
+        projection_expression = (
+            "RuntimeKernelServer.ПолучитьВременнуюТаблицуОтладки("
             + manager_path
             + ", " + bsl_string_literal(name)
-            + ", " + bsl_string_literal(context_key)
             + f", {offset}, {row_limit}, " + columns_expression + ")"
         )
-        def accept_projection(result: EvaluationResult) -> None:
-            if result.error_occurred:
-                raise BslExecutionError(result.error_text)
-            return None
-
-        self._evaluate_capture_helper(
-            expression,
-            evaluation_kind=CaptureEvaluationKind.INSPECTION,
-            stack_level=self._required_capture_kernel_stack_level(),
-            result_policy=accept_projection,
-            timeout_s=self._capture_remaining_timeout(deadline),
-        )
-        self._capture_remaining_timeout(deadline)
-        native_path = "Контекст." + context_key
         schema = self._capture_table_schema(
             "RuntimeTableTransferServer.ПолучитьКомпактнуюСхему("
-            + native_path
+            + projection_expression
             + ")",
             deadline=deadline,
         )
         self._capture_remaining_timeout(deadline)
         handle = "capture_table_" + uuid4().hex
-        self._capture_value_paths[handle] = native_path
+        self._capture_value_paths[handle] = projection_expression
         return {
             "items": ({"name": name, "schema": schema, "handle": handle},),
             "total": 1,
