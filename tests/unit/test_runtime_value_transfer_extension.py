@@ -58,7 +58,21 @@ def test_value_transfer_module_parses_and_exports_only_public_boundary() -> None
         "ПолучитьВидМатериализации",
         "ДопуститьЗначение",
         "СериализоватьЗначение",
+        "СпроецироватьЗначенияИнспекции",
     }
+
+
+def test_value_inspection_projector_is_a_closed_inline_admission_protocol() -> None:
+    """The checked-in helper is the production boundary used by context views."""
+    source = MODULE.read_text(encoding="utf-8-sig")
+    projector = source.split("Функция СпроецироватьЗначенияИнспекции", 1)[1].split(
+        "КонецФункции", 1,
+    )[0]
+
+    assert "ДопуститьЗначение" in projector
+    assert "Доступ" in projector
+    assert "Base64" in projector
+    assert "МаксимумБайт" in projector
 
 
 def test_value_encoder_has_explicit_recursive_adapters_and_limits() -> None:

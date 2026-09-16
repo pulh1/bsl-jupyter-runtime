@@ -560,3 +560,166 @@ def test_runtime_value_binding_preserves_a_pending_coordinator_outcome():
         assert status.evaluation_kind.value == "inspection"
     finally:
         close_owner(controller, transport)
+
+
+def test_runtime_value_binding_uses_the_checked_in_envelope_without_an_injected_builder():
+    """The normal runtime path owns admission, payload read and cleanup together."""
+    from base64 import b64encode
+    from hashlib import sha256
+    import json
+
+    from onec_runtime.runtime_api import PrototypeRuntimeApi
+    from test_prototype_runtime import CAPTURE_A, ScriptedSession, captured_controller, evaluation
+
+    document = {
+        "v": 1,
+        "action": "project",
+        "entries": [{
+            "name": "Оклад",
+            "denied": False,
+            "type_name": "Число",
+            "preview": "55000",
+            "size": None,
+            "shape": "scalar",
+            "cycle": False,
+        }],
+        "total": 1,
+        "next": None,
+    }
+    payload = json.dumps(document, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    base64_payload = b64encode(payload).decode("ascii")
+    envelope = "R|1|1|{}|{}|{}".format(
+        len(payload), sha256(payload).hexdigest(), len(base64_payload),
+    )
+
+    class EnvelopeSession(ScriptedSession):
+        def __init__(self):
+            super().__init__((CAPTURE_A,))
+            self.projections = 0
+            self.payload_reads = 0
+            self.cleanups = 0
+
+        def evaluate(self, expression, **kwargs):  # type: ignore[no-untyped-def]
+            if "СпроецироватьЗначенияИнспекции" in expression:
+                self.projections += 1
+                return evaluation("Строка", f'"{envelope}"')
+            if "ЗабратьКомпактнуюМатериализациюИзКонтекста" in expression:
+                self.payload_reads += 1
+                return evaluation("Строка", f'"{base64_payload}"')
+            if "УдалитьМатериализациюИзКонтекста" in expression:
+                self.cleanups += 1
+                return evaluation("Булево", "Истина")
+            return super().evaluate(expression, **kwargs)
+
+    session = EnvelopeSession()
+    controller = captured_controller(session)
+    runtime = PrototypeRuntimeApi(controller)
+    owner = controller._capture_evaluation_coordinator
+    assert owner is not None
+    try:
+        page = runtime.current_capture().context.variables[:1]
+
+        assert [item.name for item in page.items] == ["Оклад"]
+        assert page.items[0].preview == "55000"
+        assert session.projections == session.payload_reads == session.cleanups == 1
+        assert owner.status(owner._fence).last_evaluation_kind.value == "inspection"
+    finally:
+        owner.begin_close()
+        assert owner.join(2)
+
+
+def test_runtime_value_binding_validates_the_complete_path_and_view_grammar_before_builder():
+    from onec_runtime.capture_values import (
+        SafeValuePath,
+        ValueInspectionRequest,
+        ValuePathSegmentKind,
+        ValueRoot,
+        ValueRootKind,
+        ValueViewKind,
+    )
+    from test_prototype_runtime import CAPTURE_A, ScriptedSession, captured_controller
+
+    planned = []
+
+    def build(**_kwargs):
+        planned.append(True)
+        raise AssertionError("a fabricated request reached the target builder")
+
+    root = SafeValuePath(ValueRoot(ValueRootKind.CONTEXT))
+    invalid_requests = (
+        ValueInspectionRequest(
+            root, ValueViewKind.ARRAY_ITEMS, 0, 1,
+        ),
+        ValueInspectionRequest(
+            root, ValueViewKind.VARIABLES, 0, 1, exact=0,
+        ),
+        ValueInspectionRequest(
+            root.child(ValuePathSegmentKind.VARIABLE, "X").child(
+                ValuePathSegmentKind.VARIABLE, "Y",
+            ),
+            ValueViewKind.STRUCTURE_FIELDS,
+            0,
+            1,
+        ),
+        ValueInspectionRequest(
+            root.child(ValuePathSegmentKind.VARIABLE, "X").child(
+                ValuePathSegmentKind.COLUMN, "Column",
+            ),
+            ValueViewKind.STRUCTURE_FIELDS,
+            0,
+            1,
+        ),
+    )
+    session = ScriptedSession((CAPTURE_A,))
+    controller = captured_controller(session, capture_value_inspection_builder=build)
+    owner = controller._capture_evaluation_coordinator
+    assert owner is not None
+    try:
+        for request in invalid_requests:
+            with pytest.raises(CaptureValueCheckError):
+                controller.capture_value_inspection(
+                    "project", path=None, request=request, limit=None,
+                    worker_type_registrations=(),
+                )
+
+        assert planned == []
+    finally:
+        owner.begin_close()
+        assert owner.join(2)
+
+
+def test_runtime_value_binding_normalizes_a_pre_submit_builder_pending_error():
+    from onec_runtime.capture_evaluation import CaptureEvaluationKind
+    from onec_runtime.capture_values import (
+        SafeValuePath,
+        ValueInspectionRequest,
+        ValueRoot,
+        ValueRootKind,
+        ValueViewKind,
+    )
+    from test_prototype_runtime import CAPTURE_A, ScriptedSession, captured_controller
+
+    def build(**_kwargs):
+        raise CaptureEvaluationPendingError("fabricated", CaptureEvaluationKind.INSPECTION)
+
+    session = ScriptedSession((CAPTURE_A,))
+    controller = captured_controller(session, capture_value_inspection_builder=build)
+    owner = controller._capture_evaluation_coordinator
+    assert owner is not None
+    try:
+        with pytest.raises(CaptureValueCheckError, match="target projection"):
+            controller.capture_value_inspection(
+                "project",
+                path=None,
+                request=ValueInspectionRequest(
+                    SafeValuePath(ValueRoot(ValueRootKind.CONTEXT)),
+                    ValueViewKind.VARIABLES,
+                    0,
+                    1,
+                ),
+                limit=None,
+                worker_type_registrations=(),
+            )
+    finally:
+        owner.begin_close()
+        assert owner.join(2)
