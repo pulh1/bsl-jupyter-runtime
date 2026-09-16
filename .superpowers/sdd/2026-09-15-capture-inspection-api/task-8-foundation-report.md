@@ -289,3 +289,49 @@ passed `674 passed` in 45.77 seconds. The final unit suite passed `4566
 passed, 58 skipped` in 252.71 seconds, with only the existing Windows ZMQ
 Proactor warning. `python -m compileall -q src/onec_runtime
 packages/jupyter/src packages/mcp/src` and `git diff --check` pass.
+
+## Completion inspection lifecycle ownership
+
+`RuntimeSession.completion_fields()` now binds the existing composed capture
+handoff while it owns its operation lock. `PrototypeRuntimeApi.completion_fields()`
+validates the local Context path under the data-plane writer, then submits one
+`INSPECTION` instruction through `_execute_worker_instruction`. In a captured
+runtime that is a coordinator-owned `execute_system_capture` request: ticket
+submission and adoption occur while the Session and API locks remain held; the
+composed handoff encloses only the initiator ticket wait.
+
+The generated BSL calls
+`RuntimeValueTransferServer.ПолучитьДопущенныеИменаСвойствДляПодсказки` and
+serializes its bounded marker-plus-names table into a scalar `C<TAB>count`
+contract. The parser requires the declared count, one root marker, and at most
+128 unique identifiers. This preserves all 128 names and turns a truncated or
+malformed reply into `ProtocolError`. The server helper's own source contract
+admits the root before it enumerates names, so no denied root reaches a schema
+or field read. The former `RuntimeController.inspect_completion_fields` and
+its direct caller-thread `evaluate_collection` implementation were removed;
+there is no compatibility adapter.
+
+The captured RuntimeSession regressions cover a ready inspection, confirmed
+D/E admission outcomes, malformed reply, confirmed BSL error, dispatch
+uncertainty, restoration failure, caller deadline, and `KeyboardInterrupt`.
+For an acknowledged withheld result they assert one `INSPECTION` record and
+capability, a shielded workspace, accessible `status`/`current_capture`/`wait`,
+a prompt second-call `CaptureBusyError` without redispatch, and a late result's
+single full workspace restoration. The interruption case proves the operation
+lock is reacquired while the coordinator retains the pending inspection.
+The generated instruction is parsed by the pinned BSL parser; the extension
+source contract proves helper admission precedes its field-name read.
+
+RED `6179224` makes a real Session completion wait for an owned inspection
+instead of accepting a direct collection call. GREEN `be2f526` provides the
+coordinator route, scalar wire parser, Session handoff, and outcome matrix.
+No BSL module changed in this correction, so the checked-in Designer-built CFE,
+sole protocol `2`, artifact `0.1.3`, and four-source manifest remain unchanged.
+
+The exact completion/control-plane suite passed `25 passed` in 2.61 seconds.
+The expanded completion/coordinator/runtime/Jupyter/MCP suite passed `599
+passed` in 46.26 seconds. The final full unit suite passed `4576 passed, 58
+skipped` in 258.08 seconds, with only the existing Windows ZMQ Proactor
+warning. `uv run python -m compileall -q src/onec_runtime packages/jupyter/src
+packages/mcp/src`, `git diff --check`, and the no-`inspect_completion_fields`
+source check pass.
