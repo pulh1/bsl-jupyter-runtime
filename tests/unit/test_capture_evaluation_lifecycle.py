@@ -1809,3 +1809,10 @@ def test_controller_has_no_legacy_capture_evaluation_or_resume_entrypoints() -> 
         .default
         is inspect.Parameter.empty
     )
+
+
+def test_controller_exposes_no_direct_capture_completion_collection_entrypoint() -> None:
+    """Completion must enter CAPTURE only through a coordinator request."""
+    from onec_runtime.prototype_runtime import PrototypeRuntimeController
+
+    assert "inspect_completion_fields" not in PrototypeRuntimeController.__dict__

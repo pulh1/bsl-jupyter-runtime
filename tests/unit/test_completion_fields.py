@@ -449,6 +449,64 @@ def test_ready_completion_releases_session_and_api_locks_while_ticket_waits() ->
         close_owner(controller, session)
 
 
+@pytest.mark.parametrize("captured", (True, False), ids=("capture", "ready"))
+def test_completion_handoff_defers_heartbeat_while_controller_owns_debug_stream(
+    captured: bool,
+) -> None:
+    """The released Session lock must not let heartbeat poll RDBG concurrently."""
+    session = ControlledCaptureSession()
+    if captured:
+        runtime, api, controller = _captured_completion_runtime(session)
+    else:
+        controller_module = __import__(
+            "onec_runtime.prototype_runtime", fromlist=("PrototypeRuntimeController",)
+        )
+        controller = controller_module.PrototypeRuntimeController(
+            session, SERVICE, command_timeout_s=1.0,
+        )
+        controller.state = OperationState.COMPLETED
+        api = PrototypeRuntimeApi(controller)
+        api._namespace_names = ("Данные",)
+        runtime = object.__new__(RuntimeSession)
+        runtime.runtime_api = api
+        runtime._operation_lock = RLock()
+        runtime._closed = False
+
+    heartbeats: list[str] = []
+    runtime._rdbg = SimpleNamespace(heartbeat=lambda: heartbeats.append("called"))
+    runtime._processes = SimpleNamespace()
+    fields: list[tuple[str, ...]] = []
+    errors: list[BaseException] = []
+
+    def complete() -> None:
+        try:
+            fields.append(runtime.completion_fields("Контекст.Данные", timeout_s=1.0))
+        except BaseException as error:
+            errors.append(error)
+
+    caller = Thread(target=complete, name="completion-heartbeat-handoff")
+    try:
+        caller.start()
+        assert session.accepted.wait(1), "completion was not acknowledged"
+        assert session.polling.wait(1), "coordinator did not start polling"
+        assert runtime._operation_lock.acquire(blocking=False)
+        runtime._operation_lock.release()
+
+        runtime._heartbeat_tick()
+
+        assert heartbeats == []
+        session.complete(_completion_wire(), type_name="Строка")
+        caller.join(1)
+        assert not caller.is_alive()
+        assert fields == [("Номер", "Название")]
+        assert errors == []
+    finally:
+        if session.capture_pending is not None:
+            session.complete(_completion_wire(), type_name="Строка")
+        caller.join(1)
+        close_owner(controller, session)
+
+
 def test_ready_completion_submit_interruption_detaches_adopted_ticket(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
