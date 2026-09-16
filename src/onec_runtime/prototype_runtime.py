@@ -2231,11 +2231,23 @@ class PrototypeRuntimeController:
         owner = self._capture_evaluation_owner()
         stack_level = self._required_capture_kernel_stack_level()
 
+        def shield_workspace() -> None:
+            self._set_workspace(
+                "capture-materialization",
+                self.registry.evaluation_locations,
+            )
+
+        def restore_workspace() -> None:
+            self._set_workspace("full-restore", self.registry.full_locations)
+
         def step_factory(source: str) -> CaptureRemoteStep:
             return self._capture_remote_step(
                 build_live_current_capture_call(source),
                 stack_level=stack_level,
                 max_text_size=plan.max_text_size,
+                before_dispatch=shield_workspace,
+                pre_dispatch_cleanup=restore_workspace,
+                restore=restore_workspace,
             )
 
         def read(
