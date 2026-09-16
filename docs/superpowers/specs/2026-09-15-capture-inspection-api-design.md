@@ -29,7 +29,8 @@ acquire the current capture, confirm the source location quickly, inspect
   interruption.
 - Cover the lifecycle and diagnostic aspects of both observed scenarios from
   GitHub issue #5: a pending user `%%bsl` evaluation and a pending internal
-  public-value guard reached through `OnecValueProxy.to_df()`.
+  value-admission/materialization operation reached through
+  `OnecValueProxy.to_df()`.
 - Keep every live object fenced to the exact capture stop.
 - Reuse syntax information already produced by hot reload.
 - Resolve configuration sources in both Designer export and EDT project layouts.
@@ -41,10 +42,10 @@ acquire the current capture, confirm the source location quickly, inspect
   and `КонтекстОтладки`.
 - An automatically injected global `capture` variable in Jupyter.
 - Arbitrary BSL expression evaluation through the inspection API.
-- Redesigning bulk materialization or DataFrame transfer. The public-value guard
-  and any other internal CAPTURE evaluation reached from `to_df()` are in scope
-  for lifecycle ownership, but the transfer itself is unchanged.
-- Caching or optimizing repeated public-value guards, diagnosing why 1C/RDBG
+- Redesigning bulk payload transfer or DataFrame decoding. Value admission is
+  folded into the existing target-side serialization-preparation request, but
+  the payload transport and DataFrame conversion remain unchanged.
+- Wider `to_df()` pipeline performance/caching work, diagnosing why 1C/RDBG
   sometimes does not return an evaluation result, or providing in-place
   recovery after genuinely uncertain dispatch.
 - Live 1C qualification of the RDBG-stall scenarios from issue #5. It remains
@@ -343,11 +344,13 @@ An example page is self-contained:
 ### Value privacy
 
 Safe paths constrain what can be executed; a separate `CaptureValuePolicy`
-constrains what can be disclosed. Every variable page, exact lookup and child
-page applies the existing public-value guard before exposing a preview, handle
-or descendants. The check follows the underlying value identity and therefore
-also rejects an ordinary-looking alias that refers to a Worker generation
-object.
+constrains what can be disclosed. Every consuming variable-page, exact-lookup,
+child-page or materialization operation applies the public-value policy before
+exposing a preview, payload or descendants. The check follows the underlying
+value identity and therefore also rejects an ordinary-looking alias that refers
+to a Worker generation object. Publishing a Jupyter proxy exposes only a
+validated symbolic path and generation fence, so proxy creation and namespace
+synchronization perform no RDBG privacy evaluation.
 
 The validation order is fixed:
 
@@ -360,10 +363,30 @@ capture fence and lifecycle state
   → normalized snapshot
 ```
 
-The policy check may itself use the existing bounded Worker-type probe. No
-projected value is formatted, serialized or returned before that value passes
-the guard. Temporary handles are controller-owned and are removed after the
-page is normalized or the operation fails.
+The inline policy stage may reuse the existing bounded Worker-type identity
+logic, but it is emitted as part of the same consuming request. No type,
+preview, handle or payload from that request becomes public before the
+corresponding root and exposed descendants have final policy decisions. A full
+materializer may build private intermediate bytes while walking a bounded
+value, but it writes no transferable context payload and publishes no `ready`
+envelope if a required descendant is denied. A page projection may publish only
+the fixed redacted entry below for a denied selected child. Temporary handles
+are controller-owned and are removed after the page is normalized or the
+operation fails.
+
+Native-frame name discovery is the one protocol-constrained precursor. RDBG
+`evalLocalVariables` is allowed to discover candidate identifiers because RDBG
+offers no name-only variant. Its `type_name`, `presentation` and size fields are
+controller-private, untrusted input: they are discarded and may never enter a
+page, representation, exception, journal record or cache. After local bounded
+paging selects at most 100 validated identifiers, one coordinator-owned
+`inspection` request at that native level applies policy and produces the
+public type/preview descriptors. A pending or failed request exposes none of
+the inventory metadata. A denied projected child may expose only its already
+validated candidate selector through the fixed redacted page entry below; its
+inventory type, presentation and size remain discarded. Tests seed the
+discarded fields with private sentinels and prove that they cannot cross any
+public boundary.
 
 A denied value may retain its variable name in the containing frame page, but
 its type and presentation are redacted:
@@ -375,8 +398,29 @@ its type and presentation are redacted:
 It is not expandable. Exact access raises
 `CaptureValueAccessDeniedError`. The native stack renderer continues to redact
 runtime-kernel URLs, private module identity and internal generation handles.
-Lifecycle failures such as `CaptureBusyError` are decided before the privacy
-guard, so they cannot be mistranslated into a Worker-object error.
+Lifecycle failures such as `CaptureBusyError` are decided before the inline
+public-value policy stage, so they cannot be mistranslated into a Worker-object
+error.
+
+Denial has two scopes. If the requested root is denied, or any value required
+for exact access or full materialization is denied, the operation returns the
+whole-request `D` envelope and publishes no payload. Once a page root is
+admitted, a denied projected child remains in an otherwise admitted page using
+this exact route-payload object:
+
+```json
+{"name":"<validated identifier>","access":"denied","expandable":false}
+{"name":0,"access":"denied","expandable":false}
+```
+
+Those are the only two forms and the only keys. `name` is either a locally
+validated BSL identifier or a non-negative integer within the requested page
+bound. The entry contains no type, preview, size, target handle or safe path.
+Admitted siblings use the ordinary closed `ValueNode` snapshot schema. The
+outer operation returns `R` only after every selected child has reached a final
+admitted or denied policy decision; it never publishes part of a page while a
+child remains pending. Exact lookup of the same denied child still returns `D`
+and raises `CaptureValueAccessDeniedError`.
 
 ## Source module resolution
 
@@ -532,9 +576,10 @@ failure
 
 `pending_evaluation_id` is `None` when no evaluation is outstanding.
 `evaluation_kind` is `None` in that case; otherwise it is one of the safe enum
-values `user_bsl`, `public_value_guard`, `inspection` or
-`materialization_helper`. It never contains BSL source, a value handle, a
-module identity or Worker data.
+values `user_bsl`, `inspection` or `materialization_helper`. Value admission is
+a stage of the consuming inspection/materialization request, not a separate
+evaluation kind. The field never contains BSL source, a value handle, a module
+identity or Worker data.
 
 `last_evaluation_id` identifies the most recent settled waitable outcome for
 this capture. `last_user_evaluation_id` preserves the most recent user-BSL
@@ -584,8 +629,8 @@ compete to consume a result.
 
 This ownership applies to every `evalExpr` executed against a paused CAPTURE,
 not only visible `%%bsl` cells. In particular,
-`execute_system_capture()`, `_execute_worker_instruction()`, the Worker
-public-value probe, bounded inspection projections and materialization helpers
+`execute_system_capture()`, `_execute_worker_instruction()`, bounded inspection
+projections and materialization helpers with their inline value-admission stage
 must submit their target-side evaluation through the same coordinator. Direct
 calls to `RdbgSession.evaluate()` from these paths are prohibited. At most one
 coordinator record may own a pending RDBG capability for a capture.
@@ -598,8 +643,10 @@ therefore keep their existing meaning.
 
 Internal call sites pass `evaluation_kind` explicitly; the coordinator never
 infers it by inspecting generated BSL text. Pin installation/cleanup and generic
-transfer plumbing use `materialization_helper` unless a more specific caller
-labels the operation `public_value_guard` or `inspection`.
+transfer plumbing, including `to_df()` and recursive-value admission plus
+serialization preparation, use `materialization_helper`. Bounded context,
+value, type and field projections use `inspection`. No remote standalone guard
+operation is exposed or submitted.
 
 Submission transfers the evaluation to the coordinator before transport I/O.
 The coordinator, rather than the requesting Python call stack, owns dispatch,
@@ -648,9 +695,9 @@ object representation. An internal composite call has exactly one initiating
 waiter and an explicit downstream continuation. If that initiating waiter
 detaches, the coordinator finishes the already dispatched evaluation and
 required cleanup but marks that continuation abandoned. For example, a late
-`False` result from a detached
-`public_value_guard` restores CAPTURE to `paused`, but does not start table
-transfer for the abandoned `to_df()` call.
+`ready` result from a detached `materialization_helper` restores CAPTURE to
+`paused` and removes its temporary payload, but does not fetch or decode that
+payload for the abandoned `to_df()` call.
 
 Calls to `capture.wait()` are observers. Attaching, timing out or interrupting
 an observer never detaches the initiating waiter, abandons its continuation or
@@ -685,11 +732,12 @@ single pending record until it settles. The coordinator retains two bounded
 settled slots: the last `user_bsl` record and the last publicly observed,
 initiator-detached or abnormally terminated internal record. A normally
 completed internal helper with an attached initiator and no observer is returned
-to its caller and discarded. Thus an internal guard never erases the retained
-user-cell outcome, while an observed or interrupted guard remains available to
-`capture.wait()`. Each retained ID is repeatable until its slot is replaced by a
-later qualifying record or its capture fence becomes stale. Outcome objects
-already returned to Python remain immutable snapshots.
+to its caller and discarded. Thus an internal materialization or inspection
+never erases the retained user-cell outcome, while an observed or interrupted
+internal operation remains available to `capture.wait()`. Each
+retained ID is repeatable until its slot is replaced by a later qualifying
+record or its capture fence becomes stale. Outcome objects already returned to
+Python remain immutable snapshots.
 
 State transitions are defined at the failure boundaries:
 
@@ -738,17 +786,45 @@ recovery from `outcome_unknown` or `recovery_required`: their diagnostic
 directs the caller to close and restart the runtime, and teardown releases any
 quarantined pins and temporary handles.
 
-### Public-value guard result contract
+### Value-admission result contract
 
-The Worker public-value guard is an internal evaluation with
-`evaluation_kind="public_value_guard"`. Only a confirmed Boolean result decides
-privacy:
+Value admission is the first value-consuming target-side branch of every
+operation. The native-frame candidate-name exception above consumes no fields
+except validated identifiers. For `to_df()` and recursive `materialize()` the
+root policy runs before traversal inside one
+`evaluation_kind="materialization_helper"` request. Each descendant policy
+decision runs during bounded traversal before that descendant is encoded. For
+context/value pages, type lookup and field completion the same ordering is part
+of the corresponding `inspection` request. No transferable payload or `R`
+result is published until the root and every selected descendant has a final
+policy decision. The operation returns a bounded tagged envelope; only a
+confirmed tag decides root/exact denial or admits a result.
 
-| Guard observation | Public behavior |
+Every materialization and inspection payload uses this exact ASCII envelope,
+limited to 192 UTF-8 bytes:
+
+```text
+R|<runtime_generation>|<context_generation>|<payload_bytes>|<sha256>|<base64_chars>
+D|worker_generation_value
+E|value_admission_failed
+```
+
+`R` has exactly six fields. Generations are positive base-10 integers no larger
+than `2^63-1`; `payload_bytes` and `base64_chars` are positive base-10 integers
+bounded by the request budgets; `sha256` is exactly 64 lowercase hexadecimal
+characters. The request already owns the private context key, so the key never
+appears in the envelope. `D` and `E` each have exactly two fields and only the
+literal codes above. Extra fields, non-ASCII data, leading signs, malformed or
+over-budget numbers, an invalid hash, an unknown tag/code, target text, or an
+oversized envelope produce `CaptureValueCheckError` with no raw cause/context
+and still run mandatory cleanup. Route-specific payload parsers remain closed
+allowlists over the advertised typed fields.
+
+| Admission observation | Public behavior |
 | --- | --- |
-| `True` | Raise `CaptureValueAccessDeniedError`; do not expose or materialize the value |
-| `False` | Admit the value; continue the operation only while its initiating waiter remains attached |
-| Confirmed BSL error, invalid result or local guard failure | Raise `CaptureValueCheckError`; do not claim that the value is a Worker object |
+| `D|worker_generation_value` | Root/exact/full-materialization denial: raise `CaptureValueAccessDeniedError`; publish no value metadata or payload |
+| Valid `R|...` | Admit the prepared result; a page payload may contain only the fixed redacted entries defined above for denied projected children; fetch it only while its initiating waiter remains attached |
+| `E|value_admission_failed`, confirmed BSL error, or invalid envelope/result | Raise `CaptureValueCheckError`; do not claim that the value is a Worker object |
 | Acknowledged evaluation still pending at initiating-caller timeout | Keep `evaluating`, detach the initiating waiter and expose the record through `status()`/`wait()` |
 | Dispatch/acceptance uncertain | Enter `outcome_unknown` |
 | Workspace restoration failed | Enter `recovery_required` |
@@ -756,10 +832,40 @@ privacy:
 
 No `BaseException` catch may translate timeout, interruption, busy state,
 transport ambiguity or restoration failure into "Worker generation objects are
-not public values". If a `to_df()` initiating waiter detaches during the guard, table
-schema inspection and table transfer do not begin. A second `to_df()` while the
-record is pending fails before privacy probing with `CaptureBusyError` carrying
-the same safe evaluation ID and kind.
+not public values". If a `to_df()` initiating waiter detaches, the coordinator
+finishes the already accepted helper and mandatory cleanup but never fetches or
+decodes its payload. A second `to_df()` while the record is pending fails before
+another target operation with `CaptureBusyError` carrying the same safe
+evaluation ID and kind.
+
+### Extension protocol and source identity
+
+The serializer signatures and `AdmissionEnvelopeV1` are an incompatible
+Python-to-CFE protocol change. This implementation increments the extension
+protocol from `1` to `2` in both handshake modules and in the packaged manifest.
+It also increments the artifact version from `0.1.2` to `0.1.3` in
+`Configuration.xml`, both handshake modules and the manifest. MANUAL mode may
+warn and continue across an artifact-version mismatch, but it must reject
+protocol `1` before any inspection or materialization request reaches the
+target. Protocol `2` is the only supported contract after this change: there is
+no v1/v2 negotiation, legacy serializer signature, v1 envelope parser or
+compatibility shim.
+
+The exact extension artifact fingerprint includes normalized hashes for all
+four protocol-bearing BSL sources: the managed application module,
+`RuntimeKernelServer`, `RuntimeValueTransferServer`, and
+`RuntimeTableTransferServer`. A change to either serializer therefore changes
+`artifact.source_sha256`; a stale CFE/manifest cannot pass source round-trip
+verification. The checked-in CFE and manifest move together with these sources.
+
+Removing the standalone remote guard is one atomic repository migration.
+Jupyter and MCP proxy publication use a side-effect-free local
+`validate_value_reference()` operation that validates syntax, reserved roots,
+virtual capture-handle ownership and generation fences without RDBG I/O. The
+old `require_public_value_handle()` and `require_public_value_handles()` names
+are removed from core and frontend protocols. Every MCP/Jupyter materialization
+or inspection consumer then delegates dynamic policy to the same core
+`inspection` or `materialization_helper` request described above.
 
 ### Resume ownership
 
@@ -962,6 +1068,23 @@ shutdown journals a bounded abandoned-operation diagnostic and lets supervised
 process teardown own the remaining resources. It never waits indefinitely and
 never reclassifies the pending value as a Worker privacy denial.
 
+Shutdown completion uses independent monotonic axes. `RuntimeApi` closes public
+data-plane admission as soon as shutdown begins, but that state is not terminal:
+it separately reports capture-classification publication and local data-plane
+resource finalization. A repeated normal, kernel or direct API close continues
+unfinished axes even after Session has destroyed the target. Once target death
+is proven, local Worker roots, pin leases, registration ledgers and generation
+handles are finalized without another remote command. No `_closed` flag or API
+return alone may imply capture publication or data-plane finalization.
+
+`RuntimeSession` is terminal only when its local process/transport/UI resources,
+the coordinator's capture publication, and RuntimeApi data-plane resources are
+all terminal. The Jupyter wrapper removes retry hooks and stops its guardian
+only after that Session predicate becomes true. Tests use real
+`WorkerUniverseRegistry` and `ServerWorkerUniverseRegistry` ownership to prove
+that every normal/kernel first-call and retry combination reaches zero leases,
+zero registrations and no retained generation handle.
+
 ## Component boundaries
 
 `src/onec_runtime` owns all behavior and typed models:
@@ -970,7 +1093,8 @@ never reclassifies the pending value as a Worker privacy denial.
 - capture fence validation, the lock-independent control plane and
   `CaptureEvaluationCoordinator` for user and internal evaluations;
 - bounded RDBG operation plans and safe value paths;
-- `CaptureValuePolicy`, backed by the existing public-value guard;
+- `CaptureValuePolicy`, applied inside each consuming projection or
+  materialization request;
 - shared Designer/EDT source-root normalization and layout adapters;
 - demand-driven configuration source resolution;
 - pinned `SourceVersionRef` resolution;
@@ -991,23 +1115,26 @@ instead of poisoning the runtime with `CommandTimeout`. `KeyboardInterrupt`
 still interrupts the cell, but the coordinator continues owning the operation;
 the next Python cell can call `runtime.current_capture().status()` or `wait()`.
 
-Existing proxy/materialization entry points consult the capture control-plane
-state before `_require_available()` and before any privacy probe. While an
-internal evaluation is pending, a repeated `to_df()` therefore receives
-`CaptureBusyError` with safe evaluation ID/kind. It cannot reach the old broad
-guard exception handler or begin another remote instruction.
+Proxy creation and namespace synchronization are local handle publication and
+perform no target I/O. Materialization entry points consult the capture
+control-plane state before `_require_available()` and before submitting their
+combined admission/preparation request. While an internal evaluation is
+pending, a repeated `to_df()` therefore receives `CaptureBusyError` with safe
+evaluation ID/kind and cannot begin another remote instruction.
 
-`packages/mcp` gains no new public tools in the first version. Core models
-nevertheless use finite pages, scalar metadata and explicit status so a later
-MCP adapter can serialize them as `describe` and `list_children` operations
-without accepting arbitrary expressions.
+Adapting the existing `packages/mcp` capture tools is outside this plan and is
+tracked by [GitHub issue #6](https://github.com/pulh1/bsl-jupyter-runtime/issues/6).
+Core models nevertheless use finite pages, scalar metadata and explicit status
+so that work can choose an appropriate MCP contract without accepting arbitrary
+expressions. There is no backward-compatibility requirement for the old MCP
+tool names or wire schemas.
 
-The new typed inspection engine is the canonical implementation. Existing
-dictionary APIs have no compatibility guarantee. They may be removed, migrated
-or temporarily retained as private adapters according to the smallest safe
-implementation path; no deprecation shim is required. Existing MCP code that
-currently calls those dictionaries is migrated in the same change or routed
-through such a private adapter, so the repository remains internally coherent.
+The new typed inspection engine is the canonical Python implementation.
+Existing Python dictionary APIs have no compatibility guarantee and need no
+deprecation shim. This plan does not migrate MCP dictionary consumers to typed
+pages. Task 8 only replaces obsolete MCP calls to the removed remote guard with
+local reference validation so that its core API removal is atomic and the
+repository remains buildable; issue #6 owns the broader MCP redesign.
 
 ## Data flow
 
@@ -1041,24 +1168,27 @@ A value request follows this path:
 node.children[0:20]
   → validate node fence and safe path
   → reject busy, unknown or stale capture state
-  → validate declared shape and public-value policy for the root
+  → validate the locally declared shape and admit the root
   → execute the shape adapter's finite RDBG operation plan into temporary handles
-  → privacy-check every projected handle
-  → normalize type, preview, size and child keys
+  → decide inline policy for each projected handle before normalizing it
+  → encode an admitted descriptor or the fixed redacted child entry
+  → publish one immutable page only after every selected decision settles
   → return immutable ValuePage
 ```
 
-The issue #5 `to_df()` guard path follows this flow without redesigning table
-transfer:
+The issue #5 `to_df()` path follows this flow while retaining the existing bulk
+payload transport:
 
 ```text
 OnecValueProxy.to_df()
-  → read capture control-plane state before RuntimeApi availability/privacy work
-  → submit one coordinator operation(kind="public_value_guard")
-  → RDBG acknowledges: coordinator retains capability and generation pin
-  → attached waiter + False: restore workspace, then continue existing transfer
-  → detached initiating waiter + late False: restore workspace, publish safe outcome, stop
-  → True: CaptureValueAccessDeniedError
+  → read capture control-plane state before RuntimeApi availability/value work
+  → submit one coordinator operation(kind="materialization_helper")
+  → helper admits the root before traversal and each descendant before encoding
+  → publish no transferable payload until all required policy decisions settle
+  → RDBG acknowledges: coordinator retains capability, generation pin and cleanup lease
+  → attached waiter + ready: fetch and decode the existing bulk payload
+  → detached initiating waiter + late ready: discard via cleanup without payload fetch
+  → denied: CaptureValueAccessDeniedError
   → pending: CaptureBusyError for every later data-plane call; no redispatch
   → uncertain acceptance: CaptureOutcomeUnknownError
 ```
@@ -1115,9 +1245,9 @@ Required tests cover:
 - rejection of unbounded slices, unsafe names and fabricated path segments;
 - privacy rejection for direct Worker values, aliases and nested descendants,
   with lifecycle errors taking precedence;
-- exact public-value-guard classification for `True`, `False`, BSL failure,
-  invalid result, acknowledged pending, uncertain dispatch, restoration failure
-  and interrupted waiter;
+- exact composite value-admission classification for `denied`, `ready`, BSL
+  failure, invalid envelope, acknowledged pending, uncertain dispatch,
+  restoration failure and interrupted waiter;
 - evaluation faults before dispatch, during uncertain dispatch, after RDBG
   acknowledgement, after a result and during workspace restoration;
 - no generation quarantine, `retain_outcome_unknown()` or RuntimeApi poison
@@ -1134,8 +1264,8 @@ Required tests cover:
 - an attached `to_df()` initiator plus a `capture.wait()` observer, proving that
   observer timeout/interrupt does not abandon transfer and that the observed
   safe internal outcome remains repeatable until its bounded slot is replaced;
-- one active record across user BSL, guard, inspection and materialization
-  helper kinds, including bounded mandatory cleanup steps;
+- one active record across user BSL, inspection and composite
+  materialization-helper kinds, including bounded mandatory cleanup steps;
 - pre-registration of temporary-handle cleanup leases before dispatch and
   preservation of coordinator ownership after waiter detachment, with no cleanup
   `evalExpr` until the acknowledged capability settles, plus a barrier race where
@@ -1162,30 +1292,33 @@ Required tests cover:
   continues to advance;
 - distinct busy, inspection-timeout, unknown-outcome, recovery and stale
   errors;
-- migration or private adaptation of every existing MCP dictionary consumer.
+- target-I/O-free local-reference validation at every Jupyter/MCP proxy
+  publication site affected by removal of the old remote guard.
 
 The second observed scenario from issue #5 has a dedicated regression test:
 
-1. `OnecValueProxy.to_df()` reaches a `public_value_guard` coordinator record.
+1. `OnecValueProxy.to_df()` reaches one `materialization_helper` coordinator
+   record whose first value-consuming target-side branch performs value
+   admission.
 2. The fake RDBG transport acknowledges its `evalExpr` but withholds the result.
 3. The original waiter raises `CaptureEvaluationPendingError` on timeout or
    receives `KeyboardInterrupt`.
-4. Table schema inspection and transfer counters remain zero.
+4. Separate schema-read and payload-transfer counters remain zero.
 5. Exactly one pending record, RDBG capability and generation pin remain owned
    by the coordinator; the runtime is not poisoned or quarantined as unknown.
 6. From a simulated next notebook cell, `runtime.current_capture()`,
    `capture.status()` and `capture.wait(timeout_s=...)` reach that record without
    the single-writer path. Status reports `phase="evaluating"`, the same
-   evaluation ID and `evaluation_kind="public_value_guard"`.
+   evaluation ID and `evaluation_kind="materialization_helper"`.
 7. A second `to_df()` performs no dispatch and raises `CaptureBusyError`, never
    the Worker-object privacy message.
-8. Delivery of the late `False` result is consumed by the coordinator without a
-   second dispatch; required workspace restoration completes and the abandoned
-   table transfer still does not begin.
+8. Delivery of a late `ready` envelope is consumed by the coordinator without a
+   second dispatch; required workspace restoration and temporary-payload cleanup
+   complete, while payload fetch and decode do not begin.
 9. The retained internal outcome is `completed`, CAPTURE returns to `paused`
    and resume of MAIN is admitted.
 
-Sibling cases replace the late result with `True`, a confirmed BSL error and a
+Sibling cases replace the late result with `denied`, a confirmed BSL error and a
 workspace-restoration failure to prove the access-denied, value-check and
 recovery-required branches. A separate uncertain-dispatch test proves that
 `outcome_unknown` remains reserved for absence of acceptance evidence.
@@ -1248,11 +1381,12 @@ interruption leaves one queryable evaluation record and never turns into a
 misleading Worker-object error. Inspection stays unavailable until the runtime
 has proved that evaluation cleanup restored the paused capture.
 
-The issue #5 guard scenario is also an acceptance flow: after an acknowledged
-guard loses its original waiter, the next cell can acquire the capture, observe
-`phase="evaluating"` and `evaluation_kind="public_value_guard"`, wait for the
-same evaluation ID, and resume MAIN after the late result and workspace restore.
-No table transfer or second `evalExpr` occurs on the detached path.
+The issue #5 materialization scenario is also an acceptance flow: after an
+acknowledged helper loses its original waiter, the next cell can acquire the
+capture, observe `phase="evaluating"` and
+`evaluation_kind="materialization_helper"`, wait for the same evaluation ID,
+and resume MAIN after the late result, workspace restore and temporary-payload
+cleanup. No payload fetch or second `evalExpr` occurs on the detached path.
 
 ## GitHub issue #5 coverage
 
@@ -1260,11 +1394,11 @@ This implementation covers the lifecycle and diagnostic part of
 [GitHub issue #5](https://github.com/pulh1/bsl-jupyter-runtime/issues/5). It does
 not claim full resolution or close the issue. Covered criteria are:
 
-- acknowledged pending user `%%bsl` and internal public-value-guard evaluations
+- acknowledged pending user `%%bsl` and internal value-admission/materialization evaluations
   retain coordinator ownership after timeout or interruption;
 - the next notebook cell can reach safe status and wait entry points;
 - no retry dispatches BSL while the record is pending;
-- public-value guard outcomes and lifecycle failures remain distinct;
+- value-admission outcomes and lifecycle failures remain distinct;
 - late results restore a safe paused CAPTURE or report recovery explicitly;
 - bounded phase/timing evidence is journaled;
 - focused tests cover both observed scenarios and all error classifications.
@@ -1274,7 +1408,8 @@ evidence and leave issue #5 open. It must also list the work that remains in the
 issue:
 
 - investigation of the underlying 1C/RDBG stall;
-- repeated public-value-guard calls and the wider `to_df()` pipeline;
+- wider `to_df()` pipeline performance/caching beyond the combined
+  admission/preparation request;
 - in-place recovery when dispatch acceptance truly cannot be established;
 - opt-in live 1C qualification of the observed stalls.
 
