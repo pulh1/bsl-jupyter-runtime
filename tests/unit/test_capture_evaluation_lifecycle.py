@@ -1940,11 +1940,11 @@ def test_controller_has_no_legacy_capture_evaluation_or_resume_entrypoints() -> 
     from onec_runtime.prototype_runtime import PrototypeRuntimeController
     from onec_runtime.runtime_api import PrototypeRuntimeApi
 
-    # Initial CAPTURE transition, MAIN completion/message collection and the
-    # explicitly non-CAPTURE branches remain synchronous. Completion reaches
-    # CAPTURE through RuntimeApi's coordinator-owned INSPECTION request.
+    # CAPTURE setup runs through CaptureExecutor's narrow RDBG port. MAIN
+    # completion/message collection and explicitly non-CAPTURE branches still
+    # use direct session evaluation. Completion reaches CAPTURE through
+    # RuntimeApi's coordinator-owned INSPECTION request.
     assert _direct_session_evaluation_methods() == {
-        "_begin_capture",
         "_complete_main",
         "_take_context_cell_messages",
         "take_context_string",

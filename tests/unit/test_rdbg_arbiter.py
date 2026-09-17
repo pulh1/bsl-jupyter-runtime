@@ -1,4 +1,5 @@
 from threading import Event, Lock, Thread, get_ident
+from types import SimpleNamespace
 
 from uuid import uuid4
 
@@ -86,6 +87,36 @@ def test_ticket_precedes_dispatch_and_plans_share_one_reader(runtime):
     assert second.wait(3) == 'events'
     assert session.maximum == 1
     assert len({thread for _, thread in session.calls}) == 1
+
+
+def test_local_continue_callback_rejection_releases_pretransport_owner() -> None:
+    class PredispatchSession:
+        target = SimpleNamespace(target_id=TargetId(uuid4(), 'test'))
+
+        def __init__(self) -> None:
+            self.transport_calls = 0
+
+        def continue_(self, *, on_transport_dispatch):
+            on_transport_dispatch()
+            self.transport_calls += 1
+
+    session = PredispatchSession()
+    route = RouteToken('incarnation', 1, 0, 'main')
+    arbiter = RdbgArbiter(session, route)
+    try:
+        def reject() -> None:
+            raise ValueError('local state rejected Continue')
+
+        ticket = arbiter.submit(
+            route, lambda port: Settlement(port.continue_(on_transport_dispatch=reject))
+        )
+        arbiter.dispatch(ticket)
+        with pytest.raises(ValueError, match='local state rejected Continue'):
+            ticket.wait(3)
+        assert ticket.status().settled
+        assert session.transport_calls == 0
+    finally:
+        arbiter.close(timeout=3)
 
 
 def test_handoff_rejects_queued_old_epoch_before_effect(runtime):

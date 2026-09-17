@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
 import sys
@@ -105,8 +106,10 @@ class ResumeBoundarySession(ScriptedSession):
             self._block("modify")
         return super().modify(variable, value_expression)
 
-    def continue_(self) -> None:
-        super().continue_()
+    def continue_(
+        self, *, on_transport_dispatch: Callable[[], None] | None = None
+    ) -> None:
+        super().continue_(on_transport_dispatch=on_transport_dispatch)
         if self.continue_count >= 2:
             self._block("continue")
 
@@ -786,8 +789,10 @@ def test_resume_failure_after_mutation_or_required_step_requires_recovery(
                 return evaluation("Ошибка", "", error="planned cleanup failure")
             return super().evaluate(expression, **kwargs)
 
-        def continue_(self) -> None:
-            super().continue_()
+        def continue_(
+            self, *, on_transport_dispatch: Callable[[], None] | None = None
+        ) -> None:
+            super().continue_(on_transport_dispatch=on_transport_dispatch)
             if stage == "continue" and self.continue_count == 2:
                 raise RdbgTransportError("planned uncertain Continue")
 

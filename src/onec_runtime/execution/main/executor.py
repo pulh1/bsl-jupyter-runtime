@@ -17,7 +17,9 @@ class MainRdbgPort(Protocol):
 
     def modify(self, variable: str, value_expression: str) -> object: ...
 
-    def continue_(self) -> None: ...
+    def continue_(
+        self, *, on_transport_dispatch: Callable[[], None] | None = None
+    ) -> None: ...
 
     def wait_for_any_stop(self, *, timeout_s: float) -> StopEvent: ...
 
@@ -73,8 +75,9 @@ class MainExecutor:
     def continue_command(self, operation: MainOperation) -> None:
         """Issue one Continue; its acknowledgement does not finish MAIN."""
 
-        operation.continue_requested()
-        self._rdbg.continue_()
+        if operation.terminal:
+            raise RuntimeError("MAIN operation is already terminal")
+        self._rdbg.continue_(on_transport_dispatch=operation.continue_requested)
         operation.continue_acknowledged()
 
     def await_stop(self) -> StopEvent:

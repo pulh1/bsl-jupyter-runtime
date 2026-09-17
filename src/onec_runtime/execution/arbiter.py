@@ -197,7 +197,7 @@ class SessionPort:
             self._ticket._entered = False
         return result
 
-    def continue_(self) -> None:
+    def continue_(self, *, on_transport_dispatch: Callable[[], None] | None = None) -> None:
         self._require_idle()
         target = self._owner._session.target
         if target is None:
@@ -206,6 +206,16 @@ class SessionPort:
             self._transport_entered()
             with self._owner._mailbox:
                 self._ticket._stop_target = target.target_id
+            if on_transport_dispatch is not None:
+                try:
+                    on_transport_dispatch()
+                except BaseException:
+                    # RdbgSession invokes this callback before transport.request.
+                    # A local rejection cannot leave remote stop ownership live.
+                    with self._owner._mailbox:
+                        self._ticket._stop_target = None
+                        self._ticket._entered = False
+                    raise
         self._owner._session.continue_(on_transport_dispatch=entered)
         with self._owner._mailbox:
             self._ticket._entered = False

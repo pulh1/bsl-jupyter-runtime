@@ -15,6 +15,11 @@ from threading import local
 from uuid import UUID, uuid4
 
 from onec_runtime.execution.main import MainExecutor, MainOperation, MainPhase
+from onec_runtime.execution.capture import CaptureFrameIdentity, CaptureScope
+from onec_runtime.execution.capture.executor import (
+    CaptureCommandMismatchError,
+    CaptureExecutor,
+)
 
 from onec_runtime.bsl import (
     DiagnosticStage,
@@ -35,8 +40,6 @@ from onec_runtime.bsl import (
 )
 from onec_runtime.bsl.parser_target import PythonParserTarget
 from onec_runtime.capture import (
-    build_capture_transfer_call,
-    build_live_capture_begin_call,
     build_live_capture_end_call,
     build_live_capture_root_transfer_call,
     build_live_current_capture_call,
@@ -485,6 +488,7 @@ class PrototypeRuntimeController:
         )
         self.service_location = service_location
         self.kernel_location = kernel_location or service_location
+        self.capture_executor = self._new_capture_executor(session)
         self.command_timeout_s = command_timeout_s
         self.runtime_generation = runtime_generation
         self.journal = journal or RecoveryJournal()
@@ -498,12 +502,8 @@ class PrototypeRuntimeController:
         self.capture_points: tuple[ModuleLocation, ...] = ()
         self.registry = BreakpointRegistry(service_location)
         self.stop_sequence = 0
-        self.last_capture_location: ModuleLocation | None = None
-        self.capture_kernel_stack_level: int | None = None
-        self.capture_frame_stack_level: int | None = None
-        self._capture_frame_variables: tuple[FrameVariable, ...] = ()
-        self._capture_stack_frames: tuple[StackFrame, ...] = ()
-        self._capture_target_id: TargetId | None = None
+        self._next_capture_stop_sequence = 0
+        self.capture_scope: CaptureScope | None = None
         self._capture_manager_paths: dict[str, str] = {}
         self._capture_value_paths: dict[str, str] = {}
         self._capture_metadata_handles: set[str] = set()
@@ -533,6 +533,105 @@ class PrototypeRuntimeController:
         self._continuation_attempts: dict[str, _ContinuationAttemptState] = {}
         self._active_continuation_attempt_id: str | None = None
 
+    def _new_capture_executor(self, session: RdbgSession) -> CaptureExecutor:
+        return CaptureExecutor(
+            session,
+            self.kernel_location,
+            decode_command_id=lambda result: self._decode_main_completion_value(
+                result, phase="capture_command"
+            ),
+        )
+
+    @property
+    def last_capture_location(self) -> ModuleLocation | None:
+        scope = self.capture_scope
+        return scope.identity.location if scope is not None and scope.published else None
+
+    @property
+    def capture_kernel_stack_level(self) -> int | None:
+        scope = self.capture_scope
+        return (
+            scope.kernel_stack_level
+            if scope is not None
+            else self.__dict__.get("_compat_capture_kernel_stack_level")
+        )
+
+    @capture_kernel_stack_level.setter
+    def capture_kernel_stack_level(self, level: int | None) -> None:
+        scope = self.capture_scope
+        if scope is not None:
+            scope.kernel_stack_level = level
+        else:
+            self.__dict__["_compat_capture_kernel_stack_level"] = level
+
+    @property
+    def capture_frame_stack_level(self) -> int | None:
+        scope = self.capture_scope
+        return (
+            scope.frame_stack_level
+            if scope is not None
+            else self.__dict__.get("_compat_capture_frame_stack_level")
+        )
+
+    @capture_frame_stack_level.setter
+    def capture_frame_stack_level(self, level: int | None) -> None:
+        scope = self.capture_scope
+        if scope is not None:
+            scope.frame_stack_level = level
+        else:
+            self.__dict__["_compat_capture_frame_stack_level"] = level
+
+    @property
+    def _capture_frame_variables(self) -> tuple[FrameVariable, ...]:
+        scope = self.capture_scope
+        return (
+            scope.frame_variables
+            if scope is not None
+            else self.__dict__.get("_compat_capture_frame_variables", ())
+        )
+
+    @_capture_frame_variables.setter
+    def _capture_frame_variables(self, variables: tuple[FrameVariable, ...]) -> None:
+        scope = self.capture_scope
+        if scope is not None:
+            scope.frame_variables = tuple(variables)
+        else:
+            self.__dict__["_compat_capture_frame_variables"] = tuple(variables)
+
+    @property
+    def _capture_stack_frames(self) -> tuple[StackFrame, ...]:
+        scope = self.capture_scope
+        return (
+            scope.stack_frames
+            if scope is not None
+            else self.__dict__.get("_compat_capture_stack_frames", ())
+        )
+
+    @_capture_stack_frames.setter
+    def _capture_stack_frames(self, frames: tuple[StackFrame, ...]) -> None:
+        scope = self.capture_scope
+        if scope is not None:
+            scope.stack_frames = tuple(frames)
+        else:
+            self.__dict__["_compat_capture_stack_frames"] = tuple(frames)
+
+    @property
+    def _capture_target_id(self) -> TargetId | None:
+        scope = self.capture_scope
+        return (
+            scope.inspection_target_id
+            if scope is not None
+            else self.__dict__.get("_compat_capture_target_id")
+        )
+
+    @_capture_target_id.setter
+    def _capture_target_id(self, target_id: TargetId | None) -> None:
+        scope = self.capture_scope
+        if scope is not None:
+            scope.inspection_target_id = target_id
+        else:
+            self.__dict__["_compat_capture_target_id"] = target_id
+
     @staticmethod
     def _capture_identifier(value: object, *, name: str) -> str:
         if (
@@ -551,10 +650,14 @@ class PrototypeRuntimeController:
         return self.capture_frame_stack_level
 
     def _clear_capture_inspection(self) -> None:
-        self.capture_frame_stack_level = None
-        self._capture_frame_variables = ()
-        self._capture_stack_frames = ()
-        self._capture_target_id = None
+        if self.capture_scope is not None:
+            self.capture_scope.invalidate_inspection()
+        # Legacy direct frame injection in callers without a recognized stop
+        # remains supported during migration; a real scope is authoritative.
+        self.__dict__.pop("_compat_capture_frame_stack_level", None)
+        self.__dict__.pop("_compat_capture_frame_variables", None)
+        self.__dict__.pop("_compat_capture_stack_frames", None)
+        self.__dict__.pop("_compat_capture_target_id", None)
         self._capture_manager_paths.clear()
         self._capture_value_paths.clear()
         self._capture_metadata_handles.clear()
@@ -568,13 +671,25 @@ class PrototypeRuntimeController:
                 and not previous.join(min(1.0, self.command_timeout_s))
             ):
                 raise ProtocolError("Previous CAPTURE coordinator did not stop")
-        if self.active_operation is None or self._capture_target_id is None:
+        scope = self.capture_scope
+        capture_target_id = self._capture_target_id
+        capture_stop_sequence = self.stop_sequence
+        if (
+            capture_target_id is None
+            and scope is not None
+            and self.active_operation is not None
+            and scope.identity.main_command_id == self.active_operation.operation_id
+            and scope.frame_identity is CaptureFrameIdentity.CONFIRMED
+        ):
+            capture_target_id = scope.identity.target_id
+            capture_stop_sequence = scope.identity.local_stop_sequence
+        if self.active_operation is None or capture_target_id is None:
             raise ProtocolError("CAPTURE coordinator identity is incomplete")
         fence = CaptureFence(
             self.active_operation.operation_id,
             self.runtime_generation,
-            self.stop_sequence,
-            self._capture_target_id,
+            capture_stop_sequence,
+            capture_target_id,
         )
         self._capture_evaluation_coordinator = CaptureEvaluationCoordinator(
             fence,
@@ -1602,7 +1717,9 @@ class PrototypeRuntimeController:
             operation.operation_id,
             self.session.target.target_id if self.session.target is not None else None,
         )
+        state_before_dispatch = self.state
         command_write_attempted = False
+        command_writes_confirmed = False
         try:
             self._record(
                 "write-journal.jsonl",
@@ -1621,7 +1738,8 @@ class PrototypeRuntimeController:
                 tuple(user_breakpoints),
             )
             self.stop_sequence = 0
-            self.last_capture_location = None
+            self._next_capture_stop_sequence = 0
+            self.capture_scope = None
             self.recovery_checkpoint = None
             self.continue_sent = False
             self._generation_lost_notified = False
@@ -1635,6 +1753,11 @@ class PrototypeRuntimeController:
                 command_write_attempted = True
 
             def before_continue() -> None:
+                nonlocal command_writes_confirmed
+                # MainExecutor reaches this callback only after both command
+                # field writes have acknowledged. A rejection before Continue
+                # enters transport leaves the kernel paused and reusable.
+                command_writes_confirmed = True
                 self.require_debug_workspace_ready()
                 previous_state = self.state
                 self.state = OperationState.MAIN_PENDING
@@ -1656,14 +1779,20 @@ class PrototypeRuntimeController:
             )
             return self._route_stop(stop)
         except BaseException as error:
+            continue_rejected_before_transport = (
+                command_writes_confirmed
+                and self.main_operation.phase is MainPhase.ADMITTED
+            )
             if self.main_operation.phase is MainPhase.ADMITTED:
-                if command_write_attempted:
+                if command_write_attempted and not command_writes_confirmed:
                     # A failed command-field write may have reached the target.
                     # It does not prove launch, but requires reconciliation.
                     self.main_operation.mark_unknown()
                 else:
                     self.main_operation.fail_before_dispatch()
-            if self.state not in {
+            if continue_rejected_before_transport:
+                self.state = state_before_dispatch
+            elif self.state not in {
                 OperationState.CAPTURED,
                 OperationState.DEBUG_STOPPED,
                 OperationState.PARTIAL_WRITEBACK_FAILURE,
@@ -1753,9 +1882,16 @@ class PrototypeRuntimeController:
                     self.state = previous_state
                     raise
 
-        stop = self.main_executor.resume(
-            self.main_operation, before_continue=before_continue
-        )
+        try:
+            stop = self.main_executor.resume(
+                self.main_operation, before_continue=before_continue
+            )
+        except BaseException:
+            if self.main_operation.phase is MainPhase.SUSPENDED_USER:
+                # No Continue transport entry occurred. The same user stop is
+                # still owned by this operation and may be resumed again.
+                self.state = OperationState.DEBUG_STOPPED
+            raise
         return self._route_stop(stop)
 
     def _continue_main_operation(self) -> None:
@@ -1767,111 +1903,45 @@ class PrototypeRuntimeController:
         if self.active_operation is None:
             self.state = OperationState.FAILED
             raise ProtocolError("Capture stop has no active MAIN operation")
-        local_result = self.session.local_variables(stack_level=0)
-        if local_result.error_occurred:
-            self.state = OperationState.FAILED
-            raise ProtocolError(local_result.error_text)
-        transfer = self.session.evaluate(
-            build_capture_transfer_call(
-                variable.name for variable in local_result.variables
+        self._next_capture_stop_sequence += 1
+        scope = CaptureScope.from_stop(
+            self.runtime_generation,
+            self.active_operation.operation_id,
+            stop,
+            self._next_capture_stop_sequence,
+        )
+        self.capture_scope = scope
+        try:
+            setup = self.capture_executor.open_scope(scope)
+            self._replace_capture_evaluation_coordinator()
+            scope.mark_ready()
+            self._capture_manager_paths.clear()
+            self._capture_value_paths.clear()
+            self._capture_metadata_handles.clear()
+            self.stop_sequence = scope.identity.local_stop_sequence
+            self.state = OperationState.CAPTURED
+            captured = CapturedStop(
+                self.active_operation,
+                stop.location,
+                self.stop_sequence,
+                setup.variables,
+                setup.observed_command_id,
             )
-        )
-        if transfer.error_occurred:
-            self.state = OperationState.FAILED
-            raise BslExecutionError(transfer.error_text)
-        address = evaluation_to_python(transfer)
-        if not isinstance(address, str) or not address:
-            self.state = OperationState.FAILED
-            raise ProtocolError("Capture temporary-storage address is invalid")
-        stack_level = self._locate_kernel_context_frame(stop)
-        command_evidence = self.session.evaluate(
-            "ИдентификаторКоманды", stack_level=stack_level
-        )
-        if command_evidence.error_occurred:
-            self.state = OperationState.FAILED
-            raise BslExecutionError(command_evidence.error_text)
-        observed_command_id = self._decode_main_completion_value(
-            command_evidence,
-            phase="capture_command",
-        )
-        if observed_command_id != self.active_operation.operation_id:
-            if self.main_operation is not None:
+        except RdbgTransportError as error:
+            scope.note_setup_uncertain(error)
+            raise
+        except Exception as error:
+            if isinstance(error, CaptureCommandMismatchError) and self.main_operation is not None:
                 self.main_operation.mark_unknown()
-            self.state = OperationState.FAILED
-            raise ProtocolError(
-                f"Captured command {observed_command_id!r} does not match active "
-                f"operation {self.active_operation.operation_id}"
-            )
-        begin = self.session.evaluate(
-            build_live_capture_begin_call(address),
-            stack_level=stack_level,
-        )
-        if begin.error_occurred:
-            self.state = OperationState.FAILED
-            raise BslExecutionError(begin.error_text)
-        self.capture_kernel_stack_level = stack_level
-        # RDBG level zero is the exact suspended business frame used to build
-        # the capture context. The default metadata index reuses these locals;
-        # other frames and named value details are read only on explicit request.
-        self.capture_frame_stack_level = 0
-        self._capture_frame_variables = tuple(local_result.variables)
-        self._capture_stack_frames = tuple(stop.stack_frames)
-        self._capture_target_id = stop.target_id
-        self._capture_manager_paths.clear()
-        self._capture_value_paths.clear()
-        self._capture_metadata_handles.clear()
-        self.stop_sequence += 1
-        self.last_capture_location = stop.location
-        self.state = OperationState.CAPTURED
-        self._replace_capture_evaluation_coordinator()
-        captured = CapturedStop(
-            self.active_operation,
-            stop.location,
-            self.stop_sequence,
-            local_result.variables,
-            observed_command_id,
-        )
+            if isinstance(error, (ProtocolError, BslExecutionError)):
+                self.state = OperationState.FAILED
+            scope.fail_setup(error)
+            raise
         self._inject(
             FaultPoint.AFTER_CAPTURE_CHECKPOINT,
             RecoveryPhase.CAPTURED,
         )
         return captured
-
-    def _locate_kernel_context_frame(self, stop: StopEvent) -> int:
-        required = {
-            "контекст",
-            "текущаяинструкция",
-            "идентификаторкоманды",
-        }
-        stack = stop.stack
-        frames = stop.stack_frames
-        if not stack or not frames:
-            self.state = OperationState.FAILED
-            raise ProtocolError("Capture stop has no exact stack mapping for runtime kernel")
-        if (
-            len(frames) != len(stack)
-            or tuple(frame.location for frame in frames) != stack
-            or any(frame.level < 0 for frame in frames)
-            or len({frame.level for frame in frames}) != len(frames)
-        ):
-            self.state = OperationState.FAILED
-            raise ProtocolError("Capture stop stack mapping is incoherent")
-        for frame in frames:
-            stack_level = frame.level
-            if stack_level <= 0 or stack_level >= 8:
-                continue
-            frame_location = frame.location
-            if not self._same_kernel_module(frame_location):
-                continue
-            local_result = self.session.local_variables(stack_level=stack_level)
-            if local_result.error_occurred:
-                continue
-            names = {variable.name.casefold() for variable in local_result.variables}
-            if not required.issubset(names):
-                continue
-            return stack_level
-        self.state = OperationState.FAILED
-        raise ProtocolError("Runtime kernel context frame was not found")
 
     def _same_kernel_module(self, location: ModuleLocation) -> bool:
         kernel = self.kernel_location
@@ -3862,6 +3932,8 @@ class PrototypeRuntimeController:
         except RdbgTransportError as error:
             # The transport gives no pre-send acknowledgement. Treat this as
             # an ambiguous continuation: the paused frame may already be gone.
+            if self.capture_scope is not None:
+                self.capture_scope.mark_unverified()
             self._clear_capture_inspection()
             self.state = OperationState.RECOVERING
             attempt.continue_state = "outcome_unknown"
@@ -3877,9 +3949,11 @@ class PrototypeRuntimeController:
             raise
         # The debugger has accepted Continue; no frame-backed resolver may
         # survive into the next stop, even if the subsequent wait is unknown.
+        if self.capture_scope is not None:
+            self.capture_scope.mark_closed()
+        self._clear_capture_inspection()
         if on_continue_acknowledged is not None:
             on_continue_acknowledged()
-        self._clear_capture_inspection()
         attempt.continue_state = "acknowledged"
         self._record(
             "write-journal.jsonl",
@@ -3973,6 +4047,7 @@ class PrototypeRuntimeController:
                 self.main_executor = MainExecutor(
                     reconnected.session, poll_interval_s=self.command_timeout_s
                 )
+                self.capture_executor = self._new_capture_executor(reconnected.session)
                 self.breakpoint_workspace_owner._adopt_confirmed_session(
                     reconnected.session,
                     checkpoint.breakpoint_workspace,
@@ -4007,6 +4082,7 @@ class PrototypeRuntimeController:
             self.main_executor = MainExecutor(
                 reconnected.session, poll_interval_s=self.command_timeout_s
             )
+            self.capture_executor = self._new_capture_executor(reconnected.session)
             self.breakpoint_workspace_owner._adopt_confirmed_session(
                 reconnected.session,
                 checkpoint.breakpoint_workspace,

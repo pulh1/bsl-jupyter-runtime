@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+from threading import Event
 from types import SimpleNamespace
 from uuid import UUID
 
@@ -10,6 +12,7 @@ from onec_runtime.errors import (
     RdbgTransportTimeout,
     StopWaitIntervalElapsed,
 )
+from onec_runtime.execution.arbiter import RdbgArbiter, RouteToken, Settlement, WaiterDetached
 from onec_runtime.execution.main.executor import MainExecutor
 from onec_runtime.execution.main.operation import MainOperation, MainPhase
 from onec_runtime.rdbg.models import ModuleLocation, StopEvent, TargetId
@@ -29,8 +32,10 @@ class MainPort:
         self.calls.append(("modify", variable, value_expression))
         return SimpleNamespace(error_occurred=False, error_text="")
 
-    def continue_(self) -> None:
+    def continue_(self, *, on_transport_dispatch: Callable[[], None] | None = None) -> None:
         self.calls.append(("continue",))
+        if on_transport_dispatch is not None:
+            on_transport_dispatch()
 
     def wait_for_any_stop(self, *, timeout_s: float) -> StopEvent:
         self.calls.append(("wait", timeout_s))
@@ -116,3 +121,91 @@ def test_main_executor_does_not_hide_transport_timeout_as_empty_interval() -> No
 
     assert port.calls == [("continue",), ("wait", 6.0)]
     assert operation.phase is MainPhase.RUNNING
+
+
+def test_main_resume_keeps_paused_frame_on_confirmed_predispatch_rejection() -> None:
+    class RejectedPort(MainPort):
+        def continue_(self, *, on_transport_dispatch: Callable[[], None] | None = None) -> None:
+            self.calls.append(("continue",))
+            raise ProtocolError("rejected before transport entry")
+
+    port = RejectedPort()
+    operation = MainOperation(17, TARGET)
+    operation.continue_acknowledged()
+    operation.stopped(STOP, MainPhase.SUSPENDED_CAPTURE)
+
+    with pytest.raises(ProtocolError, match="before transport entry"):
+        MainExecutor(port).resume(operation)
+
+    assert operation.phase is MainPhase.SUSPENDED_CAPTURE
+    assert operation.pending_stop is STOP
+
+
+def test_main_resume_records_unknown_after_transport_entry_without_ack() -> None:
+    class AmbiguousPort(MainPort):
+        def continue_(self, *, on_transport_dispatch: Callable[[], None] | None = None) -> None:
+            self.calls.append(("continue",))
+            assert on_transport_dispatch is not None
+            on_transport_dispatch()
+            raise RdbgTransportTimeout("ack unknown")
+
+    operation = MainOperation(17, TARGET)
+    operation.continue_acknowledged()
+    operation.stopped(STOP, MainPhase.SUSPENDED_CAPTURE)
+
+    with pytest.raises(RdbgTransportTimeout, match="ack unknown"):
+        MainExecutor(AmbiguousPort()).resume(operation)
+
+    assert operation.phase is MainPhase.UNKNOWN
+    assert operation.pending_stop is None
+
+
+def test_detached_main_waiter_leaves_arbiter_owning_the_next_stop() -> None:
+    entered_wait = Event()
+    release_stop = Event()
+
+    class Session:
+        target = SimpleNamespace(target_id=TARGET)
+
+        def modify(self, variable, value_expression, *, on_transport_dispatch):
+            on_transport_dispatch()
+            return SimpleNamespace(error_occurred=False)
+
+        def continue_(self, *, on_transport_dispatch):
+            on_transport_dispatch()
+
+        def wait_for_any_stop(self, *, timeout_s, expected_target, on_transport_dispatch):
+            assert expected_target == TARGET
+            on_transport_dispatch()
+            entered_wait.set()
+            assert release_stop.wait(3)
+            return STOP
+
+    route = RouteToken("runtime", 1, 0, "main")
+    arbiter = RdbgArbiter(Session(), route)
+    operation = MainOperation(17, TARGET)
+    try:
+        ticket = arbiter.submit(
+            route,
+            lambda port: Settlement(
+                MainExecutor(port, poll_interval_s=0.1).dispatch(
+                    operation,
+                    "Результат = 17;",
+                    install_workspace=lambda: None,
+                    before_command_write=lambda: None,
+                    before_continue=lambda: None,
+                )
+            ),
+        )
+        arbiter.dispatch(ticket)
+        assert entered_wait.wait(3)
+        ticket.detach_waiter()
+        with pytest.raises(WaiterDetached):
+            ticket.wait_initiator(1)
+        assert ticket.status().awaiting_stop
+        release_stop.set()
+        assert ticket.wait_settled(3) is STOP
+        assert operation.phase is MainPhase.RUNNING
+    finally:
+        release_stop.set()
+        arbiter.close(timeout=3)

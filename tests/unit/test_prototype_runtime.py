@@ -258,7 +258,11 @@ class ScriptedSession:
             return ModifyResult(uuid4(), "Ошибка", "failed", True, "planned write failure")
         return ModifyResult(uuid4(), "Булево", "Истина", False)
 
-    def continue_(self) -> None:
+    def continue_(
+        self, *, on_transport_dispatch: Callable[[], None] | None = None
+    ) -> None:
+        if on_transport_dispatch is not None:
+            on_transport_dispatch()
         self.continue_count += 1
         self.calls.append(("continue", self.continue_count))
 
@@ -1199,6 +1203,71 @@ def test_capture_rejects_prequeued_same_location_stop_with_old_kernel_command() 
     assert controller.state is runtime_module().OperationState.FAILED
     assert controller.stop_sequence == 0
     assert ("evaluate", ("ИдентификаторКоманды", 2)) in session.calls
+    assert controller.capture_scope is not None
+    assert controller.capture_scope.observed_main_command_id == 1
+    assert controller.capture_scope.identity.main_command_id == 2
+    assert controller.capture_scope.frame_identity.value == "unverified"
+
+
+def test_capture_setup_failure_preserves_recognized_stop_scope() -> None:
+    from onec_runtime.execution.capture.scope import (
+        CaptureContextState,
+        CaptureFrameIdentity,
+        CaptureSetupStage,
+    )
+
+    class LocalFailureSession(ScriptedSession):
+        def local_variables(self, stack_level: int = 0) -> LocalVariablesResult:
+            if stack_level == 0:
+                self.calls.append(("local_variables", stack_level))
+                return LocalVariablesResult(uuid4(), (), True, "locals unavailable")
+            return super().local_variables(stack_level)
+
+    session = LocalFailureSession((CAPTURE_A,))
+    controller = runtime_module().PrototypeRuntimeController(session, SERVICE)
+
+    with pytest.raises(ProtocolError, match="locals unavailable"):
+        controller.execute_main("Результат = 1;", capture_points=(CAPTURE_A,))
+
+    scope = controller.capture_scope
+    assert scope is not None
+    assert scope.identity.target_id == TARGET
+    assert scope.identity.location == CAPTURE_A
+    assert scope.identity.main_command_id == controller.active_operation.operation_id
+    assert scope.identity.local_stop_sequence == 1
+    assert scope.setup_stage is CaptureSetupStage.STOP_RECOGNIZED
+    assert scope.context_state is CaptureContextState.SETUP_FAILED
+    assert scope.frame_identity is CaptureFrameIdentity.UNVERIFIED
+    assert scope.setup_error_code == "ProtocolError"
+    assert controller.main_operation.pending_stop is scope.stop
+    assert session.continue_count == 1
+
+
+def test_capture_owner_replacement_failure_never_publishes_ready_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = runtime_module()
+    session = ScriptedSession((CAPTURE_A,))
+    controller = runtime.PrototypeRuntimeController(session, SERVICE)
+
+    def rejected_owner() -> None:
+        raise ProtocolError("capture owner unavailable")
+
+    monkeypatch.setattr(controller, "_replace_capture_evaluation_coordinator", rejected_owner)
+
+    with pytest.raises(ProtocolError, match="capture owner unavailable"):
+        controller.execute_main("Результат = 1;", capture_points=(CAPTURE_A,))
+
+    scope = controller.capture_scope
+    assert scope is not None
+    assert scope.published is False
+    assert scope.context_state.value == "setup_failed"
+    assert scope.setup_stage.value == "context_begun"
+    assert controller.state is runtime.OperationState.FAILED
+    assert controller.stop_sequence == 0
+    assert controller._capture_evaluation_coordinator is None
+    with pytest.raises(ProtocolError):
+        controller.execute_capture("РезультатИнструкции = 2;")
 
 
 def test_business_frame_forging_kernel_locals_is_not_selected_before_real_kernel() -> None:
@@ -1242,6 +1311,10 @@ def test_capture_rejects_absent_or_malformed_kernel_stack_mapping(
         controller.execute_main("Результат = 1;", capture_points=(CAPTURE_A,))
 
     assert controller.state is runtime_module().OperationState.FAILED
+    assert controller.capture_scope is not None
+    assert controller.capture_scope.setup_stage.value == "context_transferred"
+    assert controller.capture_scope.context_state.value == "setup_failed"
+    assert controller.capture_scope.identity.target_id == TARGET
 
 
 @pytest.mark.parametrize(
@@ -1283,6 +1356,10 @@ def test_capture_accepts_the_configured_kernel_module_stack_frame() -> None:
 
     assert isinstance(captured, runtime_module().CapturedStop)
     assert controller.capture_kernel_stack_level == 2
+    assert controller.capture_scope is not None
+    assert controller.capture_scope.context_state.value == "ready"
+    assert controller.capture_scope.frame_identity.value == "confirmed"
+    assert controller.capture_scope.identity.local_stop_sequence == captured.stop_sequence
 
 
 def test_capture_exposes_observed_stack_only_after_explicit_request() -> None:
@@ -2619,6 +2696,30 @@ def test_main_setup_failure_before_continue_allows_new_command(monkeypatch) -> N
     assert controller.main_operation.command_id == 2
 
 
+def test_initial_main_continue_predispatch_rejection_keeps_target_reusable() -> None:
+    runtime = runtime_module()
+    session = ScriptedSession((SERVICE,))
+    controller = runtime.PrototypeRuntimeController(session, SERVICE)
+    continue_ = session.continue_
+
+    def rejected_continue(*, on_transport_dispatch=None):
+        raise ProtocolError("continue rejected before transport entry")
+
+    session.continue_ = rejected_continue
+    with pytest.raises(ProtocolError, match="before transport entry"):
+        controller.execute_main("Значение = 1;")
+
+    rejected = controller.main_operation
+    assert rejected.phase.value == "failed_before_dispatch"
+    assert controller.state is runtime.OperationState.IDLE
+    assert session.continue_count == 0
+
+    session.continue_ = continue_
+    completion = controller.execute_main("Значение = 2;")
+    assert completion.succeeded
+    assert completion.operation.operation_id == 2
+
+
 @pytest.mark.parametrize("failure_phase", ["result", "messages"])
 def test_main_completion_read_failure_allows_new_command(monkeypatch, failure_phase) -> None:
     runtime = runtime_module()
@@ -2717,6 +2818,30 @@ def test_main_resume_preflight_failure_preserves_user_stop(
     assert session.continue_count == continue_count
 
 
+def test_main_resume_continue_predispatch_rejection_keeps_user_stop() -> None:
+    runtime = runtime_module()
+    session = ScriptedSession((USER, SERVICE))
+    controller = runtime.PrototypeRuntimeController(session, SERVICE)
+    stopped = controller.execute_main("Результат = 1;", user_breakpoints=(USER,))
+    continue_ = session.continue_
+    continue_count = session.continue_count
+
+    def rejected_continue(*, on_transport_dispatch=None):
+        raise ProtocolError("continue rejected before transport entry")
+
+    session.continue_ = rejected_continue
+    with pytest.raises(ProtocolError, match="before transport entry"):
+        controller.resume_debug_stop()
+
+    assert controller.state is runtime.OperationState.DEBUG_STOPPED
+    assert controller.main_operation.phase.value == "suspended_user"
+    assert controller.main_operation.pending_stop is stopped.stop
+    assert session.continue_count == continue_count
+
+    session.continue_ = continue_
+    assert controller.resume_debug_stop().succeeded
+
+
 def test_failed_wait_does_not_allow_replacing_unresolved_main_operation() -> None:
     runtime = runtime_module()
     session = ScriptedSession((SERVICE,))
@@ -2750,7 +2875,9 @@ def test_main_operation_tracks_user_stop_and_ambiguous_continue() -> None:
     assert operation.phase.value == "suspended_user"
     assert operation.pending_stop.location == USER
 
-    def ambiguous_continue():
+    def ambiguous_continue(*, on_transport_dispatch=None):
+        if on_transport_dispatch is not None:
+            on_transport_dispatch()
         raise RuntimeError("lost acknowledgement")
 
     session.continue_ = ambiguous_continue
@@ -3524,8 +3651,10 @@ def test_offline_full_stack_continue_transport_loss_sends_once_and_is_unknown(
     tmp_path: Path,
 ) -> None:
     class ContinueTransportLossSession(ScriptedSession):
-        def continue_(self) -> None:
-            super().continue_()
+        def continue_(
+            self, *, on_transport_dispatch: Callable[[], None] | None = None
+        ) -> None:
+            super().continue_(on_transport_dispatch=on_transport_dispatch)
             if self.continue_count == 2:
                 raise RdbgTransportError("planned Continue transport loss")
 
@@ -4069,8 +4198,10 @@ def test_offline_official_mcp_capture_continuation_lifecycle_and_recovery(
         class ContinueEvidenceLossSession(ScriptedSession):
             controller_under_test: object | None = None
 
-            def continue_(self) -> None:
-                super().continue_()
+            def continue_(
+                self, *, on_transport_dispatch: Callable[[], None] | None = None
+            ) -> None:
+                super().continue_(on_transport_dispatch=on_transport_dispatch)
                 if self.continue_count == 2:
                     controller = self.controller_under_test
                     assert controller is not None
