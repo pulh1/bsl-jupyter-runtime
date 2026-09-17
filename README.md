@@ -59,6 +59,8 @@ runtime = InteractiveRuntimeSession.start(
 
 После опыта закройте сеанс в Python-ячейке: `runtime.close()`.
 
+Методы `runtime`, объекты результатов, CAPTURE-остановки и ленивые Python-прокси описаны в [руководстве по Python API](docs/python-api.md).
+
 Если хотите управлять расширением вручную, сначала найдите CFE из установленного пакета:
 
 ```powershell
