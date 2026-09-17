@@ -74,8 +74,9 @@ class Session:
         self.pending = PendingEvaluation(TARGET, UUID(int=3 + self._starts), self)
         return self.pending
 
-    def wait_evaluation_event(self, pending, *, timeout_s):
+    def wait_evaluation_event(self, pending, *, timeout_s, on_transport_dispatch):
         assert pending is self.pending
+        on_transport_dispatch()
         self.calls.append(("wait", pending, get_ident()))
         event = self.events.pop(0)
         if isinstance(event, BaseException):

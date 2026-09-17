@@ -1,0 +1,408 @@
+"""CAPTURE inspection uses the owned RDBG worker without poisoning its stop."""
+
+from threading import get_ident
+from uuid import UUID
+
+import pytest
+
+from onec_runtime.errors import CommandTimeout, RdbgTransportTimeout
+from onec_runtime.execution.arbiter import (
+    OutcomeUnknown,
+    RdbgArbiter,
+    RouteToken,
+    Settlement,
+)
+from onec_runtime.execution.capture.scope import (
+    CaptureContextState,
+    CaptureFrameIdentity,
+    CaptureScope,
+)
+from onec_runtime.execution.evaluation import EvaluationSuspended
+from onec_runtime.rdbg.models import (
+    DebugTarget,
+    EvaluationResult,
+    FrameVariable,
+    LocalVariablesResult,
+    ModuleLocation,
+    PendingEvaluation,
+    StackFrame,
+    StopEvent,
+    TargetId,
+)
+
+
+TARGET = TargetId(UUID(int=1), "test")
+BUSINESS = ModuleLocation("ExtensionModule", "", UUID(int=2), UUID(int=3), 50, "Runtime")
+KERNEL = ModuleLocation("ExtensionModule", "", UUID(int=20), UUID(int=21), 60, "Runtime")
+STOP = StopEvent(
+    TARGET,
+    BUSINESS,
+    "callStackFormed",
+    stack=(BUSINESS, BUSINESS, KERNEL),
+    stack_frames=tuple(
+        StackFrame(TARGET, level, location)
+        for level, location in enumerate((BUSINESS, BUSINESS, KERNEL))
+    ),
+)
+
+
+def ready_scope(stop: StopEvent = STOP) -> CaptureScope:
+    scope = CaptureScope.from_stop(7, 42, stop, 3)
+    scope.record_locals(())
+    scope.record_transfer("temporary-address")
+    scope.record_kernel_frame(2)
+    assert scope.record_main_command(42)
+    scope.record_context_begun()
+    scope.mark_ready()
+    return scope
+
+
+class Session:
+    target = DebugTarget(TARGET, "Server", "stopped")
+
+    def __init__(self, local_results: list[object], events: list[object] | None = None) -> None:
+        self.local_results = local_results
+        self.events = [] if events is None else events
+        self.calls: list[tuple[str, object, int]] = []
+        self.pending = PendingEvaluation(TARGET, UUID(int=4), self)
+        self._starts = 0
+
+    def local_variables(self, stack_level=0, *, timeout_s, on_transport_dispatch):
+        on_transport_dispatch()
+        self.calls.append(("locals", (stack_level, timeout_s), get_ident()))
+        outcome = self.local_results.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    def start_evaluation(self, expression, *, on_transport_dispatch, **kwargs):
+        on_transport_dispatch()
+        self._starts += 1
+        self.pending = PendingEvaluation(TARGET, UUID(int=3 + self._starts), self)
+        self.calls.append(("start", (expression, kwargs), get_ident()))
+        return self.pending
+
+    def wait_evaluation_event(self, pending, *, timeout_s, on_transport_dispatch):
+        assert pending is self.pending
+        on_transport_dispatch()
+        self.calls.append(("wait", (pending, timeout_s), get_ident()))
+        event = self.events.pop(0)
+        if isinstance(event, BaseException):
+            raise event
+        return event
+
+    def continue_evaluation(self, pending, stop, *, on_transport_dispatch):
+        assert pending is self.pending and stop is STOP
+        on_transport_dispatch()
+        self.calls.append(("continue-eval", pending, get_ident()))
+
+
+def test_confirmed_variable_read_failure_settles_only_request_and_retry_succeeds() -> None:
+    from onec_runtime.execution.capture.inspection import (
+        CaptureInspectionExecutor,
+        CaptureInspectionUnavailable,
+    )
+
+    rejected = LocalVariablesResult(
+        UUID(int=10), (), True, "secret target path from debugger"
+    )
+    variable = FrameVariable("Номер", "Число", "42")
+    accepted = LocalVariablesResult(UUID(int=11), (variable,))
+    session = Session([rejected, accepted])
+    route = RouteToken("runtime", 1, 0, "capture")
+    arbiter = RdbgArbiter(session, route)
+    scope = ready_scope()
+    executor = CaptureInspectionExecutor(request_timeout_s=3)
+
+    first = arbiter.submit(
+        route,
+        lambda port: Settlement(
+            executor.read_variable(scope, "Номер", stack_level=0, port=port)
+        ),
+    )
+    arbiter.dispatch(first)
+    with pytest.raises(CaptureInspectionUnavailable) as failure:
+        first.wait(3)
+
+    assert "secret target path" not in str(failure.value)
+    assert first.status().settled
+    assert arbiter.active_ticket is None
+    assert scope.context_state is CaptureContextState.READY
+    assert scope.frame_identity is CaptureFrameIdentity.CONFIRMED
+
+    second = arbiter.submit(
+        route,
+        lambda port: Settlement(
+            executor.read_variable(scope, "номер", stack_level=0, port=port)
+        ),
+    )
+    arbiter.dispatch(second)
+    assert second.wait(3) is variable
+    assert [kind for kind, _, _ in session.calls] == ["locals", "locals"]
+    assert {thread for _, _, thread in session.calls} != {get_ident()}
+    assert len({thread for _, _, thread in session.calls}) == 1
+    arbiter.close(timeout=3)
+
+
+def test_helper_eval_dispatches_once_and_reuses_pending_across_empty_intervals() -> None:
+    from onec_runtime.execution.capture.inspection import CaptureInspectionExecutor
+
+    result = EvaluationResult(UUID(int=4), "Строка", "value", False)
+    session = Session([], [CommandTimeout("empty"), CommandTimeout("empty"), result])
+    route = RouteToken("runtime", 1, 0, "capture")
+    arbiter = RdbgArbiter(session, route)
+    executor = CaptureInspectionExecutor(request_timeout_s=3, wait_interval_s=0.25)
+    ticket = arbiter.submit(
+        route,
+        lambda port: Settlement(
+            executor.evaluate_helper(
+                ready_scope(),
+                "TrustedHelper()",
+                stack_level=2,
+                max_text_size=512,
+                port=port,
+                result_policy=lambda observed: observed.presentation,
+            )
+        ),
+    )
+    arbiter.dispatch(ticket)
+
+    assert ticket.wait(3) == "value"
+    assert [kind for kind, _, _ in session.calls] == ["start", "wait", "wait", "wait"]
+    assert session.calls[0][1] == (
+        "TrustedHelper()",
+        {"max_text_size": 512, "stack_level": 2, "timeout_s": 3},
+    )
+    assert [entry[1] for entry in session.calls[1:]] == [
+        (session.pending, 0.25)
+    ] * 3
+    assert len({thread for _, _, thread in session.calls}) == 1
+    assert session.calls[0][2] != get_ident()
+    arbiter.close(timeout=3)
+
+
+def test_confirmed_helper_bsl_error_is_request_failure_and_does_not_call_policy() -> None:
+    from onec_runtime.execution.capture.inspection import (
+        CaptureInspectionExecutor,
+        CaptureInspectionUnavailable,
+    )
+
+    error_result = EvaluationResult(
+        UUID(int=4), "Неопределено", "", True, "secret target expression"
+    )
+    variable = FrameVariable("Номер", "Число", "42")
+    session = Session(
+        [LocalVariablesResult(UUID(int=10), (variable,))], [error_result]
+    )
+    route = RouteToken("runtime", 1, 0, "capture")
+    arbiter = RdbgArbiter(session, route)
+    scope = ready_scope()
+    executor = CaptureInspectionExecutor()
+    policy_calls: list[EvaluationResult] = []
+    first = arbiter.submit(
+        route,
+        lambda port: Settlement(
+            executor.evaluate_helper(
+                scope,
+                "TrustedHelper()",
+                stack_level=2,
+                port=port,
+                result_policy=lambda result: policy_calls.append(result),
+            )
+        ),
+    )
+    arbiter.dispatch(first)
+
+    with pytest.raises(CaptureInspectionUnavailable) as failure:
+        first.wait(3)
+    assert "secret target expression" not in str(failure.value)
+    assert policy_calls == []
+    assert first.status().settled
+    assert scope.context_state is CaptureContextState.READY
+    assert scope.frame_identity is CaptureFrameIdentity.CONFIRMED
+
+    second = arbiter.submit(
+        route,
+        lambda port: Settlement(
+            executor.read_variable(scope, "Номер", stack_level=0, port=port)
+        ),
+    )
+    arbiter.dispatch(second)
+    assert second.wait(3) is variable
+    arbiter.close(timeout=3)
+
+
+def test_unknown_helper_wait_retains_one_pending_owner_and_fences_next_inspection() -> None:
+    from onec_runtime.execution.capture.inspection import CaptureInspectionExecutor
+
+    result = EvaluationResult(UUID(int=4), "Строка", "value", False)
+    session = Session([], [RdbgTransportTimeout("network interval failed"), result])
+    route = RouteToken("runtime", 1, 0, "capture")
+    arbiter = RdbgArbiter(session, route)
+    scope = ready_scope()
+    executor = CaptureInspectionExecutor(wait_interval_s=0.01)
+    ticket = arbiter.submit(
+        route,
+        lambda port: Settlement(
+            executor.evaluate_helper(
+                scope,
+                "TrustedHelper()",
+                stack_level=2,
+                port=port,
+                result_policy=lambda observed: observed.presentation,
+            )
+        ),
+    )
+    arbiter.dispatch(ticket)
+
+    assert ticket.wait_unknown(3)
+    assert isinstance(ticket._error, OutcomeUnknown)
+    assert ticket.status().pending_capability is session.pending
+    assert arbiter.active_ticket is ticket
+    assert [kind for kind, _, _ in session.calls] == ["start", "wait"]
+    assert scope.context_state is CaptureContextState.READY
+    assert scope.frame_identity is CaptureFrameIdentity.CONFIRMED
+
+    next_ticket = arbiter.submit(route, lambda port: Settlement("next inspection"))
+    arbiter.dispatch(next_ticket)
+    with pytest.raises(TimeoutError):
+        next_ticket.wait(0)
+
+    arbiter.reconcile(
+        ticket,
+        lambda port: Settlement(
+            port.wait_evaluation_event(session.pending, timeout_s=0.01).presentation
+        ),
+    )
+    assert ticket.wait_settled(3) == "value"
+    assert next_ticket.wait(3) == "next inspection"
+    assert [kind for kind, _, _ in session.calls].count("start") == 1
+    arbiter.close(timeout=3)
+
+
+def test_helper_stop_retains_exact_pending_and_stop_for_reconciliation() -> None:
+    from onec_runtime.execution.capture.inspection import CaptureInspectionExecutor
+
+    result = EvaluationResult(UUID(int=4), "Строка", "value", False)
+    session = Session([], [STOP, result])
+    route = RouteToken("runtime", 1, 0, "capture")
+    arbiter = RdbgArbiter(session, route)
+    scope = ready_scope()
+    executor = CaptureInspectionExecutor(wait_interval_s=0.01)
+    ticket = arbiter.submit(
+        route,
+        lambda port: Settlement(
+            executor.evaluate_helper(
+                scope,
+                "TrustedHelper()",
+                stack_level=2,
+                port=port,
+                result_policy=lambda observed: observed.presentation,
+            )
+        ),
+    )
+    arbiter.dispatch(ticket)
+
+    assert ticket.wait_unknown(3)
+    assert isinstance(ticket._error, EvaluationSuspended)
+    assert ticket._error.pending is session.pending
+    assert ticket._error.stop is STOP
+    assert ticket.status().pending_capability is session.pending
+    assert [kind for kind, _, _ in session.calls] == ["start", "wait"]
+
+    def reconcile(port):
+        port.continue_evaluation(session.pending, STOP)
+        observed = port.wait_evaluation_event(session.pending, timeout_s=0.01)
+        return Settlement(observed.presentation)
+
+    arbiter.reconcile(ticket, reconcile)
+    assert ticket.wait_settled(3) == "value"
+    assert [kind for kind, _, _ in session.calls].count("start") == 1
+    assert scope.context_state is CaptureContextState.READY
+    arbiter.close(timeout=3)
+
+
+def test_variable_read_rejects_other_runtime_kernel_frame_before_rdbg() -> None:
+    from onec_runtime.execution.capture.inspection import CaptureInspectionExecutor
+
+    other_kernel_line = ModuleLocation(
+        KERNEL.module_type,
+        KERNEL.url,
+        KERNEL.object_id,
+        KERNEL.property_id,
+        55,
+        KERNEL.extension_name,
+    )
+    stop = StopEvent(
+        TARGET,
+        BUSINESS,
+        "callStackFormed",
+        stack=(BUSINESS, other_kernel_line, KERNEL),
+        stack_frames=tuple(
+            StackFrame(TARGET, level, location)
+            for level, location in enumerate((BUSINESS, other_kernel_line, KERNEL))
+        ),
+    )
+    session = Session([])
+    route = RouteToken("runtime", 1, 0, "capture")
+    arbiter = RdbgArbiter(session, route)
+    scope = ready_scope(stop)
+    executor = CaptureInspectionExecutor()
+    ticket = arbiter.submit(
+        route,
+        lambda port: Settlement(
+            executor.read_variable(scope, "Контекст", stack_level=1, port=port)
+        ),
+    )
+    arbiter.dispatch(ticket)
+
+    with pytest.raises(ValueError, match="kernel"):
+        ticket.wait(3)
+    assert session.calls == []
+    assert scope.context_state is CaptureContextState.READY
+    arbiter.close(timeout=3)
+
+
+def test_helper_decode_failure_settles_request_and_preserves_frame() -> None:
+    from onec_runtime.execution.capture.inspection import CaptureInspectionExecutor
+
+    result = EvaluationResult(UUID(int=4), "Строка", "malformed payload", False)
+    variable = FrameVariable("Номер", "Число", "42")
+    session = Session([LocalVariablesResult(UUID(int=10), (variable,))], [result])
+    route = RouteToken("runtime", 1, 0, "capture")
+    arbiter = RdbgArbiter(session, route)
+    scope = ready_scope()
+    executor = CaptureInspectionExecutor()
+
+    def reject_payload(_result):
+        raise ValueError("invalid private payload")
+
+    first = arbiter.submit(
+        route,
+        lambda port: Settlement(
+            executor.evaluate_helper(
+                scope,
+                "TrustedHelper()",
+                stack_level=2,
+                port=port,
+                result_policy=reject_payload,
+            )
+        ),
+    )
+    arbiter.dispatch(first)
+    with pytest.raises(ValueError, match="invalid private payload"):
+        first.wait(3)
+
+    assert first.status().settled
+    assert arbiter.active_ticket is None
+    assert scope.context_state is CaptureContextState.READY
+    assert scope.frame_identity is CaptureFrameIdentity.CONFIRMED
+    second = arbiter.submit(
+        route,
+        lambda port: Settlement(
+            executor.read_variable(scope, "Номер", stack_level=0, port=port)
+        ),
+    )
+    arbiter.dispatch(second)
+    assert second.wait(3) is variable
+    arbiter.close(timeout=3)
