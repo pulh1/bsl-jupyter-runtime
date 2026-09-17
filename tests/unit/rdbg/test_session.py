@@ -1417,6 +1417,58 @@ def test_foreign_only_stop_does_not_prevent_later_expected_poll():
     assert session.wait_for_any_stop(expected_target=foreign.target_id, timeout_s=1) is foreign_stop
 
 
+def test_continue_accepts_step_target_state_response_for_selected_target():
+    transport = FakeTransport()
+    session = ready_session(transport)
+    transport.responses["step"].append(
+        f'''<response xmlns="{RDBG_NS}"><item>
+        <targetID xmlns="{BASE_NS}"><id>{TARGET_ID}</id>
+        <infoBaseAlias>DefAlias</infoBaseAlias><targetType>ServerEmulation</targetType>
+        </targetID><stateNum>16</stateNum><state>Worked</state>
+        </item></response>'''.encode()
+    )
+
+    session.continue_()
+
+    assert session.state is SessionState.EXECUTING
+    assert transport.calls == ["step"]
+
+
+def test_continue_accepts_selected_target_among_step_state_items():
+    transport = FakeTransport()
+    session = ready_session(transport)
+    transport.responses["step"].append(
+        f'''<response xmlns="{RDBG_NS}">
+        <item><targetID xmlns="{BASE_NS}"><id>{UUID(int=91)}</id>
+        <infoBaseAlias>DefAlias</infoBaseAlias><targetType>ManagedClient</targetType>
+        </targetID><stateNum>16</stateNum><state>Worked</state></item>
+        <item><targetID xmlns="{BASE_NS}"><id>{TARGET_ID}</id>
+        <infoBaseAlias>DefAlias</infoBaseAlias><targetType>ServerEmulation</targetType>
+        </targetID><stateNum>16</stateNum><state>Worked</state></item>
+        </response>'''.encode()
+    )
+
+    session.continue_()
+
+    assert session.state is SessionState.EXECUTING
+
+
+def test_continue_rejects_step_state_response_for_another_target():
+    transport = FakeTransport()
+    session = ready_session(transport)
+    transport.responses["step"].append(
+        f'''<response xmlns="{RDBG_NS}"><item>
+        <targetID xmlns="{BASE_NS}"><id>{UUID(int=91)}</id>
+        <infoBaseAlias>DefAlias</infoBaseAlias><targetType>ServerEmulation</targetType>
+        </targetID><stateNum>16</stateNum><state>Worked</state>
+        </item></response>'''.encode()
+    )
+
+    with pytest.raises(ProtocolError, match="step acknowledgement"):
+        session.continue_()
+    assert session.state is SessionState.EXECUTING
+
+
 def test_empty_stop_interval_has_distinct_retryable_exception():
     from onec_runtime.errors import StopWaitIntervalElapsed
     session = ready_session(FakeTransport())

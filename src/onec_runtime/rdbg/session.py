@@ -59,6 +59,7 @@ from onec_runtime.rdbg.xml_codec import (
     parse_ping_target_events_from_document,
     parse_targets,
     validate_command_acknowledgement,
+    validate_step_acknowledgement,
 )
 
 
@@ -1126,7 +1127,7 @@ class RdbgSession:
             "step", build_step_request(self.alias, self.ui_id, self.target.target_id),
             on_transport_entry=entered,
         )
-        validate_command_acknowledgement(response, command="step")
+        validate_step_acknowledgement(response, self.target.target_id)
 
     def heartbeat(self, *, on_transport_dispatch: Callable[[], None] | None = None) -> dict[str, object]:
         self._require(SessionState.READY)

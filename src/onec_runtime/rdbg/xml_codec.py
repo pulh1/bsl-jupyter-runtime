@@ -124,6 +124,54 @@ def validate_command_acknowledgement(payload: bytes, *, command: str) -> None:
         raise ProtocolError(f"Invalid {command} acknowledgement")
 
 
+def validate_step_acknowledgement(payload: bytes, target: TargetId) -> None:
+    """Validate either supported step reply for the exact selected target.
+
+    The native RDBG step response can contain ``DbgTargetStateInfo`` items
+    instead of the scalar ``result=success`` used by other commands. Its item
+    list is not a new stop event; the caller must still wait for that event.
+    """
+
+    if not payload.strip():
+        return
+    try:
+        root = _parse(payload)
+        if _local_name(root) != "response":
+            raise ProtocolError("step response root is invalid")
+        results = _children(root, "result")
+        if results:
+            validate_command_acknowledgement(payload, command="step")
+            return
+        items = _children(root, "item")
+        if not items or len(items) != len(root):
+            raise ProtocolError("step target state list is invalid")
+        targets = parse_targets(payload)
+        if len(targets) != len(items):
+            raise ProtocolError("step target state list is invalid")
+        ids = [item.target_id.id for item in targets]
+        if len(set(ids)) != len(ids):
+            raise ProtocolError("step target state list contains duplicates")
+        matches = [
+            item.target_id
+            for item in targets
+            if item.target_id.id == target.id
+            and item.target_id.infobase_alias.casefold()
+            == target.infobase_alias.casefold()
+            and (
+                target.seance_id is None
+                or item.target_id.seance_id == target.seance_id
+            )
+            and (
+                target.infobase_instance_id is None
+                or item.target_id.infobase_instance_id == target.infobase_instance_id
+            )
+        ]
+        if len(matches) != 1:
+            raise ProtocolError("step reply does not identify the selected target")
+    except (ProtocolError, ValueError) as error:
+        raise ProtocolError("Invalid step acknowledgement") from error
+
+
 def _serialize(root: ElementTree.Element) -> bytes:
     return ElementTree.tostring(root, encoding="utf-8", xml_declaration=True)
 
