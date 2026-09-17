@@ -194,6 +194,22 @@ class SessionPort:
         if not self._live or get_ident() != self._owner._worker.ident:
             raise RuntimeError('Session port is confined to its active worker plan')
 
+    def handoff_route(self, next_route: RouteToken) -> None:
+        """Change route inside the active plan before its next RDBG operation.
+
+        The executor must first establish the stop or Continue evidence for the
+        transition. A handoff does not retire this ticket or any remote capability.
+        """
+        self._check()
+        with self._owner._mailbox:
+            if self._owner._active is not self._ticket or self._ticket._phase != 'running':
+                raise RuntimeError('Route handoff requires the active worker plan')
+            current = self._owner._route
+            if next_route.incarnation != current.incarnation or next_route.epoch <= current.epoch:
+                raise StaleRoute('Route handoff requires a newer epoch of this incarnation')
+            self._owner._route = next_route
+            self._owner._mailbox.notify_all()
+
     def _transport_entered(self) -> None:
         self._check()
         with self._owner._mailbox:
@@ -455,6 +471,16 @@ class RdbgArbiter:
                     raise StopPendingTeardown('A stopped plan cannot settle after blocking remote work')
                 if ticket._pending is not None or ticket._stop_target is not None or ticket._entered:
                     raise OutcomeUnknown('Settlement cannot discard an unretired capability')
+                if outcome.next_route is not None:
+                    with self._mailbox:
+                        current = self._route
+                        next_route = outcome.next_route
+                        newer_epoch = next_route.epoch > current.epoch
+                        newer_revision = (next_route.epoch == current.epoch
+                                          and next_route.context_id == current.context_id
+                                          and next_route.revision > current.revision)
+                        if next_route.incarnation != current.incarnation or not (newer_epoch or newer_revision):
+                            raise StaleRoute('Settlement cannot reverse or repeat the current route')
             except BaseException as error:
                 with self._mailbox:
                     if reconciling or ticket._entered or ticket._pending is not None or ticket._stop_target is not None or isinstance(error, OutcomeUnknown):

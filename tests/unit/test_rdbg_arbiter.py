@@ -140,6 +140,148 @@ def test_handoff_rejects_queued_old_epoch_before_effect(runtime):
     assert [name for name, _ in session.calls] == ['blocked', 'event']
 
 
+def test_active_worker_handoff_precedes_capture_setup_and_survives_setup_failure(runtime):
+    session, main_route, arbiter = runtime
+    capture_route = RouteToken('incarnation', 2, 0, 'capture-stop')
+    observed = []
+    stale_tickets = []
+    original_start = session.start_evaluation
+
+    def capture_setup(expression, **kwargs):
+        observed.append((arbiter.current_route, arbiter.active_ticket, ticket.status().settled))
+        return original_start(expression, **kwargs)
+
+    session.start_evaluation = capture_setup
+
+    def main_to_capture(port):
+        stale = arbiter.submit(main_route, lambda p: Settlement(evaluate(p, 'stale')))
+        stale_tickets.append(stale)
+        arbiter.dispatch(stale)
+        port.handoff_route(capture_route)
+        port.start_evaluation('')  # Confirmed local setup error, before transport.
+        return Settlement('unreachable')
+
+    ticket = arbiter.submit(main_route, main_to_capture)
+    arbiter.dispatch(ticket)
+    with pytest.raises(ValueError, match='empty expression'):
+        ticket.wait(3)
+    with pytest.raises(StaleRoute):
+        stale_tickets[0].wait(3)
+    assert observed == [(capture_route, ticket, False)]
+    assert arbiter.current_route == capture_route
+    assert session.calls == []
+
+
+def test_worker_handoff_keeps_pending_eval_capability_on_active_ticket(runtime):
+    session, main_route, arbiter = runtime
+    capture_route = RouteToken('incarnation', 2, 0, 'capture-stop')
+    observed = []
+
+    def main_to_capture(port):
+        pending = port.start_evaluation('setup')
+        port.handoff_route(capture_route)
+        observed.append((arbiter.active_ticket, ticket.status().pending_capability,
+                         ticket.status().settled, arbiter.current_route))
+        return Settlement(port.wait_evaluation_event(pending, timeout_s=1).presentation)
+
+    ticket = arbiter.submit(main_route, main_to_capture)
+    arbiter.dispatch(ticket)
+    assert ticket.wait(3) == 'setup'
+    owner, pending, settled, route = observed[0]
+    assert owner is ticket
+    assert pending is session.pending
+    assert not settled
+    assert route == capture_route
+    assert arbiter.current_route == capture_route
+
+
+def test_stale_settlement_cannot_reverse_worker_route_handoff(runtime):
+    _, main_route, arbiter = runtime
+    capture_route = RouteToken('incarnation', 2, 0, 'capture-stop')
+
+    def main_to_capture(port):
+        port.handoff_route(capture_route)
+        return Settlement('wrong-route', next_route=main_route)
+
+    ticket = arbiter.submit(main_route, main_to_capture)
+    arbiter.dispatch(ticket)
+    with pytest.raises(StaleRoute):
+        ticket.wait(3)
+    assert arbiter.current_route == capture_route
+
+
+def test_confirmed_capture_continue_handoffs_to_main_before_waiting_for_stop():
+    from onec_runtime.rdbg.models import ModuleLocation, StopEvent
+
+    capture_route = RouteToken('incarnation', 2, 0, 'capture-stop')
+    main_route = RouteToken('incarnation', 3, 0, 'main-command')
+    target_id = TargetId(uuid4(), 'test')
+    location = ModuleLocation('ExtensionModule', '', uuid4(), uuid4(), 1, 'Test')
+    stop = StopEvent(target_id, location, 'breakpoint')
+
+    class ContinueSession:
+        target = SimpleNamespace(target_id=target_id)
+
+        def continue_(self, *, on_transport_dispatch):
+            on_transport_dispatch()
+
+        def wait_for_any_stop(self, *, expected_target, on_transport_dispatch, **kwargs):
+            assert expected_target == target_id
+            observed.append((arbiter.current_route, arbiter.active_ticket,
+                             ticket.status().awaiting_stop, ticket.status().settled))
+            on_transport_dispatch()
+            return stop
+
+    observed = []
+    arbiter = RdbgArbiter(ContinueSession(), capture_route)
+    try:
+        def resume_capture(port):
+            port.continue_()
+            port.handoff_route(main_route)
+            return Settlement(port.wait_for_any_stop(timeout_s=1))
+
+        ticket = arbiter.submit(capture_route, resume_capture)
+        arbiter.dispatch(ticket)
+        assert ticket.wait(3) is stop
+        assert observed == [(main_route, ticket, True, False)]
+        assert arbiter.current_route == main_route
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_route_handoff_rejects_caller_thread_and_expired_port(runtime):
+    _, route, arbiter = runtime
+    next_route = RouteToken('incarnation', 2, 0, 'capture-stop')
+    stored_ports = []
+    entered = Event()
+    release = Event()
+
+    def plan(port):
+        stored_ports.append(port)
+        entered.set()
+        assert release.wait(3)
+        return Settlement('done')
+
+    ticket = arbiter.submit(route, plan)
+    arbiter.dispatch(ticket)
+    assert entered.wait(3)
+    with pytest.raises(RuntimeError, match='confined'):
+        stored_ports[0].handoff_route(next_route)
+    assert arbiter.current_route == route
+    release.set()
+    assert ticket.wait(3) == 'done'
+
+    def second_plan(port):
+        with pytest.raises(RuntimeError, match='confined'):
+            stored_ports[0].handoff_route(next_route)
+        return Settlement('still-main')
+
+    second = arbiter.submit(route, second_plan)
+    arbiter.dispatch(second)
+    assert second.wait(3) == 'still-main'
+    assert arbiter.current_route == route
+
+
 def test_queued_cancellation_has_no_effect(runtime):
     session, route, arbiter = runtime
     ticket = arbiter.submit(route, lambda port: Settlement(evaluate(port, 'cancelled')))
