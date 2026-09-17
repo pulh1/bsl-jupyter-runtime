@@ -259,7 +259,7 @@ that frame if necessary.
 
 ## Sequential value expansion
 
-A variable is represented by a `ValueNode`:
+A successfully projected variable is represented by a `ValueNode`:
 
 ```python
 data = capture.context.locals["СтруктураДанных"]
@@ -274,7 +274,16 @@ data.expandable
 The preview is bounded to 512 characters. Containers display a summary and an
 expansion marker; they are not materialized automatically.
 
-Every node has a universal child view:
+A bounded page may also contain a name-only `UnavailableValueNode` when one
+selected value cannot be projected. Its public snapshot has `name`,
+`access="unavailable"` and `expandable=false`, without type, preview or child
+path. Other entries in that page remain readable. An exact lookup of this entry
+raises `CaptureValueCheckError`; a later read may retry at the same confirmed
+CAPTURE stop. This marker does not imply support for arbitrary 1C objects.
+`DeniedValueNode` remains a separate privacy-policy result and exact access to
+it raises `CaptureValueAccessDeniedError`.
+
+Every ordinary `ValueNode` has a universal child view:
 
 ```python
 data.children[:20]
@@ -402,25 +411,46 @@ Lifecycle failures such as `CaptureBusyError` are decided before the inline
 public-value policy stage, so they cannot be mistranslated into a Worker-object
 error.
 
-Denial has two scopes. If the requested root is denied, or any value required
-for exact access or full materialization is denied, the operation returns the
-whole-request `D` envelope and publishes no payload. Once a page root is
-admitted, a denied projected child remains in an otherwise admitted page using
-this exact route-payload object:
+For full materialization, a denied required value fails the whole request and
+publishes no transferable payload. For inspection, a denied selected value
+appears in the response using this exact wire-entry variant:
 
 ```json
-{"name":"<validated identifier>","access":"denied","expandable":false}
-{"name":0,"access":"denied","expandable":false}
+{"name":"<validated identifier>","denied":true}
+{"name":0,"denied":true}
 ```
 
-Those are the only two forms and the only keys. `name` is either a locally
+Those are the only two selector forms and the only keys for a denied wire
+entry. The Python page converts it to `DeniedValueNode` with public fields
+`name`, `access="denied"` and `expandable=false`. `name` is either a locally
 validated BSL identifier or a non-negative integer within the requested page
 bound. The entry contains no type, preview, size, target handle or safe path.
-Admitted siblings use the ordinary closed `ValueNode` snapshot schema. The
-outer operation returns `R` only after every selected child has reached a final
-admitted or denied policy decision; it never publishes part of a page while a
-child remains pending. Exact lookup of the same denied child still returns `D`
-and raises `CaptureValueAccessDeniedError`.
+Admitted siblings use the ordinary closed `ValueNode` snapshot schema. A value
+that cannot be inspected without exposing value metadata uses exactly this third wire-entry
+variant, with no metadata or denied flag:
+
+```json
+{"name":"<validated identifier>","unavailable":true}
+{"name":0,"unavailable":true}
+```
+
+The Python page converts this entry to the name-only public
+`UnavailableValueNode` (`access="unavailable"`, `expandable=false`); it does
+not expose a type, preview, size or child path. The outer operation returns
+`R` only after every selected child has reached a final admitted, denied or
+unavailable result; it never publishes a partial page while a child remains
+pending. Exact lookup of a denied child raises
+`CaptureValueAccessDeniedError`. Exact lookup of an unavailable child raises
+`CaptureValueCheckError`, without turning a confirmed paused CAPTURE stop into a
+failed frame. A corrected inspection request may run again on that same stop.
+
+Compatibility amendment (2026-09-17): the `unavailable` wire-entry variant is
+introduced in extension protocol `4` with artifact `0.1.7`. The protocol `3`
+decoder rejects its unknown field, so both extension handshake targets and the
+packaged manifest must advertise `4`. MANUAL mode may accept a different
+artifact version but still rejects a different protocol before inspection.
+An older user-managed CFE therefore requires an explicit upgrade; no implicit
+v3/v4 wire negotiation is provided.
 
 ## Source module resolution
 
@@ -823,7 +853,7 @@ allowlists over the advertised typed fields.
 | Admission observation | Public behavior |
 | --- | --- |
 | `D|worker_generation_value` | Root/exact/full-materialization denial: raise `CaptureValueAccessDeniedError`; publish no value metadata or payload |
-| Valid `R|...` | Admit the prepared result; a page payload may contain only the fixed redacted entries defined above for denied projected children; fetch it only while its initiating waiter remains attached |
+| Valid `R|...` | Admit the prepared result; a page payload may contain the fixed `denied` and `unavailable` entries defined above alongside admitted descriptors; fetch it only while its initiating waiter remains attached |
 | `E|value_admission_failed`, confirmed BSL error, or invalid envelope/result | Raise `CaptureValueCheckError`; do not claim that the value is a Worker object |
 | Acknowledged evaluation still pending at initiating-caller timeout | Keep `evaluating`, detach the initiating waiter and expose the record through `status()`/`wait()` |
 | Dispatch/acceptance uncertain | Enter `outcome_unknown` |
@@ -1171,7 +1201,7 @@ node.children[0:20]
   → validate the locally declared shape and admit the root
   → execute the shape adapter's finite RDBG operation plan into temporary handles
   → decide inline policy for each projected handle before normalizing it
-  → encode an admitted descriptor or the fixed redacted child entry
+  → encode an admitted descriptor or the fixed denied/unavailable child entry
   → publish one immutable page only after every selected decision settles
   → return immutable ValuePage
 ```
@@ -1240,6 +1270,8 @@ Required tests cover:
 - protocol fixtures for every advertised shape and bound in the expansion
   matrix;
 - safe structure, array, value-table and row expansion;
+- a page with one unavailable value and readable siblings; exact lookup raises
+  `CaptureValueCheckError` and a corrected request succeeds at the same stop;
 - rejection of unsupported maps, value trees, undocumented layouts and value
   tables wider than the supported schema bound;
 - rejection of unbounded slices, unsafe names and fabricated path segments;

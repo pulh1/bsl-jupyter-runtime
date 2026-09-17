@@ -31,6 +31,7 @@ from onec_runtime.capture_inspection import DebugFrame, StackPage
 from onec_runtime.capture_values import (
     DeniedValueNode,
     SafeValuePath,
+    UnavailableValueNode,
     ValueNode,
     ValuePage,
     ValueRoot,
@@ -1290,6 +1291,7 @@ def test_extension_registers_capture_snapshot_formatters_without_global_alias() 
 
     expected = {
         CaptureStatus, StackPage, DebugFrame, ValuePage, ValueNode, DeniedValueNode,
+        UnavailableValueNode,
     }
     assert expected <= plain.type_printers.keys()
     assert expected <= html.type_printers.keys()

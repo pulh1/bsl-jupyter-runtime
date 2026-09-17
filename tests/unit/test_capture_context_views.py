@@ -661,6 +661,69 @@ def test_runtime_value_inline_transfer_rejects_denial_or_invalid_metadata(
         assert owner.join(2)
 
 
+def test_runtime_value_inline_page_preserves_unavailable_and_denied_wire_entries():
+    """Sealing must not describe either name-only wire entry."""
+    from base64 import b64encode
+    from hashlib import sha256
+    import json
+
+    from onec_runtime.privacy import public_artifact_value
+    from onec_runtime.runtime_api import PrototypeRuntimeApi
+    from test_prototype_runtime import CAPTURE_A, ScriptedSession, captured_controller, evaluation
+
+    document = {
+        "v": 1, "action": "project",
+        "entries": [
+            {"name": "Недоступное", "unavailable": True},
+            {"name": "Секретное", "denied": True},
+            {"name": "Доступное", "denied": False, "type_name": "Число",
+             "preview": "42", "size": None, "shape": "scalar", "cycle": False},
+        ],
+        "total": 3, "next": None,
+    }
+    payload = json.dumps(document, ensure_ascii=False, separators=(",", ":")).encode()
+    encoded = b64encode(payload).decode("ascii")
+    envelope = "R|1|1|{}|{}|{}|{}".format(
+        len(payload), sha256(payload).hexdigest(), len(encoded), encoded,
+    )
+
+    class InlineSession(ScriptedSession):
+        def __init__(self):
+            super().__init__((CAPTURE_A,))
+            self.projections = 0
+
+        def evaluate(self, expression, **kwargs):  # type: ignore[no-untyped-def]
+            if "СериализоватьИнспекциюДляОтладки" in expression:
+                self.projections += 1
+                return evaluation("Строка", f'"{envelope}"')
+            return super().evaluate(expression, **kwargs)
+
+    session = InlineSession()
+    controller = captured_controller(session)
+    runtime = PrototypeRuntimeApi(controller)
+    owner = controller._capture_evaluation_coordinator
+    assert owner is not None
+    try:
+        capture = runtime.current_capture()
+        page = capture.context.variables[:3]
+
+        assert [item.name for item in page.items] == [
+            "Недоступное", "Секретное", "Доступное",
+        ]
+        assert public_artifact_value(page.items[0]) == {
+            "name": "Недоступное", "access": "unavailable", "expandable": False,
+        }
+        assert public_artifact_value(page.items[1]) == {
+            "name": "Секретное", "access": "denied", "expandable": False,
+        }
+        assert page.items[2].preview == "42"
+        assert session.projections == 1
+        assert capture.status().can_inspect
+    finally:
+        owner.begin_close()
+        assert owner.join(2)
+
+
 def test_confirmed_inline_decoder_failure_leaves_capture_paused_for_next_inspection():
     """One bad inline payload does not poison the stopped frame or add cleanup work."""
     from base64 import b64encode

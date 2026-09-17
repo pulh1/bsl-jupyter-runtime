@@ -66,6 +66,7 @@ def test_capture_value_snapshots_expose_only_normalized_public_fields() -> None:
     from onec_runtime.capture_values import (
         SafePathSegment,
         SafeValuePath,
+        UnavailableValueNode,
         ValueNode,
         ValuePage,
         ValuePathSegmentKind,
@@ -98,6 +99,9 @@ def test_capture_value_snapshots_expose_only_normalized_public_fields() -> None:
     }
     assert "object at" not in serialized
     assert "_owner" not in serialized and "_lineage" not in serialized
+    assert public_artifact_value(UnavailableValueNode("Недоступное")) == {
+        "name": "Недоступное", "access": "unavailable", "expandable": False,
+    }
 
 
 def test_attached_frame_and_live_descriptors_never_publish_inspection_capabilities() -> None:

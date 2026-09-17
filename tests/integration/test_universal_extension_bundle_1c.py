@@ -380,8 +380,8 @@ def _build_table_bound_instrumented_bundle(
         source_root=source,
         output_root=root / "bundle",
         platform_bin=platform,
-        artifact_version="0.1.6",
-        protocol_version="3",
+        artifact_version="0.1.7",
+        protocol_version="4",
     )
 
 
@@ -480,8 +480,8 @@ def test_unbounded_to_df_keeps_all_rows_after_schema_probe(
         source_root=_REPOSITORY / "onec" / "OnecInteractiveRuntime",
         output_root=tmp_path / "bundle",
         platform_bin=platform,
-        artifact_version="0.1.6",
-        protocol_version="3",
+        artifact_version="0.1.7",
+        protocol_version="4",
     )
     config = _config(tmp_path / "target", platform)
     create_empty_infobase(config)
@@ -516,8 +516,8 @@ def test_bounded_to_df_initializes_value_transfer_module(
         source_root=_REPOSITORY / "onec" / "OnecInteractiveRuntime",
         output_root=tmp_path / "bundle",
         platform_bin=platform,
-        artifact_version="0.1.6",
-        protocol_version="3",
+        artifact_version="0.1.7",
+        protocol_version="4",
     )
     config = _config(tmp_path / "target", platform)
     create_empty_infobase(config)

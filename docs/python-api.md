@@ -108,17 +108,19 @@ for frame in page.frames:
 | `capture.stack[index]`, `capture.stack[start:stop]` | Один `DebugFrame` или страница `StackPage`. `capture.stack.native` открывает физические кадры, включая служебные. Срез должен иметь конечные границы и не больше 100 кадров. |
 | `capture.context.variables[name]`, `capture.context.variables[start:stop]` | Значение по точному имени или ограниченная страница переменных staged CAPTURE-контекста. |
 
-`StackPage` содержит `frames`, `total`, `next_cursor`; `with_methods()` добавляет разрешённые по исходникам имена и сигнатуры методов. `DebugFrame` содержит `source`, `line`, `native_level`, `source_status`, `method_status`; `frame.variables`, `frame.parameters`, `frame.locals` открывают переменные этого кадра. Страницы переменных содержат `items`, `total`, `next_cursor`. `ValueNode` показывает `name`, `type_name`, `preview`, `size`, `shape`, `expandable` и разрешает ограниченное чтение через `children`, `fields`, `items`, `columns`, `rows`. Выбор страницы требует конечного среза; бесконечная итерация намеренно недоступна. Некоторые значения или сведения об исходниках могут быть недоступны; это отражается диагностикой чтения, а не обязательной потерей CAPTURE.
+`StackPage` содержит `frames`, `total`, `next_cursor`; `with_methods()` добавляет разрешённые по исходникам имена и сигнатуры методов. `DebugFrame` содержит `source`, `line`, `native_level`, `source_status`, `method_status`; `frame.variables`, `frame.parameters`, `frame.locals` открывают переменные этого кадра. Страницы переменных содержат `items`, `total`, `next_cursor`. Обычный `ValueNode` показывает `name`, `type_name`, `preview`, `size`, `shape`, `expandable` и разрешает ограниченное чтение через `children`, `fields`, `items`, `columns`, `rows`. Выбор страницы требует конечного среза; бесконечная итерация намеренно недоступна.
+
+Если отдельное значение не удалось представить через CAPTURE inspection, страница сохраняет доступных соседей и помещает на его место `UnavailableValueNode`: только проверенное `name`, `access == "unavailable"` и `expandable == False`, без типа, preview и пути для раскрытия. Точечный доступ к такому значению вызывает `CaptureValueCheckError`; после исправления причины можно повторить чтение на той же CAPTURE-остановке, если `capture.status().can_inspect` остаётся истинным. `DeniedValueNode` с `access == "denied"` означает запрет доступа по политике приватности; точечный доступ к нему вызывает `CaptureValueAccessDeniedError`. Маркер `unavailable` не обещает поддержку произвольных объектов 1С и сам по себе не означает потерю остановленного кадра.
 
 `capture.context.variables` читает поля `КонтекстОтладки`, перенесённые из остановленного кадра. Новое имя, присвоенное в CAPTURE-ячейке без префикса `КонтекстОтладки`, попадает в постоянный notebook `Контекст` и доступно через `bsl`/`namespace_snapshot()`, но не появляется в staged кадре. Присваивание `КонтекстОтладки.Имя = ...` меняет существующий корень staged кадра. Для вложенных значений массив и строки таблицы выбираются индексом, а поля структуры и колонки строки — именем: `node.rows[0].fields["Сумма"]`.
 
 ```python
 frame = capture.stack[0]
 for node in frame.locals[:10].items:
-    print(node.name, node.preview)
+    print(node)
 
 for node in capture.context.variables[:10].items:
-    print(node.name, node.preview)
+    print(node)
 
 runtime.resume_capture()
 runtime.clear_capture_points()

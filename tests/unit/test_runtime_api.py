@@ -4291,6 +4291,63 @@ def test_api_project_value_keeps_composite_request_under_one_writer(
     assert results == [[5]]
 
 
+def _api_with_real_materialization_context_io(
+    payload: bytes,
+) -> tuple[PrototypeRuntimeApi, FakeController, list[str]]:
+    """Exercise generated API keys against the controller's actual key policy."""
+    controller = FakeController()
+    expressions: list[str] = []
+    encoded = b64encode(payload).decode()
+
+    class ContextSession:
+        def evaluate(self, expression: str, **_kwargs: object) -> EvaluationResult:
+            expressions.append(expression)
+            if "ЗабратьКомпактнуюМатериализациюИзКонтекста" in expression:
+                return evaluation("Строка", f'"{encoded}"')
+            if "УдалитьМатериализациюИзКонтекста" in expression:
+                return evaluation("Булево", "Истина")
+            raise AssertionError(f"unexpected expression: {expression}")
+
+    context_owner = PrototypeRuntimeController(ContextSession(), SERVICE)  # type: ignore[arg-type]
+    controller.take_context_string = context_owner.take_context_string  # type: ignore[method-assign]
+    controller.drop_context_value = context_owner.drop_context_value  # type: ignore[method-assign]
+    return PrototypeRuntimeApi(controller), controller, expressions
+
+
+def test_generated_materialization_key_is_read_and_cleaned_by_real_controller() -> None:
+    payload = json.dumps(
+        {"version": 1, "root": {"t": "string", "v": "ready"}},
+        separators=(",", ":"),
+    ).encode()
+    api, controller, expressions = _api_with_real_materialization_context_io(payload)
+    controller.worker_results.clear()
+    encoded = b64encode(payload).decode()
+    controller.worker_results.append(
+        f"R|1|1|{len(payload)}|{sha256(payload).hexdigest()}|{len(encoded)}"
+    )
+
+    assert api.materialize_value("Контекст.Данные", max_bytes=4096) == "ready"
+
+    key = re.search(r"__onec_materialization_[0-9a-f]{32}", controller.main_sources[0])
+    assert key is not None
+    assert len(expressions) == 2
+    assert all(key.group(0) in expression for expression in expressions)
+    assert "ЗабратьКомпактнуюМатериализациюИзКонтекста" in expressions[0]
+    assert "УдалитьМатериализациюИзКонтекста" in expressions[1]
+
+
+def test_generated_materialization_cleanup_preserves_admission_error() -> None:
+    api, controller, expressions = _api_with_real_materialization_context_io(b"")
+    controller.worker_results.clear()
+    controller.worker_results.append("invalid admission envelope")
+
+    with pytest.raises(CaptureValueCheckError, match="admission result"):
+        api.materialize_value("Контекст.Данные", max_bytes=4096)
+
+    assert len(expressions) == 1
+    assert "УдалитьМатериализациюИзКонтекста" in expressions[0]
+
+
 def test_api_routes_recursive_value_materialization_without_active_worker() -> None:
     controller = FakeController()
     api = PrototypeRuntimeApi(controller)

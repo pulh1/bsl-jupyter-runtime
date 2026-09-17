@@ -131,7 +131,7 @@ def test_manifest_builder_binds_cfe_dump_bsl_and_breakpoint_lines(
     assert manifest.cfe_sha256 == sha256(cfe.read_bytes()).hexdigest()
     assert manifest.cfe_size == len(b"cfe-fixture")
     assert manifest.artifact_version == "0.1.3"
-    assert manifest.protocol_version == "3"
+    assert manifest.protocol_version == "4"
     assert (
         manifest.breakpoints.managed.object_id
         == manifest.fingerprints.identity.root_id
@@ -198,14 +198,14 @@ def test_builder_runs_clean_commands_in_order_with_a_fresh_infobase_each_time(
         output_root=output,
         platform_bin=designer.parent,
         artifact_version="0.1.3",
-        protocol_version="3",
+        protocol_version="4",
     )
     second = build_runtime_extension_bundle(
         source_root=source,
         output_root=output,
         platform_bin=designer.parent,
         artifact_version="0.1.3",
-        protocol_version="3",
+        protocol_version="4",
     )
 
     assert first.manifest == second.manifest
@@ -261,7 +261,7 @@ def test_builder_rejects_requested_version_mismatch_before_starting_1c(
             output_root=output,
             platform_bin=designer.parent,
             artifact_version="9.9.9",
-            protocol_version="3",
+            protocol_version="4",
         )
 
 
@@ -314,7 +314,7 @@ def test_builder_keeps_canonical_repository_source_immutable(
         output_root=output,
         platform_bin=designer.parent,
         artifact_version="0.1.3",
-        protocol_version="3",
+        protocol_version="4",
     )
 
     assert config_dump_info.read_bytes() == original

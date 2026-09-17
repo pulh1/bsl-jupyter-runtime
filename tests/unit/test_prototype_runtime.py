@@ -163,7 +163,7 @@ def test_system_main_preserves_retained_worker_breakpoints() -> None:
     )
 
 
-def test_controller_cleanup_accepts_only_server_owned_projection_key() -> None:
+def test_controller_cleanup_accepts_only_server_owned_context_keys() -> None:
     runtime = runtime_module()
     class CleanupSession:
         def __init__(self) -> None:
@@ -177,10 +177,14 @@ def test_controller_cleanup_accepts_only_server_owned_projection_key() -> None:
     controller = runtime.PrototypeRuntimeController(session, SERVICE)
 
     controller.drop_context_value("__onec_projection_" + "a" * 32)
+    controller.drop_context_value("__onec_materialization_" + "a" * 32)
 
     assert any("__onec_projection_" in expression for expression in session.calls)
+    assert any("__onec_materialization_" in expression for expression in session.calls)
     with pytest.raises(ProtocolError, match="context key"):
         controller.drop_context_value("__onec_projection_not-a-uuid")
+    with pytest.raises(ProtocolError, match="context key"):
+        controller.drop_context_value("__onec_materialization_" + "A" * 32)
 
 
 class ScriptedSession:

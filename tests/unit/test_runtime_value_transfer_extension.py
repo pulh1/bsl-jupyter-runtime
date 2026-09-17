@@ -95,6 +95,25 @@ def test_value_inspection_projector_is_a_closed_inline_admission_protocol() -> N
     assert "Значение.Колонки.Количество() >= ЛимитКолонок" in names
 
 
+def test_inspection_entry_failure_keeps_the_rest_of_the_page_available() -> None:
+    """An unsupported 1C object must not abort a page of frame locals."""
+    source = MODULE.read_text(encoding="utf-8-sig")
+    entry = source.split("Функция ЗаписьЗначенияИнспекции(", 1)[1].split(
+        "КонецФункции", 1
+    )[0]
+    projector = source.split("Функция СпроецироватьЗначенияИнспекции(", 1)[1].split(
+        "КонецФункции", 1
+    )[0]
+
+    assert "ДопуститьЗначение(Значение" in entry
+    assert "ОписаниеЗначенияИнспекции(Значение)" in entry
+    assert "Исключение" in entry
+    assert 'Новый Структура("name,unavailable", Имя, Истина)' in entry
+    assert projector.index("Для Каждого Имя Из СтраницаИмен.Имена") < projector.index(
+        'Новый Структура("name,unavailable", Имя, Истина)'
+    )
+
+
 def test_debugger_inspection_helper_returns_one_bounded_inline_envelope() -> None:
     """One eval result contains the admitted projection, with no private key."""
     source = MODULE.read_text(encoding="utf-8-sig")

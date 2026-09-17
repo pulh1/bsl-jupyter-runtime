@@ -143,6 +143,9 @@ MAX_CAPTURE_VALUE_PATH_SEGMENTS = CaptureValuePolicy().max_depth + 1
 # its pre-projection read finite even when the target reports an unexpected
 # frame shape; the selected BSL roots remain capped at the protocol's 100.
 MAX_CAPTURE_VALUE_NATIVE_INVENTORY = 10_000
+_MATERIALIZATION_CONTEXT_KEY = re.compile(
+    r"__(?:onec_compact_table|onec_value|onec_projection|onec_materialization)_[0-9a-f]{32}\Z"
+)
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -198,6 +201,11 @@ def _denied_capture_value_metadata() -> ValueMetadata:
     raise CaptureValueAccessDeniedError("capture value is private")
 
 
+def _unavailable_capture_value_metadata() -> ValueMetadata:
+    """A sealed unavailable record has no target metadata to retain."""
+    raise CaptureValueCheckError("capture value metadata is unavailable")
+
+
 def _seal_capture_projected_value(
     value: PrivateProjectedValue,
 ) -> PrivateProjectedValue:
@@ -217,6 +225,12 @@ def _seal_capture_projected_value(
             _denied_capture_value_metadata,
             denied=True,
             cycle=value.cycle,
+        )
+    if value.unavailable:
+        return PrivateProjectedValue(
+            value.name,
+            _unavailable_capture_value_metadata,
+            unavailable=True,
         )
     metadata = value.describe()
     if not isinstance(metadata, ValueMetadata):
@@ -4261,10 +4275,7 @@ class PrototypeRuntimeController:
         return tuple(messages)
 
     def take_context_string(self, key: str, *, max_text_size: int) -> str:
-        if not re.fullmatch(
-            r"__(?:onec_compact_table|onec_value|onec_projection)_[0-9a-f]{32}",
-            key,
-        ):
+        if not _MATERIALIZATION_CONTEXT_KEY.fullmatch(key):
             raise ProtocolError("materialization context key is invalid")
         if type(max_text_size) is not int or max_text_size <= 0:
             raise ProtocolError("compact table maximum text size is invalid")
@@ -4303,10 +4314,7 @@ class PrototypeRuntimeController:
         ))
 
     def drop_context_value(self, key: str) -> None:
-        if not re.fullmatch(
-            r"__(?:onec_compact_table|onec_value|onec_projection)_[0-9a-f]{32}",
-            key,
-        ):
+        if not _MATERIALIZATION_CONTEXT_KEY.fullmatch(key):
             raise ProtocolError("materialization context key is invalid")
         expression = (
             "RuntimeKernelServer."

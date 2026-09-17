@@ -35,7 +35,7 @@ _PROTOCOL_SOURCES = frozenset(
         _TABLE_TRANSFER_SOURCE,
     }
 )
-_PROTOCOL_VERSION = "3"
+_PROTOCOL_VERSION = "4"
 _PERMANENT_IDENTITY_RUNTIME_MODULE_NAMES = (
     "RuntimeContextStoreServer",
     "RuntimeKernelServer",
@@ -531,7 +531,7 @@ def read_extension_manifest(path: Path) -> ExtensionManifest:
     if extension_name != EXTENSION_NAME:
         raise _fail("manifest extension_name is not the packaged extension")
     if protocol_version != _PROTOCOL_VERSION:
-        raise _fail("manifest protocol_version must be protocol 3")
+        raise _fail("manifest protocol_version must be protocol 4")
     if cfe_filename != f"{EXTENSION_NAME}.cfe":
         raise _fail("manifest cfe_filename is invalid")
     fingerprints = _parse_fingerprints(root["fingerprints"])

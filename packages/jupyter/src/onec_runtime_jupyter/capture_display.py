@@ -14,6 +14,7 @@ from onec_runtime.capture_inspection import DebugFrame, RuntimeFrameMarker, Stac
 from onec_runtime.capture_values import (
     DeniedValueNode,
     SafeValuePath,
+    UnavailableValueNode,
     ValueNode,
     ValuePage,
     ValuePathSegmentKind,
@@ -28,10 +29,12 @@ MAX_LABEL_CHARS = 512
 MAX_PATH_CHARS = 1_024
 
 CaptureSnapshot: TypeAlias = (
-    CaptureStatus | StackPage | DebugFrame | ValueNode | DeniedValueNode | ValuePage
+    CaptureStatus | StackPage | DebugFrame | ValueNode | DeniedValueNode
+    | UnavailableValueNode | ValuePage
 )
 _SNAPSHOT_TYPES = (
-    CaptureStatus, StackPage, DebugFrame, ValueNode, DeniedValueNode, ValuePage,
+    CaptureStatus, StackPage, DebugFrame, ValueNode, DeniedValueNode,
+    UnavailableValueNode, ValuePage,
 )
 
 
@@ -190,7 +193,7 @@ def _path_text(path: SafeValuePath) -> str:
     return text
 
 
-def _node_text(node: ValueNode | DeniedValueNode) -> str:
+def _node_text(node: ValueNode | DeniedValueNode | UnavailableValueNode) -> str:
     name = _clean(str(node.name), 256)
     if type(node) is DeniedValueNode:
         # The denied node intentionally owns no path, type, preview, size, or
@@ -198,6 +201,10 @@ def _node_text(node: ValueNode | DeniedValueNode) -> str:
         if node.access != "denied" or node.expandable:
             raise TypeError("denied capture node contract is invalid")
         return f"{name}: <private runtime value>"
+    if type(node) is UnavailableValueNode:
+        if node.access != "unavailable" or node.expandable:
+            raise TypeError("unavailable capture node contract is invalid")
+        return f"{name}: <unavailable>"
     type_name = "unknown" if node.type_name is None else _clean(node.type_name, 256)
     text = f"{name}: {type_name} = {_clean(node.preview)}"
     if node.size is not None:
@@ -292,12 +299,13 @@ def _frame_html(frame: DebugFrame) -> str:
     )
 
 
-def _node_html(node: ValueNode | DeniedValueNode) -> str:
-    css_class = (
-        "onec-capture-private"
-        if type(node) is DeniedValueNode
-        else "onec-capture-value"
-    )
+def _node_html(node: ValueNode | DeniedValueNode | UnavailableValueNode) -> str:
+    if type(node) is DeniedValueNode:
+        css_class = "onec-capture-private"
+    elif type(node) is UnavailableValueNode:
+        css_class = "onec-capture-unavailable"
+    else:
+        css_class = "onec-capture-value"
     return f'<span class="{css_class}">{_html_text(_node_text(node))}</span>'
 
 

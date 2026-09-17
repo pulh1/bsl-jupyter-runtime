@@ -32,7 +32,7 @@ from onec_runtime.capture_values import (
     ValueViewKind,
     VariableRole,
 )
-from onec_runtime.errors import CaptureValueCheckError, ProtocolError
+from onec_runtime.errors import CapturePathError, CaptureValueCheckError, ProtocolError
 from onec_runtime.experiment import bsl_string_literal
 
 
@@ -799,15 +799,27 @@ def _decode_columns(document: dict[str, object], limit: int | None) -> tuple[str
 
 
 def _decode_entry(value: object, *, named: bool) -> PrivateProjectedValue:
-    raw = _exact_object(value, frozenset({"name", "denied"})) if isinstance(value, dict) and value.get("denied") is True else _exact_object(
-        value,
-        frozenset({"name", "denied", "type_name", "preview", "size", "shape", "cycle"}),
-    )
+    if isinstance(value, dict) and value.get("unavailable") is True:
+        raw = _exact_object(value, frozenset({"name", "unavailable"}))
+    elif isinstance(value, dict) and value.get("denied") is True:
+        raw = _exact_object(value, frozenset({"name", "denied"}))
+    else:
+        raw = _exact_object(
+            value,
+            frozenset({"name", "denied", "type_name", "preview", "size", "shape", "cycle"}),
+        )
     name = raw["name"]
     if named:
-        name = SafePathSegment(ValuePathSegmentKind.FIELD, name).key
+        try:
+            name = SafePathSegment(ValuePathSegmentKind.FIELD, name).key
+        except CapturePathError:
+            raise CaptureValueCheckError("CAPTURE value payload is invalid") from None
     elif type(name) is not int or name < 0:
         raise CaptureValueCheckError("CAPTURE value payload is invalid")
+    if "unavailable" in raw:
+        return PrivateProjectedValue(
+            name, lambda: _unavailable_metadata(), unavailable=True,
+        )
     denied = raw["denied"]
     if type(denied) is not bool:
         raise CaptureValueCheckError("CAPTURE value payload is invalid")
@@ -851,3 +863,7 @@ def _selector_key(value: str | int) -> str | int:
 
 def _denied_metadata() -> ValueMetadata:
     raise CaptureValueCheckError("denied capture value metadata is unavailable")
+
+
+def _unavailable_metadata() -> ValueMetadata:
+    raise CaptureValueCheckError("capture value metadata is unavailable")
