@@ -1872,3 +1872,253 @@ def test_real_session_foreign_stop_cannot_poison_main_owner():
     arbiter.close(timeout=3)
     session.state = SessionState.ATTACHED
     assert session.wait_for_any_stop(expected_target=foreign.target_id, timeout_s=1) is foreign_stop
+
+
+def _unknown_server_stop(*, absence_results, block_confirmation=None,
+                         handoff_to_capture=False):
+    from onec_runtime.rdbg.models import DebugTarget
+    from onec_runtime.rdbg.session import BoundServerTargetAbsence
+
+    target = TargetId(uuid4(), 'DefAlias', uuid4())
+    client = TargetId(uuid4(), 'DefAlias', target.seance_id)
+    evidence = BoundServerTargetAbsence(client, target, 1.0, 1)
+
+    class ServerSession:
+        def __init__(self):
+            self.target = DebugTarget(target, 'Server', 'stopped')
+            self.calls = []
+            self.absence_results = list(absence_results)
+            self.confirmation_entered = Event()
+
+        def continue_(self, *, on_transport_dispatch):
+            on_transport_dispatch()
+            self.calls.append(('continue', get_ident()))
+
+        def terminate_bound_server_session(self):
+            self.calls.append(('terminate', get_ident()))
+            return True
+
+        def wait_for_bound_server_targets_absent(self, expected_target, *, timeout_s):
+            self.calls.append(('confirm', get_ident(), expected_target, timeout_s))
+            self.confirmation_entered.set()
+            if block_confirmation is not None:
+                assert block_confirmation.wait(3)
+            outcome = self.absence_results.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return evidence if outcome is None else outcome
+
+    session = ServerSession()
+    route = RouteToken('server-stop', 1, 0, 'main')
+    capture_route = RouteToken(route.incarnation, 2, 0, 'capture-scope')
+    arbiter = RdbgArbiter(session, route)
+
+    def unknown_main(port):
+        port.continue_()
+        if handoff_to_capture:
+            port.handoff_route(capture_route)
+        raise OutcomeUnknown('stop is not correlated')
+
+    ticket = arbiter.submit(route, unknown_main)
+    arbiter.dispatch(ticket)
+    assert ticket.wait_unknown(3)
+    return session, capture_route if handoff_to_capture else route, arbiter, ticket, target, evidence
+
+
+def test_server_stop_teardown_uses_same_worker_and_exact_proof():
+    session, route, arbiter, ticket, target, evidence = _unknown_server_stop(
+        absence_results=[None],
+    )
+    queued = arbiter.submit(route, lambda port: Settlement('must not run'))
+    arbiter.dispatch(queued)
+    with pytest.raises(ArbiterBusy, match='fenced unknown'):
+        arbiter.teardown_fenced_server_target(ticket, route, grace_s=0.1)
+    assert arbiter.request_stop(ticket).name == 'REQUESTED'
+    with pytest.raises(CancelledBeforeEffect):
+        queued.wait_settled(3)
+
+    attempt = arbiter.teardown_fenced_server_target(ticket, route, grace_s=0.1)
+    result = attempt.wait(3)
+
+    from onec_runtime.execution.termination import ServerTerminationConfirmed
+    assert isinstance(result, ServerTerminationConfirmed)
+    assert result.expected_target == target and result.absence is evidence
+    with pytest.raises(arbiter_module.TargetTerminated) as raised:
+        ticket.wait_settled(3)
+    assert raised.value.evidence is result
+    assert [call[0] for call in session.calls] == ['continue', 'terminate', 'confirm']
+    assert len({call[1] for call in session.calls}) == 1
+    with pytest.raises(RuntimeError, match='closed'):
+        arbiter.submit(route, lambda port: Settlement(None))
+    arbiter.close(timeout=3)
+
+
+def test_server_stop_after_main_to_capture_handoff_uses_current_route():
+    from onec_runtime.execution.termination import ServerTerminationConfirmed
+
+    session, capture_route, arbiter, ticket, target, evidence = _unknown_server_stop(
+        absence_results=[None], handoff_to_capture=True,
+    )
+    assert arbiter.current_route == capture_route
+    assert arbiter.request_stop(ticket).name == 'REQUESTED'
+    attempt = arbiter.teardown_fenced_server_target(ticket, capture_route, grace_s=0.1)
+
+    result = attempt.wait(3)
+    assert isinstance(result, ServerTerminationConfirmed)
+    assert result.expected_target == target and result.absence is evidence
+    with pytest.raises(arbiter_module.TargetTerminated):
+        ticket.wait_settled(3)
+    arbiter.close(timeout=3)
+
+
+def test_server_stop_rejects_foreign_absence_without_repeating_termination():
+    from onec_runtime.execution.termination import TerminationUnknown, ServerTerminationConfirmed
+    from onec_runtime.rdbg.session import BoundServerTargetAbsence
+
+    wrong_target = TargetId(uuid4(), 'DefAlias', uuid4())
+    wrong_client = TargetId(uuid4(), 'DefAlias', wrong_target.seance_id)
+    foreign = BoundServerTargetAbsence(wrong_client, wrong_target, 1.0, 1)
+    session, route, arbiter, ticket, target, evidence = _unknown_server_stop(
+        absence_results=[foreign, None],
+    )
+    assert arbiter.request_stop(ticket).name == 'REQUESTED'
+    first = arbiter.teardown_fenced_server_target(ticket, route, grace_s=0.01)
+    result = first.wait(3)
+    assert isinstance(result, TerminationUnknown)
+    assert result.error_type == 'EvidenceMismatch'
+    assert result.expected_target == target
+    assert ticket.wait_unknown(0)
+    assert arbiter.active_ticket is ticket
+
+    second = arbiter.teardown_fenced_server_target(ticket, route, grace_s=0.01)
+    confirmed = second.wait(3)
+    assert isinstance(confirmed, ServerTerminationConfirmed)
+    assert confirmed.absence is evidence
+    assert [call[0] for call in session.calls] == ['continue', 'terminate', 'confirm', 'confirm']
+    with pytest.raises(arbiter_module.TargetTerminated):
+        ticket.wait_settled(3)
+    arbiter.close(timeout=3)
+
+
+def test_server_stop_unknown_keeps_owner_and_retries_only_absence_probe():
+    from onec_runtime.execution.termination import TerminationUnknown, ServerTerminationConfirmed
+
+    session, route, arbiter, ticket, target, evidence = _unknown_server_stop(
+        absence_results=[CommandTimeout('registry interval'), None],
+    )
+    assert arbiter.request_stop(ticket).name == 'REQUESTED'
+    first = arbiter.teardown_fenced_server_target(ticket, route, grace_s=0.01)
+    unknown = first.wait(3)
+    assert isinstance(unknown, TerminationUnknown)
+    assert unknown.expected_target == target
+    assert ticket.wait_unknown(0)
+    assert arbiter.active_ticket is ticket
+    with pytest.raises(ArbiterBusy):
+        arbiter.close(timeout=0)
+    with pytest.raises(ArbiterBusy):
+        arbiter.submit(route, lambda port: Settlement('unsafe'))
+
+    second = arbiter.teardown_fenced_server_target(ticket, route, grace_s=0.01)
+    confirmed = second.wait(3)
+    assert isinstance(confirmed, ServerTerminationConfirmed)
+    assert confirmed.absence is evidence
+    assert [call[0] for call in session.calls] == ['continue', 'terminate', 'confirm', 'confirm']
+    with pytest.raises(arbiter_module.TargetTerminated):
+        ticket.wait_settled(3)
+    arbiter.close(timeout=3)
+
+
+def test_server_stop_teardown_waiter_timeout_retains_worker_and_route_fence():
+    from onec_runtime.execution.termination import ServerTerminationConfirmed
+
+    release_confirmation = Event()
+    session, route, arbiter, ticket, target, evidence = _unknown_server_stop(
+        absence_results=[None], block_confirmation=release_confirmation,
+    )
+    assert arbiter.request_stop(ticket).name == 'REQUESTED'
+    stale = RouteToken(route.incarnation, route.epoch + 1, 0, route.context_id)
+    with pytest.raises(StaleRoute):
+        arbiter.teardown_fenced_server_target(ticket, stale, grace_s=0.01)
+    attempt = arbiter.teardown_fenced_server_target(ticket, route, grace_s=0.01)
+    assert session.confirmation_entered.wait(3)
+    try:
+        with pytest.raises(TimeoutError):
+            attempt.wait(0.01)
+        with pytest.raises(ArbiterBusy):
+            arbiter.teardown_fenced_server_target(ticket, route, grace_s=0.01)
+        assert arbiter.active_ticket is ticket
+        assert ticket.wait_unknown(0)
+    finally:
+        release_confirmation.set()
+    assert isinstance(attempt.wait(3), ServerTerminationConfirmed)
+    with pytest.raises(arbiter_module.TargetTerminated):
+        ticket.wait_settled(3)
+    arbiter.close(timeout=3)
+
+
+def test_real_rdbg_server_teardown_and_absence_share_arbiter_worker():
+    from onec_runtime.execution.termination import ServerTerminationConfirmed
+    from onec_runtime.rdbg.models import DebugTarget, ModuleLocation
+    from onec_runtime.rdbg.session import RdbgSession, SessionState
+    from onec_runtime.rdbg.xml_codec import BASE_NS, RDBG_NS
+
+    seance_id = uuid4()
+    target = TargetId(uuid4(), 'DefAlias', seance_id)
+    client = TargetId(uuid4(), 'DefAlias', seance_id)
+
+    def registry(*subjects):
+        items = ''.join(
+            f'''<item><targetIDStr>target</targetIDStr><targetID xmlns="{BASE_NS}">
+              <id>{identity.id}</id><infoBaseAlias>DefAlias</infoBaseAlias>
+              <seanceId>{seance_id}</seanceId><targetType>{kind}</targetType>
+              </targetID><stateNum>1</stateNum><state>stopped</state></item>'''
+            for identity, kind in subjects
+        )
+        return f'<response xmlns="{RDBG_NS}"><result>success</result>{items}</response>'.encode()
+
+    class Transport:
+        def __init__(self):
+            self.calls = []
+            self.registries = [
+                registry((target, 'Server'), (client, 'ManagedClient')),
+                registry((client, 'ManagedClient')),
+                registry(),
+            ]
+
+        def request(self, command, payload=b'', **kwargs):
+            self.calls.append((command, get_ident()))
+            if command == 'getDbgAllTargetStates':
+                return self.registries.pop(0)
+            return b''
+
+    transport = Transport()
+    location = ModuleLocation('ExtensionModule', '', uuid4(), uuid4(), 1, 'Test')
+    session = RdbgSession(transport, location, server_target_type='Server')
+    session.state = SessionState.READY
+    session.target = DebugTarget(target, 'Server', 'stopped')
+    session.attached_targets[target.id] = session.target
+    session._bound_client_target = client
+    route = RouteToken('real-server-stop', 1, 0, 'main')
+    arbiter = RdbgArbiter(session, route)
+
+    def unknown_main(port):
+        port.continue_()
+        raise OutcomeUnknown('waiting for stop')
+
+    ticket = arbiter.submit(route, unknown_main)
+    arbiter.dispatch(ticket)
+    assert ticket.wait_unknown(3)
+    assert arbiter.request_stop(ticket).name == 'REQUESTED'
+    attempt = arbiter.teardown_fenced_server_target(ticket, route, grace_s=0.1)
+    result = attempt.wait(3)
+
+    assert isinstance(result, ServerTerminationConfirmed)
+    assert result.expected_target == target
+    assert [command for command, _ in transport.calls] == [
+        'step', 'getDbgAllTargetStates', 'terminateDbgTarget',
+        'getDbgAllTargetStates', 'terminateDbgTarget', 'getDbgAllTargetStates',
+    ]
+    assert len({thread for _, thread in transport.calls}) == 1
+    with pytest.raises(arbiter_module.TargetTerminated):
+        ticket.wait_settled(3)
+    arbiter.close(timeout=3)

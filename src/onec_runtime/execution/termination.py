@@ -106,11 +106,14 @@ def terminate_server_target(
     expected_target: TargetId,
     *,
     grace_s: float = 30.0,
+    request_termination: bool = True,
 ) -> ServerTerminationConfirmed | TerminationUnknown:
     """Request teardown and require absence within a confirmation interval.
 
     ``grace_s`` limits proof gathering, never execution of the BSL command.
-    An expired interval preserves unknown target ownership.
+    An expired interval preserves unknown target ownership. After an earlier
+    uncertain request, ``request_termination=False`` probes only the registry
+    and never repeats the remote termination command.
     """
 
     if (
@@ -120,15 +123,18 @@ def terminate_server_target(
         or grace_s < 0
     ):
         raise ValueError("grace_s must be finite and non-negative")
+    if type(request_termination) is not bool:
+        raise TypeError("request_termination must be a boolean")
 
     requested: bool | None = None
-    try:
-        requested = port.terminate_bound_server_session()
-    except Exception:
-        # A failed request does not prove that teardown was rejected. Query
-        # the registry anyway: exact absence is stronger evidence than the
-        # request response.
-        pass
+    if request_termination:
+        try:
+            requested = port.terminate_bound_server_session()
+        except Exception:
+            # A failed request does not prove that teardown was rejected. Query
+            # the registry anyway: exact absence is stronger evidence than the
+            # request response.
+            pass
     try:
         absence = port.wait_for_bound_server_targets_absent(
             expected_target, timeout_s=float(grace_s)

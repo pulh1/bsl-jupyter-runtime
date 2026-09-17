@@ -10,12 +10,16 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum, auto
+from math import isfinite
 from threading import Condition, Thread, get_ident
 from typing import Any, Callable, Protocol
 from uuid import uuid4
 
 from onec_runtime.errors import CommandTimeout, EvaluationDispatchUnknown, StopWaitIntervalElapsed
-from onec_runtime.execution.termination import FileTerminationConfirmed, ServerTerminationConfirmed
+from onec_runtime.execution.termination import (
+    FileTerminationConfirmed, ServerTerminationConfirmed, TerminationUnknown,
+    terminate_server_target,
+)
 from onec_runtime.rdbg.models import DebugTarget, EvaluationResult, LocalVariablesResult, ModuleLocation, ModifyResult, PendingEvaluation, StopEvent, TargetId
 from onec_runtime.rdbg.session import BoundServerTargetAbsence
 
@@ -56,6 +60,12 @@ class EvaluationSession(Protocol):
 
     def continue_evaluation(self, pending: PendingEvaluation, stop: StopEvent, *,
                             on_transport_dispatch: Callable[[], None]) -> None: ...
+
+    def terminate_bound_server_session(self) -> bool: ...
+
+    def wait_for_bound_server_targets_absent(
+        self, expected_target: TargetId, *, timeout_s: float,
+    ) -> BoundServerTargetAbsence: ...
 
 
 
@@ -140,6 +150,7 @@ class ExecutionTicket:
         self._ever_entered = False
         self._stop_requested = False
         self._stop_blocked_after_effect = False
+        self._server_termination_attempted = False
         self._stop_target: TargetId | None = None
         self._effect_target: TargetId | None = None
         self._value: Any = None
@@ -423,6 +434,28 @@ class SessionPort:
 Plan = Callable[[SessionPort], Settlement]
 
 
+class ServerTeardownAttempt:
+    """One worker-owned termination attempt; waiter expiry changes no ownership."""
+
+    def __init__(self, owner: RdbgArbiter, ticket: ExecutionTicket,
+                 expected_target: TargetId, grace_s: float,
+                 request_termination: bool) -> None:
+        self._owner = owner
+        self.ticket = ticket
+        self.expected_target = expected_target
+        self.grace_s = grace_s
+        self.request_termination = request_termination
+        self._result: ServerTerminationConfirmed | TerminationUnknown | None = None
+        self._done = False
+
+    def wait(self, timeout: float | None = None) -> ServerTerminationConfirmed | TerminationUnknown:
+        with self._owner._mailbox:
+            if not self._owner._mailbox.wait_for(lambda: self._done, timeout):
+                raise TimeoutError('Local teardown waiter interval elapsed; target remains owned')
+            assert self._result is not None
+            return self._result
+
+
 class RdbgArbiter:
     """Own one session after bootstrap, with one mailbox and one worker.
 
@@ -440,6 +473,7 @@ class RdbgArbiter:
         self._queue: deque[ExecutionTicket] = deque()
         self._active: ExecutionTicket | None = None
         self._reconciliation: Plan | None = None
+        self._server_teardown: ServerTeardownAttempt | None = None
         self._closed = False
         self._worker = Thread(target=self._run, name='rdbg-arbiter', daemon=True)
         self._worker.start()
@@ -502,10 +536,44 @@ class RdbgArbiter:
         """Schedule evidence collection or confirmed teardown, never blind retry."""
         with self._mailbox:
             self._check_ticket(ticket)
-            if self._active is not ticket or ticket._phase != 'unknown' or self._reconciliation is not None:
+            if (self._active is not ticket or ticket._phase != 'unknown'
+                    or self._reconciliation is not None or self._server_teardown is not None):
                 raise ArbiterBusy('Reconciliation requires the unknown owner')
             self._reconciliation = plan
             self._mailbox.notify_all()
+
+    def teardown_fenced_server_target(
+        self, ticket: ExecutionTicket, route: RouteToken, *, grace_s: float = 30.0,
+    ) -> ServerTeardownAttempt:
+        """Run exact server teardown and absence proof on the RDBG worker.
+
+        Only an unknown, stopped ticket may enter. An unknown proof retains
+        the owner; a later explicit attempt probes absence without resending
+        the termination command. The returned wait is local and detachable.
+        """
+        if (isinstance(grace_s, bool) or not isinstance(grace_s, (int, float))
+                or not isfinite(float(grace_s)) or grace_s < 0):
+            raise ValueError('grace_s must be finite and non-negative')
+        with self._mailbox:
+            self._check_ticket(ticket)
+            if route != self._route:
+                raise StaleRoute('Server teardown belongs to another route')
+            if (self._active is not ticket or ticket._phase != 'unknown'
+                    or not ticket._stop_requested or self._reconciliation is not None
+                    or self._server_teardown is not None):
+                raise ArbiterBusy('Server teardown requires the fenced unknown owner')
+            expected = (ticket._pending.target_id if ticket._pending is not None else
+                        ticket._stop_target or ticket._effect_target)
+            if expected is None:
+                raise ValueError('Server teardown requires an exact affected target')
+            attempt = ServerTeardownAttempt(
+                self, ticket, expected, float(grace_s),
+                request_termination=not ticket._server_termination_attempted,
+            )
+            ticket._server_termination_attempted = True
+            self._server_teardown = attempt
+            self._mailbox.notify_all()
+            return attempt
 
     def retire_terminated_target(
         self,
@@ -520,7 +588,8 @@ class RdbgArbiter:
         """
         with self._mailbox:
             self._check_ticket(ticket)
-            if self._active is not ticket or ticket._phase != 'unknown' or self._reconciliation is not None:
+            if (self._active is not ticket or ticket._phase != 'unknown'
+                    or self._reconciliation is not None or self._server_teardown is not None):
                 raise ArbiterBusy('Target retirement requires the unknown owner')
             if route != self._route:
                 raise StaleRoute('Termination evidence belongs to another route')
@@ -583,25 +652,31 @@ class RdbgArbiter:
     def _run(self) -> None:
         while True:
             with self._mailbox:
-                self._mailbox.wait_for(lambda: self._closed or self._reconciliation is not None or (
+                self._mailbox.wait_for(lambda: self._closed or self._server_teardown is not None or
+                    self._reconciliation is not None or (
                     self._active is None and bool(self._queue) and self._queue[0]._ready
                 ))
                 if self._closed:
                     return
-                reconciling = self._reconciliation is not None
-                if reconciling:
-                    ticket = self._active
-                    assert ticket is not None
-                    plan = self._reconciliation
-                    self._reconciliation = None
-                else:
-                    ticket = self._queue.popleft()
-                    if ticket._route != self._route:
-                        self._settle(ticket, error=StaleRoute())
-                        continue
-                    self._active = ticket
-                    plan = ticket._plan
-                ticket._phase = 'running'
+                teardown = self._server_teardown
+                if teardown is None:
+                    reconciling = self._reconciliation is not None
+                    if reconciling:
+                        ticket = self._active
+                        assert ticket is not None
+                        plan = self._reconciliation
+                        self._reconciliation = None
+                    else:
+                        ticket = self._queue.popleft()
+                        if ticket._route != self._route:
+                            self._settle(ticket, error=StaleRoute())
+                            continue
+                        self._active = ticket
+                        plan = ticket._plan
+                    ticket._phase = 'running'
+            if teardown is not None:
+                self._run_server_teardown(teardown)
+                continue
             port = SessionPort(self, ticket)
             try:
                 outcome = plan(port)
@@ -638,3 +713,28 @@ class RdbgArbiter:
                     self._active = None
             finally:
                 port._live = False
+
+    def _run_server_teardown(self, attempt: ServerTeardownAttempt) -> None:
+        assert get_ident() == self._worker.ident
+        try:
+            result = terminate_server_target(
+                self._session, attempt.expected_target, grace_s=attempt.grace_s,
+                request_termination=attempt.request_termination,
+            )
+        except BaseException as error:
+            result = TerminationUnknown(
+                attempt.expected_target, 'confirmation', type(error).__name__, None,
+            )
+        with self._mailbox:
+            assert self._server_teardown is attempt
+            self._server_teardown = None
+            if isinstance(result, ServerTerminationConfirmed):
+                try:
+                    self.retire_terminated_target(attempt.ticket, self._route, result)
+                except ValueError:
+                    result = TerminationUnknown(
+                        attempt.expected_target, 'confirmation', 'EvidenceMismatch', None,
+                    )
+            attempt._result = result
+            attempt._done = True
+            self._mailbox.notify_all()
