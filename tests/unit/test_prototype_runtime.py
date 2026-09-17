@@ -2538,6 +2538,185 @@ def test_captured_recovery_mismatch_loses_generation_once() -> None:
         resume_controller(controller)
 
 
+def test_main_lifecycle_survives_returned_waiters_and_multiple_capture_stops() -> None:
+    runtime = runtime_module()
+    session = ScriptedSession((CAPTURE_A, CAPTURE_B, SERVICE))
+    controller = runtime.PrototypeRuntimeController(session, SERVICE)
+    phases = []
+    wait = session.wait_for_any_stop
+
+    def observe_wait(*, timeout_s):
+        phases.append(controller.main_operation.phase.value)
+        return wait(timeout_s=timeout_s)
+
+    session.wait_for_any_stop = observe_wait
+    controller.execute_main("Значение = 1;", capture_points=(CAPTURE_A, CAPTURE_B))
+    operation = controller.main_operation
+    assert operation.command_id == 1
+    assert operation.target == TARGET
+    assert operation.phase.value == "suspended_capture"
+    assert operation.pending_stop.location == CAPTURE_A
+    assert not operation.terminal
+
+    controller.execute_capture("РезультатИнструкции = 1;")
+    assert operation.phase.value == "suspended_capture"
+    resume_controller(controller)
+    assert controller.main_operation is operation
+    assert operation.pending_stop.location == CAPTURE_B
+    assert operation.phase.value == "suspended_capture"
+    completion = resume_controller(controller)
+    assert controller.main_operation is operation
+    assert operation.phase.value == "completed"
+    assert operation.terminal
+    assert operation.completion is completion
+    assert operation.pending_stop is None
+    assert phases == ["running", "running", "running"]
+
+
+def test_initial_main_journal_failure_allows_new_command(monkeypatch) -> None:
+    runtime = runtime_module()
+    session = ScriptedSession((SERVICE,))
+    controller = runtime.PrototypeRuntimeController(session, SERVICE)
+    flush = controller._flush_journal
+
+    def fail_flush():
+        raise OSError("journal unavailable")
+
+    monkeypatch.setattr(controller, "_flush_journal", fail_flush)
+    with pytest.raises(OSError, match="journal unavailable"):
+        controller.execute_main("Значение = 1;")
+    rejected = controller.main_operation
+    assert rejected.phase.value == "failed_before_dispatch"
+    assert rejected.terminal
+    assert session.continue_count == 0
+    assert not session.calls
+    monkeypatch.setattr(controller, "_flush_journal", flush)
+    completion = controller.execute_main("Значение = 2;")
+    assert completion.succeeded
+    assert controller.main_operation is not rejected
+
+
+def test_main_setup_failure_before_continue_allows_new_command(monkeypatch) -> None:
+    runtime = runtime_module()
+    session = ScriptedSession((SERVICE,))
+    controller = runtime.PrototypeRuntimeController(session, SERVICE)
+    set_workspace = controller._set_workspace
+
+    def fail_workspace(*args, **kwargs):
+        raise ProtocolError("workspace failure")
+
+    monkeypatch.setattr(controller, "_set_workspace", fail_workspace)
+    with pytest.raises(ProtocolError, match="workspace failure"):
+        controller.execute_main("Значение = 1;")
+    rejected = controller.main_operation
+    assert rejected.terminal
+    assert rejected.phase.value == "failed_before_dispatch"
+    assert session.continue_count == 0
+    monkeypatch.setattr(controller, "_set_workspace", set_workspace)
+    completion = controller.execute_main("Значение = 2;")
+    assert completion.succeeded
+    assert controller.main_operation is not rejected
+    assert controller.main_operation.command_id == 2
+
+
+@pytest.mark.parametrize("failure_phase", ["result", "messages"])
+def test_main_completion_read_failure_allows_new_command(monkeypatch, failure_phase) -> None:
+    runtime = runtime_module()
+    session = ScriptedSession((SERVICE, SERVICE))
+    controller = runtime.PrototypeRuntimeController(session, SERVICE)
+    read_messages = controller._take_kernel_cell_messages
+    decode_value = controller._decode_main_completion_value
+
+    def fail_messages(key):
+        raise RuntimeError("message decoding failed")
+
+    def fail_result(value, *, phase):
+        if phase == "result":
+            raise RuntimeError("result decoding failed")
+        return decode_value(value, phase=phase)
+
+    if failure_phase == "messages":
+        monkeypatch.setattr(controller, "_take_kernel_cell_messages", fail_messages)
+    else:
+        monkeypatch.setattr(controller, "_decode_main_completion_value", fail_result)
+    with pytest.raises(RuntimeError, match="decoding failed"):
+        controller.execute_main("Значение = 1;")
+    completed = controller.main_operation
+    assert completed.terminal
+    assert completed.phase.value == "completed"
+    assert completed.completion is None
+    monkeypatch.setattr(controller, "_take_kernel_cell_messages", read_messages)
+    monkeypatch.setattr(controller, "_decode_main_completion_value", decode_value)
+    completion = controller.execute_main("Значение = 2;")
+    assert completion.succeeded
+    assert controller.main_operation is not completed
+    assert controller.main_operation.command_id == 2
+
+
+def test_failed_command_write_requires_reconciliation_before_retry(monkeypatch) -> None:
+    runtime = runtime_module()
+    session = ScriptedSession((SERVICE,))
+    controller = runtime.PrototypeRuntimeController(session, SERVICE)
+
+    def failed_modify(*args, **kwargs):
+        raise RuntimeError("write acknowledgement lost")
+
+    monkeypatch.setattr(session, "modify", failed_modify)
+    with pytest.raises(RuntimeError, match="acknowledgement lost"):
+        controller.execute_main("Значение = 1;")
+    operation = controller.main_operation
+    assert operation.phase.value == "unknown"
+    assert session.continue_count == 0
+    with pytest.raises(ProtocolError, match="unresolved"):
+        controller.execute_main("Значение = 2;")
+    assert controller.main_operation is operation
+
+
+def test_failed_wait_does_not_allow_replacing_unresolved_main_operation() -> None:
+    runtime = runtime_module()
+    session = ScriptedSession((SERVICE,))
+    controller = runtime.PrototypeRuntimeController(session, SERVICE)
+
+    def failed_wait(*, timeout_s):
+        raise RuntimeError("stop observation unavailable")
+
+    session.wait_for_any_stop = failed_wait
+    with pytest.raises(RuntimeError, match="stop observation unavailable"):
+        controller.execute_main("Значение = 1;")
+    operation = controller.main_operation
+    assert controller.state is runtime.OperationState.FAILED
+    assert not operation.terminal
+    calls_before = list(session.calls)
+
+    with pytest.raises(ProtocolError, match="MAIN operation.*unresolved"):
+        controller.execute_main("Значение = 2;")
+
+    assert controller.main_operation is operation
+    assert controller.operation_id == operation.command_id == 1
+    assert session.calls == calls_before
+
+
+def test_main_operation_tracks_user_stop_and_ambiguous_continue() -> None:
+    runtime = runtime_module()
+    session = ScriptedSession((USER,))
+    controller = runtime.PrototypeRuntimeController(session, SERVICE)
+    controller.execute_main("Значение = 1;", user_breakpoints=(USER,))
+    operation = controller.main_operation
+    assert operation.phase.value == "suspended_user"
+    assert operation.pending_stop.location == USER
+
+    def ambiguous_continue():
+        raise RuntimeError("lost acknowledgement")
+
+    session.continue_ = ambiguous_continue
+    with pytest.raises(RuntimeError, match="lost acknowledgement"):
+        controller.resume_debug_stop()
+    assert controller.main_operation is operation
+    assert operation.phase.value == "unknown"
+    assert not operation.terminal
+    assert operation.pending_stop is None
+
+
 def test_operation_identity_survives_capture_and_final_completion() -> None:
     runtime = runtime_module()
     session = ScriptedSession((CAPTURE_A, SERVICE))

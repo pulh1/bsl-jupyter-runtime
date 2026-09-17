@@ -14,6 +14,8 @@ from functools import lru_cache
 from threading import local
 from uuid import UUID, uuid4
 
+from onec_runtime.execution.main import MainOperation, MainPhase
+
 from onec_runtime.bsl import (
     DiagnosticStage,
     LoweringMode,
@@ -489,6 +491,7 @@ class PrototypeRuntimeController:
         self.state = OperationState.IDLE
         self.operation_id = 0
         self.active_operation: OperationHandle | None = None
+        self.main_operation: MainOperation | None = None
         self.capture_points: tuple[ModuleLocation, ...] = ()
         self.registry = BreakpointRegistry(service_location)
         self.stop_sequence = 0
@@ -1536,6 +1539,11 @@ class PrototypeRuntimeController:
             OperationState.COMPLETED,
             OperationState.FAILED,
         )
+        if self.main_operation is not None and not self.main_operation.terminal:
+            raise ProtocolError(
+                f"MAIN operation {self.main_operation.command_id} is unresolved "
+                f"({self.main_operation.phase.value}); a new command cannot be admitted"
+            )
         if lowered_source is None:
             message_collector_key = self.message_collector_key(LoweringMode.MAIN)
             lowering = self.lowerer.lower(
@@ -1587,17 +1595,22 @@ class PrototypeRuntimeController:
             visible_source_context,
         )
         self.active_operation = operation
-        self._record(
-            "write-journal.jsonl",
-            "main_started",
-            runtime_generation=self.runtime_generation,
-            operation_id=operation.operation_id,
-            state_before=self.state.value,
-            visible_sha256=sha256(visible_source.encode("utf-8")).hexdigest(),
-            lowered_sha256=executed_source.artifact.source_sha256,
+        self.main_operation = MainOperation(
+            operation.operation_id,
+            self.session.target.target_id if self.session.target is not None else None,
         )
-        self._flush_journal()
+        command_write_attempted = False
         try:
+            self._record(
+                "write-journal.jsonl",
+                "main_started",
+                runtime_generation=self.runtime_generation,
+                operation_id=operation.operation_id,
+                state_before=self.state.value,
+                visible_sha256=sha256(visible_source.encode("utf-8")).hexdigest(),
+                lowered_sha256=executed_source.artifact.source_sha256,
+            )
+            self._flush_journal()
             self.capture_points = tuple(capture_points)
             self.registry = BreakpointRegistry(
                 self.service_location,
@@ -1614,6 +1627,7 @@ class PrototypeRuntimeController:
             self.last_debug_stop = None
             self.breakpoint_workspaces.clear()
             self._set_workspace("full", self._allowed_locations)
+            command_write_attempted = True
             instruction = self.session.modify(
                 "ТекущаяИнструкция", bsl_string_literal(lowered_text)
             )
@@ -1626,10 +1640,17 @@ class PrototypeRuntimeController:
             if on_transport_dispatch is not None:
                 on_transport_dispatch()
             self.require_debug_workspace_ready()
-            self.session.continue_()
+            self._continue_main_operation()
             stop = self.session.wait_for_any_stop(timeout_s=self.command_timeout_s)
             return self._route_stop(stop)
         except BaseException as error:
+            if self.main_operation.phase is MainPhase.ADMITTED:
+                if command_write_attempted:
+                    # A failed command-field write may have reached the target.
+                    # It does not prove launch, but requires reconciliation.
+                    self.main_operation.mark_unknown()
+                else:
+                    self.main_operation.fail_before_dispatch()
             if self.state not in {
                 OperationState.CAPTURED,
                 OperationState.DEBUG_STOPPED,
@@ -1671,6 +1692,12 @@ class PrototypeRuntimeController:
             ),
         )
         self.stop_history.append(classified)
+        if self.main_operation is not None:
+            phase = {
+                StopReason.CAPTURE: MainPhase.SUSPENDED_CAPTURE,
+                StopReason.USER_BREAKPOINT: MainPhase.SUSPENDED_USER,
+            }.get(classified.reason, MainPhase.UNKNOWN)
+            self.main_operation.stopped(stop, phase)
         if classified.reason is StopReason.MAIN_SERVICE:
             return self._complete_main()
         if classified.reason is StopReason.CAPTURE:
@@ -1704,9 +1731,17 @@ class PrototypeRuntimeController:
         if on_transport_dispatch is not None:
             on_transport_dispatch()
         self.require_debug_workspace_ready()
-        self.session.continue_()
+        self._continue_main_operation()
         stop = self.session.wait_for_any_stop(timeout_s=self.command_timeout_s)
         return self._route_stop(stop)
+
+    def _continue_main_operation(self) -> None:
+        operation = self.main_operation
+        if operation is not None:
+            operation.continue_requested()
+        self.session.continue_()
+        if operation is not None:
+            operation.continue_acknowledged()
 
     def _begin_capture(self, stop: StopEvent) -> CapturedStop:
         if self.active_operation is None:
@@ -1740,6 +1775,8 @@ class PrototypeRuntimeController:
             phase="capture_command",
         )
         if observed_command_id != self.active_operation.operation_id:
+            if self.main_operation is not None:
+                self.main_operation.mark_unknown()
             self.state = OperationState.FAILED
             raise ProtocolError(
                 f"Captured command {observed_command_id!r} does not match active "
@@ -3801,7 +3838,7 @@ class PrototypeRuntimeController:
             if on_transport_dispatch is not None:
                 on_transport_dispatch()
             self.require_debug_workspace_ready()
-            self.session.continue_()
+            self._continue_main_operation()
         except RdbgTransportError as error:
             # The transport gives no pre-send acknowledgement. Treat this as
             # an ambiguous continuation: the paused frame may already be gone.
@@ -3988,6 +4025,8 @@ class PrototypeRuntimeController:
                 f"Completed command {completed_id!r} does not match active "
                 f"operation {self.active_operation.operation_id}"
             )
+        if self.main_operation is not None:
+            self.main_operation.remote_completed()
         result_evaluation = self.session.evaluate("Результат")
         error_evaluation = self.session.evaluate("Ошибка")
         if result_evaluation.error_occurred:
@@ -4026,6 +4065,8 @@ class PrototypeRuntimeController:
             messages,
             diagnostic,
         )
+        if self.main_operation is not None:
+            self.main_operation.complete(completion)
         self._record(
             "write-journal.jsonl",
             "main_completed" if completion.succeeded else "main_failed",
