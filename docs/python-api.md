@@ -34,6 +34,8 @@ runtime.close()
 
 `RuntimeStatus` содержит `state`, `runtime_generation`, `operation_id`, `worker_generation` и `capture_setup`. Последнее поле равно `None`, когда незавершённого открытия CAPTURE нет; иначе это снимок `CaptureSetupSnapshot` с `setup_stage`, `context_state`, `frame_identity` и безопасным `error_code`. `state == capture_setup_failed` после подтверждённой ошибки чтения locals, переноса, поиска kernel frame или начала контекста сохраняет остановленную MAIN-команду. До успешного открытия контекста новую CAPTURE-ячейку и `resume_capture()` выполнить нельзя; `CaptureView` в этой стадии ещё недоступен. Совпадение target и адреса строки само по себе не доказывает, что при повторной проверке это та же физическая остановка, поэтому публичного повтора setup пока нет.
 
+Во время ожидания остановки MAIN вызов `status()` из другого Python-потока возвращает `state == main_pending` и идентификатор текущей команды. Такое наблюдение не прерывает выполнение 1С и не занимает RDBG.
+
 `RuntimeNamespaceSnapshot` содержит `names`, `runtime_generation`, `context_generation`. Поколения используются для проверки актуальности прокси. Состав состояний `OperationState` включает `idle`, `main_pending`, `captured`, `capture_setup_failed`, `evaluating_capture`, `resuming`, `recovering`, `completed`, `failed` и другие диагностические состояния; не считайте любое состояние, отличное от `captured`, потерей target.
 
 ## `%%bsl` и значения в Python
