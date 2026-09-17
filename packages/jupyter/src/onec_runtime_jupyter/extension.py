@@ -211,7 +211,14 @@ def _source_session_for_shell(
 
 
 class OnecValueProxy:
-    """A lazy symbolic reference to one persistent BSL context value."""
+    """A lazy symbolic reference to a persistent BSL context value.
+
+    Obtain one from the notebook ``bsl`` namespace after a successful BSL
+    cell. Constructing or displaying a proxy does not copy its value. Each
+    materialization checks the runtime and context generations; a proxy from
+    an old session or context raises ``ProtocolError`` instead of reading a
+    new value with the same name.
+    """
 
     __slots__ = (
         "_runtime_ref",
@@ -253,6 +260,15 @@ class OnecValueProxy:
         uuid_suffix: str = "__uuid",
         chunk_size: int | None = None,
     ) -> Any:
+        """Copy a BSL value table into a pandas DataFrame.
+
+        ``refs`` selects ``presentation``, ``uuid`` or ``both`` for reference
+        values. ``ref_columns`` overrides that choice by column;
+        ``uuid_suffix`` names additional UUID columns in ``both`` mode.
+        ``chunk_size`` bounds transfer requests. On a sliced proxy, only the
+        selected rows are transferred. Raises ``ProtocolError`` for a stale
+        proxy or a runtime without table transfer support.
+        """
         runtime = self._validated_runtime()
         if self._selection is not None:
             project = getattr(runtime, "project_to_df", None)
@@ -290,6 +306,14 @@ class OnecValueProxy:
         max_items: int = 100_000,
         max_bytes: int = 64 * 1024 * 1024,
     ) -> Any:
+        """Copy a supported BSL value into an ordinary Python value.
+
+        Reference options match :meth:`to_df`. ``max_depth``, ``max_items``
+        and ``max_bytes`` bound the recursive result; ``chunk_size`` bounds
+        transfer requests. A sliced proxy transfers only its selected range.
+        The return type depends on the BSL value's shape. A stale proxy or a
+        runtime without transfer support raises ``ProtocolError``.
+        """
         runtime = self._validated_runtime()
         if self._selection is not None:
             project = getattr(runtime, "project_value", None)
@@ -321,11 +345,17 @@ class OnecValueProxy:
         )
 
     def head(self, limit: int) -> OnecValueProxy:
+        """Return a lazy proxy for the first positive ``limit`` items."""
         if type(limit) is not int or limit <= 0:
             raise ProtocolError("bounded slice limit must be a positive integer")
         return self[:limit]
 
     def __getitem__(self, selection: object) -> OnecValueProxy:
+        """Return a lazy proxy for a finite, nonnegative ``start:stop`` slice.
+
+        Steps and repeated slicing of an already selected proxy are rejected.
+        No remote data is copied until :meth:`materialize` or :meth:`to_df`.
+        """
         if (
             not isinstance(selection, slice)
             or selection.step is not None
@@ -355,6 +385,11 @@ class OnecValueProxy:
         )
 
     def tabular_section(self, name: str) -> OnecValueProxy:
+        """Return a lazy proxy for the named tabular section of this value.
+
+        ``name`` must be one BSL identifier. The returned proxy retains the
+        same runtime and context generation fence as its parent.
+        """
         if self._selection is not None:
             raise ProtocolError("bounded projection cannot extend a nested path")
         if not isinstance(name, str) or not re.fullmatch(
@@ -495,6 +530,13 @@ class _BslNamespaceBridge:
 
 
 class BslNamespace:
+    """Look up persistent BSL values as lazy Python proxies.
+
+    The Jupyter adapter installs this object as ``bsl``. Use ``bsl.Name`` or
+    ``bsl["Name"]``; bracket lookup is useful when a BSL name conflicts with
+    an existing Python binding.
+    """
+
     __slots__ = ("_bridge",)
 
     def __init__(self, bridge: _BslNamespaceBridge) -> None:

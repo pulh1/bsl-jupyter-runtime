@@ -183,7 +183,14 @@ class _RuntimeSessionShutdownState:
 
 @dataclass(frozen=True, slots=True, repr=False)
 class RuntimeSessionConfig:
-    """Configuration owned by the headless runtime session."""
+    """Inputs for one headless 1C session.
+
+    ``runtime`` supplies platform and infobase settings. ``source_root`` is
+    the local configuration export used for module lookup and file capture
+    points. ``extension_mode`` selects automatic or manual extension setup;
+    ``chunk_size`` bounds transfer requests. ``evidence_root`` and
+    ``startup_profiler`` are optional local diagnostics settings.
+    """
 
     runtime: RuntimeConfig
     evidence_root: Path | str | None = None
@@ -605,7 +612,13 @@ def _handshake_summary(evidence: ExtensionHandshakeEvidence) -> dict[str, object
 
 
 class RuntimeSession:
-    """Own one headless 1C runtime/debugger pair."""
+    """Own one headless 1C runtime and debugger session.
+
+    Use :meth:`start` to create an owned session and :meth:`close` to release it.
+    BSL execution, CAPTURE inspection and value transfer all operate on this
+    session's current runtime generation. The Jupyter wrapper installs
+    ``%%bsl`` and value proxies on top of this core API.
+    """
 
     def __init__(
         self,
@@ -727,6 +740,12 @@ class RuntimeSession:
         *,
         progress: Callable[[str], None] | None = None,
     ) -> "RuntimeSession":
+        """Start one owned runtime from ``config``.
+
+        ``progress``, when supplied, receives human-readable startup stage
+        messages. Returns a session that the caller must eventually close.
+        Startup errors are raised to the caller after cleanup is attempted.
+        """
         runtime = config.runtime
         artifacts = ArtifactWriter(config.evidence_root, "runtime-session")
         profiler = config.startup_profiler or PhaseRecorder()
@@ -1265,6 +1284,14 @@ class RuntimeSession:
             Callable[[OperationExecutionProvenance], None] | None
         ) = None,
     ) -> RuntimeReply:
+        """Execute one BSL cell in the current MAIN or CAPTURE route.
+
+        ``source`` is the visible cell text. ``source_unit`` and
+        ``on_execution_provenance`` let notebook adapters correlate diagnostics
+        with that cell. Returns a :class:`RuntimeReply`; a CAPTURE stop may
+        suspend the MAIN command without completing it. Transport and
+        admission failures may raise instead of returning a reply.
+        """
         with self._operation_lock:
             arguments: dict[str, object] = {}
             if source_unit is not None:
@@ -1700,6 +1727,14 @@ class RuntimeSession:
         continuation_attempt_id: str | None = None,
         timeout_s: float | None = None,
     ) -> RuntimeReply:
+        """Continue the currently captured MAIN command.
+
+        ``dirty_roots`` adds root bindings that must be written back before
+        Continue. ``continuation_attempt_id`` is an optional orchestration
+        token. ``timeout_s`` limits the initiating caller's wait; it is not a
+        deadline for BSL execution. Returns the next runtime reply, which may
+        represent another stop or MAIN completion. Requires an active CAPTURE.
+        """
         with self._operation_lock:
             active = self._active_capture_ticket
             completion_seen = False
@@ -2070,7 +2105,11 @@ class RuntimeSession:
             self._file_capture_points = tuple(locations)
 
     def add_capture_point(self, path: str, line: int) -> ModuleLocation:
-        """Arm a common-module breakpoint using only a source path and line."""
+        """Arm a common-module capture point by path and one-based line.
+
+        ``path`` names a module inside ``config.source_root``. Returns the
+        resolved debugger location. A configured source root is required.
+        """
         if not isinstance(path, str) or not path:
             raise ValueError("capture point path must be a non-empty string")
         if type(line) is not int or line < 1:
@@ -2089,6 +2128,7 @@ class RuntimeSession:
             return location
 
     def clear_capture_points(self) -> None:
+        """Remove capture points configured for this session."""
         self.configure_capture_points(())
 
     def to_df(
@@ -2101,6 +2141,15 @@ class RuntimeSession:
         chunk_size: int | None = None,
         profiler: PhaseRecorder | None = None,
     ) -> pd.DataFrame:
+        """Copy a persistent BSL table at ``handle`` into a DataFrame.
+
+        A handle has a form such as ``Контекст.Таблица``. ``refs`` selects
+        presentation, UUID or both for references; ``ref_columns`` overrides
+        that policy by column, and ``uuid_suffix`` names added UUID columns.
+        ``chunk_size`` bounds transfer chunks; ``profiler`` records local
+        transfer phases when supplied. A failed transfer does not itself
+        establish that an active CAPTURE frame was lost.
+        """
         with self._operation_lock:
             self.validate_value_reference(handle)
             with self._capture_materialization_caller_handoff():
@@ -2139,6 +2188,14 @@ class RuntimeSession:
         timeout_s: float | None = None,
         profiler: PhaseRecorder | None = None,
     ) -> object:
+        """Copy a supported persistent BSL value at ``handle`` into Python.
+
+        Reference options match :meth:`to_df`. ``max_depth``, ``max_items``
+        and ``max_bytes`` bound the result; ``chunk_size`` bounds transfer
+        chunks. ``timeout_s`` limits the local caller's wait for a CAPTURE
+        transfer, not the running BSL command. The Python result type depends
+        on the BSL value's shape.
+        """
         with self._operation_lock:
             self.validate_value_reference(handle)
             options: dict[str, object] = {
@@ -2218,15 +2275,28 @@ class RuntimeSession:
             return self.runtime_api.validate_value_reference(handle)
 
     def status(self) -> RuntimeStatus:
+        """Return the current runtime state and generation identifiers."""
         return self.runtime_api.status()
 
     def current_capture(self) -> CaptureView:
+        """Return a view fenced to the current CAPTURE stop.
+
+        Raises ``NoActiveCaptureError`` if no capture is available. Keep the
+        returned view only for this stop; its status becomes stale after
+        continuation or a different stop.
+        """
         return self.runtime_api._current_capture(
             resolve_sources=getattr(self, "_capture_stack_source_resolver", None),
             bind_frame=getattr(self, "_capture_stack_frame_binder", None),
         )
 
     def namespace_snapshot(self) -> RuntimeNamespaceSnapshot:
+        """Return persistent BSL names and the generations fencing proxies.
+
+        Notebook value proxies use this snapshot to reject access after the
+        runtime or context generation changes. A closed session cannot supply
+        a live snapshot.
+        """
         with self._operation_lock:
             if self._closed:
                 raise ProtocolError("ZUP demo runtime session is closed")
@@ -2256,6 +2326,11 @@ class RuntimeSession:
         return self._closed
 
     def close(self) -> None:
+        """Release the owned session and its local resources.
+
+        If cleanup cannot finish, the owner retains incomplete work so a
+        later ``close()`` call can retry it.
+        """
         self._close(shutdown=False)
 
     def close_for_kernel_shutdown(self) -> None:

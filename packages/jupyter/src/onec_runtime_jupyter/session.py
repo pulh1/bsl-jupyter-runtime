@@ -27,7 +27,12 @@ _OWNED_SESSION_ATTR = "_onec_interactive_runtime_owner"
 
 
 class InteractiveRuntimeSession:
-    """Own a runtime through normal shutdown and abrupt Windows kernel exit."""
+    """Own a core runtime for one interactive notebook shell.
+
+    :meth:`start` installs the BSL magic and Python value namespace. Public
+    methods not defined here are delegated to :attr:`runtime`, the owned
+    ``RuntimeSession``. The wrapper also arranges cleanup at kernel exit.
+    """
 
     def __init__(
         self, runtime: RuntimeSession, guardian: GuardianHandle | None = None,
@@ -46,6 +51,14 @@ class InteractiveRuntimeSession:
         shell: InteractiveShell | None = None,
         display: NotebookDisplayConfig | None = None,
     ) -> "InteractiveRuntimeSession":
+        """Start a runtime and install its notebook integration.
+
+        ``config`` selects the platform, infobase and source export. ``shell``
+        defaults to the current IPython shell. ``display`` chooses notebook
+        reply presentation. Returns the owner; call :meth:`close` or use it as
+        a context manager. An existing owner in the same shell is closed
+        before the replacement starts.
+        """
         target_shell = shell or InteractiveShell.instance()
         previous_owner = getattr(target_shell, _OWNED_SESSION_ATTR, None)
         if isinstance(previous_owner, InteractiveRuntimeSession):
@@ -80,6 +93,10 @@ class InteractiveRuntimeSession:
             raise
 
     def close(self) -> None:
+        """Close the owned runtime and release its shutdown registration.
+
+        An incomplete core cleanup remains retryable through another call.
+        """
         self._close(shutdown=False)
 
     def _close(self, *, shutdown: bool) -> None:
@@ -133,13 +150,16 @@ class InteractiveRuntimeSession:
             logging.getLogger(__name__).warning("1C runtime cleanup failed during shutdown")
 
     def configure_capture_source(self, project: str, source_root: Path | str) -> None:
+        """Bind symbolic capture lookup to a local project source export."""
         self.runtime.configure_capture_source(project, Path(source_root).resolve())
 
     def __getattr__(self, name: str) -> object:
         return getattr(self.runtime, name)
 
     def __enter__(self) -> "InteractiveRuntimeSession":
+        """Return the owner for a ``with`` block."""
         return self
 
     def __exit__(self, *_args: object) -> None:
+        """Close the session when leaving a ``with`` block."""
         self.close()
