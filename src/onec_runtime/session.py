@@ -304,6 +304,27 @@ def _expose_startup_cleanup_retry(
         error.add_note(_STARTUP_CLEANUP_RETRY_NOTE)
 
 
+def _bound_server_cleanup_target(rdbg: RdbgSession | None) -> TargetId | None:
+    """Keep the original bound session identity even if the active target changes."""
+    if rdbg is None:
+        return None
+    client = getattr(rdbg, "_bound_client_target", None)
+    if client is None:
+        # Startup can fail before the managed client is bound to a server
+        # session. There is then no bound server target for RDBG to verify.
+        return None
+    if not isinstance(client, TargetId):
+        raise ProtocolError("Bound client target identity is invalid")
+    current = getattr(getattr(rdbg, "target", None), "target_id", None)
+    if (
+        isinstance(current, TargetId)
+        and current.infobase_alias.casefold() == client.infobase_alias.casefold()
+        and current.seance_id == client.seance_id
+    ):
+        return current
+    return client
+
+
 class _StartupAttemptCleanup:
     def __init__(
         self,
@@ -318,6 +339,8 @@ class _StartupAttemptCleanup:
         self._rdbg = rdbg
         self._server_session_terminated = not self._server_mode or rdbg is None
         self._native_client_termination_requested = False
+        self._native_termination_acknowledged = False
+        self._bound_server_expected_target = _bound_server_cleanup_target(rdbg)
         self._processes_closed = False
         self._debug_ui_detached = not self._server_mode or rdbg is None
         self._transport_closed = transport is None
@@ -339,17 +362,18 @@ class _StartupAttemptCleanup:
         self.cleanup_error_types = ()
         if self._server_mode:
             if not self._server_session_terminated:
-                try:
-                    assert self._rdbg is not None
-                    self._native_client_termination_requested = self._rdbg.terminate_bound_server_session()
-                except RdbgDebugUiNotRegistered:
-                    # Native termination cannot use a UI the server has lost.
-                    # Close only our client, then finish deregistration.
-                    self._server_session_terminated = True
-                except BaseException as error:
-                    errors.append(error)
-                else:
-                    self._server_session_terminated = True
+                if not self._native_termination_acknowledged:
+                    try:
+                        assert self._rdbg is not None
+                        self._native_client_termination_requested = self._rdbg.terminate_bound_server_session()
+                    except RdbgDebugUiNotRegistered:
+                        # Native termination cannot use a UI the server has lost.
+                        # Close only our client, then finish deregistration.
+                        self._server_session_terminated = True
+                    except BaseException as error:
+                        errors.append(error)
+                    else:
+                        self._native_termination_acknowledged = True
                 self._raise_cleanup_error(errors)
             if not self._processes_closed:
                 try:
@@ -361,6 +385,22 @@ class _StartupAttemptCleanup:
                     errors.append(error)
                 else:
                     self._processes_closed = True
+                self._raise_cleanup_error(errors)
+            if not self._server_session_terminated:
+                if self._bound_server_expected_target is None:
+                    # No bound server session was established before startup
+                    # failed; the owned client has now been closed.
+                    self._server_session_terminated = True
+                else:
+                    try:
+                        assert self._rdbg is not None
+                        self._rdbg.wait_for_bound_server_targets_absent(
+                            self._bound_server_expected_target
+                        )
+                    except BaseException as error:
+                        errors.append(error)
+                    else:
+                        self._server_session_terminated = True
                 self._raise_cleanup_error(errors)
             if not self._debug_ui_detached:
                 try:
@@ -660,6 +700,8 @@ class RuntimeSession:
         self._debug_ui_detached = not config.runtime.is_server_infobase
         self._server_session_terminated = not config.runtime.is_server_infobase
         self._native_client_termination_requested = False
+        self._native_termination_acknowledged = False
+        self._bound_server_expected_target = _bound_server_cleanup_target(rdbg)
         self._operation_lock = RLock()
         self._capture_locations: dict[tuple[str, int], object] = {}
         self._capture_source_catalog: CaptureSourceCatalog | None = None
@@ -2360,6 +2402,15 @@ class RuntimeSession:
             self._close_lock.release()
 
     def _close_locked(self, *, shutdown: bool, operation_owned: bool) -> None:
+        if self.config.runtime.is_server_infobase:
+            # Some owners are constructed before these teardown fields exist;
+            # capture the bound identity once before the first close attempt.
+            if not hasattr(self, "_native_termination_acknowledged"):
+                self._native_termination_acknowledged = False
+            if not hasattr(self, "_bound_server_expected_target"):
+                self._bound_server_expected_target = _bound_server_cleanup_target(
+                    self._rdbg
+                )
         state = self._refresh_shutdown_state()
         if state.terminal:
             return
@@ -2425,18 +2476,19 @@ class RuntimeSession:
         try:
             if self.config.runtime.is_server_infobase:
                 if not self._server_session_terminated:
-                    try:
-                        self._native_client_termination_requested = self._rdbg.terminate_bound_server_session()
-                    except RdbgDebugUiNotRegistered:
-                        # The UI is gone; fall back to closing our owned client.
-                        self._server_session_terminated = True
-                    except BaseException as error:
-                        errors.append(error)
-                    else:
-                        self._server_session_terminated = True
+                    if not self._native_termination_acknowledged:
+                        try:
+                            self._native_client_termination_requested = self._rdbg.terminate_bound_server_session()
+                        except RdbgDebugUiNotRegistered:
+                            # The UI is gone; fall back to closing our owned client.
+                            self._server_session_terminated = True
+                        except BaseException as error:
+                            errors.append(error)
+                        else:
+                            self._native_termination_acknowledged = True
                 # Server termination needs the owned client connection alive.
                 # The cluster debugger belongs to the service, not this session.
-                if self._server_session_terminated and not self._processes_closed:
+                if (self._server_session_terminated or self._native_termination_acknowledged) and not self._processes_closed:
                     try:
                         if self._native_client_termination_requested:
                             self._processes.close(graceful_client_timeout_s=3.0)
@@ -2446,7 +2498,20 @@ class RuntimeSession:
                         errors.append(error)
                     else:
                         self._processes_closed = True
-                if self._processes_closed and not self._debug_ui_detached:
+                if self._processes_closed and not self._server_session_terminated:
+                    if self._bound_server_expected_target is None:
+                        # Startup never established a bound server session.
+                        self._server_session_terminated = True
+                    else:
+                        try:
+                            self._rdbg.wait_for_bound_server_targets_absent(
+                                self._bound_server_expected_target
+                            )
+                        except BaseException as error:
+                            errors.append(error)
+                        else:
+                            self._server_session_terminated = True
+                if self._server_session_terminated and self._processes_closed and not self._debug_ui_detached:
                     try:
                         self._rdbg.detach()
                     except BaseException as error:

@@ -2,13 +2,15 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 import os
+from uuid import uuid4
 
 import pytest
 
 from onec_runtime.config import RuntimeConfig
-from onec_runtime.errors import ProtocolError, RdbgDebugUiNotRegistered, TargetLost
+from onec_runtime.errors import CommandTimeout, ProtocolError, RdbgDebugUiNotRegistered, TargetLost
 from onec_runtime.extension_state import ExtensionStateStore, InfobaseExtensionLock
 from onec_runtime.processes import FileModeProcesses, debuggee_command
+from onec_runtime.rdbg.models import DebugTarget, TargetId
 from onec_runtime.session import RuntimeSession, RuntimeSessionConfig
 from onec_runtime.artifacts import ArtifactWriter
 from onec_runtime import toolchain
@@ -208,6 +210,74 @@ def test_kernel_shutdown_terminates_server_before_worker_cleanup(tmp_path: Path)
     assert events == ["server-terminate", "client-close", "debugger-detach", "transport-close"]
     session.close()
     assert events == ["server-terminate", "client-close", "debugger-detach", "transport-close"]
+
+
+@pytest.mark.parametrize("startup", [False, True])
+def test_server_close_waits_for_old_target_absence_before_becoming_terminal(
+    tmp_path: Path, startup: bool,
+) -> None:
+    from onec_runtime.session import _StartupAttemptCleanup
+
+    events: list[str] = []
+    seance_id = uuid4()
+    client = TargetId(uuid4(), "runtime_test", seance_id=seance_id)
+    server = TargetId(uuid4(), "runtime_test", seance_id=seance_id)
+    old_target_visible = True
+
+    def verify_absence(expected_target: TargetId) -> object:
+        assert expected_target == server
+        events.append("verify-absence")
+        if old_target_visible:
+            raise CommandTimeout("old target remains in debugger registry")
+        return object()
+
+    rdbg = SimpleNamespace(
+        target=DebugTarget(server, "Server", "stopped"),
+        _bound_client_target=client,
+        terminate_bound_server_session=lambda: events.append("server-terminate") or True,
+        wait_for_bound_server_targets_absent=verify_absence,
+        detach=lambda: events.append("debugger-detach"),
+    )
+    processes = SimpleNamespace(close=lambda **_kwargs: events.append("client-close"))
+    transport = SimpleNamespace(close=lambda: events.append("transport-close"))
+    config = server_config(tmp_path)
+    if startup:
+        owner = _StartupAttemptCleanup(config, processes, transport, rdbg)
+        close = owner.retry_cleanup
+    else:
+        owner = RuntimeSession(
+            RuntimeSessionConfig(config, tmp_path / "evidence"),
+            processes,
+            transport,
+            rdbg,
+            SimpleNamespace(close=lambda: events.append("api-close")),
+            ArtifactWriter(tmp_path / "evidence", "test"),
+            heartbeat_interval_s=3600,
+        )
+        close = owner.close
+
+    # The active RDBG target may change after the owner was created; teardown
+    # must still verify the server target from this owner's original session.
+    rdbg.target = DebugTarget(
+        TargetId(uuid4(), "runtime_test", seance_id=uuid4()), "Server", "stopped"
+    )
+    with pytest.raises(ProtocolError, match="cleanup failed"):
+        close()
+    assert owner._server_session_terminated is False
+    assert "verify-absence" in events
+    assert "debugger-detach" not in events
+    assert "transport-close" not in events
+    if not startup:
+        assert owner.is_closed is False
+
+    old_target_visible = False
+    close()
+    assert owner._server_session_terminated is True
+    assert events.count("server-terminate") == 1
+    assert events.count("verify-absence") == 2
+    assert events[-2:] == ["debugger-detach", "transport-close"]
+    if not startup:
+        assert owner.is_closed is True
 
 
 def test_kernel_shutdown_retries_native_termination_before_closing_client(tmp_path: Path) -> None:
