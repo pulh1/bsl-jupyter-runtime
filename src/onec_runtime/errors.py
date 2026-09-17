@@ -347,6 +347,10 @@ class CommandTimeout(RuntimeProbeError):
     """A command did not complete by its monotonic deadline."""
 
 
+class StopWaitIntervalElapsed(CommandTimeout):
+    """A stop polling interval ended normally without a matching stop event."""
+
+
 class BslExecutionError(RuntimeProbeError):
     """The kernel captured a BSL execution exception."""
 

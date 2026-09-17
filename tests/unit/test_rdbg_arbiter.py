@@ -379,3 +379,181 @@ def test_sequential_capabilities_keep_logical_slot_until_final_settlement(runtim
     assert ticket.wait(3) == 'multi-step-complete'
     assert later.wait(3) == 'later'
     assert [name for name, _ in session.calls] == ['first', 'event', 'blocked', 'event', 'later', 'event']
+
+
+def test_main_stop_intervals_preserve_one_logical_owner(runtime):
+    from onec_runtime.errors import StopWaitIntervalElapsed
+    from onec_runtime.rdbg.models import DebugTarget, ModuleLocation, StopEvent
+    session, route, arbiter = runtime
+    target = TargetId(uuid4(), 'main')
+    session.target = DebugTarget(target, 'Server', 'stopped')
+    stop = StopEvent(target, ModuleLocation('ExtensionModule', '', uuid4(), uuid4(), 1, 'Test'), 'breakpoint')
+    polls = []
+    def continue_(*, on_transport_dispatch):
+        on_transport_dispatch()
+        session.record('continue')
+    def wait_for_any_stop(*, timeout_s, expected_target, on_transport_dispatch):
+        on_transport_dispatch()
+        polls.append(timeout_s)
+        if len(polls) < 3:
+            raise StopWaitIntervalElapsed('interval')
+        session.record('stop', True)
+        return stop
+    session.continue_ = continue_
+    session.wait_for_any_stop = wait_for_any_stop
+    def main(port):
+        port.continue_()
+        while True:
+            try:
+                result = port.wait_for_any_stop(timeout_s=0.01)
+                return Settlement(result)
+            except StopWaitIntervalElapsed:
+                pass
+    ticket = arbiter.submit(route, main)
+    arbiter.dispatch(ticket)
+    assert session.entered.wait(3)
+    later = arbiter.submit(route, lambda port: Settlement(evaluate(port, 'later')))
+    arbiter.dispatch(later)
+    assert arbiter.active_ticket is ticket
+    assert ticket.status().awaiting_stop
+    assert [name for name, _ in session.calls] == ['continue', 'stop']
+    session.release.set()
+    assert ticket.wait(3) is stop
+    assert later.wait(3) == 'later'
+    assert len(polls) == 3
+
+
+def test_continue_settlement_without_stop_is_quarantined(runtime):
+    from onec_runtime.rdbg.models import DebugTarget, ModuleLocation, StopEvent
+    session, route, arbiter = runtime
+    target = TargetId(uuid4(), 'main')
+    session.target = DebugTarget(target, 'Server', 'stopped')
+    session.continue_ = lambda *, on_transport_dispatch: on_transport_dispatch()
+    stop = StopEvent(target, ModuleLocation('ExtensionModule', '', uuid4(), uuid4(), 1, 'Test'), 'breakpoint')
+    session.wait_for_any_stop = lambda **kwargs: stop
+    def main(port):
+        port.continue_()
+        return Settlement('premature')
+    ticket = arbiter.submit(route, main)
+    arbiter.dispatch(ticket)
+    assert ticket.wait_unknown(3)
+    assert ticket.status().awaiting_stop
+    arbiter.reconcile(ticket, lambda port: Settlement(port.wait_for_any_stop(timeout_s=1)))
+    assert ticket.wait(3) is stop
+
+@pytest.mark.parametrize('failure', ['ambiguous_continue', 'expired_wait'])
+def test_main_unknown_can_reconcile_without_repeating_continue(runtime, failure):
+    from onec_runtime.errors import StopWaitIntervalElapsed
+    from onec_runtime.rdbg.models import DebugTarget, ModuleLocation, StopEvent
+    session, route, arbiter = runtime
+    target = TargetId(uuid4(), 'main')
+    session.target = DebugTarget(target, 'Server', 'stopped')
+    stop = StopEvent(target, ModuleLocation('ExtensionModule', '', uuid4(), uuid4(), 1, 'Test'), 'breakpoint')
+    def continue_(*, on_transport_dispatch):
+        on_transport_dispatch()
+        session.record('continue')
+        if failure == 'ambiguous_continue':
+            raise OSError('ack lost')
+    def expired(**kwargs):
+        raise StopWaitIntervalElapsed('interval')
+    session.continue_ = continue_
+    session.wait_for_any_stop = expired
+    def main(port):
+        port.continue_()
+        return Settlement(port.wait_for_any_stop(timeout_s=0.01))
+    ticket = arbiter.submit(route, main)
+    arbiter.dispatch(ticket)
+    assert ticket.wait_unknown(3)
+    assert ticket.status().awaiting_stop
+    session.wait_for_any_stop = lambda **kwargs: stop
+    arbiter.reconcile(ticket, lambda port: Settlement(port.wait_for_any_stop(timeout_s=1)))
+    assert ticket.wait(3) is stop
+    assert [name for name, _ in session.calls] == ['continue']
+
+
+def test_ambiguous_modify_cannot_be_swallowed_or_followed_by_new_effects():
+    session = Session()
+    route = RouteToken('quarantine', 1, 0, 'main')
+    arbiter = RdbgArbiter(session, route)
+    def modify(variable, value_expression, *, on_transport_dispatch):
+        on_transport_dispatch()
+        session.record('modify')
+        raise OSError('write acknowledgement lost')
+    session.modify = modify
+    def plan(port):
+        try:
+            port.modify('command', '1')
+        except OSError:
+            pass
+        return Settlement('not evidence')
+    ticket = arbiter.submit(route, plan)
+    arbiter.dispatch(ticket)
+    assert ticket.wait_unknown(3)
+    later = arbiter.submit(route, lambda port: Settlement(evaluate(port, 'unsafe')))
+    arbiter.dispatch(later)
+    with pytest.raises(TimeoutError):
+        later.wait(0)
+    with pytest.raises(ArbiterBusy):
+        arbiter.close(timeout=0)
+    assert [name for name, _ in session.calls] == ['modify']
+    # The daemon intentionally retains ownership: no remote evidence permits
+    # retirement. The test must not manufacture an acknowledgement for cleanup.
+
+
+@pytest.mark.parametrize('command', ['set_breakpoints', 'modify', 'continue_'])
+def test_main_port_predispatch_error_releases_queue(runtime, command):
+    from onec_runtime.rdbg.models import DebugTarget
+    session, route, arbiter = runtime
+    session.target = DebugTarget(TargetId(uuid4(), 'main'), 'Server', 'stopped')
+    def reject(*args, **kwargs):
+        raise ValueError('local validation')
+    setattr(session, command, reject)
+    def plan(port):
+        if command == 'set_breakpoints':
+            port.set_breakpoints(())
+        elif command == 'modify':
+            port.modify('', '')
+        else:
+            port.continue_()
+        return Settlement(None)
+    ticket = arbiter.submit(route, plan)
+    arbiter.dispatch(ticket)
+    with pytest.raises(ValueError):
+        ticket.wait(3)
+    later = arbiter.submit(route, lambda port: Settlement(evaluate(port, 'safe')))
+    arbiter.dispatch(later)
+    assert later.wait(3) == 'safe'
+
+
+def test_real_session_foreign_stop_cannot_poison_main_owner():
+    from onec_runtime.rdbg.models import DebugTarget, ModuleLocation, StopEvent
+    from onec_runtime.rdbg.session import RdbgSession, SessionState
+
+    class Transport:
+        def request(self, command, *args, **kwargs):
+            assert command == 'step'
+            return b''
+
+    location = ModuleLocation('ExtensionModule', '', uuid4(), uuid4(), 1, 'Test')
+    session = RdbgSession(Transport(), location)
+    expected = DebugTarget(TargetId(uuid4(), 'expected'), 'Server', 'stopped')
+    foreign = DebugTarget(TargetId(uuid4(), 'foreign'), 'Server', 'stopped')
+    session.target = expected
+    session.attached_targets.update({expected.target_id.id: expected, foreign.target_id.id: foreign})
+    session.state = SessionState.READY
+    expected_stop = StopEvent(expected.target_id, location, 'breakpoint')
+    foreign_stop = StopEvent(foreign.target_id, location, 'breakpoint')
+    session._event_queue.extend((foreign_stop, expected_stop))
+    route = RouteToken('routing', 1, 0, 'main')
+    arbiter = RdbgArbiter(session, route)
+    def main(port):
+        port.continue_()
+        return Settlement(port.wait_for_any_stop(timeout_s=1))
+    ticket = arbiter.submit(route, main)
+    arbiter.dispatch(ticket)
+    assert ticket.wait(3) is expected_stop
+    assert session.target is expected
+    assert not ticket.status().awaiting_stop
+    arbiter.close(timeout=3)
+    session.state = SessionState.ATTACHED
+    assert session.wait_for_any_stop(expected_target=foreign.target_id, timeout_s=1) is foreign_stop

@@ -11,6 +11,7 @@ from uuid import UUID, uuid4
 
 from onec_runtime.errors import (
     CommandTimeout,
+    StopWaitIntervalElapsed,
     EvaluationDispatchUnknown,
     ProtocolError,
     RdbgDebugUiNotRegistered,
@@ -342,13 +343,15 @@ class RdbgSession:
             dbgui=str(self.ui_id),
         )
 
-    def set_breakpoints(self, locations: tuple[ModuleLocation, ...]) -> None:
+    def set_breakpoints(self, locations: tuple[ModuleLocation, ...], *,
+                        on_transport_dispatch: Callable[[], None] | None = None) -> None:
         self._require(SessionState.ATTACHED, SessionState.READY)
         if not locations:
             raise ValueError("At least one breakpoint location is required")
         response = self._request(
             "setBreakpoints",
             build_breakpoints_request(self.alias, self.ui_id, locations),
+            on_transport_entry=on_transport_dispatch,
         )
         validate_command_acknowledgement(response, command="setBreakpoints")
         self._breakpoint_installed = True
@@ -360,6 +363,7 @@ class RdbgSession:
         *,
         profile_page_start: int | None = None,
         profile_result_id: str = "",
+        on_transport_dispatch: Callable[[], None] | None = None,
     ) -> tuple[list[StopEvent], list[EvaluationResult]]:
         metadata = {
             "page_start": profile_page_start,
@@ -372,6 +376,7 @@ class RdbgSession:
                 b"",
                 timeout_s=timeout_s,
                 dbgui=str(self.ui_id),
+                on_transport_entry=on_transport_dispatch,
             ),
             output_bytes=len,
             **metadata,
@@ -455,10 +460,10 @@ class RdbgSession:
             if result.result_id in pending_result_ids
         )
 
-    def _pop_queued_stop(self) -> StopEvent | None:
+    def _pop_queued_stop(self, expected_target: TargetId | None = None) -> StopEvent | None:
         queued = list(self._event_queue)
         for index, event in enumerate(queued):
-            if isinstance(event, StopEvent):
+            if isinstance(event, StopEvent) and (expected_target is None or event.target_id == expected_target):
                 del queued[index]
                 self._event_queue = deque(queued)
                 return event
@@ -498,21 +503,25 @@ class RdbgSession:
         self,
         *,
         timeout_s: float = 60.0,
+        expected_target: TargetId | None = None,
         on_poll: Callable[[], None] | None = None,
+        on_transport_dispatch: Callable[[], None] | None = None,
     ) -> StopEvent:
+        # Select ownership before _admit_stop changes target and session state.
+        # Foreign stops stay queued in their original relative order.
         self._require(SessionState.ATTACHED, SessionState.EXECUTING)
         deadline = monotonic() + timeout_s
         while monotonic() < deadline:
             if on_poll is not None:
                 on_poll()
-            queued = self._pop_queued_stop()
+            queued = self._pop_queued_stop(expected_target)
             if queued is not None:
                 return self._admit_stop(queued)
             remaining = max(0.1, min(6.0, deadline - monotonic()))
-            polled = self._poll(remaining)
+            polled = self._poll(remaining, on_transport_dispatch=on_transport_dispatch)
             self._ingest_poll_events(*polled)
             sleep(0.05)
-        raise CommandTimeout("Timed out waiting for a runtime stop")
+        raise StopWaitIntervalElapsed("Timed out waiting for a runtime stop")
 
     def read_current_stack(self, *, timeout_s: float = 5.0) -> StopEvent:
         self._require(SessionState.ATTACHED, SessionState.READY)
@@ -970,7 +979,8 @@ class RdbgSession:
                 return result
         return result
 
-    def modify(self, variable: str, value_expression: str) -> ModifyResult:
+    def modify(self, variable: str, value_expression: str, *,
+               on_transport_dispatch: Callable[[], None] | None = None) -> ModifyResult:
         self._require(SessionState.READY)
         if self.target is None:
             raise TargetLost("No target has been selected")
@@ -985,6 +995,7 @@ class RdbgSession:
                 value_expression,
                 result_id,
             ),
+            on_transport_entry=on_transport_dispatch,
         )
         if not response.strip():
             raise ProtocolError("RDBG modifyValue returned an empty response")
@@ -996,14 +1007,20 @@ class RdbgSession:
             )
         return result
 
-    def continue_(self) -> None:
+    def continue_(self, *, on_transport_dispatch: Callable[[], None] | None = None) -> None:
         self._require(SessionState.READY)
         if self.target is None:
             raise TargetLost("No target has been selected")
-        self._request(
-            "step", build_step_request(self.alias, self.ui_id, self.target.target_id)
+        def entered() -> None:
+            if on_transport_dispatch is not None:
+                on_transport_dispatch()
+            # Once entered, polling must remain possible even without an ack.
+            self.state = SessionState.EXECUTING
+        response = self._request(
+            "step", build_step_request(self.alias, self.ui_id, self.target.target_id),
+            on_transport_entry=entered,
         )
-        self.state = SessionState.EXECUTING
+        validate_command_acknowledgement(response, command="step")
 
     def heartbeat(self) -> dict[str, object]:
         self._require(SessionState.READY)

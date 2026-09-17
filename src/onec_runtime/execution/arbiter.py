@@ -14,11 +14,24 @@ from typing import Any, Callable, Protocol
 from uuid import uuid4
 
 from onec_runtime.errors import EvaluationDispatchUnknown
-from onec_runtime.rdbg.models import EvaluationResult, PendingEvaluation, StopEvent
+from onec_runtime.rdbg.models import DebugTarget, EvaluationResult, ModuleLocation, ModifyResult, PendingEvaluation, StopEvent, TargetId
 
 
 class EvaluationSession(Protocol):
     """Session owns protocol validation, correlation and capability retirement."""
+
+    target: DebugTarget | None
+
+    def set_breakpoints(self, locations: tuple[ModuleLocation, ...], *,
+                        on_transport_dispatch: Callable[[], None]) -> None: ...
+
+    def modify(self, variable: str, value_expression: str, *,
+               on_transport_dispatch: Callable[[], None]) -> ModifyResult: ...
+
+    def continue_(self, *, on_transport_dispatch: Callable[[], None]) -> None: ...
+
+    def wait_for_any_stop(self, *, timeout_s: float, expected_target: TargetId,
+                          on_transport_dispatch: Callable[[], None]) -> StopEvent: ...
 
     def start_evaluation(self, expression: str, *, max_text_size: int,
                          stack_level: int, timeout_s: float,
@@ -78,6 +91,7 @@ class TicketStatus:
     settled: bool
     waiter_detached: bool
     pending_capability: PendingEvaluation | None
+    awaiting_stop: bool
 
 
 class ExecutionTicket:
@@ -91,12 +105,13 @@ class ExecutionTicket:
         self._detached = False
         self._pending: PendingEvaluation | None = None
         self._entered = False
+        self._stop_target: TargetId | None = None
         self._value: Any = None
         self._error: BaseException | None = None
 
     def status(self) -> TicketStatus:
         with self._owner._mailbox:
-            return TicketStatus(self._phase, self._phase == 'settled', self._detached, self._pending)
+            return TicketStatus(self._phase, self._phase == 'settled', self._detached, self._pending, self._stop_target is not None)
 
     def detach_waiter(self) -> None:
         with self._owner._mailbox:
@@ -114,6 +129,11 @@ class ExecutionTicket:
 
     def wait(self, timeout: float | None = None) -> Any:
         return self._wait(timeout, respect_detach=True)
+
+    def wait_initiator(self, timeout: float | None = None) -> Any:
+        """Wait for the owning notebook caller; other observers use wait_settled."""
+
+        return self.wait(timeout)
 
     def wait_settled(self, timeout: float | None = None) -> Any:
         """Observer wait, independent of the detached initiating waiter."""
@@ -138,7 +158,7 @@ class ExecutionTicket:
 
 
 class SessionPort:
-    """Worker-confined, capability-preserving eval operations only.
+    """Worker-confined operations preserving eval and Continue ownership.
 
     Synchronous eval wrappers and arbitrary session methods are intentionally
     absent: they hide pending ownership. Additional operations need explicit
@@ -159,11 +179,54 @@ class SessionPort:
         with self._owner._mailbox:
             self._ticket._entered = True
 
+    def _require_idle(self) -> None:
+        self._check()
+        if self._ticket._pending is not None or self._ticket._stop_target is not None or self._ticket._entered:
+            raise ArbiterBusy('A remote operation is still outstanding')
+
+    def set_breakpoints(self, locations: tuple[ModuleLocation, ...]) -> None:
+        self._require_idle()
+        self._owner._session.set_breakpoints(locations, on_transport_dispatch=self._transport_entered)
+        with self._owner._mailbox:
+            self._ticket._entered = False
+
+    def modify(self, variable: str, value_expression: str) -> ModifyResult:
+        self._require_idle()
+        result = self._owner._session.modify(variable, value_expression, on_transport_dispatch=self._transport_entered)
+        with self._owner._mailbox:
+            self._ticket._entered = False
+        return result
+
+    def continue_(self) -> None:
+        self._require_idle()
+        target = self._owner._session.target
+        if target is None:
+            raise ValueError('Continue requires a selected target')
+        def entered() -> None:
+            self._transport_entered()
+            with self._owner._mailbox:
+                self._ticket._stop_target = target.target_id
+        self._owner._session.continue_(on_transport_dispatch=entered)
+        with self._owner._mailbox:
+            self._ticket._entered = False
+
+    def wait_for_any_stop(self, *, timeout_s: float = 60.0) -> StopEvent:
+        self._check()
+        expected = self._ticket._stop_target
+        if expected is None:
+            raise ValueError('No Continue stop is outstanding')
+        stop = self._owner._session.wait_for_any_stop(
+            timeout_s=timeout_s, expected_target=expected, on_transport_dispatch=self._transport_entered)
+        if stop.target_id != expected:
+            raise OutcomeUnknown('Stop belongs to a different target')
+        with self._owner._mailbox:
+            self._ticket._stop_target = None
+            self._ticket._entered = False
+        return stop
+
     def _start(self, operation: Callable[..., PendingEvaluation], expression: str,
                **options: Any) -> PendingEvaluation:
-        self._check()
-        if self._ticket._pending is not None:
-            raise ArbiterBusy('An evaluation capability is already owned')
+        self._require_idle()
         try:
             pending = operation(expression, on_transport_dispatch=self._transport_entered, **options)
         except EvaluationDispatchUnknown as error:
@@ -217,7 +280,7 @@ Plan = Callable[[SessionPort], Settlement]
 class RdbgArbiter:
     """Own one session after bootstrap, with one mailbox and one worker.
 
-    This first port exposes only capability-preserving evaluation operations.
+    The port exposes evaluation and MAIN command operations with ownership evidence.
     No background polling is started: active plans read events on this worker.
     Unknown plans keep the slot until a reconciliation/teardown plan supplies a
     confirmed settlement. This primitive cannot itself infer protocol evidence
@@ -294,7 +357,7 @@ class RdbgArbiter:
         # Called only under mailbox; no callbacks or transport work here.
         ticket._value = value
         ticket._error = error
-        assert ticket._pending is None, 'Cannot settle an owned evaluation capability'
+        assert ticket._pending is None and ticket._stop_target is None and not ticket._entered, 'Cannot settle an owned evaluation capability'
         ticket._phase = 'settled'
         self._mailbox.notify_all()
 
@@ -325,11 +388,11 @@ class RdbgArbiter:
                 outcome = plan(port)
                 if not isinstance(outcome, Settlement):
                     raise TypeError('Plan must return a confirmed Settlement')
-                if ticket._pending is not None:
+                if ticket._pending is not None or ticket._stop_target is not None or ticket._entered:
                     raise OutcomeUnknown('Settlement cannot discard an unretired capability')
             except BaseException as error:
                 with self._mailbox:
-                    if reconciling or ticket._entered or ticket._pending is not None or isinstance(error, OutcomeUnknown):
+                    if reconciling or ticket._entered or ticket._pending is not None or ticket._stop_target is not None or isinstance(error, OutcomeUnknown):
                         ticket._phase = 'unknown'
                         ticket._error = error
                         self._mailbox.notify_all()

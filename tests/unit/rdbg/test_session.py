@@ -1030,3 +1030,98 @@ def test_pending_evaluation_survives_interval_timeout_and_consumes_one_late_resu
         session.wait_evaluation_event(pending, timeout_s=0.025)
     assert transport.calls.count("evalExpr") == 1
     assert not session._pending_evaluation_states
+
+@pytest.mark.parametrize('command', ['set_breakpoints', 'modify', 'continue_'])
+def test_main_commands_report_transport_entry_after_validation(command):
+    transport = FakeTransport()
+    session = ready_session(transport)
+    entered = []
+    def invoke():
+        if command == 'set_breakpoints':
+            return session.set_breakpoints((LOCATION,), on_transport_dispatch=lambda: entered.append(True))
+        if command == 'modify':
+            return session.modify('x', '1', on_transport_dispatch=lambda: entered.append(True))
+        return session.continue_(on_transport_dispatch=lambda: entered.append(True))
+    session.state = SessionState.DETACHED
+    with pytest.raises(ProtocolError):
+        invoke()
+    assert entered == []
+    assert transport.calls == []
+    session.state = SessionState.READY
+    if command == 'modify':
+        with pytest.raises(ProtocolError):  # Empty response is ambiguous after entry.
+            invoke()
+    else:
+        invoke()
+    assert entered == [True]
+
+
+def test_continue_validates_remote_acknowledgement():
+    transport = FakeTransport()
+    session = ready_session(transport)
+    transport.responses['step'].append(b'<response><result>failure</result></response>')
+    with pytest.raises(ProtocolError):
+        session.continue_()
+    assert session.state is SessionState.EXECUTING
+
+
+def test_wait_expected_target_preserves_foreign_stop_before_admission():
+    transport = FakeTransport()
+    session = ready_session(transport)
+    expected = session.target
+    foreign = DebugTarget(TargetId(UUID('33333333-3333-3333-3333-333333333333'), 'DefAlias'), 'ServerEmulation', 'stopped')
+    session.attached_targets[foreign.target_id.id] = foreign
+    foreign_stop = StopEvent(foreign.target_id, LOCATION, 'breakpoint')
+    expected_stop = StopEvent(expected.target_id, LOCATION, 'breakpoint')
+    session._event_queue.extend((foreign_stop, expected_stop))
+    session.state = SessionState.EXECUTING
+    assert session.wait_for_any_stop(expected_target=expected.target_id, timeout_s=1) is expected_stop
+    assert session.target is expected
+    assert session.state is SessionState.READY
+    # Another owner can later consume the original foreign event.
+    session.state = SessionState.ATTACHED
+    assert session.wait_for_any_stop(expected_target=foreign.target_id, timeout_s=1) is foreign_stop
+    assert session.target is foreign
+    assert transport.calls == []
+
+
+def test_foreign_only_stop_does_not_prevent_later_expected_poll():
+    transport = FakeTransport()
+    session = ready_session(transport)
+    expected = session.target
+    foreign = DebugTarget(TargetId(UUID('33333333-3333-3333-3333-333333333333'), 'DefAlias'), 'ServerEmulation', 'stopped')
+    session.attached_targets[foreign.target_id.id] = foreign
+    foreign_stop = StopEvent(foreign.target_id, LOCATION, 'breakpoint')
+    session._event_queue.append(foreign_stop)
+    session.state = SessionState.EXECUTING
+    with pytest.raises(CommandTimeout):
+        session.wait_for_any_stop(expected_target=expected.target_id, timeout_s=0.001)
+    assert session.target is expected
+    assert session.state is SessionState.EXECUTING
+    expected_stop = StopEvent(expected.target_id, LOCATION, 'breakpoint')
+    session._event_queue.append(expected_stop)
+    assert session.wait_for_any_stop(expected_target=expected.target_id, timeout_s=1) is expected_stop
+    session.state = SessionState.ATTACHED
+    assert session.wait_for_any_stop(expected_target=foreign.target_id, timeout_s=1) is foreign_stop
+
+
+def test_empty_stop_interval_has_distinct_retryable_exception():
+    from onec_runtime.errors import StopWaitIntervalElapsed
+    session = ready_session(FakeTransport())
+    session.state = SessionState.EXECUTING
+    with pytest.raises(StopWaitIntervalElapsed):
+        session.wait_for_any_stop(timeout_s=0)
+    assert session.state is SessionState.EXECUTING
+
+
+def test_stop_transport_timeout_is_not_an_empty_interval():
+    from onec_runtime.errors import RdbgTransportTimeout, StopWaitIntervalElapsed
+    class FailedTransport(FakeTransport):
+        def request(self, *args, **kwargs):
+            raise RdbgTransportTimeout('network timeout')
+    session = ready_session(FailedTransport())
+    session.state = SessionState.EXECUTING
+    with pytest.raises(RdbgTransportTimeout) as raised:
+        session.wait_for_any_stop(timeout_s=1)
+    assert not isinstance(raised.value, StopWaitIntervalElapsed)
+    assert session.state is SessionState.EXECUTING
