@@ -1008,6 +1008,7 @@ class RdbgSession:
         timeout_s: float = 30.0,
         max_text_size: int = 307_200,
         retry_delays_s: tuple[float, ...] = (0.05, 0.10, 0.15),
+        on_transport_dispatch: Callable[[], None] | None = None,
     ) -> LocalVariablesResult:
         self._require(SessionState.READY)
         if self.target is None:
@@ -1032,6 +1033,7 @@ class RdbgSession:
                     result_id,
                     max_text_size=max_text_size,
                 ),
+                on_transport_entry=on_transport_dispatch,
                 timeout_s=remaining,
             )
             if response.strip():

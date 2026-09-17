@@ -525,6 +525,56 @@ def test_local_variables_bounds_the_http_request_by_its_deadline() -> None:
     assert 0 < transport.request_timeout <= 0.25
 
 
+def test_local_variables_callback_rejection_prevents_transport_and_pending_state() -> None:
+    transport = FakeTransport()
+    session = ready_session(transport)
+
+    def reject() -> None:
+        raise ValueError("local owner rejected dispatch")
+
+    with pytest.raises(ValueError, match="local owner rejected dispatch"):
+        session.local_variables(timeout_s=1, on_transport_dispatch=reject)
+
+    assert transport.calls == []
+    assert session._pending_local_variables == {}
+    assert session.state is SessionState.READY
+
+
+def test_local_variables_marks_transport_entry_before_each_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_id = UUID("11111111-9999-9999-9999-999999999999")
+    second_id = UUID("22222222-9999-9999-9999-999999999999")
+    events: list[str] = []
+
+    class OrderedTransport(FakeTransport):
+        def request(self, command: str, payload: bytes = b"", **options: object) -> bytes:
+            events.append("request")
+            return super().request(command, payload, **options)
+
+    transport = OrderedTransport()
+    for result_id in (first_id, second_id):
+        transport.responses["evalLocalVariables"].append(
+            f"""<response xmlns="{RDBG_NS}"><result>
+              <expressionResultID xmlns="{CALC_NS}">{result_id}</expressionResultID>
+              <calculationResult xmlns="{CALC_NS}"/><errorOccurred>false</errorOccurred>
+            </result></response>""".encode()
+        )
+    session = ready_session(transport)
+    result_ids = iter((first_id, second_id))
+    monkeypatch.setattr("onec_runtime.rdbg.session.uuid4", lambda: next(result_ids))
+
+    result = session.local_variables(
+        timeout_s=1,
+        retry_delays_s=(0,),
+        on_transport_dispatch=lambda: events.append("dispatch"),
+    )
+
+    assert result.result_id == second_id
+    assert events == ["dispatch", "request", "dispatch", "request"]
+    assert transport.calls == ["evalLocalVariables", "evalLocalVariables"]
+
+
 def test_evaluate_targets_selected_stack_frame(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
