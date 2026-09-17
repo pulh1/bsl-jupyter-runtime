@@ -64,6 +64,22 @@ def test_workspace_success_is_aggregate_not_point_verification() -> None:
     assert not hasattr(receipt, "verified_breakpoints")
 
 
+def test_workspace_install_can_use_the_current_operation_port() -> None:
+    """The arbiter plan supplies its worker-bound port for this installation."""
+    legacy_session = _Session()
+    operation_port = _Session()
+    owner = _owner(legacy_session)
+    desired = owner.prepare(
+        captures=(CAPTURE,), ordinary_users=(), worker_slots=(), shielded=False
+    )
+
+    receipt = owner.install(desired, port=operation_port)
+
+    assert receipt.version == desired.version
+    assert operation_port.calls == [(SERVICE, CAPTURE)]
+    assert legacy_session.calls == []
+
+
 def test_worker_duplicates_collapse_but_cross_group_overlap_is_rejected() -> None:
     session = _Session()
     owner = _owner(session)
