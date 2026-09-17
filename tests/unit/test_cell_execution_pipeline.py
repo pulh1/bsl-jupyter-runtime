@@ -2,6 +2,7 @@
 
 import pytest
 
+from onec_runtime.bsl.source_maps import SourceUnitKind, SourceUnitRef, source_sha256
 from onec_runtime.execution.contracts import (
     Accepted,
     CommonCell,
@@ -18,9 +19,15 @@ from onec_runtime.execution.contracts import (
 from onec_runtime.execution.pipeline import CellExecutionPipeline
 
 
+def unit(source: str) -> SourceUnitRef:
+    return SourceUnitRef(
+        SourceUnitKind.NOTEBOOK_CELL, "pipeline-cell", 1, source_sha256(source)
+    )
+
+
 def test_controller_selected_third_policy_runs_without_pipeline_route_changes() -> None:
     class Parser:
-        def prepare(self, source: str, source_unit: str) -> CommonCell:
+        def prepare(self, source: str, source_unit: SourceUnitRef) -> CommonCell:
             return CommonCell(source_unit, source, {"visible": source_unit}, "hash-abc")
 
     class Snapshots:
@@ -78,7 +85,7 @@ def test_controller_selected_third_policy_runs_without_pipeline_route_changes() 
 
     pipeline = CellExecutionPipeline(Parser(), Controller(ThirdRoute()), Snapshots(), Replies())
 
-    assert pipeline.execute("abc", "unit-1") == "third:executed-ABC:ABC"
+    assert pipeline.execute("abc", unit("abc")) == "third:executed-ABC:ABC"
 
 
 def test_stale_preparation_retries_locally_without_dispatching_old_cell() -> None:
@@ -133,7 +140,7 @@ def test_stale_preparation_retries_locally_without_dispatching_old_cell() -> Non
 
     pipeline = CellExecutionPipeline(Parser(), Controller(), Snapshots(), Replies())
 
-    assert pipeline.execute("source", "unit") == "new-route-result"
+    assert pipeline.execute("source", unit("source")) == "new-route-result"
     assert parse_count == 1
     assert prepared_nonces == ["nonce-1", "nonce-2"]
     assert dispatched == ["nonce-2"]
@@ -173,7 +180,7 @@ def test_policy_diagnostic_is_published_only_after_guard_validation() -> None:
 
     pipeline = CellExecutionPipeline(Parser(), Controller(), Snapshots(), Replies())
 
-    assert pipeline.execute("source", "unit") == {"source_error": "unknown variable"}
+    assert pipeline.execute("source", unit("source")) == {"source_error": "unknown variable"}
 
 
 def test_interrupt_after_admission_requests_remote_stop_for_accepted_ticket() -> None:
@@ -218,7 +225,7 @@ def test_interrupt_after_admission_requests_remote_stop_for_accepted_ticket() ->
     pipeline = CellExecutionPipeline(Parser(), Controller(), Snapshots(), Replies())
 
     with pytest.raises(KeyboardInterrupt):
-        pipeline.execute("source", "unit")
+        pipeline.execute("source", unit("source"))
     assert stop_requests == [ticket]
 
 
@@ -251,7 +258,7 @@ def test_rejected_unavailable_preparation_returns_typed_reply_without_waiting() 
 
     pipeline = CellExecutionPipeline(Parser(), Controller(), Snapshots(), Replies())
 
-    assert pipeline.execute("source", "unit") == {"unavailable": "target is stopping"}
+    assert pipeline.execute("source", unit("source")) == {"unavailable": "target is stopping"}
 
 
 def test_stale_route_diagnostic_is_discarded_and_reprepared() -> None:
@@ -301,7 +308,7 @@ def test_stale_route_diagnostic_is_discarded_and_reprepared() -> None:
 
     pipeline = CellExecutionPipeline(Parser(), Controller(), Snapshots(), Replies())
 
-    assert pipeline.execute("source", "unit") == "new-route-result"
+    assert pipeline.execute("source", unit("source")) == "new-route-result"
 
 
 def test_unavailable_context_returns_without_reading_snapshots() -> None:
@@ -326,7 +333,7 @@ def test_unavailable_context_returns_without_reading_snapshots() -> None:
 
     pipeline = CellExecutionPipeline(Parser(), Controller(), Snapshots(), Replies())
 
-    assert pipeline.execute("source", "unit") == "previous operation is unresolved"
+    assert pipeline.execute("source", unit("source")) == "previous operation is unresolved"
 
 
 def test_common_parse_diagnostic_returns_before_requesting_route() -> None:
@@ -344,7 +351,7 @@ def test_common_parse_diagnostic_returns_before_requesting_route() -> None:
 
     pipeline = CellExecutionPipeline(Parser(), Controller(), object(), Replies())
 
-    assert pipeline.execute("broken", "unit") == "syntax error"
+    assert pipeline.execute("broken", unit("broken")) == "syntax error"
 
 
 def test_interrupt_during_submit_after_ticket_adoption_requests_stop_once() -> None:
@@ -389,7 +396,7 @@ def test_interrupt_during_submit_after_ticket_adoption_requests_stop_once() -> N
     pipeline = CellExecutionPipeline(Parser(), Controller(), Snapshots(), Replies())
 
     with pytest.raises(KeyboardInterrupt):
-        pipeline.execute("source", "unit")
+        pipeline.execute("source", unit("source"))
     assert stop_requests == [ticket]
 
 
@@ -428,7 +435,7 @@ def test_interrupt_during_submit_before_ticket_adoption_has_nothing_to_stop() ->
     pipeline = CellExecutionPipeline(Parser(), Controller(), Snapshots(), Replies())
 
     with pytest.raises(KeyboardInterrupt):
-        pipeline.execute("source", "unit")
+        pipeline.execute("source", unit("source"))
     assert stop_requests == []
 
 

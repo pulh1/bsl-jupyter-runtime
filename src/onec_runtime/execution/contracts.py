@@ -11,7 +11,7 @@ from onec_runtime.bsl.source_maps import MappedSource, SourceUnitRef
 
 @dataclass(frozen=True, slots=True)
 class CommonCell:
-    source_unit: object
+    source_unit: SourceUnitRef
     parsed_units: object
     source_maps: object
     source_hash: str
@@ -124,7 +124,9 @@ class SubmissionReceipt:
 
 
 class CommonCellParser(Protocol):
-    def prepare(self, source: str, source_unit: object) -> CommonCell | SourceDiagnostic: ...
+    def prepare(
+        self, source: str, source_unit: SourceUnitRef
+    ) -> CommonCell | SourceDiagnostic: ...
 
 
 class PreparationSnapshotReader(Protocol):

@@ -1,5 +1,6 @@
 """Generic cell preparation and admission; route decisions remain in its ports."""
 
+from onec_runtime.bsl.source_maps import SourceUnitRef
 from onec_runtime.execution.contracts import (
     Accepted,
     CommonCell,
@@ -31,7 +32,7 @@ class CellExecutionPipeline:
         self._snapshots = snapshots
         self._replies = replies
 
-    def execute(self, source: str, source_unit: object) -> object:
+    def execute(self, source: str, source_unit: SourceUnitRef) -> object:
         common: CommonCell = self._parser.prepare(source, source_unit)
         if isinstance(common, SourceDiagnostic):
             return self._replies.diagnostic_reply(common)
