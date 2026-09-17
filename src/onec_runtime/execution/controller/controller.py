@@ -232,6 +232,28 @@ class ExecutionController:
             self._arbiter.dispatch(ticket)
             return ticket
 
+    def submit_resume_debug_stop(self) -> ExecutionTicket:
+        """Continue the current user breakpoint in the same MAIN command."""
+
+        with self._lock:
+            operation = self.main_operation
+            if (
+                operation is None
+                or operation.phase is not MainPhase.SUSPENDED_USER
+                or operation.pending_stop is None
+                or self.capture_scope is not None
+            ):
+                raise ProtocolError("No user breakpoint can be resumed")
+            route = self._arbiter.current_route
+
+            def plan(port: SessionPort) -> Settlement:
+                stop = self._main_executor.resume(operation, port=port)
+                return self._route_stop(port, operation, stop)
+
+            ticket = self._arbiter.submit(route, plan)
+            self._arbiter.dispatch(ticket)
+            return ticket
+
     def _route_stop(
         self, port: SessionPort, operation: MainOperation, stop: StopEvent
     ) -> Settlement:

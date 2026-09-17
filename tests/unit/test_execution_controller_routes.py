@@ -282,3 +282,48 @@ def test_confirmed_variable_inspection_failure_does_not_poison_capture() -> None
         assert len({thread for _, thread in session.calls}) == 1
     finally:
         arbiter.close(timeout=3)
+
+
+def test_user_breakpoint_resumes_same_main_operation_on_owned_worker() -> None:
+    from onec_runtime.execution.controller.controller import (
+        ExecutionController,
+        MainYieldKind,
+    )
+    from onec_runtime.rdbg.models import ModuleLocation
+
+    user_location = ModuleLocation(
+        "ExtensionModule", "", UUID(int=99), UUID(int=100), 10, "Business"
+    )
+
+    class UserStopSession(CompleteSession):
+        def __init__(self) -> None:
+            super().__init__()
+            self.stops = deque(
+                (
+                    StopEvent(TARGET, user_location, "callStackFormed", stop_by_breakpoint=True),
+                    StopEvent(TARGET, KERNEL, MAIN_STOP.reason, stop_by_breakpoint=True),
+                )
+            )
+
+    session = UserStopSession()
+    arbiter = RdbgArbiter(session, RouteToken("runtime-1", 1, 0, "main"))
+    controller = ExecutionController(
+        arbiter,
+        MainExecutor(poll_interval_s=0.1),
+        CaptureExecutor(None, KERNEL, decode_command_id=evaluation_to_python),
+        CaptureCellEvaluator(),
+        BreakpointRegistry(KERNEL, (BUSINESS,), (user_location,)),
+        runtime_generation=1,
+    )
+    try:
+        stopped = controller.submit_main("Результат = 1;").wait(3)
+        assert stopped.kind is MainYieldKind.DEBUG_STOP
+        assert stopped.operation.phase is MainPhase.SUSPENDED_USER
+
+        finished = controller.submit_resume_debug_stop().wait(3)
+        assert finished.kind is MainYieldKind.COMPLETED
+        assert finished.operation is stopped.operation
+        assert finished.operation.phase is MainPhase.COMPLETED
+        assert len({thread for _, thread in session.calls}) == 1
+    finally:
+        arbiter.close(timeout=3)
