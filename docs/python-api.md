@@ -136,6 +136,40 @@ if status.can_wait:
 
 `CaptureEvaluationKind` различает пользовательский BSL (`user_bsl`), чтение (`inspection`) и вспомогательную материализацию (`materialization_helper`). `CaptureFailureDiagnostic` содержит безопасные `code`, `message` и `recommended_action`. `CaptureEvaluationTiming` содержит время создания, отметки этапов в миллисекундах, `remote_step_count` и `poll_count`; отсутствующая отметка имеет значение `None`. Поля `failure` и `diagnostic` описывают состояние операции, но сами по себе не доказывают потерю остановленного target.
 
+### Исправление в том же CAPTURE
+
+Ошибочная BSL-ячейка, чтение stack/variables и неудачная материализация относятся к отдельным операциям CAPTURE. При подтверждённой ошибке они не снимают остановку сами по себе: сначала проверьте `capture.status()`, исправьте причину и повторите только нужную операцию. Следующий пример запускается в уже остановленном CAPTURE; `ТаблицаСтрок` — прокси `bsl` из ранее успешной BSL-ячейки с более чем одной строкой.
+
+```python
+from onec_runtime.errors import CaptureValueCheckError, MaterializationLimitError
+
+capture = runtime.current_capture()
+
+# Ошибка пользовательской BSL остаётся ошибкой этой ячейки, а не resume.
+failed = runtime.execute_bsl('ВызватьИсключение "проверка CAPTURE";')
+assert not failed.succeeded
+assert capture.status().can_inspect
+
+# Тот же остановленный кадр доступен для проверки и исправленной ячейки.
+frame = capture.stack[0]
+local_names = [node.name for node in frame.locals[:20].items]
+context_names = [node.name for node in capture.context.variables[:20].items]
+corrected = runtime.execute_bsl("РезультатИнструкции = 42;")
+assert corrected.succeeded
+
+proxy = bsl["ТаблицаСтрок"]       # ленивое значение, данных в Python ещё нет
+try:
+    proxy.materialize(max_items=1)  # намеренно мало для таблицы с несколькими строками
+except (MaterializationLimitError, CaptureValueCheckError):
+    # Неудача materialize() не доказывает потерю кадра.
+    assert capture.status().can_inspect
+
+rows = proxy.to_df(refs="presentation")  # повтор с подходящим способом переноса
+reply = runtime.resume_capture()
+```
+
+В реальной программе выбирайте лимит `max_items` по данным, а не полагайтесь на этот намеренно маленький лимит. Если после любой операции `status().phase` равна `evaluating` или `outcome_unknown`, не отправляйте повтор: используйте `capture.wait()` с `pending_evaluation_id`. Если фаза `recovery_required` или `stale`, frame и прокси больше не пригодны для нового чтения; следуйте `failure.recommended_action` либо откройте новый runtime. После `resume_capture()` старый `CaptureView` становится `stale`, а прокси, привязанные к прежнему контексту, нужно получить заново после следующей успешной публикации BSL-значений.
+
 ## Прерывание ячейки и Stop
 
 `KeyboardInterrupt` или кнопка остановки notebook прерывают ожидание Python-ячейки. После отправки команды в 1С это само по себе **не подтверждает** прекращение BSL-кода. Сначала проверьте `runtime.status()` (в notebook — `%bsl_status`). Если сохранилась текущая CAPTURE-остановка, `runtime.current_capture().status()` показывает её фазу; `capture.wait(timeout_s=..., evaluation_id=...)` позволяет наблюдать уже принятую оценку без повторной отправки. Истечение `timeout_s` у `capture.wait()` возвращает `pending`, а у `resume_capture()` прекращает ожидание вызывающего; эти интервалы не служат сроком выполнения BSL.
