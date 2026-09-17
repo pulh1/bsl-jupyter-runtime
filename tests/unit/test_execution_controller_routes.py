@@ -1,6 +1,7 @@
 """The controller keeps one MAIN operation across a CAPTURE stop."""
 
 from collections import deque
+from hashlib import sha256
 from threading import Event
 from uuid import UUID
 
@@ -372,4 +373,57 @@ def test_resume_admission_fences_later_capture_cell_before_worker_runs() -> None
         release.set()
         if "resume_ticket" in locals():
             resume_ticket.wait_settled(3)
+        arbiter.close(timeout=3)
+
+
+def test_capture_materialization_uses_current_scope_and_one_rdbg_owner() -> None:
+    from onec_runtime.capture_evaluation import AdmissionEnvelopeV1
+    from onec_runtime.execution.controller.controller import ExecutionController
+    from test_capture_materialization_executor import transfer_plan
+
+    envelope = AdmissionEnvelopeV1(7, 1, 1, sha256(b"a").hexdigest(), 4)
+
+    class MaterializationSession(CompleteSession):
+        def wait_evaluation_event(self, pending, *, timeout_s, on_transport_dispatch):
+            expression = self.expression
+            if (
+                "__onec_compact_table_" in expression
+                or "ЗабратьКомпактнуюМатериализацию" in expression
+                or '"admission"' in expression
+            ):
+                on_transport_dispatch()
+                self._record("wait_eval")
+                self.pending = None
+                if "ЗабратьКомпактнуюМатериализацию" in expression:
+                    return EvaluationResult(pending.result_id, "Строка", '"YQ=="', False)
+                if "Контекст.Удалить" in expression:
+                    return EvaluationResult(pending.result_id, "Булево", "Истина", False)
+                return EvaluationResult(pending.result_id, "Строка", envelope.encode(), False)
+            return super().wait_evaluation_event(
+                pending, timeout_s=timeout_s,
+                on_transport_dispatch=on_transport_dispatch,
+            )
+
+    session = MaterializationSession()
+    arbiter = RdbgArbiter(session, RouteToken("runtime-1", 1, 0, "main"))
+    controller = ExecutionController(
+        arbiter,
+        MainExecutor(poll_interval_s=0.1),
+        CaptureExecutor(None, KERNEL, decode_command_id=evaluation_to_python),
+        CaptureCellEvaluator(),
+        BreakpointRegistry(KERNEL, (BUSINESS,)),
+        runtime_generation=1,
+    )
+    try:
+        scope = controller.submit_main("Результат = 1;").wait(3).scope
+        key = "__onec_compact_table_" + "a" * 32
+        payload = controller.submit_capture_materialization(
+            transfer_plan(key)
+        ).wait(3)
+        assert payload == b"a"
+        assert controller.capture_scope is scope and scope.published
+        assert scope.temporary_cleanup_debts == ()
+        assert controller.submit_resume().wait(3).kind.value == "completed"
+        assert len({thread for _, thread in session.calls}) == 1
+    finally:
         arbiter.close(timeout=3)

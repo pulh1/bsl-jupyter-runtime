@@ -24,6 +24,10 @@ from onec_runtime.execution.capture.adapter import CaptureSetupAdapter
 from onec_runtime.execution.capture.cell_evaluator import CaptureCellEvaluator
 from onec_runtime.execution.capture.executor import CaptureExecutor
 from onec_runtime.execution.capture.inspection import CaptureInspectionExecutor
+from onec_runtime.execution.capture.materialization import (
+    CaptureMaterializationExecutor,
+    CaptureMaterializationPlan,
+)
 from onec_runtime.execution.capture.operation_executor import CaptureCellOperationExecutor
 from onec_runtime.execution.capture.scope import CaptureContextState, CaptureScope
 from onec_runtime.execution.capture.writeback import CaptureWritebackExecutor
@@ -68,6 +72,7 @@ class ExecutionController:
         self._capture_executor = capture_executor
         self._capture_cell_executor = CaptureCellOperationExecutor(capture_cell_evaluator)
         self._capture_inspection_executor = CaptureInspectionExecutor()
+        self._capture_materialization_executor = CaptureMaterializationExecutor()
         self._capture_writeback_executor = CaptureWritebackExecutor()
         self._registry = registry
         self._generation = runtime_generation
@@ -237,6 +242,43 @@ class ExecutionController:
                     scope, name, stack_level=stack_level, port=port
                 )
                 return Settlement(variable)
+
+            ticket = self._arbiter.submit(route, plan)
+            self._arbiter.dispatch(ticket)
+            return ticket
+
+    def submit_capture_materialization(
+        self, transfer_plan: CaptureMaterializationPlan
+    ) -> ExecutionTicket:
+        """Execute one private value transfer inside the current stop."""
+
+        with self._lock:
+            if self._resume_in_flight():
+                raise ProtocolError("CAPTURE resume has already been admitted")
+            scope = self.capture_scope
+            operation = self.main_operation
+            route = self._capture_route
+            if (
+                scope is None
+                or scope.context_state is not CaptureContextState.READY
+                or operation is None
+                or operation.phase is not MainPhase.SUSPENDED_CAPTURE
+                or route is None
+            ):
+                raise ProtocolError("No ready CAPTURE stop is available")
+
+            def plan(port: SessionPort) -> Settlement:
+                return self._capture_materialization_executor.execute(
+                    scope,
+                    transfer_plan,
+                    port=port,
+                    shield_workspace=lambda worker: worker.set_breakpoints(
+                        self._registry.evaluation_locations
+                    ),
+                    restore_workspace=lambda worker: worker.set_breakpoints(
+                        self._registry.full_locations
+                    ),
+                )
 
             ticket = self._arbiter.submit(route, plan)
             self._arbiter.dispatch(ticket)
