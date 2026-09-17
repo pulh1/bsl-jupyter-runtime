@@ -112,6 +112,56 @@ def test_binds_persistent_and_captured_contexts_without_aliasing(
     parser_target.parse(result.source, "БлокНоутбука")
 
 
+def test_lowering_profiles_define_route_specific_result_capture_and_map_behavior(
+    parser_target: PythonParserTarget,
+) -> None:
+    """Break caught: a route profile must control every route-specific lowering choice."""
+    from onec_runtime.bsl.semantic_lowering import (
+        CAPTURE_LOWERING_PROFILE,
+        MAIN_LOWERING_PROFILE,
+        CaptureNamespaceRule,
+        LoweringProfile,
+        SemanticNotebookLowerer,
+    )
+
+    main = SemanticNotebookLowerer(parser_target).lower(
+        "Результат = 1;",
+        profile=MAIN_LOWERING_PROFILE,
+    )
+    capture = SemanticNotebookLowerer(parser_target).lower(
+        "РезультатИнструкции = КонтекстОтладки.Скаляр;",
+        profile=CAPTURE_LOWERING_PROFILE,
+    )
+    preview_profile = LoweringProfile(
+        result_channel="Итог",
+        capture_namespace_rule=CaptureNamespaceRule.MEMBER_ROOT,
+        source_map_tag="preview",
+    )
+    preview = SemanticNotebookLowerer(parser_target).lower(
+        "Итог = КонтекстОтладки.Скаляр;",
+        profile=preview_profile,
+    )
+
+    assert main.source == "Результат = 1;"
+    assert main.mapped_source.artifact.mode == "main"
+    assert capture.source == "РезультатИнструкции = КонтекстОтладки.Скаляр;"
+    assert capture.dirty_roots == ()
+    assert capture.mapped_source.artifact.mode == "capture"
+    assert preview.source == "Итог = КонтекстОтладки.Скаляр;"
+    assert preview.mapped_source.artifact.mode == "preview"
+    assert preview_profile == LoweringProfile(
+        result_channel="Итог",
+        capture_namespace_rule=CaptureNamespaceRule.MEMBER_ROOT,
+        source_map_tag="preview",
+    )
+
+    with pytest.raises(TypeError, match="LoweringMode"):
+        SemanticNotebookLowerer(parser_target).lower(
+            "Результат = 1;",
+            mode="other",  # type: ignore[arg-type]
+        )
+
+
 def test_persistent_name_catalog_preserves_first_committed_bsl_spelling(
     parser_target: PythonParserTarget,
 ) -> None:

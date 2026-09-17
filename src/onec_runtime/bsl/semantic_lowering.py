@@ -26,6 +26,46 @@ class LoweringMode(str, Enum):
     CAPTURE = "capture"
 
 
+class CaptureNamespaceRule(str, Enum):
+    FORBIDDEN = "forbidden"
+    MEMBER_ROOT = "member_root"
+
+
+@dataclass(frozen=True, slots=True)
+class LoweringProfile:
+    result_channel: str
+    capture_namespace_rule: CaptureNamespaceRule
+    source_map_tag: str
+
+    def __post_init__(self) -> None:
+        try:
+            result_tokens = tokenize(self.result_channel)
+        except BslLexError as error:
+            raise ValueError("result channel must be a BSL identifier") from error
+        if (
+            len(result_tokens) != 1
+            or result_tokens[0].type != "ID"
+            or result_tokens[0].text != self.result_channel
+        ):
+            raise ValueError("result channel must be a BSL identifier")
+        if type(self.capture_namespace_rule) is not CaptureNamespaceRule:
+            raise ValueError("capture namespace rule must be a CaptureNamespaceRule")
+        if not isinstance(self.source_map_tag, str) or not self.source_map_tag:
+            raise ValueError("source map tag must be a nonempty string")
+
+
+MAIN_LOWERING_PROFILE = LoweringProfile(
+    result_channel="Результат",
+    capture_namespace_rule=CaptureNamespaceRule.FORBIDDEN,
+    source_map_tag=LoweringMode.MAIN.value,
+)
+CAPTURE_LOWERING_PROFILE = LoweringProfile(
+    result_channel="РезультатИнструкции",
+    capture_namespace_rule=CaptureNamespaceRule.MEMBER_ROOT,
+    source_map_tag=LoweringMode.CAPTURE.value,
+)
+
+
 class SemanticLoweringError(ValueError):
     def __init__(
         self,
@@ -476,7 +516,8 @@ class SemanticNotebookLowerer:
         self,
         source: str,
         *,
-        mode: LoweringMode,
+        mode: LoweringMode | None = None,
+        profile: LoweringProfile | None = None,
         message_collector_key: str = "__onec_cell_messages",
         worker_exports: tuple[WorkerExport, ...] | None = None,
     ) -> SemanticLoweringResult:
@@ -493,6 +534,7 @@ class SemanticNotebookLowerer:
         return self.lower_mapped(
             visible,
             mode=mode,
+            profile=profile,
             message_collector_key=message_collector_key,
             worker_exports=worker_exports,
         )
@@ -501,10 +543,12 @@ class SemanticNotebookLowerer:
         self,
         source: MappedSource,
         *,
-        mode: LoweringMode,
+        mode: LoweringMode | None = None,
+        profile: LoweringProfile | None = None,
         message_collector_key: str = "__onec_cell_messages",
         worker_exports: tuple[WorkerExport, ...] | None = None,
     ) -> SemanticLoweringResult:
+        resolved_profile = self._resolve_profile(mode=mode, profile=profile)
         if worker_exports is not None and type(worker_exports) is not tuple:
             raise TypeError("worker exports must be an immutable tuple")
         catalog = (
@@ -518,17 +562,37 @@ class SemanticNotebookLowerer:
         try:
             return self._lower_mapped(
                 source,
-                mode=mode,
+                profile=resolved_profile,
                 message_collector_key=message_collector_key,
             )
         finally:
             del self._call_exports
 
+    @staticmethod
+    def _resolve_profile(
+        *,
+        mode: LoweringMode | None,
+        profile: LoweringProfile | None,
+    ) -> LoweringProfile:
+        if profile is not None:
+            if mode is not None:
+                raise ValueError("mode and profile cannot both be provided")
+            if not isinstance(profile, LoweringProfile):
+                raise TypeError("profile must be a LoweringProfile")
+            return profile
+        if mode is None:
+            raise TypeError("mode or profile is required")
+        if not isinstance(mode, LoweringMode):
+            raise TypeError("mode must be a LoweringMode")
+        if mode is LoweringMode.MAIN:
+            return MAIN_LOWERING_PROFILE
+        return CAPTURE_LOWERING_PROFILE
+
     def _lower_mapped(
         self,
         source: MappedSource,
         *,
-        mode: LoweringMode,
+        profile: LoweringProfile,
         message_collector_key: str,
     ) -> SemanticLoweringResult:
         if not isinstance(source, MappedSource):
@@ -546,12 +610,10 @@ class SemanticNotebookLowerer:
         root = self.parser_target.parse_ast(source.text, "БлокНоутбука")
         self._source = source.text
         self._tokens = tokenize(source.text)
-        self._mode = mode
+        self._profile = profile
         self._context = dict(self._initial_context)
         self._cell_local_names = self._loop_variables(root)
-        result_channel = (
-            "Результат" if mode is LoweringMode.MAIN else "РезультатИнструкции"
-        )
+        result_channel = profile.result_channel
         self._cell_local_names.setdefault(result_channel.casefold(), result_channel)
         module_context_aliases = self._validate_worker_context_flow(root)
         for normalized, name in self._assignment_roots(root).items():
@@ -582,7 +644,7 @@ class SemanticNotebookLowerer:
             self._edits,
             source_length=len(source.text),
         )
-        lowered = self._build_mapped_source(source, mapped_edits, mode=mode)
+        lowered = self._build_mapped_source(source, mapped_edits, profile=profile)
         self._initial_context = dict(self._context)
         self._module_context_aliases = module_context_aliases
         return SemanticLoweringResult(
@@ -1353,7 +1415,7 @@ class SemanticNotebookLowerer:
         return SourceSpan(name.start, name.end)
 
     def _require_capture_namespace(self, node: Any) -> None:
-        if self._mode is not LoweringMode.CAPTURE:
+        if self._profile.capture_namespace_rule is CaptureNamespaceRule.FORBIDDEN:
             raise SemanticLoweringError(
                 f"КонтекстОтладки is only available in CAPTURE at {node.span.start}",
                 span=SourceSpan(node.span.start, node.span.end),
@@ -1468,7 +1530,7 @@ class SemanticNotebookLowerer:
         source: MappedSource,
         edits: tuple[_MappedEdit, ...],
         *,
-        mode: LoweringMode,
+        profile: LoweringProfile,
     ) -> MappedSource:
         builder = SourceTransformBuilder(source)
         cursor = 0
@@ -1486,7 +1548,10 @@ class SemanticNotebookLowerer:
             cursor = edit.end
         if cursor < len(source.text) or not edits:
             builder.copy(SourceSpan(cursor, len(source.text)))
-        return builder.build(SourceArtifactKind.SEMANTIC_LOWERING, mode=mode.value)
+        return builder.build(
+            SourceArtifactKind.SEMANTIC_LOWERING,
+            mode=profile.source_map_tag,
+        )
 
     @classmethod
     def _validated_mapped_edits(
