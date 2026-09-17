@@ -1,0 +1,16 @@
+# Route selection and admission
+
+Design authority: [MAIN/CAPTURE execution spec](../../../../docs/superpowers/specs/2026-09-17-main-capture-execution-design.md), sections 3–6 and 10.
+
+The current implementation is `../../prototype_runtime.py` (`PrototypeRuntimeController`), with MAIN lifecycle state in `../main/operation.py`. This directory is the destination for controller extraction; `ExecutionController` and `ExecutionControllerPort` are target names. Preserve existing public imports through compatibility exports when moving implementation.
+
+- `RuntimeSession` provides MAIN/CAPTURE policy/executor route bindings, arbiter and service ports. The controller selects the admissible binding and retains the current `MainOperation` and `CaptureScope`; it does not construct a new executor for each cell.
+- Create one `MainOperation` at accepted MAIN admission, and one `CaptureScope` at each recognized capture stop before setup. Validate command identity at capture entry and completion. A MAIN command survives its CAPTURE stops; a cell reply or loss of a single frame does not establish command completion or target loss.
+- Expose stable preparation context only for MAIN ready or confirmed CAPTURE idle. `await_preparation_context`, `validate_preparation` and `submit_cell` are the target port boundaries. Tokens are opaque to callers; each preparation gets its own nonce. Validate owner/fence, context revision and namespace/Worker guards before acceptance and arrange revalidation before side effects. The controller calls version-owner ports rather than storing a second mutable catalog.
+- Stop routing and admission belong here. Lowering, expression construction, message/result formatting, eval, writeback and cleanup belong to policies/executors. Return results through typed outcomes/callback ports; executors must not import this concrete controller.
+- Do not add a second MAIN/CAPTURE phase enum. Derive readiness/status from operation/scope evidence and resource debts. A failed request, waiter detachment, transport interval timeout or recovery checkpoint alone cannot prove frame or target loss. A nonterminal MAIN operation prevents replacement admission even if legacy `OperationState` says FAILED.
+- One arbiter serializes runtime RDBG and event reading. Controller routing updates must respect that ownership; mailbox/state locks must not cover transport, user callbacks or waiting for results. Unknown dispatch/Continue remains owned until reconciled, without blind retry or activation of a replacement runtime.
+
+Transitional `OperationHandle`/`OperationState` and coordinator `CapturePhase` still support existing clients. Remove duplicated authority as their owners migrate rather than claiming the target lifecycle from those enums. The controller currently contains remote execution and setup code; extraction must preserve its fences while moving that code to the responsible executor.
+
+Focused checks: `tests/unit/test_prototype_runtime.py`, `test_main_operation.py`, `test_runtime_api.py`, `test_capture_control_plane.py` and `test_capture_resume_lifecycle.py`. New port coverage must exercise command-ID mismatch, MAIN → CAPTURE → MAIN transitions, stale context/nonce/version rejection before side effects and unknown Continue without duplicate dispatch or event readers.
