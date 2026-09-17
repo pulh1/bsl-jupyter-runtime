@@ -7,6 +7,10 @@ result or the debugger protocol's pending evaluation capability.
 from dataclasses import dataclass, field
 from enum import Enum
 
+from onec_runtime.execution.capture.resources import (
+    TemporaryCleanupDebt,
+    TemporaryCleanupState,
+)
 from onec_runtime.rdbg.models import (
     FrameVariable,
     ModuleLocation,
@@ -92,6 +96,9 @@ class CaptureScope:
     stack_frames: tuple[StackFrame, ...] = field(default=(), init=False, repr=False)
     inspection_target_id: TargetId | None = field(default=None, init=False)
     published: bool = field(default=False, init=False)
+    _temporary_keys: dict[str, TemporaryCleanupState] = field(
+        default_factory=dict, init=False, repr=False
+    )
 
     def __post_init__(self) -> None:
         if (
@@ -170,6 +177,42 @@ class CaptureScope:
             self.context_state,
             self.frame_identity,
             self.setup_error_code,
+        )
+
+    def track_temporary_key(self, key: str) -> None:
+        """Adopt a created key before any attempt to delete it."""
+
+        if not isinstance(key, str) or not key:
+            raise ValueError("temporary key must be non-empty text")
+        if key in self._temporary_keys:
+            raise ValueError("temporary key is already tracked")
+        self._temporary_keys[key] = TemporaryCleanupState.LIVE
+
+    def note_temporary_cleanup_failure(self, key: str) -> None:
+        """Record a confirmed deletion rejection without losing the frame."""
+
+        if key not in self._temporary_keys:
+            raise KeyError("temporary key is not tracked")
+        self._temporary_keys[key] = TemporaryCleanupState.CONFIRMED_FAILURE
+
+    def note_temporary_cleanup_unknown(self, key: str) -> None:
+        """Keep an ambiguous deletion blocked until its outcome is checked."""
+
+        if key not in self._temporary_keys:
+            raise KeyError("temporary key is not tracked")
+        self._temporary_keys[key] = TemporaryCleanupState.UNKNOWN
+
+    def confirm_temporary_cleanup(self, key: str) -> None:
+        """Retire a key only after deletion or absence is confirmed."""
+
+        del self._temporary_keys[key]
+
+    @property
+    def temporary_cleanup_debts(self) -> tuple[TemporaryCleanupDebt, ...]:
+        return tuple(
+            TemporaryCleanupDebt(key, state)
+            for key, state in sorted(self._temporary_keys.items())
+            if state is not TemporaryCleanupState.LIVE
         )
 
     def note_setup_uncertain(self, error: BaseException) -> None:
