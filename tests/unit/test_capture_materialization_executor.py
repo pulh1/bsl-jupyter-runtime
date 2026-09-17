@@ -277,6 +277,47 @@ def test_confirmed_cleanup_rejection_is_key_debt_and_releases_ticket() -> None:
     arbiter.close(timeout=3)
 
 
+def test_confirmed_cleanup_debt_can_be_retried_without_repeating_transfer() -> None:
+    from onec_runtime.execution.capture.materialization import CaptureMaterializationExecutor
+
+    session = Session([
+        EvaluationResult(UUID(int=4), "Строка", "D|worker_generation_value", False),
+        EvaluationResult(UUID(int=5), "Ошибка", "", True, "private cleanup error"),
+        EvaluationResult(UUID(int=6), "Булево", "Истина", False),
+    ])
+    route = RouteToken("runtime", 1, 0, "capture")
+    arbiter = RdbgArbiter(session, route)
+    scope = ready_scope()
+    key = "__onec_compact_table_" + "9" * 32
+    first = arbiter.submit(route, plan_call(scope, transfer_plan(key)))
+    arbiter.dispatch(first)
+    with pytest.raises(ConfirmedTemporaryKeyCleanupFailure):
+        first.wait(3)
+
+    executor = CaptureMaterializationExecutor(wait_interval_s=0.01)
+    retry = arbiter.submit(
+        route,
+        lambda port: executor.retry_confirmed_cleanup(
+            scope,
+            key,
+            port=port,
+            shield_workspace=lambda worker: worker.set_breakpoints(SHIELDED),
+            restore_workspace=lambda worker: worker.set_breakpoints(FULL),
+        ),
+    )
+    arbiter.dispatch(retry)
+    assert retry.wait(3) is None
+    assert scope.temporary_cleanup_debts == ()
+    sources = [value[0] for kind, value, _ in session.calls if kind == "start"]
+    assert len(sources) == 3
+    assert "admission" in sources[0]
+    assert all("admission" not in source for source in sources[1:])
+    assert all("ЗабратьКомпактнуюМатериализацию" not in source for source in sources[1:])
+    assert "Контекст.Удалить" in sources[2]
+    assert len({thread for _, _, thread in session.calls}) == 1
+    arbiter.close(timeout=3)
+
+
 def test_unknown_cleanup_retains_pending_and_blocks_next_request() -> None:
     session = Session([
         EvaluationResult(UUID(int=4), "Строка", "D|worker_generation_value", False),

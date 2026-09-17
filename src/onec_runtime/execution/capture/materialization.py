@@ -24,6 +24,7 @@ from onec_runtime.execution.capture.scope import (
     CaptureFrameIdentity,
     CaptureScope,
 )
+from onec_runtime.execution.capture.resources import TemporaryCleanupState
 from onec_runtime.execution.evaluation import (
     EvaluationPort,
     EvaluationSuspended,
@@ -232,6 +233,67 @@ class CaptureMaterializationExecutor:
             request_timeout_s=self._request_timeout_s,
             wait_interval_s=self._wait_interval_s,
         )
+
+    def retry_confirmed_cleanup(
+        self,
+        scope: CaptureScope,
+        key: str,
+        *,
+        port: CaptureMaterializationPort,
+        shield_workspace: Callable[[CaptureMaterializationPort], None],
+        restore_workspace: Callable[[CaptureMaterializationPort], None],
+    ) -> Settlement:
+        """Retry only a proved rejection of the idempotent private-key delete.
+
+        An ambiguous deletion belongs to its original arbiter ticket and must
+        be reconciled there. This operation never repeats admission or payload
+        transfer, so a value-producing expression cannot run twice.
+        """
+
+        if (
+            scope.context_state is not CaptureContextState.READY
+            or scope.frame_identity is not CaptureFrameIdentity.CONFIRMED
+            or scope.kernel_stack_level is None
+            or not isinstance(key, str)
+            or _PRIVATE_KEY.fullmatch(key) is None
+            or not any(
+                debt.key == key and debt.state is TemporaryCleanupState.CONFIRMED_FAILURE
+                for debt in scope.temporary_cleanup_debts
+            )
+        ):
+            raise ProtocolError("No confirmed CAPTURE cleanup failure can be retried")
+
+        try:
+            shield_workspace(port)
+        except BaseException as error:
+            raise CaptureOperationRepairRequired("workspace_restore") from error
+        expression = build_live_current_capture_call(
+            "Контекст.Удалить(" + bsl_string_literal(key) + ");\n"
+            "Результат = Истина;\nРезультатИнструкции = Результат;"
+        )
+        try:
+            deletion = self._evaluate(
+                port,
+                expression,
+                stack_level=scope.kernel_stack_level,
+                max_text_size=2048,
+            )
+        except (OutcomeUnknown, EvaluationSuspended):
+            scope.note_temporary_cleanup_unknown(key)
+            raise
+        except BaseException as error:
+            scope.note_temporary_cleanup_unknown(key)
+            raise TemporaryKeyCleanupOutcomeUnknown(key) from error
+
+        if not deletion.error_occurred:
+            scope.confirm_temporary_cleanup(key)
+        try:
+            restore_workspace(port)
+        except BaseException as error:
+            raise CaptureOperationRepairRequired("workspace_restore") from error
+        if deletion.error_occurred:
+            raise ConfirmedTemporaryKeyCleanupFailure(key)
+        return Settlement(None)
 
     @staticmethod
     def _validate(scope: CaptureScope, plan: CaptureMaterializationPlan) -> None:
