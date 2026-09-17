@@ -31,6 +31,7 @@ from onec_runtime.errors import (
     CaptureValueAccessDeniedError,
     CaptureValueCheckError,
     CommandTimeout,
+    EvaluationDispatchUnknown,
     NoCaptureEvaluationError,
     ProtocolError,
     StaleCaptureError,
@@ -383,8 +384,15 @@ class CaptureStatus:
             if self.evaluation_kind is not None:
                 raise ValueError("evaluation_kind requires pending_evaluation_id")
         else:
-            if self.phase is not CapturePhase.EVALUATING:
-                raise ValueError("pending_evaluation_id requires evaluating phase")
+            if self.phase not in {
+                CapturePhase.EVALUATING,
+                CapturePhase.OUTCOME_UNKNOWN,
+            }:
+                raise ValueError("pending_evaluation_id requires an active evaluation phase")
+            if self.phase is CapturePhase.OUTCOME_UNKNOWN and self.failure is None:
+                raise ValueError(
+                    "pending_evaluation_id requires failure during outcome_unknown"
+                )
             object.__setattr__(
                 self,
                 "evaluation_kind",
@@ -413,8 +421,13 @@ class CaptureStatus:
             selected_id = self.pending_evaluation_id or self.last_evaluation_id
             if selected_id is None or self.evaluation_timing.evaluation_id != selected_id:
                 raise ValueError("evaluation_timing does not match selected evaluation")
-        if self.phase is CapturePhase.OUTCOME_UNKNOWN and self.last_evaluation_id is None:
-            raise ValueError("outcome_unknown phase requires last_evaluation_id")
+        if (
+            self.phase is CapturePhase.OUTCOME_UNKNOWN
+            and self.pending_evaluation_id is None
+            and self.last_evaluation_id is None
+            and self.failure is None
+        ):
+            raise ValueError("outcome_unknown phase requires last_evaluation_id or failure")
 
     @property
     def can_inspect(self) -> bool:
@@ -1182,7 +1195,10 @@ class CaptureEvaluationCoordinator:
             self._require_fence_locked(request.fence)
             if self._phase is CapturePhase.OUTCOME_UNKNOWN:
                 raise CaptureOutcomeUnknownError(
-                    self._last.evaluation_id if self._last is not None else None, self._failure,
+                    self._active.evaluation_id if self._active is not None
+                    else None if self._active_resume is not None
+                    else self._last.evaluation_id if self._last is not None else None,
+                    self._failure,
                 )
             if self._phase is CapturePhase.RECOVERY_REQUIRED:
                 raise CaptureRecoveryRequiredError(self._failure)
@@ -1229,7 +1245,9 @@ class CaptureEvaluationCoordinator:
             self._require_fence_locked(request.fence)
             if self._phase is CapturePhase.OUTCOME_UNKNOWN:
                 raise CaptureOutcomeUnknownError(
-                    self._last.evaluation_id if self._last is not None else None,
+                    self._active.evaluation_id if self._active is not None
+                    else None if self._active_resume is not None
+                    else self._last.evaluation_id if self._last is not None else None,
                     self._failure,
                 )
             if self._phase is CapturePhase.RECOVERY_REQUIRED:
@@ -1896,6 +1914,14 @@ class CaptureEvaluationCoordinator:
             ) from None
         except TargetLost:
             raise _RemoteStepFailure(CapturePhase.STALE, "target_lost", uncertain=True) from None
+        except EvaluationDispatchUnknown as error:
+            capability = error.pending
+            with self._condition:
+                record.capability = capability
+                record.acknowledged = True
+                self._phase = CapturePhase.OUTCOME_UNKNOWN
+                self._failure = _diagnostic("dispatch_uncertain")
+                self._condition.notify_all()
         except BaseException:
             raise _RemoteStepFailure(
                 CapturePhase.OUTCOME_UNKNOWN if entered else CapturePhase.PAUSED,
@@ -1945,7 +1971,11 @@ class CaptureEvaluationCoordinator:
                 raise _RemoteStepFailure(CapturePhase.RECOVERY_REQUIRED, "evaluation_stream_failed", uncertain=True)
             with self._condition:
                 record.capability = None
+                if isinstance(record, _CaptureResumeRecord):
+                    self._phase = CapturePhase.RESUMING
+                    self._failure = None
                 self._evidence_locked(record, "result_received", step_index=step_index)
+                self._condition.notify_all()
             self._flush_evidence()
             with self._condition:
                 closing = self._closing

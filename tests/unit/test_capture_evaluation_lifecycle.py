@@ -20,6 +20,8 @@ from onec_runtime.capture_evaluation import (
     CaptureEvaluationTicket,
     CaptureFence,
     CapturePhase,
+    CaptureRemoteStep,
+    CaptureResumeRequest,
 )
 from onec_runtime.errors import (
     CaptureBusyError,
@@ -27,6 +29,7 @@ from onec_runtime.errors import (
     CaptureOutcomeUnknownError,
     CaptureRecoveryRequiredError,
     CommandTimeout,
+    EvaluationDispatchUnknown,
     StaleCaptureError,
     TargetLost,
 )
@@ -423,12 +426,13 @@ def test_rdbg_dispatch_marker_runs_at_transport_entry_before_acceptance() -> Non
     transport = FailingEvalTransport()
     session = ready_rdbg(transport)
 
-    with pytest.raises(OSError, match="transport failure"):
+    with pytest.raises(EvaluationDispatchUnknown) as raised:
         session.start_evaluation(
             "Результат = 1",
             on_transport_dispatch=transport.mark_evalexpr_dispatch,
         )
 
+    assert isinstance(raised.value.__cause__, OSError)
     assert transport.dispatch_marker_set is True
     assert transport.request_entered is True
     assert transport.calls == ["evalExpr"]
@@ -447,9 +451,9 @@ def test_rdbg_dispatch_marker_runs_at_transport_entry_before_acceptance() -> Non
         ),
         (
             "Результат = 1",
-            CapturePhase.OUTCOME_UNKNOWN,
-            CaptureEvaluationState.UNKNOWN,
-            "dispatch_uncertain",
+            CapturePhase.RECOVERY_REQUIRED,
+            CaptureEvaluationState.FAILED,
+            "evaluation_stream_failed",
             "quarantine",
             ["evalExpr"],
         ),
@@ -565,11 +569,12 @@ def test_coordinator_keeps_local_eval_request_build_before_dispatch_boundary(
             real_build_eval_request,
         )
         transport.reset_observations()
-        with pytest.raises(OSError, match="transport failure"):
+        with pytest.raises(EvaluationDispatchUnknown) as raised:
             session.start_evaluation(
                 "Результат = 2",
                 on_transport_dispatch=transport.mark_evalexpr_dispatch,
             )
+        assert isinstance(raised.value.__cause__, OSError)
         assert transport.dispatch_marker_set is True
         assert transport.request_entered is True
         assert transport.calls == ["evalExpr"]
@@ -1004,6 +1009,153 @@ def test_transport_entry_without_known_acceptance_is_the_only_outcome_unknown_ca
         assert controller.breakpoint_workspace_owner.confirmed_snapshot.shielded is True
     finally:
         close_owner(controller, session)
+
+
+def test_dispatch_unknown_keeps_capability_for_eventual_result_without_redispatch() -> None:
+    fence = CaptureFence(7, 1, 1)
+    owner = CaptureEvaluationCoordinator(fence, poll_interval_s=0.01)
+    pending = PendingEvaluation(TARGET, uuid4(), object())
+    dispatches: list[str] = []
+    polled: list[PendingEvaluation] = []
+    dispositions: list[str] = []
+    first_poll = Event()
+    release_result = Event()
+
+    def dispatch(entered):  # type: ignore[no-untyped-def]
+        entered()
+        dispatches.append("evalExpr")
+        try:
+            raise OSError("synthetic evalExpr transport failure")
+        except OSError as error:
+            raise EvaluationDispatchUnknown(pending) from error
+
+    def poll(capability: PendingEvaluation, timeout_s: float) -> EvaluationResult:
+        del timeout_s
+        polled.append(capability)
+        if len(polled) == 1:
+            first_poll.set()
+            raise CommandTimeout("synthetic pending result")
+        assert release_result.wait(1)
+        return EvaluationResult(capability.result_id, "Число", "901", False)
+
+    try:
+        ticket = owner.submit_evaluation(CaptureEvaluationRequest(
+            fence,
+            CaptureEvaluationKind.USER_BSL,
+            dispatch,
+            poll,
+            lambda result: result.presentation,
+            pin_lease=dispositions.append,
+        ))
+
+        assert first_poll.wait(1)
+        pending_status = owner.status(fence)
+        assert pending_status.phase is CapturePhase.OUTCOME_UNKNOWN
+        assert pending_status.pending_evaluation_id == ticket.evaluation_id
+        assert pending_status.evaluation_kind is CaptureEvaluationKind.USER_BSL
+        assert pending_status.failure is not None
+        assert pending_status.failure.code == "dispatch_uncertain"
+        assert pending_status.can_wait
+        assert not pending_status.can_resume_capture
+        release_result.set()
+        outcome = owner.wait(fence, ticket.evaluation_id, timeout_s=1)
+
+        assert outcome.state is CaptureEvaluationState.COMPLETED
+        assert outcome.result == "901"
+        settled_status = owner.status(fence)
+        assert settled_status.phase is CapturePhase.PAUSED
+        assert settled_status.failure is None
+        assert settled_status.can_resume_capture
+        assert dispatches == ["evalExpr"]
+        assert polled == [pending, pending]
+        assert dispositions == ["release"]
+    finally:
+        owner.begin_close()
+        assert owner.join(2)
+
+
+def test_resume_dispatch_unknown_keeps_capability_until_continue_acknowledgement() -> None:
+    fence = CaptureFence(7, 1, 1)
+    owner = CaptureEvaluationCoordinator(fence, poll_interval_s=0.01)
+    previous_pending = PendingEvaluation(TARGET, uuid4(), object())
+    previous_ticket = owner.submit_evaluation(CaptureEvaluationRequest(
+        fence,
+        CaptureEvaluationKind.USER_BSL,
+        lambda entered: previous_pending,
+        lambda capability, timeout_s: EvaluationResult(
+            capability.result_id, "Число", "900", False,
+        ),
+        lambda result: result.presentation,
+    ))
+    assert owner.wait(fence, previous_ticket.evaluation_id, timeout_s=1).result == "900"
+    pending = PendingEvaluation(TARGET, uuid4(), object())
+    dispatches: list[str] = []
+    polled: list[PendingEvaluation] = []
+    first_poll = Event()
+    release_result = Event()
+    remote_step_finished = Event()
+    finish_resume = Event()
+
+    def dispatch(entered):  # type: ignore[no-untyped-def]
+        entered()
+        dispatches.append("evalExpr")
+        try:
+            raise OSError("synthetic evalExpr transport failure")
+        except OSError as error:
+            raise EvaluationDispatchUnknown(pending) from error
+
+    def poll(capability: PendingEvaluation, timeout_s: float) -> EvaluationResult:
+        del timeout_s
+        polled.append(capability)
+        if len(polled) == 1:
+            first_poll.set()
+            raise CommandTimeout("synthetic pending result")
+        assert release_result.wait(1)
+        return EvaluationResult(capability.result_id, "Булево", "Истина", False)
+
+    def execute(context):  # type: ignore[no-untyped-def]
+        context.execute_inline(CaptureRemoteStep(dispatch, poll))
+        remote_step_finished.set()
+        assert finish_resume.wait(1)
+        return "resumed"
+
+    try:
+        request = CaptureResumeRequest(
+            fence,
+            lambda: None,
+            lambda: None,
+            execute,
+            settlement=lambda error: (CapturePhase.PAUSED, None),
+        )
+        ticket = owner.submit_resume(request)
+
+        assert first_poll.wait(1)
+        uncertain = owner.status(fence)
+        assert uncertain.phase is CapturePhase.OUTCOME_UNKNOWN
+        assert uncertain.pending_evaluation_id is None
+        assert uncertain.evaluation_kind is None
+        assert uncertain.failure is not None
+        assert uncertain.failure.code == "dispatch_uncertain"
+        assert uncertain.can_wait
+        with pytest.raises(CaptureOutcomeUnknownError) as blocked:
+            owner.submit_resume(request)
+        assert blocked.value.evaluation_id is None
+
+        release_result.set()
+        assert remote_step_finished.wait(1)
+        assert owner.status(fence).phase is CapturePhase.RESUMING
+        owner.mark_continue_acknowledged(fence)
+        assert not owner.capture_view_is_current(fence)
+
+        finish_resume.set()
+        assert ticket.wait_initiator(timeout_s=1) == "resumed"
+        assert dispatches == ["evalExpr"]
+        assert polled == [pending, pending]
+    finally:
+        release_result.set()
+        finish_resume.set()
+        owner.begin_close()
+        assert owner.join(2)
 
 
 def test_initiator_error_policy_runs_once_outside_condition_and_can_read_status() -> None:
