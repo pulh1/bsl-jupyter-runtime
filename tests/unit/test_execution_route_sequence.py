@@ -30,7 +30,7 @@ from onec_runtime.table_value import evaluation_to_python
 
 
 TARGET = TargetId(UUID(int=1), "route-test")
-BUSINESS = ModuleLocation("ExtensionModule", "", UUID(int=2), UUID(int=3), 50, "Runtime")
+BUSINESS = ModuleLocation("ExtensionModule", "", UUID(int=20), UUID(int=30), 50, "Business")
 KERNEL = ModuleLocation("ExtensionModule", "", UUID(int=2), UUID(int=3), 60, "Runtime")
 CAPTURE_STOP = StopEvent(
     TARGET,

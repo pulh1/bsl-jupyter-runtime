@@ -23,8 +23,10 @@ from onec_runtime.execution.arbiter import (
 from onec_runtime.execution.capture.adapter import CaptureSetupAdapter
 from onec_runtime.execution.capture.cell_evaluator import CaptureCellEvaluator
 from onec_runtime.execution.capture.executor import CaptureExecutor
+from onec_runtime.execution.capture.inspection import CaptureInspectionExecutor
 from onec_runtime.execution.capture.operation_executor import CaptureCellOperationExecutor
 from onec_runtime.execution.capture.scope import CaptureContextState, CaptureScope
+from onec_runtime.execution.capture.writeback import CaptureWritebackExecutor
 from onec_runtime.execution.main import MainExecutor, MainOperation, MainPhase
 from onec_runtime.execution.main.completion import MainRemoteCompletion, read_main_completion
 from onec_runtime.rdbg.models import EvaluationResult, StopEvent
@@ -65,6 +67,8 @@ class ExecutionController:
         self._main_executor = main_executor
         self._capture_executor = capture_executor
         self._capture_cell_executor = CaptureCellOperationExecutor(capture_cell_evaluator)
+        self._capture_inspection_executor = CaptureInspectionExecutor()
+        self._capture_writeback_executor = CaptureWritebackExecutor()
         self._registry = registry
         self._generation = runtime_generation
         self._lock = RLock()
@@ -115,6 +119,7 @@ class ExecutionController:
         self,
         lowered_source: str,
         *,
+        dirty_roots: tuple[str, ...] = (),
         result_policy: Callable[[EvaluationResult], object] | None = None,
     ) -> ExecutionTicket:
         """Run one cell inside the current stop; policy interprets its result."""
@@ -132,6 +137,7 @@ class ExecutionController:
             ):
                 raise ProtocolError("No ready CAPTURE stop is available")
             selected_policy = result_policy or (lambda result: result)
+            scope.admit_cell_dirty_roots(dirty_roots)
 
             def plan(port: SessionPort) -> Settlement:
                 return self._capture_cell_executor.execute(
@@ -153,11 +159,7 @@ class ExecutionController:
             return ticket
 
     def submit_resume(self) -> ExecutionTicket:
-        """Close a clean CAPTURE context and resume the same MAIN command.
-
-        Dirty-root writeback is not yet connected to this component path. The
-        product RuntimeApi must not route a dirty scope here until it is.
-        """
+        """Write dirty roots, close CAPTURE, and resume the same MAIN command."""
 
         with self._lock:
             scope = self.capture_scope
@@ -175,6 +177,11 @@ class ExecutionController:
                 raise ProtocolError("CAPTURE temporary cleanup debt requires repair")
 
             def plan(port: SessionPort) -> Settlement:
+                ledger = scope.begin_writeback()
+                assert scope.kernel_stack_level is not None
+                self._capture_writeback_executor.flush(
+                    port, ledger, stack_level=scope.kernel_stack_level
+                )
                 self._capture_executor.end_scope(
                     scope, port=CaptureSetupAdapter(port)
                 )
@@ -192,6 +199,34 @@ class ExecutionController:
                 port.handoff_route(next_route)
                 stop = self._main_executor.await_stop(port=port)
                 return self._route_stop(port, operation, stop)
+
+            ticket = self._arbiter.submit(route, plan)
+            self._arbiter.dispatch(ticket)
+            return ticket
+
+    def submit_capture_variable(
+        self, name: str, *, stack_level: int = 0
+    ) -> ExecutionTicket:
+        """Read one user-frame variable in the current CAPTURE stop."""
+
+        with self._lock:
+            scope = self.capture_scope
+            operation = self.main_operation
+            route = self._capture_route
+            if (
+                scope is None
+                or scope.context_state is not CaptureContextState.READY
+                or operation is None
+                or operation.phase is not MainPhase.SUSPENDED_CAPTURE
+                or route is None
+            ):
+                raise ProtocolError("No ready CAPTURE stop is available")
+
+            def plan(port: SessionPort) -> Settlement:
+                variable = self._capture_inspection_executor.read_variable(
+                    scope, name, stack_level=stack_level, port=port
+                )
+                return Settlement(variable)
 
             ticket = self._arbiter.submit(route, plan)
             self._arbiter.dispatch(ticket)
