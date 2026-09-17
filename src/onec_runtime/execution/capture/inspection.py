@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Protocol
 
-from onec_runtime.errors import ProtocolError
+from onec_runtime.capture_values import (
+    MAX_PAGE_ITEMS,
+    SafePathSegment,
+    ValuePathSegmentKind,
+)
+from onec_runtime.errors import CapturePathError, ProtocolError
 from onec_runtime.execution.capture.scope import (
     CaptureContextState,
     CaptureFrameIdentity,
@@ -30,6 +36,18 @@ class CaptureInspectionPort(EvaluationPort, Protocol):
 
 class CaptureInspectionUnavailable(ProtocolError):
     """A confirmed inspection failure that does not invalidate the frame."""
+
+
+MAX_NATIVE_VARIABLE_INVENTORY = 10_000
+
+
+@dataclass(frozen=True, slots=True)
+class NativeVariablePage:
+    """Only safe variable names, never RDBG value presentations."""
+
+    names: tuple[str, ...]
+    total: int
+    next_cursor: int | None
 
 
 class CaptureInspectionExecutor:
@@ -72,6 +90,65 @@ class CaptureInspectionExecutor:
         if len(matches) != 1:
             raise CaptureInspectionUnavailable("CAPTURE variable is unavailable")
         return matches[0]
+
+    def read_variable_page(
+        self,
+        scope: CaptureScope,
+        *,
+        stack_level: int,
+        start: int,
+        stop: int,
+        port: CaptureInspectionPort,
+    ) -> NativeVariablePage:
+        """Read one bounded page of safe native-frame variable names.
+
+        The complete RDBG inventory is private input and capped before any
+        names are exposed. The checks here compare saved scope/frame/target
+        fields; they do not query the remote target to prove the same stop.
+        The owner must admit this plan through the arbiter's route fence.
+        A confirmed RDBG error only settles this inspection request.
+        """
+
+        self._require_frame(scope, stack_level, allow_kernel=False)
+        if (
+            type(start) is not int
+            or type(stop) is not int
+            or start < 0
+            or stop < start
+        ):
+            raise ValueError("CAPTURE variable pages require nonnegative bounds")
+        if stop - start > MAX_PAGE_ITEMS:
+            raise ValueError("CAPTURE variable pages require at most 100 names")
+        response = port.local_variables(
+            stack_level=stack_level, timeout_s=self._request_timeout_s
+        )
+        self._require_frame(scope, stack_level, allow_kernel=False)
+        if not isinstance(response, LocalVariablesResult) or response.error_occurred:
+            raise CaptureInspectionUnavailable("CAPTURE frame variables are unavailable")
+        variables = response.variables
+        if (
+            type(variables) is not tuple
+            or len(variables) > MAX_NATIVE_VARIABLE_INVENTORY
+            or any(not isinstance(item, FrameVariable) for item in variables)
+        ):
+            raise CaptureInspectionUnavailable("CAPTURE frame inventory is unavailable")
+        try:
+            names = tuple(
+                SafePathSegment(ValuePathSegmentKind.VARIABLE, item.name).key
+                for item in variables
+            )
+        except CapturePathError as error:
+            raise CaptureInspectionUnavailable(
+                "CAPTURE frame inventory is unavailable"
+            ) from error
+        if len({name.casefold() for name in names}) != len(names):
+            raise CaptureInspectionUnavailable("CAPTURE frame inventory is unavailable")
+        selected = names[start:stop]
+        return NativeVariablePage(
+            selected,
+            len(names),
+            stop if selected and stop < len(names) else None,
+        )
 
     def evaluate_helper(
         self,

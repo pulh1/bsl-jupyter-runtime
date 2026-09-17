@@ -144,6 +144,207 @@ def test_confirmed_variable_read_failure_settles_only_request_and_retry_succeeds
     arbiter.close(timeout=3)
 
 
+def test_native_variable_page_exposes_only_bounded_names_and_cursor() -> None:
+    from onec_runtime.execution.capture.inspection import CaptureInspectionExecutor
+
+    variables = (
+        FrameVariable("Первый", "Строка", "private value A"),
+        FrameVariable("Второй", "Строка", "private value B"),
+        FrameVariable("Третий", "Строка", "private value C"),
+        FrameVariable("Четвертый", "Строка", "private value D"),
+    )
+    session = Session([LocalVariablesResult(UUID(int=12), variables)])
+    route = RouteToken("runtime", 1, 0, "capture")
+    arbiter = RdbgArbiter(session, route)
+    scope = ready_scope()
+    executor = CaptureInspectionExecutor(request_timeout_s=3)
+    ticket = arbiter.submit(
+        route,
+        lambda port: Settlement(
+            executor.read_variable_page(
+                scope, stack_level=0, start=1, stop=3, port=port
+            )
+        ),
+    )
+    arbiter.dispatch(ticket)
+
+    page = ticket.wait(3)
+    assert page.names == ("Второй", "Третий")
+    assert page.total == 4
+    assert page.next_cursor == 3
+    assert "private value" not in repr(page)
+    assert [(kind, payload) for kind, payload, _ in session.calls] == [
+        ("locals", (0, 3))
+    ]
+    assert session.calls[0][2] != get_ident()
+    arbiter.close(timeout=3)
+
+
+def test_native_variable_page_rejects_kernel_and_invalid_bounds_before_rdbg() -> None:
+    from onec_runtime.execution.capture.inspection import CaptureInspectionExecutor
+
+    session = Session([])
+    route = RouteToken("runtime", 1, 0, "capture")
+    arbiter = RdbgArbiter(session, route)
+    scope = ready_scope()
+    executor = CaptureInspectionExecutor()
+
+    for level, start, stop, expected in (
+        (2, 0, 1, "kernel"),
+        (0, 0, 101, "at most 100"),
+        (0, -1, 1, "nonnegative"),
+    ):
+        ticket = arbiter.submit(
+            route,
+            lambda port, level=level, start=start, stop=stop: Settlement(
+                executor.read_variable_page(
+                    scope, stack_level=level, start=start, stop=stop, port=port
+                )
+            ),
+        )
+        arbiter.dispatch(ticket)
+        with pytest.raises(ValueError, match=expected):
+            ticket.wait(3)
+
+    assert session.calls == []
+    assert scope.context_state is CaptureContextState.READY
+    arbiter.close(timeout=3)
+
+
+def test_confirmed_native_variable_page_error_allows_retry_on_same_scope() -> None:
+    from onec_runtime.execution.capture.inspection import (
+        CaptureInspectionExecutor,
+        CaptureInspectionUnavailable,
+    )
+
+    rejected = LocalVariablesResult(UUID(int=12), (), True, "private debugger path")
+    accepted = LocalVariablesResult(
+        UUID(int=13), (FrameVariable("Счетчик", "Число", "25"),)
+    )
+    session = Session([rejected, accepted])
+    route = RouteToken("runtime", 1, 0, "capture")
+    arbiter = RdbgArbiter(session, route)
+    scope = ready_scope()
+    executor = CaptureInspectionExecutor()
+
+    first = arbiter.submit(
+        route,
+        lambda port: Settlement(
+            executor.read_variable_page(
+                scope, stack_level=0, start=0, stop=1, port=port
+            )
+        ),
+    )
+    arbiter.dispatch(first)
+    with pytest.raises(CaptureInspectionUnavailable) as failure:
+        first.wait(3)
+    assert "private debugger path" not in str(failure.value)
+    assert first.status().settled
+    assert scope.frame_identity is CaptureFrameIdentity.CONFIRMED
+
+    second = arbiter.submit(
+        route,
+        lambda port: Settlement(
+            executor.read_variable_page(
+                scope, stack_level=0, start=0, stop=1, port=port
+            )
+        ),
+    )
+    arbiter.dispatch(second)
+    assert second.wait(3).names == ("Счетчик",)
+    arbiter.close(timeout=3)
+
+
+def test_native_variable_page_rejects_duplicate_or_unsafe_inventory() -> None:
+    from onec_runtime.execution.capture.inspection import (
+        CaptureInspectionExecutor,
+        CaptureInspectionUnavailable,
+    )
+
+    inventories = (
+        (FrameVariable("Имя", "Строка", "a"), FrameVariable("имя", "Строка", "b")),
+        (FrameVariable("Недопустимое имя", "Строка", "private"),),
+    )
+    session = Session(
+        [LocalVariablesResult(UUID(int=14 + index), values)
+         for index, values in enumerate(inventories)]
+    )
+    route = RouteToken("runtime", 1, 0, "capture")
+    arbiter = RdbgArbiter(session, route)
+    scope = ready_scope()
+    executor = CaptureInspectionExecutor()
+    for _ in inventories:
+        ticket = arbiter.submit(
+            route,
+            lambda port: Settlement(
+                executor.read_variable_page(
+                    scope, stack_level=0, start=0, stop=1, port=port
+                )
+            ),
+        )
+        arbiter.dispatch(ticket)
+        with pytest.raises(CaptureInspectionUnavailable) as failure:
+            ticket.wait(3)
+        assert "private" not in str(failure.value)
+        assert scope.context_state is CaptureContextState.READY
+    arbiter.close(timeout=3)
+
+
+def test_native_variable_page_rejects_oversized_private_inventory() -> None:
+    from onec_runtime.execution.capture.inspection import (
+        CaptureInspectionExecutor,
+        CaptureInspectionUnavailable,
+    )
+
+    oversized = tuple(
+        FrameVariable(f"V{index}", "Число", "private presentation")
+        for index in range(10_001)
+    )
+    session = Session([LocalVariablesResult(UUID(int=16), oversized)])
+    route = RouteToken("runtime", 1, 0, "capture")
+    arbiter = RdbgArbiter(session, route)
+    scope = ready_scope()
+    ticket = arbiter.submit(
+        route,
+        lambda port: Settlement(
+            CaptureInspectionExecutor().read_variable_page(
+                scope, stack_level=0, start=0, stop=1, port=port
+            )
+        ),
+    )
+    arbiter.dispatch(ticket)
+
+    with pytest.raises(CaptureInspectionUnavailable) as failure:
+        ticket.wait(3)
+    assert "private presentation" not in str(failure.value)
+    assert scope.frame_identity is CaptureFrameIdentity.CONFIRMED
+    arbiter.close(timeout=3)
+
+
+def test_native_variable_page_rejects_scope_target_mismatch_before_rdbg() -> None:
+    from onec_runtime.execution.capture.inspection import CaptureInspectionExecutor
+
+    session = Session([])
+    route = RouteToken("runtime", 1, 0, "capture")
+    arbiter = RdbgArbiter(session, route)
+    scope = ready_scope()
+    scope.inspection_target_id = TargetId(UUID(int=99), "test")
+    ticket = arbiter.submit(
+        route,
+        lambda port: Settlement(
+            CaptureInspectionExecutor().read_variable_page(
+                scope, stack_level=0, start=0, stop=1, port=port
+            )
+        ),
+    )
+    arbiter.dispatch(ticket)
+
+    with pytest.raises(RuntimeError, match="not ready"):
+        ticket.wait(3)
+    assert session.calls == []
+    arbiter.close(timeout=3)
+
+
 def test_helper_eval_dispatches_once_and_reuses_pending_across_empty_intervals() -> None:
     from onec_runtime.execution.capture.inspection import CaptureInspectionExecutor
 

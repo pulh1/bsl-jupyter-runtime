@@ -110,57 +110,77 @@ class ExecutionController:
         self.capture_scope: CaptureScope | None = None
         self._capture_route: RouteToken | None = None
         self._resume_ticket: ExecutionTicket | None = None
+        self._main_stop_ticket: ExecutionTicket | None = None
         self._preparation_revision = 0
         self._preparations: dict[object, _PreparationRecord] = {}
 
     def await_preparation_context(self) -> PreparationContext | Unavailable:
         """Select one stable statement route without reserving RDBG for lowering.
 
-        This component boundary reports an active remote operation as typed
-        unavailable; waiting across it belongs to the future composition root.
+        A MAIN command's stop ticket is observed outside the controller lock.
+        Its initiating notebook waiter may detach without cancelling this wait.
         """
 
         parser_target = self._parser_target
         provider = self._snapshot_provider
         if parser_target is None or provider is None:
             return Unavailable("Statement preparation is not configured")
-        snapshot = provider()
-        if not isinstance(snapshot, RoutePreparationSnapshot):
-            raise TypeError("snapshot provider must return RoutePreparationSnapshot")
-        with self._lock:
-            operation = self.main_operation
-            scope = self.capture_scope
-            if self._resume_in_flight() or self._arbiter.has_pending_operations:
-                return Unavailable("RDBG operation is still active")
-            if (
-                scope is not None
-                and scope.context_state is CaptureContextState.READY
-                and scope.frame_identity is CaptureFrameIdentity.CONFIRMED
-                and operation is not None
-                and operation.phase is MainPhase.SUSPENDED_CAPTURE
-            ):
-                owner: MainOperation | CaptureScope | None = scope
-                policy = CaptureCellPolicy(SnapshotRouteBinding(
-                    parser_target, owner=snapshot.owner, version=snapshot.version
-                ))
-            elif scope is None and (operation is None or operation.terminal):
-                owner = operation
-                policy = MainCellPolicy(SnapshotRouteBinding(
-                    parser_target, owner=snapshot.owner, version=snapshot.version
-                ))
-            else:
-                return Unavailable("No stable MAIN or CAPTURE route is available")
-            route = self._arbiter.current_route
-            token = object()
-            nonce = object()
-            context = PreparationContext(token, nonce, policy, snapshot)
-            self._preparations[nonce] = _PreparationRecord(
-                context, route, self._preparation_revision, snapshot, owner
-            )
-            # Abandoned local preparations cannot retain an unbounded history.
-            if len(self._preparations) > 1024:
-                self._preparations.pop(next(iter(self._preparations)))
-            return context
+        while True:
+            with self._lock:
+                stop_ticket = self._main_stop_ticket
+                if stop_ticket is not None and stop_ticket.status().settled:
+                    self._main_stop_ticket = None
+                    stop_ticket = None
+            if stop_ticket is not None:
+                try:
+                    stop_ticket.wait_settled()
+                except Exception:
+                    # A settled MAIN error still needs route classification.
+                    pass
+                continue
+
+            snapshot = provider()
+            if not isinstance(snapshot, RoutePreparationSnapshot):
+                raise TypeError("snapshot provider must return RoutePreparationSnapshot")
+            with self._lock:
+                stop_ticket = self._main_stop_ticket
+                if stop_ticket is not None:
+                    if not stop_ticket.status().settled:
+                        continue
+                    self._main_stop_ticket = None
+                operation = self.main_operation
+                scope = self.capture_scope
+                if self._resume_in_flight() or self._arbiter.has_pending_operations:
+                    return Unavailable("RDBG operation is still active")
+                if (
+                    scope is not None
+                    and scope.context_state is CaptureContextState.READY
+                    and scope.frame_identity is CaptureFrameIdentity.CONFIRMED
+                    and operation is not None
+                    and operation.phase is MainPhase.SUSPENDED_CAPTURE
+                ):
+                    owner: MainOperation | CaptureScope | None = scope
+                    policy = CaptureCellPolicy(SnapshotRouteBinding(
+                        parser_target, owner=snapshot.owner, version=snapshot.version
+                    ))
+                elif scope is None and (operation is None or operation.terminal):
+                    owner = operation
+                    policy = MainCellPolicy(SnapshotRouteBinding(
+                        parser_target, owner=snapshot.owner, version=snapshot.version
+                    ))
+                else:
+                    return Unavailable("No stable MAIN or CAPTURE route is available")
+                route = self._arbiter.current_route
+                token = object()
+                nonce = object()
+                context = PreparationContext(token, nonce, policy, snapshot)
+                self._preparations[nonce] = _PreparationRecord(
+                    context, route, self._preparation_revision, snapshot, owner
+                )
+                # Abandoned local preparations cannot retain an unbounded history.
+                if len(self._preparations) > 1024:
+                    self._preparations.pop(next(iter(self._preparations)))
+                return context
 
     def validate_preparation(
         self, context: PreparationContext, guards: object
@@ -339,12 +359,15 @@ class ExecutionController:
             ticket: ExecutionTicket | None = None
             try:
                 ticket = self._arbiter.submit(route, plan)
+                self._main_stop_ticket = ticket
                 if _receipt is not None:
                     _receipt.adopt(ticket)
                 self._preparation_revision += 1
                 self._arbiter.dispatch(ticket)
             except BaseException:
                 if _receipt is None or _receipt.ticket is None:
+                    if self._main_stop_ticket is ticket:
+                        self._main_stop_ticket = None
                     self.main_operation = None
                     self._command_sequence -= 1
                 elif ticket is not None:
@@ -461,6 +484,7 @@ class ExecutionController:
 
             ticket = self._arbiter.submit(route, plan)
             self._resume_ticket = ticket
+            self._main_stop_ticket = ticket
             self._preparation_revision += 1
             self._arbiter.dispatch(ticket)
             return ticket
@@ -603,6 +627,7 @@ class ExecutionController:
                 return self._route_stop(port, operation, stop)
 
             ticket = self._arbiter.submit(route, plan)
+            self._main_stop_ticket = ticket
             self._preparation_revision += 1
             self._arbiter.dispatch(ticket)
             return ticket

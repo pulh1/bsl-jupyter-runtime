@@ -1,6 +1,6 @@
 """Controller-selected statement preparation has one fenced admission path."""
 
-from threading import Event, get_ident
+from threading import Event, Thread, get_ident
 
 import pytest
 
@@ -248,6 +248,7 @@ def test_worker_revalidates_snapshot_before_first_remote_side_effect() -> None:
             accepted.ticket.wait_initiator()
         assert session.calls == []
         assert controller.main_operation.phase is MainPhase.FAILED_BEFORE_DISPATCH
+        assert isinstance(controller.await_preparation_context().policy, MainCellPolicy)
     finally:
         release.set()
         arbiter.close(timeout=3)
@@ -313,7 +314,7 @@ def test_submission_receipt_is_adopted_before_first_transport_entry() -> None:
         arbiter.close(timeout=3)
 
 
-def test_main_in_flight_reports_temporary_unavailable_without_blocking_caller() -> None:
+def test_preparation_waits_for_main_stop_without_holding_controller_lock() -> None:
     entered = Event()
     release = Event()
 
@@ -332,16 +333,129 @@ def test_main_in_flight_reports_temporary_unavailable_without_blocking_caller() 
         lambda: RoutePreparationSnapshot(owner, 1, (), ()),
         session=WaitingSession(),
     )
+    result = []
+    finished = Event()
+
+    def await_route():
+        try:
+            result.append(controller.await_preparation_context())
+        finally:
+            finished.set()
+
+    waiter = Thread(target=await_route)
     try:
+        old_context = controller.await_preparation_context()
         ticket = controller.submit_main("Результат = 1;")
         assert entered.wait(3)
-        unavailable = controller.await_preparation_context()
-        assert isinstance(unavailable, Unavailable)
-        assert "active" in unavailable.reason
+        ticket.detach_waiter()
+        waiter.start()
+        assert not finished.wait(0.1)
+        assert isinstance(
+            controller.validate_preparation(
+                old_context, old_context.capabilities.for_pipeline().guards
+            ), StalePreparation
+        )
         release.set()
-        assert ticket.wait_initiator().kind.value == "capture"
+        assert ticket.wait_settled().kind.value == "capture"
+        assert finished.wait(3)
+        assert isinstance(result[0].policy, CaptureCellPolicy)
     finally:
         release.set()
+        waiter.join(3)
+        ticket.wait_settled(3)
+        arbiter.close(timeout=3)
+
+
+def test_preparation_waits_for_queued_main_before_choosing_capture_route() -> None:
+    blocker_entered = Event()
+    release_blocker = Event()
+    finished = Event()
+    result = []
+
+    owner = object()
+    controller, arbiter, _session, _parser = _runtime(
+        lambda: RoutePreparationSnapshot(owner, 1, (), ())
+    )
+
+    def blocker_plan(_port):
+        blocker_entered.set()
+        assert release_blocker.wait(3)
+        return Settlement(None)
+
+    def await_route():
+        try:
+            result.append(controller.await_preparation_context())
+        finally:
+            finished.set()
+
+    blocker = arbiter.submit(arbiter.current_route, blocker_plan)
+    arbiter.dispatch(blocker)
+    waiter = Thread(target=await_route)
+    try:
+        assert blocker_entered.wait(3)
+        main = controller.submit_main("Результат = 1;")
+        assert main.status().phase == "queued"
+        waiter.start()
+        assert not finished.wait(0.1)
+        release_blocker.set()
+        blocker.wait_settled(3)
+        assert main.wait_settled(3).kind.value == "capture"
+        assert finished.wait(3)
+        assert isinstance(result[0].policy, CaptureCellPolicy)
+    finally:
+        release_blocker.set()
+        waiter.join(3)
+        arbiter.close(timeout=3)
+
+
+def test_preparation_waits_for_resumed_main_completion() -> None:
+    entered = Event()
+    release = Event()
+    finished = Event()
+    result = []
+
+    class WaitingResumeSession(CompleteSession):
+        def __init__(self):
+            super().__init__()
+            self.stop_count = 0
+
+        def wait_for_any_stop(self, *, timeout_s, expected_target, on_transport_dispatch):
+            self.stop_count += 1
+            if self.stop_count == 2:
+                entered.set()
+                assert release.wait(3)
+            return super().wait_for_any_stop(
+                timeout_s=timeout_s,
+                expected_target=expected_target,
+                on_transport_dispatch=on_transport_dispatch,
+            )
+
+    owner = object()
+    controller, arbiter, _session, _parser = _runtime(
+        lambda: RoutePreparationSnapshot(owner, 1, (), ()),
+        session=WaitingResumeSession(),
+    )
+
+    def await_route():
+        try:
+            result.append(controller.await_preparation_context())
+        finally:
+            finished.set()
+
+    waiter = Thread(target=await_route)
+    try:
+        assert controller.submit_main("Результат = 1;").wait_settled(3).kind.value == "capture"
+        resumed = controller.submit_resume()
+        assert entered.wait(3)
+        waiter.start()
+        assert not finished.wait(0.1)
+        release.set()
+        assert resumed.wait_settled(3).kind.value == "completed"
+        assert finished.wait(3)
+        assert isinstance(result[0].policy, MainCellPolicy)
+    finally:
+        release.set()
+        waiter.join(3)
         arbiter.close(timeout=3)
 
 
