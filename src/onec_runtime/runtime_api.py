@@ -1148,6 +1148,22 @@ class PrototypeRuntimeApi:
                 )
             )
         )
+        if (
+            not capture_controls_state
+            and self._controller.state is OperationState.MAIN_PENDING
+        ):
+            # The notebook caller owns the API writer while MAIN waits for its
+            # next stop. Status is an observation of already published local
+            # state and must not wait for that same operation to finish.
+            with self._generation_lock:
+                worker_generation = self._worker_generation_handle
+            return RuntimeStatus(
+                OperationState.MAIN_PENDING,
+                self._controller.runtime_generation,
+                self._controller.operation_id,
+                worker_generation,
+                setup,
+            )
         if not capture_controls_state:
             with self._single_writer():
                 self._require_available()
