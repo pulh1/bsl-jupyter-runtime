@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+from enum import Enum, auto
 from threading import Condition, Thread, get_ident
 from typing import Any, Callable, Protocol
 from uuid import uuid4
@@ -69,6 +70,10 @@ class OutcomeUnknown(RuntimeError):
     """Remote effects may still be live; retain ownership and pending evidence."""
 
 
+class StopPendingTeardown(OutcomeUnknown):
+    """Stop blocked a later effect after earlier remote work had started."""
+
+
 class StaleRoute(RuntimeError):
     pass
 
@@ -85,6 +90,14 @@ class ArbiterBusy(RuntimeError):
     pass
 
 
+class StopRequestOutcome(Enum):
+    """Admission result, not evidence that remote execution has stopped."""
+
+    CANCELLED_BEFORE_EFFECT = auto()
+    REQUESTED = auto()
+    ALREADY_SETTLED = auto()
+
+
 @dataclass(frozen=True)
 class TicketStatus:
     phase: str
@@ -92,6 +105,7 @@ class TicketStatus:
     waiter_detached: bool
     pending_capability: PendingEvaluation | None
     awaiting_stop: bool
+    stop_requested: bool
 
 
 class ExecutionTicket:
@@ -105,13 +119,19 @@ class ExecutionTicket:
         self._detached = False
         self._pending: PendingEvaluation | None = None
         self._entered = False
+        self._ever_entered = False
+        self._stop_requested = False
+        self._stop_blocked_after_effect = False
         self._stop_target: TargetId | None = None
         self._value: Any = None
         self._error: BaseException | None = None
 
     def status(self) -> TicketStatus:
         with self._owner._mailbox:
-            return TicketStatus(self._phase, self._phase == 'settled', self._detached, self._pending, self._stop_target is not None)
+            return TicketStatus(
+                self._phase, self._phase == 'settled', self._detached, self._pending,
+                self._stop_target is not None, self._stop_requested,
+            )
 
     def detach_waiter(self) -> None:
         with self._owner._mailbox:
@@ -177,7 +197,13 @@ class SessionPort:
     def _transport_entered(self) -> None:
         self._check()
         with self._owner._mailbox:
+            if self._ticket._stop_requested:
+                if self._ticket._ever_entered:
+                    self._ticket._stop_blocked_after_effect = True
+                    raise StopPendingTeardown('Remote work preceded Stop; target evidence is required')
+                raise CancelledBeforeEffect()
             self._ticket._entered = True
+            self._ticket._ever_entered = True
 
     def _require_idle(self) -> None:
         self._check()
@@ -203,6 +229,7 @@ class SessionPort:
         if target is None:
             raise ValueError('Continue requires a selected target')
         def entered() -> None:
+            previously_entered = self._ticket._ever_entered
             self._transport_entered()
             with self._owner._mailbox:
                 self._ticket._stop_target = target.target_id
@@ -215,6 +242,7 @@ class SessionPort:
                     with self._owner._mailbox:
                         self._ticket._stop_target = None
                         self._ticket._entered = False
+                        self._ticket._ever_entered = previously_entered
                     raise
         self._owner._session.continue_(on_transport_dispatch=entered)
         with self._owner._mailbox:
@@ -322,6 +350,8 @@ class RdbgArbiter:
         with self._mailbox:
             if self._closed:
                 raise RuntimeError('Arbiter is closed')
+            if self._active is not None and self._active._stop_requested:
+                raise ArbiterBusy('Stop is requested for the active operation')
             if route != self._route:
                 raise StaleRoute()
             ticket = ExecutionTicket(self, route, plan)
@@ -336,6 +366,29 @@ class RdbgArbiter:
                 raise RuntimeError('Ticket is no longer queued')
             ticket._ready = True
             self._mailbox.notify_all()
+
+    def request_stop(self, ticket: ExecutionTicket) -> StopRequestOutcome:
+        """Fence user dispatch; a later stop plan must establish remote termination.
+
+        A queued ticket has no remote effects and can be cancelled locally.
+        An active ticket keeps ownership until its plan settles or reconciles.
+        """
+        with self._mailbox:
+            self._check_ticket(ticket)
+            if ticket._phase == 'settled':
+                return StopRequestOutcome.ALREADY_SETTLED
+            if ticket._phase == 'queued':
+                self._queue.remove(ticket)
+                self._settle(ticket, error=CancelledBeforeEffect())
+                return StopRequestOutcome.CANCELLED_BEFORE_EFFECT
+            if self._active is not ticket:
+                raise ArbiterBusy('Stop requires the active operation')
+            if not ticket._stop_requested:
+                ticket._stop_requested = True
+                while self._queue:
+                    self._settle(self._queue.popleft(), error=CancelledBeforeEffect())
+                self._mailbox.notify_all()
+            return StopRequestOutcome.REQUESTED
 
     def reconcile(self, ticket: ExecutionTicket, plan: Plan) -> None:
         """Schedule evidence collection or confirmed teardown, never blind retry."""
@@ -398,6 +451,8 @@ class RdbgArbiter:
                 outcome = plan(port)
                 if not isinstance(outcome, Settlement):
                     raise TypeError('Plan must return a confirmed Settlement')
+                if ticket._stop_blocked_after_effect and not reconciling:
+                    raise StopPendingTeardown('A stopped plan cannot settle after blocking remote work')
                 if ticket._pending is not None or ticket._stop_target is not None or ticket._entered:
                     raise OutcomeUnknown('Settlement cannot discard an unretired capability')
             except BaseException as error:

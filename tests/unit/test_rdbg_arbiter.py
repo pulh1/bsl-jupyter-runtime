@@ -149,6 +149,170 @@ def test_queued_cancellation_has_no_effect(runtime):
     assert session.calls == []
 
 
+def test_stop_cancels_queued_ticket_without_touching_active_owner(runtime):
+    session, route, arbiter = runtime
+    active = arbiter.submit(route, lambda port: Settlement(evaluate(port, 'blocked')))
+    arbiter.dispatch(active)
+    assert session.entered.wait(3)
+    queued = arbiter.submit(route, lambda port: Settlement(evaluate(port, 'must-not-run')))
+    arbiter.dispatch(queued)
+    try:
+        assert arbiter.request_stop(queued).name == 'CANCELLED_BEFORE_EFFECT'
+        with pytest.raises(CancelledBeforeEffect):
+            queued.wait(3)
+        assert arbiter.active_ticket is active
+        assert [name for name, _ in session.calls] == ['blocked']
+    finally:
+        session.release.set()
+        active.wait_settled(3)
+    assert active.wait(3) == 'blocked'
+
+
+def test_active_stop_fences_queued_and_new_user_dispatch_until_settlement(runtime):
+    session, route, arbiter = runtime
+    active = arbiter.submit(route, lambda port: Settlement(evaluate(port, 'blocked')))
+    arbiter.dispatch(active)
+    assert session.entered.wait(3)
+    queued = arbiter.submit(route, lambda port: Settlement(evaluate(port, 'must-not-run')))
+    arbiter.dispatch(queued)
+    try:
+        assert arbiter.request_stop(active).name == 'REQUESTED'
+        assert active.status().stop_requested
+        assert not active.status().settled
+        with pytest.raises(CancelledBeforeEffect):
+            queued.wait(3)
+        with pytest.raises(ArbiterBusy):
+            arbiter.submit(route, lambda port: Settlement(evaluate(port, 'too-late')))
+        assert [name for name, _ in session.calls] == ['blocked']
+    finally:
+        session.release.set()
+        active.wait_settled(3)
+    assert active.wait(3) == 'blocked'
+    assert active.status().stop_requested
+    later = arbiter.submit(route, lambda port: Settlement(evaluate(port, 'after-completion')))
+    arbiter.dispatch(later)
+    assert later.wait(3) == 'after-completion'
+    assert [name for name, _ in session.calls] == ['blocked', 'event', 'after-completion', 'event']
+
+
+def test_completed_ticket_wins_stop_race_without_fencing_route(runtime):
+    session, route, arbiter = runtime
+    ticket = arbiter.submit(route, lambda port: Settlement(evaluate(port, 'finished')))
+    arbiter.dispatch(ticket)
+    assert ticket.wait(3) == 'finished'
+
+    assert arbiter.request_stop(ticket).name == 'ALREADY_SETTLED'
+    assert not ticket.status().stop_requested
+    later = arbiter.submit(route, lambda port: Settlement(evaluate(port, 'later')))
+    arbiter.dispatch(later)
+    assert later.wait(3) == 'later'
+
+
+def test_active_stop_before_first_transport_effect_cancels_dispatch(runtime):
+    session, route, arbiter = runtime
+    entered_plan = Event()
+    release_plan = Event()
+
+    def plan(port):
+        entered_plan.set()
+        assert release_plan.wait(3)
+        return Settlement(evaluate(port, 'must-not-run'))
+
+    ticket = arbiter.submit(route, plan)
+    arbiter.dispatch(ticket)
+    assert entered_plan.wait(3)
+    try:
+        assert arbiter.request_stop(ticket).name == 'REQUESTED'
+    finally:
+        release_plan.set()
+    with pytest.raises(CancelledBeforeEffect):
+        ticket.wait(3)
+    assert session.calls == []
+
+
+def test_stop_fences_dispatch_after_local_continue_callback_rejects_transport(runtime):
+    session, route, arbiter = runtime
+    session.target = SimpleNamespace(target_id=TargetId(uuid4(), 'main'))
+    callback_entered = Event()
+    release_callback = Event()
+
+    def continue_(*, on_transport_dispatch):
+        on_transport_dispatch()
+        session.record('continue-transport')
+
+    def reject_continue():
+        callback_entered.set()
+        assert release_callback.wait(3)
+        raise ValueError('local rejection before transport')
+
+    def plan(port):
+        try:
+            port.continue_(on_transport_dispatch=reject_continue)
+        except ValueError:
+            return Settlement(evaluate(port, 'must-not-run'))
+        raise AssertionError('Continue callback should reject before transport')
+
+    session.continue_ = continue_
+    ticket = arbiter.submit(route, plan)
+    arbiter.dispatch(ticket)
+    assert callback_entered.wait(3)
+    try:
+        assert arbiter.request_stop(ticket).name == 'REQUESTED'
+    finally:
+        release_callback.set()
+    with pytest.raises(CancelledBeforeEffect):
+        ticket.wait(3)
+    assert session.calls == []
+
+
+def test_stop_after_confirmed_modify_blocks_continue_and_retains_owner():
+    session = Session()
+    session.target = SimpleNamespace(target_id=TargetId(uuid4(), 'main'))
+    route = RouteToken('stop-after-modify', 1, 0, 'main')
+    arbiter = RdbgArbiter(session, route)
+    modified = Event()
+    release_plan = Event()
+
+    def modify(variable, expression, *, on_transport_dispatch):
+        on_transport_dispatch()
+        session.record('modify')
+
+    def continue_(*, on_transport_dispatch):
+        on_transport_dispatch()
+        session.record('continue')
+
+    def plan(port):
+        port.modify('ТекущаяИнструкция', '1')
+        modified.set()
+        assert release_plan.wait(3)
+        try:
+            port.continue_()
+        except OutcomeUnknown:
+            return Settlement('caught-error-is-not-stop-evidence')
+        return Settlement('should-not-complete')
+
+    session.modify = modify
+    session.continue_ = continue_
+    ticket = arbiter.submit(route, plan)
+    arbiter.dispatch(ticket)
+    assert modified.wait(3)
+    assert arbiter.request_stop(ticket).name == 'REQUESTED'
+    release_plan.set()
+
+    assert ticket.wait_unknown(3)
+    assert ticket.status().stop_requested
+    assert not ticket.status().awaiting_stop
+    assert arbiter.active_ticket is ticket
+    assert [name for name, _ in session.calls] == ['modify']
+    with pytest.raises(ArbiterBusy):
+        arbiter.submit(route, lambda port: Settlement('unsafe'))
+    # The fake supplies teardown evidence only after the quarantine assertions;
+    # production reconciliation must obtain this evidence from the target.
+    arbiter.reconcile(ticket, lambda port: Settlement('target-gone'))
+    assert ticket.wait_settled(3) == 'target-gone'
+    arbiter.close(timeout=3)
+
+
 def test_detach_does_not_cancel_late_settlement(runtime):
     session, route, arbiter = runtime
     ticket = arbiter.submit(route, lambda port: Settlement(evaluate(port, 'blocked')))
