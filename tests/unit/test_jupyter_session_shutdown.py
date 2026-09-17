@@ -318,6 +318,36 @@ def test_replacement_closes_previous_before_starting_next(monkeypatch):
             owner.close()
 
 
+def test_replacement_waits_for_previous_runtime_to_finish_cleanup(monkeypatch):
+    class IncompleteRuntime(session_module.RuntimeSession):
+        def __init__(self) -> None:
+            self.closes = 0
+
+        def close(self) -> None:
+            self.closes += 1
+
+        @property
+        def is_closed(self) -> bool:
+            return False
+
+    shell = InteractiveShell()
+    previous_runtime = IncompleteRuntime()
+    previous_owner = InteractiveRuntimeSession(previous_runtime)
+    setattr(shell, session_module._OWNED_SESSION_ATTR, previous_owner)
+
+    def unexpected_start(config, *, progress):
+        pytest.fail("replacement started before target termination was confirmed")
+
+    monkeypatch.setattr(session_module.RuntimeSession, "start", unexpected_start)
+    try:
+        with pytest.raises(ProtocolError, match="cleanup is still in progress"):
+            InteractiveRuntimeSession.start(object(), shell=shell)
+        assert previous_runtime.closes == 1
+        assert getattr(shell, session_module._OWNED_SESSION_ATTR) is previous_owner
+    finally:
+        delattr(shell, session_module._OWNED_SESSION_ATTR)
+
+
 def test_failed_previous_close_prevents_replacement_start(monkeypatch):
     shell = InteractiveShell()
     first = RuntimeResource()

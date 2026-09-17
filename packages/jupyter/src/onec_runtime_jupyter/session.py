@@ -9,6 +9,7 @@ from threading import RLock
 
 from IPython.core.interactiveshell import InteractiveShell
 
+from onec_runtime.errors import ProtocolError
 from onec_runtime.session import RuntimeSession, RuntimeSessionConfig
 from onec_runtime_jupyter.extension import (
     NotebookDisplayConfig,
@@ -49,6 +50,10 @@ class InteractiveRuntimeSession:
         previous_owner = getattr(target_shell, _OWNED_SESSION_ATTR, None)
         if isinstance(previous_owner, InteractiveRuntimeSession):
             previous_owner.close()
+            if not previous_owner._closed:
+                raise ProtocolError(
+                    "Previous runtime session cleanup is still in progress"
+                )
         for session_id in recover_failed_guards(config):
             print(
                 f"Не удалось завершить предыдущий сеанс 1С {session_id}; "
