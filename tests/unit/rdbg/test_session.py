@@ -229,6 +229,69 @@ def test_heartbeat_renews_the_registered_debug_ui_lease() -> None:
     assert transport.calls == ["pingDebugUIParams", "getDbgAllTargetStates"]
 
 
+def test_heartbeat_marks_each_transport_entry_before_request() -> None:
+    events: list[str] = []
+
+    class OrderedTransport(FakeTransport):
+        def test_server(self) -> float:
+            events.append("test_server")
+            return super().test_server()
+
+        def request(self, command: str, payload: bytes = b"", **options: object) -> bytes:
+            events.append(command)
+            return super().request(command, payload, **options)
+
+    transport = OrderedTransport()
+    transport.responses["pingDebugUIParams"].append(b"")
+    transport.responses["getDbgAllTargetStates"].append(target_states_payload())
+    session = ready_session(transport)
+
+    result = session.heartbeat(on_transport_dispatch=lambda: events.append("dispatch"))
+
+    assert result == {"rtt_ms": 1.0, "target_state": "stopped"}
+    assert events == [
+        "dispatch", "test_server", "dispatch", "pingDebugUIParams",
+        "dispatch", "getDbgAllTargetStates",
+    ]
+
+
+def test_heartbeat_callback_rejection_blocks_first_and_later_transport_entries() -> None:
+    class CountingTransport(FakeTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.server_checks = 0
+
+        def test_server(self) -> float:
+            self.server_checks += 1
+            return super().test_server()
+
+    first = CountingTransport()
+    first_session = ready_session(first)
+
+    def reject_first() -> None:
+        raise ValueError("before first entry")
+
+    with pytest.raises(ValueError, match="before first entry"):
+        first_session.heartbeat(on_transport_dispatch=reject_first)
+    assert first.server_checks == 0
+    assert first.calls == []
+
+    later = CountingTransport()
+    later_session = ready_session(later)
+    attempts = 0
+
+    def reject_second() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 2:
+            raise ValueError("before second entry")
+
+    with pytest.raises(ValueError, match="before second entry"):
+        later_session.heartbeat(on_transport_dispatch=reject_second)
+    assert later.server_checks == 1
+    assert later.calls == []
+
+
 def test_heartbeat_reports_lost_selected_target_after_renewing_lease() -> None:
     """Break: treating a missing selected target as a healthy heartbeat."""
     transport = FakeTransport()
@@ -256,6 +319,141 @@ def started_payload(target_id: UUID) -> bytes:
     return f"""<response xmlns="{RDBG_NS}"><result><cmdID>targetStarted</cmdID>
       <targetID xmlns="{BASE_NS}"><id>{target_id}</id><infoBaseAlias>DefAlias</infoBaseAlias>
       <targetType>ManagedClient</targetType></targetID></result></response>""".encode()
+
+
+@pytest.mark.parametrize(
+    ("blocked_entry", "expected_calls"),
+    [
+        (3, ["pingDebugUIParams"]),
+        (4, ["pingDebugUIParams", "clearBreakOnNextStatement"]),
+        (5, ["pingDebugUIParams", "clearBreakOnNextStatement", "attachDetachDbgTargets"]),
+    ],
+)
+def test_heartbeat_fences_each_autoattach_effect_after_ping(
+    blocked_entry: int, expected_calls: list[str],
+) -> None:
+    transport = FakeTransport()
+    transport.responses["pingDebugUIParams"].append(
+        started_payload(UUID("33333333-3333-3333-3333-333333333333"))
+    )
+    transport.responses["getDbgAllTargetStates"].append(target_states_payload())
+    session = ready_session(transport)
+    session._breakpoint_installed = True
+    session._breakpoint_locations = (LOCATION,)
+    entries = 0
+
+    def reject_at_entry() -> None:
+        nonlocal entries
+        entries += 1
+        if entries == blocked_entry:
+            raise ValueError("Stop fenced autoattach")
+
+    with pytest.raises(ValueError, match="Stop fenced autoattach"):
+        session.heartbeat(on_transport_dispatch=reject_at_entry)
+
+    assert entries == blocked_entry
+    assert transport.calls == expected_calls
+
+
+def test_eval_wait_fences_autoattach_discovered_during_poll() -> None:
+    transport = FakeTransport()
+    transport.responses["pingDebugUIParams"].append(
+        started_payload(UUID("33333333-3333-3333-3333-333333333333"))
+    )
+    session = ready_session(transport)
+    pending = session.start_evaluation("1")
+    entries = 0
+
+    def reject_autoattach() -> None:
+        nonlocal entries
+        entries += 1
+        if entries == 2:
+            raise ValueError("Stop fenced eval poll autoattach")
+
+    with pytest.raises(ValueError, match="Stop fenced eval poll autoattach"):
+        session.wait_evaluation_event(
+            pending, timeout_s=1, on_transport_dispatch=reject_autoattach,
+        )
+
+    assert transport.calls == ["evalExpr", "pingDebugUIParams"]
+    assert id(pending) in session._pending_evaluation_states
+
+
+def test_eval_result_survives_fenced_autoattach_in_same_ping() -> None:
+    transport = FakeTransport()
+    session = ready_session(transport)
+    pending = session.start_evaluation("1")
+    discovered_id = UUID("33333333-3333-3333-3333-333333333333")
+    transport.responses["pingDebugUIParams"].append(f'''<response xmlns="{RDBG_NS}">
+      <result><cmdID>targetStarted</cmdID>
+        <targetID xmlns="{BASE_NS}"><id>{discovered_id}</id>
+          <infoBaseAlias>DefAlias</infoBaseAlias><targetType>ManagedClient</targetType>
+        </targetID></result>
+      <result><cmdID>exprEvaluated</cmdID><evalExprResBaseData>
+        <expressionResultID xmlns="{CALC_NS}">{pending.result_id}</expressionResultID>
+        <resultValueInfo xmlns="{CALC_NS}"><typeName>Число</typeName><pres>MQ==</pres></resultValueInfo>
+        <errorOccurred xmlns="{CALC_NS}">false</errorOccurred>
+      </evalExprResBaseData></result></response>'''.encode())
+    entries = 0
+
+    def stop_before_autoattach() -> None:
+        nonlocal entries
+        entries += 1
+        if entries == 2:
+            raise ValueError("Stop fenced autoattach")
+
+    with pytest.raises(ValueError, match="Stop fenced autoattach"):
+        session.wait_evaluation_event(
+            pending, timeout_s=1, on_transport_dispatch=stop_before_autoattach,
+        )
+
+    assert transport.calls == ["evalExpr", "pingDebugUIParams"]
+    assert id(pending) in session._pending_evaluation_states
+    result = session.wait_evaluation_event(pending, timeout_s=0.01)
+    assert (result.result_id, result.presentation) == (pending.result_id, "1")
+    assert transport.calls == ["evalExpr", "pingDebugUIParams"]
+
+
+def test_main_stop_wait_fences_autoattach_discovered_during_poll() -> None:
+    transport = FakeTransport()
+    transport.responses["pingDebugUIParams"].append(
+        started_payload(UUID("33333333-3333-3333-3333-333333333333"))
+    )
+    session = ready_session(transport)
+    session.state = SessionState.EXECUTING
+    entries = 0
+
+    def reject_autoattach() -> None:
+        nonlocal entries
+        entries += 1
+        if entries == 2:
+            raise ValueError("Stop fenced MAIN poll autoattach")
+
+    with pytest.raises(ValueError, match="Stop fenced MAIN poll autoattach"):
+        session.wait_for_any_stop(timeout_s=1, on_transport_dispatch=reject_autoattach)
+
+    assert transport.calls == ["pingDebugUIParams"]
+
+
+def test_local_variables_wait_fences_autoattach_discovered_during_poll() -> None:
+    transport = FakeTransport()
+    transport.responses["evalLocalVariables"].append(b"")
+    transport.responses["pingDebugUIParams"].append(
+        started_payload(UUID("33333333-3333-3333-3333-333333333333"))
+    )
+    session = ready_session(transport)
+    entries = 0
+
+    def reject_autoattach() -> None:
+        nonlocal entries
+        entries += 1
+        if entries == 3:
+            raise ValueError("Stop fenced locals poll autoattach")
+
+    with pytest.raises(ValueError, match="Stop fenced locals poll autoattach"):
+        session.local_variables(timeout_s=1, on_transport_dispatch=reject_autoattach)
+
+    assert transport.calls == ["evalLocalVariables", "pingDebugUIParams"]
 
 
 def test_heartbeat_preserves_stop_evaluation_and_locals_for_real_consumers(
@@ -620,6 +818,70 @@ def test_evaluation_stop_is_returned_before_matching_result(
     session.continue_evaluation(pending, stop)
     assert session.wait_evaluation_event(pending, timeout_s=1) is result
     assert transport.calls.count("step") == 1
+
+
+def test_continue_evaluation_callback_rejection_keeps_exact_pending_stop() -> None:
+    transport = FakeTransport()
+    session = ready_session(transport)
+    pending = session.start_evaluation("1")
+    stop = StopEvent(pending.target_id, UNREGISTERED, "callStackFormed")
+    session._event_queue.append(stop)
+    assert session.wait_evaluation_event(pending, timeout_s=1) is stop
+
+    def reject() -> None:
+        raise ValueError("Stop fenced Continue")
+
+    with pytest.raises(ValueError, match="Stop fenced Continue"):
+        session.continue_evaluation(pending, stop, on_transport_dispatch=reject)
+
+    assert "step" not in transport.calls
+    assert session._pending_evaluation_states[id(pending)].suspended_stop is stop
+    assert session.state is SessionState.READY
+
+
+def test_continue_evaluation_marks_exact_stop_before_step_request() -> None:
+    events: list[str] = []
+
+    class OrderedTransport(FakeTransport):
+        def request(self, command: str, payload: bytes = b"", **options: object) -> bytes:
+            if command == "step":
+                events.append("step")
+            return super().request(command, payload, **options)
+
+    transport = OrderedTransport()
+    session = ready_session(transport)
+    pending = session.start_evaluation("1")
+    stop = StopEvent(pending.target_id, UNREGISTERED, "callStackFormed")
+    session._event_queue.append(stop)
+    assert session.wait_evaluation_event(pending, timeout_s=1) is stop
+
+    session.continue_evaluation(
+        pending, stop, on_transport_dispatch=lambda: events.append("dispatch"),
+    )
+
+    assert events == ["dispatch", "step"]
+    assert session._pending_evaluation_states[id(pending)].suspended_stop is None
+    assert transport.calls.count("step") == 1
+
+
+def test_continue_evaluation_rejects_foreign_stop_before_callback() -> None:
+    transport = FakeTransport()
+    session = ready_session(transport)
+    pending = session.start_evaluation("1")
+    owned_stop = StopEvent(pending.target_id, UNREGISTERED, "callStackFormed")
+    session._event_queue.append(owned_stop)
+    assert session.wait_evaluation_event(pending, timeout_s=1) is owned_stop
+    foreign_stop = StopEvent(pending.target_id, UNREGISTERED, "callStackFormed")
+    entered: list[str] = []
+
+    with pytest.raises(ProtocolError, match="stale or foreign"):
+        session.continue_evaluation(
+            pending, foreign_stop, on_transport_dispatch=lambda: entered.append("step"),
+        )
+
+    assert entered == []
+    assert "step" not in transport.calls
+    assert session._pending_evaluation_states[id(pending)].suspended_stop is owned_stop
 
 
 def test_start_evaluation_accepts_empty_xml_acknowledgement() -> None:

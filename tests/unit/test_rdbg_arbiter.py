@@ -40,7 +40,7 @@ class Session:
     def start_collection_evaluation(self, expression, **kwargs):
         return self.start_evaluation(expression, **kwargs)
 
-    def wait_evaluation_event(self, pending, *, timeout_s):
+    def wait_evaluation_event(self, pending, *, timeout_s, on_transport_dispatch=None):
         assert pending is self.pending
         self.record('event')
         return EvaluationResult(pending.result_id, 'String', self.expression, False)
@@ -51,6 +51,12 @@ class Session:
         return LocalVariablesResult(
             uuid4(), (FrameVariable(f'level{stack_level}', 'Number', '1'),)
         )
+
+    def heartbeat(self, *, on_transport_dispatch):
+        for command in ('test-server', 'ping', 'targets'):
+            on_transport_dispatch()
+            self.record(command)
+        return {'rtt_ms': 1.0, 'target_state': 'stopped'}
 
     def record(self, name, block=False):
         with self.lock:
@@ -65,6 +71,47 @@ class Session:
         finally:
             with self.lock:
                 self.active -= 1
+
+
+class StoppedEvaluationSession(Session):
+    def __init__(self):
+        super().__init__()
+        self.stop = None
+        self.resumed = False
+        self.continue_callbacks = 0
+
+    def wait_evaluation_event(self, pending, *, timeout_s, on_transport_dispatch=None):
+        assert pending is self.pending
+        if not self.resumed:
+            if self.stop is None:
+                from onec_runtime.rdbg.models import ModuleLocation, StopEvent
+
+                location = ModuleLocation('ExtensionModule', '', uuid4(), uuid4(), 1, 'Test')
+                self.stop = StopEvent(pending.target_id, location, 'breakpoint')
+            self.record('stop')
+            return self.stop
+        self.record('result')
+        return EvaluationResult(pending.result_id, 'String', self.expression, False)
+
+    def continue_evaluation(self, pending, stop, *, on_transport_dispatch=None):
+        assert pending is self.pending
+        if on_transport_dispatch is not None:
+            self.continue_callbacks += 1
+            on_transport_dispatch()
+        self.record('step')
+        self.resumed = True
+
+
+def close_stopped_eval_test_arbiter(arbiter, route, ticket, session):
+    """Use explicit test target proof only when a RED failure leaves ownership unknown."""
+    from onec_runtime.execution.termination import FileTerminationConfirmed
+
+    if ticket.wait_unknown(3):
+        proof = FileTerminationConfirmed(session.pending.target_id, 1234, -15)
+        arbiter.retire_terminated_target(ticket, route, proof)
+        with pytest.raises(arbiter_module.TargetTerminated):
+            ticket.wait_settled(3)
+    arbiter.close(timeout=3)
 
 
 def evaluate(port, expression):
@@ -110,6 +157,201 @@ def test_local_variables_result_retires_transport_entry_before_next_ticket(runti
     arbiter.dispatch(later)
     assert later.wait(3) == 'later'
     assert [name for name, _ in session.calls] == ['locals', 'later', 'event']
+
+
+def test_heartbeat_waits_behind_active_eval_and_runs_on_same_worker(runtime):
+    session, route, arbiter = runtime
+    active = arbiter.submit(route, lambda port: Settlement(evaluate(port, 'blocked')))
+    arbiter.dispatch(active)
+    assert session.entered.wait(3)
+    heartbeat = arbiter.submit(route, lambda port: Settlement(port.heartbeat()))
+    arbiter.dispatch(heartbeat)
+    assert [name for name, _ in session.calls] == ['blocked']
+
+    session.release.set()
+    assert active.wait(3) == 'blocked'
+    assert heartbeat.wait(3) == {'rtt_ms': 1.0, 'target_state': 'stopped'}
+    assert [name for name, _ in session.calls] == [
+        'blocked', 'event', 'test-server', 'ping', 'targets',
+    ]
+    assert len({thread for _, thread in session.calls}) == 1
+
+
+def test_heartbeat_rejects_pending_eval_before_transport(runtime):
+    session, route, arbiter = runtime
+
+    def plan(port):
+        pending = port.start_evaluation('first')
+        try:
+            with pytest.raises(ArbiterBusy):
+                port.heartbeat()
+        finally:
+            result = port.wait_evaluation_event(pending, timeout_s=1)
+        return Settlement(result.presentation)
+
+    ticket = arbiter.submit(route, plan)
+    arbiter.dispatch(ticket)
+    assert ticket.wait(3) == 'first'
+    assert [name for name, _ in session.calls] == ['first', 'event']
+
+
+def test_continue_evaluation_dispatches_exact_pending_stop_with_callback():
+    session = StoppedEvaluationSession()
+    route = RouteToken('eval-stop', 1, 0, 'capture-scope')
+    arbiter = RdbgArbiter(session, route)
+
+    def plan(port):
+        pending = port.start_evaluation('pending')
+        stop = port.wait_evaluation_event(pending, timeout_s=1)
+        port.continue_evaluation(pending, stop)
+        return Settlement(port.wait_evaluation_event(pending, timeout_s=1).presentation)
+
+    ticket = arbiter.submit(route, plan)
+    arbiter.dispatch(ticket)
+    try:
+        assert ticket.wait(3) == 'pending'
+        assert session.continue_callbacks == 1
+        assert [name for name, _ in session.calls] == ['pending', 'stop', 'step', 'result']
+    finally:
+        close_stopped_eval_test_arbiter(arbiter, route, ticket, session)
+
+
+def test_stop_before_continue_evaluation_prevents_step_for_pending_eval():
+    session = StoppedEvaluationSession()
+    route = RouteToken('eval-stop-race', 1, 0, 'capture-scope')
+    arbiter = RdbgArbiter(session, route)
+    stop_received = Event()
+    release_plan = Event()
+
+    def plan(port):
+        pending = port.start_evaluation('pending')
+        stop = port.wait_evaluation_event(pending, timeout_s=1)
+        stop_received.set()
+        assert release_plan.wait(3)
+        port.continue_evaluation(pending, stop)
+        return Settlement('unsafe')
+
+    ticket = arbiter.submit(route, plan)
+    arbiter.dispatch(ticket)
+    assert stop_received.wait(3)
+    try:
+        assert arbiter.request_stop(ticket).name == 'REQUESTED'
+        release_plan.set()
+        assert ticket.wait_unknown(3)
+        assert ticket.status().pending_capability is session.pending
+        assert session.continue_callbacks == 1
+        assert [name for name, _ in session.calls] == ['pending', 'stop']
+    finally:
+        release_plan.set()
+        close_stopped_eval_test_arbiter(arbiter, route, ticket, session)
+
+
+def test_continue_evaluation_refuses_foreign_stop_before_dispatch():
+    from onec_runtime.rdbg.models import StopEvent
+
+    session = StoppedEvaluationSession()
+    route = RouteToken('eval-foreign-stop', 1, 0, 'capture-scope')
+    arbiter = RdbgArbiter(session, route)
+
+    def plan(port):
+        pending = port.start_evaluation('pending')
+        owned_stop = port.wait_evaluation_event(pending, timeout_s=1)
+        foreign_stop = StopEvent(owned_stop.target_id, owned_stop.location, owned_stop.reason)
+        with pytest.raises(ValueError, match='owned stop'):
+            port.continue_evaluation(pending, foreign_stop)
+        port.continue_evaluation(pending, owned_stop)
+        return Settlement(port.wait_evaluation_event(pending, timeout_s=1).presentation)
+
+    ticket = arbiter.submit(route, plan)
+    arbiter.dispatch(ticket)
+    try:
+        assert not ticket.wait_unknown(3), 'foreign stop must be rejected inside the plan'
+        assert ticket.wait(3) == 'pending'
+        assert session.continue_callbacks == 1
+        assert [name for name, _ in session.calls] == ['pending', 'stop', 'step', 'result']
+    finally:
+        close_stopped_eval_test_arbiter(arbiter, route, ticket, session)
+
+
+def test_settlement_cannot_discard_pending_evaluation_stop():
+    session = StoppedEvaluationSession()
+    route = RouteToken('eval-suspended-stop', 1, 0, 'capture-scope')
+    arbiter = RdbgArbiter(session, route)
+
+    def plan(port):
+        pending = port.start_evaluation('pending')
+        stop = port.wait_evaluation_event(pending, timeout_s=1)
+        assert stop is session.stop
+        return Settlement('premature')
+
+    ticket = arbiter.submit(route, plan)
+    arbiter.dispatch(ticket)
+    try:
+        assert ticket.wait_unknown(3)
+        assert ticket.status().pending_capability is session.pending
+        assert arbiter.active_ticket is ticket
+        with pytest.raises(ArbiterBusy):
+            arbiter.close(timeout=0)
+    finally:
+        close_stopped_eval_test_arbiter(arbiter, route, ticket, session)
+
+
+def test_heartbeat_rejects_pending_continue_stop_before_transport(runtime):
+    from onec_runtime.rdbg.models import ModuleLocation, StopEvent
+
+    session, route, arbiter = runtime
+    target_id = TargetId(uuid4(), 'main')
+    session.target = SimpleNamespace(target_id=target_id)
+    stop = StopEvent(target_id, ModuleLocation('ExtensionModule', '', uuid4(), uuid4(), 1, 'Test'), 'breakpoint')
+
+    def continue_(*, on_transport_dispatch):
+        on_transport_dispatch()
+        session.record('continue')
+
+    def wait_for_any_stop(*, expected_target, on_transport_dispatch, **kwargs):
+        assert expected_target == target_id
+        on_transport_dispatch()
+        session.record('wait-stop')
+        return stop
+
+    session.continue_ = continue_
+    session.wait_for_any_stop = wait_for_any_stop
+
+    def plan(port):
+        port.continue_()
+        try:
+            with pytest.raises(ArbiterBusy):
+                port.heartbeat()
+        finally:
+            observed_stop = port.wait_for_any_stop(timeout_s=1)
+        return Settlement(observed_stop)
+
+    ticket = arbiter.submit(route, plan)
+    arbiter.dispatch(ticket)
+    assert ticket.wait(3) is stop
+    assert [name for name, _ in session.calls] == ['continue', 'wait-stop']
+
+
+def test_heartbeat_stop_before_first_transport_entry_sends_nothing(runtime):
+    session, route, arbiter = runtime
+    entered_plan = Event()
+    release_plan = Event()
+
+    def plan(port):
+        entered_plan.set()
+        assert release_plan.wait(3)
+        return Settlement(port.heartbeat())
+
+    ticket = arbiter.submit(route, plan)
+    arbiter.dispatch(ticket)
+    assert entered_plan.wait(3)
+    try:
+        assert arbiter.request_stop(ticket).name == 'REQUESTED'
+    finally:
+        release_plan.set()
+    with pytest.raises(CancelledBeforeEffect):
+        ticket.wait(3)
+    assert session.calls == []
 
 
 def test_local_variables_rejects_outstanding_eval_before_transport(runtime):
@@ -223,6 +465,79 @@ def test_local_variables_timeout_after_dispatch_keeps_arbiter_owner():
         later.wait(3)
     with pytest.raises(RuntimeError, match='closed'):
         arbiter.submit(route, lambda port: Settlement('stale'))
+    arbiter.close(timeout=3)
+
+
+def test_heartbeat_timeout_after_transport_entry_keeps_owner_until_target_proof():
+    from onec_runtime.execution.termination import FileTerminationConfirmed
+
+    session = Session()
+    target = TargetId(uuid4(), 'heartbeat')
+    session.target = SimpleNamespace(target_id=target)
+    route = RouteToken('heartbeat-timeout', 1, 0, 'capture-scope')
+    arbiter = RdbgArbiter(session, route)
+
+    def timed_out(*, on_transport_dispatch):
+        on_transport_dispatch()
+        session.record('test-server')
+        raise CommandTimeout('heartbeat transport response missing')
+
+    session.heartbeat = timed_out
+    ticket = arbiter.submit(route, lambda port: Settlement(port.heartbeat()))
+    arbiter.dispatch(ticket)
+    assert ticket.wait_unknown(3)
+    assert arbiter.active_ticket is ticket
+    later = arbiter.submit(route, lambda port: Settlement(evaluate(port, 'unsafe')))
+    arbiter.dispatch(later)
+    with pytest.raises(TimeoutError):
+        later.wait(0)
+    assert [name for name, _ in session.calls] == ['test-server']
+
+    proof = FileTerminationConfirmed(target, 1234, -15)
+    arbiter.retire_terminated_target(ticket, route, proof)
+    with pytest.raises(arbiter_module.TargetTerminated):
+        ticket.wait_settled(3)
+    with pytest.raises(CancelledBeforeEffect):
+        later.wait(3)
+    arbiter.close(timeout=3)
+
+
+def test_stop_between_heartbeat_requests_blocks_later_transport_entry():
+    from onec_runtime.execution.termination import FileTerminationConfirmed
+
+    session = Session()
+    target = TargetId(uuid4(), 'heartbeat')
+    session.target = SimpleNamespace(target_id=target)
+    route = RouteToken('heartbeat-stop', 1, 0, 'capture-scope')
+    arbiter = RdbgArbiter(session, route)
+    first_request_done = Event()
+    release_heartbeat = Event()
+
+    def heartbeat(*, on_transport_dispatch):
+        on_transport_dispatch()
+        session.record('test-server')
+        first_request_done.set()
+        assert release_heartbeat.wait(3)
+        on_transport_dispatch()
+        session.record('ping-must-not-run')
+        return {'rtt_ms': 1.0}
+
+    session.heartbeat = heartbeat
+    ticket = arbiter.submit(route, lambda port: Settlement(port.heartbeat()))
+    arbiter.dispatch(ticket)
+    assert first_request_done.wait(3)
+    try:
+        assert arbiter.request_stop(ticket).name == 'REQUESTED'
+    finally:
+        release_heartbeat.set()
+    assert ticket.wait_unknown(3)
+    assert [name for name, _ in session.calls] == ['test-server']
+    assert arbiter.active_ticket is ticket
+
+    proof = FileTerminationConfirmed(target, 1234, -15)
+    arbiter.retire_terminated_target(ticket, route, proof)
+    with pytest.raises(arbiter_module.TargetTerminated):
+        ticket.wait_settled(3)
     arbiter.close(timeout=3)
 
 
@@ -749,6 +1064,8 @@ def test_session_port_cannot_escape_worker_plan(runtime):
         ports[0].start_evaluation('escaped')
     with pytest.raises(RuntimeError, match='confined'):
         ports[0].local_variables(timeout_s=1)
+    with pytest.raises(RuntimeError, match='confined'):
+        ports[0].heartbeat()
     assert session.calls == []
 
 
@@ -903,6 +1220,183 @@ def test_real_rdbg_local_variables_callback_flows_through_arbiter(monkeypatch):
         assert ticket.status().settled
         assert transport.calls == ['evalLocalVariables']
     finally:
+        arbiter.close(timeout=3)
+
+
+def test_real_rdbg_heartbeat_runs_all_requests_on_arbiter_worker():
+    from onec_runtime.rdbg.models import DebugTarget, ModuleLocation
+    from onec_runtime.rdbg.session import RdbgSession, SessionState
+    from onec_runtime.rdbg.xml_codec import BASE_NS, RDBG_NS
+
+    target = TargetId(uuid4(), 'DefAlias')
+
+    class Transport:
+        def __init__(self):
+            self.calls = []
+
+        def test_server(self):
+            self.calls.append(('test-server', get_ident()))
+            return 1.0
+
+        def request(self, command, payload=b'', **kwargs):
+            self.calls.append((command, get_ident()))
+            if command == 'pingDebugUIParams':
+                return b''
+            assert command == 'getDbgAllTargetStates'
+            return f'''<response xmlns="{RDBG_NS}"><result>success</result><item>
+              <targetIDStr>target</targetIDStr><targetID xmlns="{BASE_NS}">
+              <id>{target.id}</id><infoBaseAlias>DefAlias</infoBaseAlias>
+              <targetType>ServerEmulation</targetType></targetID>
+              <stateNum>1</stateNum><state>stopped</state>
+              </item></response>'''.encode()
+
+    transport = Transport()
+    location = ModuleLocation('ExtensionModule', '', uuid4(), uuid4(), 1, 'Test')
+    session = RdbgSession(transport, location)
+    session.state = SessionState.READY
+    session.target = DebugTarget(target, 'ServerEmulation', 'stopped')
+    route = RouteToken('real-heartbeat', 1, 0, 'capture-scope')
+    arbiter = RdbgArbiter(session, route)
+    try:
+        ticket = arbiter.submit(route, lambda port: Settlement(port.heartbeat()))
+        arbiter.dispatch(ticket)
+        assert ticket.wait(3) == {'rtt_ms': 1.0, 'target_state': 'stopped'}
+        assert [command for command, _ in transport.calls] == [
+            'test-server', 'pingDebugUIParams', 'getDbgAllTargetStates',
+        ]
+        assert len({thread for _, thread in transport.calls}) == 1
+        assert ticket.status().settled
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_stop_between_eval_ping_and_autoattach_fences_hidden_rdbg_effect():
+    from onec_runtime.execution.termination import FileTerminationConfirmed
+    from onec_runtime.rdbg.models import DebugTarget, ModuleLocation
+    from onec_runtime.rdbg.session import RdbgSession, SessionState
+    from onec_runtime.rdbg.xml_codec import BASE_NS, RDBG_NS
+
+    target = TargetId(uuid4(), 'DefAlias')
+    discovered_id = uuid4()
+    ping_entered = Event()
+    release_ping = Event()
+
+    class Transport:
+        def __init__(self):
+            self.calls = []
+
+        def request(self, command, payload=b'', **kwargs):
+            self.calls.append(command)
+            if command == 'pingDebugUIParams':
+                ping_entered.set()
+                assert release_ping.wait(3)
+                return f'''<response xmlns="{RDBG_NS}"><result><cmdID>targetStarted</cmdID>
+                  <targetID xmlns="{BASE_NS}"><id>{discovered_id}</id>
+                  <infoBaseAlias>DefAlias</infoBaseAlias>
+                  <targetType>ManagedClient</targetType></targetID></result></response>'''.encode()
+            return b''
+
+    transport = Transport()
+    location = ModuleLocation('ExtensionModule', '', uuid4(), uuid4(), 1, 'Test')
+    session = RdbgSession(transport, location)
+    session.state = SessionState.READY
+    session.target = DebugTarget(target, 'ServerEmulation', 'stopped')
+    session.attached_targets[target.id] = session.target
+    route = RouteToken('eval-ping-stop', 1, 0, 'capture-scope')
+    arbiter = RdbgArbiter(session, route)
+
+    def plan(port):
+        pending = port.start_evaluation('1')
+        return Settlement(port.wait_evaluation_event(pending, timeout_s=1))
+
+    ticket = arbiter.submit(route, plan)
+    arbiter.dispatch(ticket)
+    assert ping_entered.wait(3)
+    try:
+        assert arbiter.request_stop(ticket).name == 'REQUESTED'
+        release_ping.set()
+        assert ticket.wait_unknown(3)
+        assert transport.calls == ['evalExpr', 'pingDebugUIParams']
+        assert arbiter.active_ticket is ticket
+    finally:
+        release_ping.set()
+        if ticket.wait_unknown(3):
+            proof = FileTerminationConfirmed(target, 1234, -15)
+            arbiter.retire_terminated_target(ticket, route, proof)
+            with pytest.raises(arbiter_module.TargetTerminated):
+                ticket.wait_settled(3)
+        arbiter.close(timeout=3)
+
+
+def test_stop_after_ping_reconciles_result_despite_fenced_autoattach():
+    from onec_runtime.execution.termination import FileTerminationConfirmed
+    from onec_runtime.rdbg.models import DebugTarget, ModuleLocation
+    from onec_runtime.rdbg.session import RdbgSession, SessionState
+    from onec_runtime.rdbg.xml_codec import BASE_NS, CALC_NS, RDBG_NS
+
+    target = TargetId(uuid4(), 'DefAlias')
+    discovered_id = uuid4()
+    ping_entered = Event()
+    release_ping = Event()
+
+    class Transport:
+        def __init__(self):
+            self.calls = []
+
+        def request(self, command, payload=b'', **kwargs):
+            self.calls.append(command)
+            if command == 'pingDebugUIParams':
+                ping_entered.set()
+                assert release_ping.wait(3)
+                pending = next(iter(session._pending_evaluation_states.values())).capability
+                return f'''<response xmlns="{RDBG_NS}">
+                  <result><cmdID>targetStarted</cmdID>
+                    <targetID xmlns="{BASE_NS}"><id>{discovered_id}</id>
+                    <infoBaseAlias>DefAlias</infoBaseAlias>
+                    <targetType>ManagedClient</targetType></targetID></result>
+                  <result><cmdID>exprEvaluated</cmdID><evalExprResBaseData>
+                    <expressionResultID xmlns="{CALC_NS}">{pending.result_id}</expressionResultID>
+                    <resultValueInfo xmlns="{CALC_NS}"><typeName>Число</typeName><pres>MQ==</pres></resultValueInfo>
+                    <errorOccurred xmlns="{CALC_NS}">false</errorOccurred>
+                  </evalExprResBaseData></result></response>'''.encode()
+            return b''
+
+    transport = Transport()
+    location = ModuleLocation('ExtensionModule', '', uuid4(), uuid4(), 1, 'Test')
+    session = RdbgSession(transport, location)
+    session.state = SessionState.READY
+    session.target = DebugTarget(target, 'ServerEmulation', 'stopped')
+    session.attached_targets[target.id] = session.target
+    route = RouteToken('eval-ping-result-stop', 1, 0, 'capture-scope')
+    arbiter = RdbgArbiter(session, route)
+
+    def plan(port):
+        pending = port.start_evaluation('1')
+        return Settlement(port.wait_evaluation_event(pending, timeout_s=1).presentation)
+
+    ticket = arbiter.submit(route, plan)
+    arbiter.dispatch(ticket)
+    assert ping_entered.wait(3)
+    try:
+        assert arbiter.request_stop(ticket).name == 'REQUESTED'
+        release_ping.set()
+        assert ticket.wait_unknown(3)
+        assert transport.calls == ['evalExpr', 'pingDebugUIParams']
+        pending = ticket.status().pending_capability
+        assert pending is not None
+        arbiter.reconcile(ticket, lambda port: Settlement(
+            port.wait_evaluation_event(pending, timeout_s=0.01).presentation,
+        ))
+        assert ticket.wait_settled(3) == '1'
+        assert transport.calls == ['evalExpr', 'pingDebugUIParams']
+    finally:
+        release_ping.set()
+        if ticket.wait_unknown(3):
+            arbiter.retire_terminated_target(
+                ticket, route, FileTerminationConfirmed(target, 1234, -15),
+            )
+            with pytest.raises(arbiter_module.TargetTerminated):
+                ticket.wait_settled(3)
         arbiter.close(timeout=3)
 
 
@@ -1069,7 +1563,7 @@ def test_stop_after_empty_capture_eval_interval_retains_capability_for_reconcili
     release_wait = Event()
     wait_threads = []
 
-    def wait_evaluation_event(pending, *, timeout_s):
+    def wait_evaluation_event(pending, *, timeout_s, on_transport_dispatch=None):
         assert pending is session.pending
         wait_threads.append(get_ident())
         if len(wait_threads) == 1:
@@ -1120,7 +1614,7 @@ def test_eval_transport_timeout_escapes_broad_interval_retry_with_pending_owner(
     session, route, arbiter = runtime
     waits = []
 
-    def wait_evaluation_event(pending, *, timeout_s):
+    def wait_evaluation_event(pending, *, timeout_s, on_transport_dispatch=None):
         assert pending is session.pending
         waits.append(get_ident())
         if len(waits) == 1:
@@ -1192,7 +1686,7 @@ def test_matching_capture_result_wins_stop_request_during_wait(runtime):
     entered_wait = Event()
     release_wait = Event()
 
-    def wait_evaluation_event(pending, *, timeout_s):
+    def wait_evaluation_event(pending, *, timeout_s, on_transport_dispatch=None):
         assert pending is session.pending
         entered_wait.set()
         assert release_wait.wait(3)

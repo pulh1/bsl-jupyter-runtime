@@ -31,6 +31,8 @@ class EvaluationSession(Protocol):
     def local_variables(self, stack_level: int = 0, *, timeout_s: float,
                         on_transport_dispatch: Callable[[], None]) -> LocalVariablesResult: ...
 
+    def heartbeat(self, *, on_transport_dispatch: Callable[[], None]) -> dict[str, object]: ...
+
     def modify(self, variable: str, value_expression: str, *,
                on_transport_dispatch: Callable[[], None]) -> ModifyResult: ...
 
@@ -48,10 +50,12 @@ class EvaluationSession(Protocol):
                                     stack_level: int, timeout_s: float,
                                     on_transport_dispatch: Callable[[], None]) -> PendingEvaluation: ...
 
-    def wait_evaluation_event(self, pending: PendingEvaluation, *, timeout_s: float
+    def wait_evaluation_event(self, pending: PendingEvaluation, *, timeout_s: float,
+                              on_transport_dispatch: Callable[[], None]
                               ) -> EvaluationResult | StopEvent: ...
 
-    def continue_evaluation(self, pending: PendingEvaluation, stop: StopEvent) -> None: ...
+    def continue_evaluation(self, pending: PendingEvaluation, stop: StopEvent, *,
+                            on_transport_dispatch: Callable[[], None]) -> None: ...
 
 
 
@@ -131,6 +135,7 @@ class ExecutionTicket:
         self._ready = False
         self._detached = False
         self._pending: PendingEvaluation | None = None
+        self._pending_stop: StopEvent | None = None
         self._entered = False
         self._ever_entered = False
         self._stop_requested = False
@@ -267,6 +272,14 @@ class SessionPort:
             self._ticket._entered = False
         return result
 
+    def heartbeat(self) -> dict[str, object]:
+        """Renew the Debug UI lease without creating a second event reader."""
+        self._require_idle()
+        result = self._owner._session.heartbeat(on_transport_dispatch=self._transport_entered)
+        with self._owner._mailbox:
+            self._ticket._entered = False
+        return result
+
     def modify(self, variable: str, value_expression: str) -> ModifyResult:
         self._require_idle()
         result = self._owner._session.modify(variable, value_expression, on_transport_dispatch=self._transport_entered)
@@ -351,7 +364,10 @@ class SessionPort:
                               ) -> EvaluationResult | StopEvent:
         self._require_pending(pending)
         try:
-            event = self._owner._session.wait_evaluation_event(pending, timeout_s=timeout_s)
+            event = self._owner._session.wait_evaluation_event(
+                pending, timeout_s=timeout_s,
+                on_transport_dispatch=self._transport_entered,
+            )
         except CommandTimeout as error:
             if type(error) is not CommandTimeout:
                 raise OutcomeUnknown('Evaluation wait failed before its remote outcome was proven') from error
@@ -363,14 +379,27 @@ class SessionPort:
             # The session contract retires this exact capability on matched result.
             with self._owner._mailbox:
                 self._ticket._pending = None
+                self._ticket._pending_stop = None
                 self._ticket._entered = False
         elif not isinstance(event, StopEvent):
             raise OutcomeUnknown('Session returned an unrecognized evaluation event')
+        else:
+            if event.target_id != pending.target_id:
+                raise OutcomeUnknown('Evaluation stop belongs to a different target')
+            with self._owner._mailbox:
+                self._ticket._pending_stop = event
         return event
 
     def continue_evaluation(self, pending: PendingEvaluation, stop: StopEvent) -> None:
         self._require_pending(pending)
-        self._owner._session.continue_evaluation(pending, stop)
+        if stop is not self._ticket._pending_stop:
+            raise ValueError('The exact owned stop is required to continue evaluation')
+        self._owner._session.continue_evaluation(
+            pending, stop, on_transport_dispatch=self._transport_entered,
+        )
+        with self._owner._mailbox:
+            self._ticket._pending_stop = None
+            self._ticket._entered = False
 
 
 Plan = Callable[[SessionPort], Settlement]
@@ -500,6 +529,7 @@ class RdbgArbiter:
             while self._queue:
                 self._settle(self._queue.popleft(), error=CancelledBeforeEffect())
             ticket._pending = None
+            ticket._pending_stop = None
             ticket._stop_target = None
             ticket._entered = False
             self._settle(ticket, error=TargetTerminated(evidence))
@@ -527,7 +557,8 @@ class RdbgArbiter:
         # Called only under mailbox; no callbacks or transport work here.
         ticket._value = value
         ticket._error = error
-        assert ticket._pending is None and ticket._stop_target is None and not ticket._entered, 'Cannot settle an owned evaluation capability'
+        assert (ticket._pending is None and ticket._pending_stop is None
+                and ticket._stop_target is None and not ticket._entered), 'Cannot settle an owned evaluation capability'
         ticket._phase = 'settled'
         self._mailbox.notify_all()
 

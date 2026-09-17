@@ -260,9 +260,10 @@ class RdbgSession:
             self._managed_client_id = next(iter(client_ids))
         return candidates
 
-    def list_targets(self) -> list[DebugTarget]:
+    def list_targets(self, *, on_transport_dispatch: Callable[[], None] | None = None) -> list[DebugTarget]:
         payload = self._request(
-            "getDbgAllTargetStates", build_get_targets_request(self.alias, self.ui_id)
+            "getDbgAllTargetStates", build_get_targets_request(self.alias, self.ui_id),
+            on_transport_entry=on_transport_dispatch,
         )
         return parse_targets(payload)
 
@@ -479,7 +480,6 @@ class RdbgSession:
             item_count=len,
             **metadata,
         )
-        self._attach_discovered_targets(targets)
         stops = self._profile(
             "rdbg.ping.extract_stops",
             lambda: parse_ping_events_from_document(document),
@@ -502,9 +502,19 @@ class RdbgSession:
         )
         for evaluation in evaluations:
             self._pending_evaluations[evaluation.result_id] = evaluation
+        try:
+            self._attach_discovered_targets(targets, on_transport_dispatch=on_transport_dispatch)
+        except BaseException:
+            # The ping has already consumed these events. Preserve them even
+            # when Stop fences an autoattach request from the same response.
+            self._ingest_poll_events(stops, evaluations)
+            raise
         return stops, evaluations
 
-    def _attach_discovered_targets(self, targets: list[DebugTarget]) -> None:
+    def _attach_discovered_targets(
+        self, targets: list[DebugTarget], *,
+        on_transport_dispatch: Callable[[], None] | None = None,
+    ) -> None:
         for target in self._attachable_targets(targets):
             if target.target_id.id in self.attached_targets:
                 continue
@@ -512,12 +522,14 @@ class RdbgSession:
                 self._request(
                     "clearBreakOnNextStatement",
                     build_clear_break_request(self.alias, self.ui_id),
+                    on_transport_entry=on_transport_dispatch,
                 )
             self._request(
                 "attachDetachDbgTargets",
                 build_attach_target_request(
                     self.alias, self.ui_id, target.target_id, attach=True
                 ),
+                on_transport_entry=on_transport_dispatch,
             )
             self.attached_targets[target.target_id.id] = target
             if self._breakpoint_installed:
@@ -526,6 +538,7 @@ class RdbgSession:
                     build_breakpoints_request(
                         self.alias, self.ui_id, self._breakpoint_locations
                     ),
+                    on_transport_entry=on_transport_dispatch,
                 )
 
     def _ingest_poll_events(
@@ -815,6 +828,7 @@ class RdbgSession:
         pending: PendingEvaluation,
         *,
         timeout_s: float,
+        on_transport_dispatch: Callable[[], None] | None = None,
     ) -> EvaluationResult | StopEvent:
         """Consume one event; interval expiry leaves the capability registered.
 
@@ -854,7 +868,9 @@ class RdbgSession:
             remaining = deadline - monotonic()
             if remaining <= 0:
                 break
-            polled = self._poll(min(6.0, remaining))
+            interval = min(6.0, remaining)
+            polled = (self._poll(interval) if on_transport_dispatch is None else
+                      self._poll(interval, on_transport_dispatch=on_transport_dispatch))
             self._ingest_poll_events(*polled)
         raise CommandTimeout(
             f"Timed out waiting for expression result {pending.result_id}"
@@ -864,13 +880,15 @@ class RdbgSession:
         self,
         pending: PendingEvaluation,
         stop: StopEvent,
+        *,
+        on_transport_dispatch: Callable[[], None] | None = None,
     ) -> None:
         state = self._require_pending_evaluation(pending)
         if state.suspended_stop is not stop:
             raise ProtocolError("Pending evaluation stop is stale or foreign")
         if stop.target_id != pending.target_id or self.target is None:
             raise ProtocolError("Pending evaluation target changed")
-        self.continue_()
+        self.continue_(on_transport_dispatch=on_transport_dispatch)
         state.suspended_stop = None
 
     def _require_pending_evaluation(
@@ -1047,7 +1065,9 @@ class RdbgSession:
                 pending = self._pending_local_variables.pop(result_id, None)
                 if pending is not None:
                     return pending
-                polled = self._poll(max(0.1, min(6.0, deadline - monotonic())))
+                interval = max(0.1, min(6.0, deadline - monotonic()))
+                polled = (self._poll(interval) if on_transport_dispatch is None else
+                          self._poll(interval, on_transport_dispatch=on_transport_dispatch))
                 self._ingest_poll_events(*polled)
             raise CommandTimeout(
                 f"Timed out waiting for local variables result {result_id}"
@@ -1108,21 +1128,24 @@ class RdbgSession:
         )
         validate_command_acknowledgement(response, command="step")
 
-    def heartbeat(self) -> dict[str, object]:
+    def heartbeat(self, *, on_transport_dispatch: Callable[[], None] | None = None) -> dict[str, object]:
         self._require(SessionState.READY)
         if self.target is None:
             raise TargetLost("No target has been selected")
         with self._request_admission_lock:
             if self._requests_invalidated:
                 raise ProtocolError("RDBG session was invalidated")
+        if on_transport_dispatch is not None:
+            on_transport_dispatch()
         rtt_ms = self.transport.test_server()
         # The platform expires the registered Debug UI unless its dedicated
         # long-poll endpoint is called. Server and target probes alone do not
         # renew that lease. Bound idle empty-response waiting while RuntimeSession
         # holds its shared operation lock; returned events are still ingested.
-        self._ingest_poll_events(*self._poll(0.1))
+        self._ingest_poll_events(*self._poll(0.1, on_transport_dispatch=on_transport_dispatch))
         matches = [
-            target for target in self.list_targets() if target.target_id.id == self.target.target_id.id
+            target for target in self.list_targets(on_transport_dispatch=on_transport_dispatch)
+            if target.target_id.id == self.target.target_id.id
         ]
         if len(matches) != 1:
             raise TargetLost("Selected target disappeared during heartbeat")
