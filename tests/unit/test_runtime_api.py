@@ -1866,6 +1866,24 @@ def test_api_routes_main_then_capture_cell_and_preserves_operation() -> None:
     assert controller.resume_roots == [("Скаляр",)]
 
 
+def test_controller_selected_capture_preparer_rejects_before_target_dispatch() -> None:
+    """A route policy may reject a cell without dispatching it to the stopped target."""
+    controller = _PinnedOperationController()
+    api = PrototypeRuntimeApi(controller, capture_points=(LOCATION,))
+    assert api.execute_bsl("Результат = Capture();").kind is RuntimeReplyKind.CAPTURED
+
+    class RejectingPreparer:
+        def prepare(self, *_args: object, **_kwargs: object) -> object:
+            raise ProtocolError("capture route rejected source")
+
+    controller.current_cell_preparer = RejectingPreparer()
+    with pytest.raises(ProtocolError, match="capture route rejected source"):
+        api.execute_bsl("Результат = 1;")
+
+    assert controller.capture_mapped_sources == []
+    assert api.status().state is OperationState.CAPTURED
+
+
 def test_api_routes_ordinary_main_and_reports_failed_completion() -> None:
     controller = FakeController()
     api = PrototypeRuntimeApi(controller)

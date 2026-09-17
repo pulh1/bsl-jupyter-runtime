@@ -130,10 +130,13 @@ from onec_runtime.errors import (
     WorkerPromotionOutcomeUnknown,
 )
 from onec_runtime.execution.common import NotebookCommonParser
+from onec_runtime.execution.capture.preparation import CaptureCellPreparer
 from onec_runtime.execution.contracts import (
     OperationSourceMapBundle,
     SourceDiagnostic,
 )
+from onec_runtime.execution.main.preparation import MainCellPreparer
+from onec_runtime.execution.preparation import RoutePreparationInput
 from onec_runtime.breakpoint_workspace import (
     BreakpointWorkspaceController,
     BreakpointWorkspaceOutcomeUnknown,
@@ -981,6 +984,8 @@ class PrototypeRuntimeApi:
         worker_module_builder: WorkerModuleArtifactBuilder | object | None = None,
     ) -> None:
         self._controller = controller
+        self._main_cell_preparer = MainCellPreparer()
+        self._capture_cell_preparer = CaptureCellPreparer()
         self._capture_points = tuple(capture_points)
         self._capture_ticket: CaptureCorrelationTicket | None = None
         self._capture_inspection_quarantined = False
@@ -3668,53 +3673,45 @@ class PrototypeRuntimeApi:
             context_before: tuple[str, ...] = self._namespace_names
             message_collector_key = ""
             if lowerer is not None and source_maps.statement_execution is not None:
-                lowering_mode = LoweringMode(mode)
                 observed_before = getattr(lowerer, "persistent_names", ())
                 if isinstance(observed_before, tuple) and all(
                     isinstance(name, str) for name in observed_before
                 ):
                     context_before = observed_before
-                key_factory = getattr(self._controller, "message_collector_key", None)
-                if callable(key_factory):
-                    message_collector_key = key_factory(lowering_mode)
                 assert source_maps.statement_execution is not None
-                lowering_catalog = (
-                    self._complete_notebook_catalog(candidate_catalog)
-                    if candidate_catalog is not None
-                    else (
-                        None
-                        if operation_pin is None
-                        else self._operation_pin_catalog(operation_pin)
+                # Migration seam: the controller will supply this binding in
+                # its PreparationContext. Older controllers still expose only
+                # OperationState, so choose their default policy here.
+                preparer = getattr(self._controller, "current_cell_preparer", None)
+                if preparer is None:
+                    preparer = (
+                        self._capture_cell_preparer
+                        if self._controller.state is OperationState.CAPTURED
+                        else self._main_cell_preparer
                     )
-                )
+                key_factory = getattr(self._controller, "message_collector_key", None)
                 try:
-                    lower_mapped = getattr(lowerer, "lower_mapped", None)
-                    if callable(lower_mapped):
-                        lowering = lower_mapped(
-                            source_maps.statement_execution,
-                            mode=lowering_mode,
-                            message_collector_key=(
-                                message_collector_key or "__onec_cell_messages"
+                    prepared_statement = preparer.prepare(
+                        RoutePreparationInput(
+                            statement=source_maps.statement_execution,
+                            lowerer=lowerer,
+                            candidate_catalog=candidate_catalog,
+                            operation_pin=operation_pin,
+                            message_key_factory=(
+                                key_factory if callable(key_factory) else None
                             ),
-                            worker_exports=lowering_catalog,
+                            complete_catalog=self._complete_notebook_catalog,
+                            pinned_catalog=self._operation_pin_catalog,
+                            temporary_catalog=self._temporary_worker_catalog,
+                            with_pin_prelude=lambda result, pin, route: (
+                                self._with_generation_pin_prelude(
+                                    result, pin, mode=route
+                                )
+                            ),
                         )
-                    else:
-                        with self._temporary_worker_catalog(
-                            lowerer,
-                            lowering_catalog,
-                        ):
-                            lowering = lowerer.lower(
-                                cell_source,
-                                mode=lowering_mode,
-                                message_collector_key=(
-                                    message_collector_key or "__onec_cell_messages"
-                                ),
-                            )
-                    lowering = self._with_generation_pin_prelude(
-                        lowering,
-                        None if candidate_catalog is not None else operation_pin,
-                        mode=lowering_mode,
                     )
+                    lowering = prepared_statement.lowering
+                    message_collector_key = prepared_statement.message_collector_key
                 except (BslLexError, BslParseError) as error:
                     self._restore_namespace_context(lowerer, context_before)
                     return self._source_failure_reply(
