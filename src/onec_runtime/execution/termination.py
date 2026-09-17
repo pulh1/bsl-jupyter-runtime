@@ -22,6 +22,19 @@ class ServerTerminationPort(Protocol):
     ) -> BoundServerTargetAbsence: ...
 
 
+class _PollableProcess(Protocol):
+    def poll(self) -> int | None: ...
+
+
+class FileTerminationPort(Protocol):
+    """The exact owned 1C debuggee process, excluding the private dbgs."""
+
+    pid: int
+    process: _PollableProcess
+
+    def close(self, timeout_s: float) -> None: ...
+
+
 @dataclass(frozen=True, slots=True)
 class ServerTerminationConfirmed:
     expected_target: TargetId
@@ -36,6 +49,51 @@ class TerminationUnknown:
     stage: Literal["request", "confirmation"]
     error_type: str
     client_termination_requested: bool | None
+
+
+@dataclass(frozen=True, slots=True)
+class FileTerminationConfirmed:
+    expected_target: TargetId
+    pid: int
+    returncode: int
+
+
+@dataclass(frozen=True, slots=True)
+class FileTerminationUnknown:
+    """The owned debuggee has not been proven to exit."""
+
+    expected_target: TargetId
+    pid: int
+    error_type: str
+
+
+def terminate_file_target(
+    process: FileTerminationPort,
+    expected_target: TargetId,
+    *,
+    grace_s: float = 30.0,
+) -> FileTerminationConfirmed | FileTerminationUnknown:
+    """Terminate the captured file-mode debuggee and verify its process exit."""
+
+    if (
+        isinstance(grace_s, bool)
+        or not isinstance(grace_s, (int, float))
+        or not isfinite(float(grace_s))
+        or grace_s < 0
+    ):
+        raise ValueError("grace_s must be finite and non-negative")
+    pid = process.pid
+    try:
+        process.close(timeout_s=float(grace_s))
+    except Exception as error:
+        return FileTerminationUnknown(expected_target, pid, type(error).__name__)
+    try:
+        returncode = process.process.poll()
+    except Exception as error:
+        return FileTerminationUnknown(expected_target, pid, type(error).__name__)
+    if returncode is None:
+        return FileTerminationUnknown(expected_target, pid, "ExitUnverified")
+    return FileTerminationConfirmed(expected_target, pid, returncode)
 
 
 def terminate_server_target(
