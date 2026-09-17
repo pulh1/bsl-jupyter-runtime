@@ -11,8 +11,9 @@ ordered command protocol. The approved design is
 - Local failure before command-field writes, or after confirmed writes but before Continue enters transport, becomes terminal `failed_before_dispatch`; an attempted command-field write with unresolved outcome remains `unknown`. Writes alone do not prove MAIN launch.
 - A matching remote completion ID closes MAIN before result/message decoding; presentation errors do not reopen the command or block the next admission.
 - `MainExecutor` writes the command fields, issues Continue, and waits across bounded RDBG poll intervals without an execution deadline. Its methods accept the port of the current operation; a default port exists only for the transitional controller. The controller still routes the returned stop.
+- `completion.py` reads `ЗавершеннаяКоманда`, `Результат`, `Ошибка` and optional messages through the exact pending evaluation capability. Matching command ID marks `MainOperation` remotely completed before decoding result or messages. It returns private scalar data to the controller for source-mapped presentation and has no raw `RdbgSession` dependency. The transitional controller's `_complete_main()` has not yet switched to this reader.
 - This package does not import concrete controllers or `RdbgSession`. Protocol value models may be shared.
 
 The transitional controller still exposes `OperationHandle` and `OperationState` for existing clients. They are compatibility state, not the MAIN lifecycle authority. The controller still invokes the executor on its caller thread; arbiter ownership, typed completion contracts, status API integration and confirmed target termination remain separate migration steps.
 
-Focused checks: `tests/unit/test_main_operation.py`, `tests/unit/test_main_executor.py` and `tests/unit/test_prototype_runtime.py`.
+Focused checks: `tests/unit/test_main_operation.py`, `tests/unit/test_main_executor.py`, `tests/unit/test_main_completion_reader.py` and `tests/unit/test_prototype_runtime.py`.
