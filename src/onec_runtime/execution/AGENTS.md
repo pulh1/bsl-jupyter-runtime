@@ -2,7 +2,7 @@
 
 Design authority: [MAIN/CAPTURE execution spec](../../../docs/superpowers/specs/2026-09-17-main-capture-execution-design.md), especially sections 3, 4, 6, 7 and 10.
 
-Current entry points are `../runtime_api.py`, `../prototype_runtime.py` and `../capture_evaluation.py`; `main/operation.py` holds the extracted MAIN command lifecycle. The pipeline, controller port, route policies and common arbiter described below are the target architecture, not a claim that migration is complete.
+Current entry points are `../runtime_api.py`, `../prototype_runtime.py` and `../capture_evaluation.py`. Extracted pieces already in use are `main/operation.py`, `main/executor.py`, `capture/scope.py`, `capture/executor.py`, the common parser and the MAIN/CAPTURE statement preparers. `arbiter.py` and `pipeline.py` have tested contracts but are not yet wired into the runtime. The controller route context and single-owner RDBG migration described below remain target architecture.
 
 ```text
 RuntimeSession -> RuntimeApi -> CellExecutionPipeline -> controller port
