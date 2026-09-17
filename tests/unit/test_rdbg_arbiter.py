@@ -965,6 +965,33 @@ def test_stop_after_confirmed_modify_blocks_continue_and_retains_owner():
     arbiter.close(timeout=3)
 
 
+def test_modify_callback_rejection_does_not_claim_remote_dispatch(runtime):
+    session, route, arbiter = runtime
+    entries = []
+
+    def modify(variable, value_expression, *, on_transport_dispatch):
+        on_transport_dispatch()
+        session.record('modify-must-not-run')
+
+    def reject():
+        entries.append('callback')
+        raise ValueError('local writeback bookkeeping rejected')
+
+    def plan(port):
+        with pytest.raises(ValueError, match='bookkeeping'):
+            port.modify('root', 'value', on_transport_dispatch=reject)
+        return Settlement(evaluate(port, 'next-safe-operation'))
+
+    session.modify = modify
+    ticket = arbiter.submit(route, plan)
+    arbiter.dispatch(ticket)
+    assert ticket.wait(3) == 'next-safe-operation'
+    assert entries == ['callback']
+    assert [name for name, _ in session.calls] == [
+        'next-safe-operation', 'event',
+    ]
+
+
 def test_detach_does_not_cancel_late_settlement(runtime):
     session, route, arbiter = runtime
     ticket = arbiter.submit(route, lambda port: Settlement(evaluate(port, 'blocked')))

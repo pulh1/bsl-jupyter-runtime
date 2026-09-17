@@ -280,9 +280,27 @@ class SessionPort:
             self._ticket._entered = False
         return result
 
-    def modify(self, variable: str, value_expression: str) -> ModifyResult:
+    def modify(self, variable: str, value_expression: str, *,
+               on_transport_dispatch: Callable[[], None] | None = None) -> ModifyResult:
         self._require_idle()
-        result = self._owner._session.modify(variable, value_expression, on_transport_dispatch=self._transport_entered)
+        previously_entered = self._ticket._ever_entered
+
+        def entered() -> None:
+            self._transport_entered()
+            if on_transport_dispatch is not None:
+                try:
+                    on_transport_dispatch()
+                except BaseException:
+                    # The caller's bookkeeping rejected this command before
+                    # transport entry; preserve prior ownership evidence.
+                    with self._owner._mailbox:
+                        self._ticket._entered = False
+                        self._ticket._ever_entered = previously_entered
+                    raise
+
+        result = self._owner._session.modify(
+            variable, value_expression, on_transport_dispatch=entered
+        )
         with self._owner._mailbox:
             self._ticket._entered = False
         return result
