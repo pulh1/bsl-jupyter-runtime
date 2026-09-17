@@ -76,7 +76,7 @@ def test_termination_ack_without_absence_keeps_exact_target_unknown() -> None:
 
 
 @pytest.mark.parametrize("failure", [RdbgDebugUiNotRegistered, ProtocolError])
-def test_failed_termination_request_never_claims_target_absence(
+def test_failed_termination_request_can_still_prove_target_absence(
     failure: type[Exception],
 ) -> None:
     contract = _termination_contract()
@@ -90,13 +90,37 @@ def test_failed_termination_request_never_claims_target_absence(
 
     result = contract.terminate_server_target(port, TARGET)
 
+    assert isinstance(result, contract.ServerTerminationConfirmed)
+    assert result.expected_target == TARGET
+    assert result.absence is port.evidence
+    assert "private target detail" not in repr(result)
+    assert port.calls == ["terminate", ("confirm", TARGET, 30.0)]
+
+
+def test_failed_termination_request_without_absence_remains_unknown() -> None:
+    contract = _termination_contract()
+
+    class FailedRequestAndProofPort(_ServerPort):
+        def terminate_bound_server_session(self) -> bool:
+            self.calls.append("terminate")
+            raise ProtocolError("private request detail")
+
+        def wait_for_bound_server_targets_absent(
+            self, expected_target: TargetId, *, timeout_s: float
+        ) -> BoundServerTargetAbsence:
+            self.calls.append(("confirm", expected_target, timeout_s))
+            raise CommandTimeout("private registry detail")
+
+    port = FailedRequestAndProofPort(BoundServerTargetAbsence(CLIENT, TARGET, 1.0, 1))
+
+    result = contract.terminate_server_target(port, TARGET)
+
     assert isinstance(result, contract.TerminationUnknown)
     assert result.expected_target == TARGET
-    assert result.stage == "request"
-    assert result.error_type == failure.__name__
+    assert result.stage == "confirmation"
     assert result.client_termination_requested is None
-    assert "private target detail" not in repr(result)
-    assert port.calls == ["terminate"]
+    assert "private" not in repr(result)
+    assert port.calls == ["terminate", ("confirm", TARGET, 30.0)]
 
 
 def test_mismatched_registry_evidence_does_not_confirm_original_target() -> None:

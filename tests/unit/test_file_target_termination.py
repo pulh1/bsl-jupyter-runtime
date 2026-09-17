@@ -75,6 +75,24 @@ def test_file_stop_preserves_owner_when_termination_raises() -> None:
     assert "private process path" not in repr(result)
 
 
+def test_file_stop_can_confirm_exit_even_when_close_raises() -> None:
+    process = FakeOwnedProcess()
+
+    def exited_then_raised(timeout_s: float) -> None:
+        process.calls.append(timeout_s)
+        process.process.returncode = -15
+        raise RuntimeError("stream close failed")
+
+    process.close = exited_then_raised
+
+    result = terminate_file_target(process, TARGET, grace_s=2)
+
+    assert isinstance(result, FileTerminationConfirmed)
+    assert result.pid == process.pid
+    assert result.returncode == -15
+    assert process.calls == [2.0]
+
+
 @pytest.mark.parametrize("grace_s", [-1.0, float("inf"), float("nan"), True])
 def test_file_stop_rejects_invalid_confirmation_grace_before_process_call(
     grace_s: object,

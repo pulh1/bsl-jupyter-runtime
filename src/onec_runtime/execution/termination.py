@@ -83,16 +83,21 @@ def terminate_file_target(
     ):
         raise ValueError("grace_s must be finite and non-negative")
     pid = process.pid
+    close_error_type: str | None = None
     try:
         process.close(timeout_s=float(grace_s))
     except Exception as error:
-        return FileTerminationUnknown(expected_target, pid, type(error).__name__)
+        # Closing owned streams may fail after the debuggee has exited. The
+        # process exit, rather than the close return, is the target evidence.
+        close_error_type = type(error).__name__
     try:
         returncode = process.process.poll()
     except Exception as error:
         return FileTerminationUnknown(expected_target, pid, type(error).__name__)
     if returncode is None:
-        return FileTerminationUnknown(expected_target, pid, "ExitUnverified")
+        return FileTerminationUnknown(
+            expected_target, pid, close_error_type or "ExitUnverified"
+        )
     return FileTerminationConfirmed(expected_target, pid, returncode)
 
 
@@ -116,12 +121,14 @@ def terminate_server_target(
     ):
         raise ValueError("grace_s must be finite and non-negative")
 
+    requested: bool | None = None
     try:
         requested = port.terminate_bound_server_session()
-    except Exception as error:
-        return TerminationUnknown(
-            expected_target, "request", type(error).__name__, None
-        )
+    except Exception:
+        # A failed request does not prove that teardown was rejected. Query
+        # the registry anyway: exact absence is stronger evidence than the
+        # request response.
+        pass
     try:
         absence = port.wait_for_bound_server_targets_absent(
             expected_target, timeout_s=float(grace_s)
