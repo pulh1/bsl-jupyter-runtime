@@ -9,7 +9,7 @@ from enum import StrEnum
 from hashlib import sha256
 from math import isfinite
 from pathlib import Path
-from threading import Event, RLock, Thread, current_thread
+from threading import Event, Lock, RLock, Thread, current_thread
 from time import sleep
 from typing import Iterator, cast
 from uuid import UUID, uuid4
@@ -120,6 +120,38 @@ from onec_runtime.toolchain import (
     dump_target_extension_cfe,
     dump_target_extension_files,
 )
+
+
+# Runtime-bound references use this process-local epoch to remain stale after
+# a replacement bootstrap, even when the controller's internal generations
+# would otherwise restart from their constructor default.
+_runtime_generation_lock = Lock()
+_next_runtime_generation = 0
+
+
+def _allocate_runtime_generation() -> int:
+    """Return the next unique runtime generation for this Python process."""
+
+    global _next_runtime_generation
+    with _runtime_generation_lock:
+        _next_runtime_generation += 1
+        return _next_runtime_generation
+
+
+def _bootstrap_runtime_controller(
+    rdbg: RdbgSession,
+    service_location: ModuleLocation,
+    journal: RecoveryJournal,
+) -> PrototypeRuntimeController:
+    """Create the controller for one newly bootstrapped runtime target."""
+
+    return PrototypeRuntimeController(
+        rdbg,
+        service_location,
+        command_timeout_s=90.0,
+        runtime_generation=_allocate_runtime_generation(),
+        journal=journal,
+    )
 
 
 class ExtensionMode(StrEnum):
@@ -1119,11 +1151,10 @@ class RuntimeSession:
                 verify_extension_safe_mode_disabled(rdbg)
 
             journal = RecoveryJournal(artifacts.append_jsonl)
-            controller = PrototypeRuntimeController(
+            controller = _bootstrap_runtime_controller(
                 rdbg,
                 service_location,
-                command_timeout_s=90.0,
-                journal=journal,
+                journal,
             )
             notebook_worker_builder = NotebookWorkerArtifactBuilder(runtime)
             worker_module_builder = WorkerModuleArtifactBuilder(
