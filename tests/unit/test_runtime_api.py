@@ -579,6 +579,43 @@ def test_execute_bsl_binds_the_exact_supplied_visible_source_unit() -> None:
     assert controller.main_sources == []
 
 
+def test_execute_bsl_uses_common_parser_diagnostic_with_visible_location(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A shared-parser error must reach the existing mapped RuntimeReply path."""
+    import onec_runtime.execution.common as common
+    from onec_runtime.bsl.source_maps import SourceSpan
+
+    source = "Результат = 1;"
+    unit = SourceUnitRef(
+        SourceUnitKind.NOTEBOOK_CELL,
+        "shared-parser-cell",
+        2,
+        source_sha256(source),
+    )
+
+    def reject(_target: object, _source: str, *, source_unit: SourceUnitRef) -> object:
+        assert source_unit == unit
+        position = source.index("1")
+        raise BslParseError(
+            "planned common parser failure",
+            span=SourceSpan(position, position + 1),
+        )
+
+    monkeypatch.setattr(common, "split_notebook_cell", reject)
+    controller = FakeController()
+    reply = PrototypeRuntimeApi(controller).execute_bsl(source, source_unit=unit)
+
+    assert reply.kind is RuntimeReplyKind.SOURCE_FAILED
+    assert reply.state is OperationState.COMPLETED
+    assert reply.diagnostic is not None
+    assert reply.diagnostic.stage is DiagnosticStage.PARSING
+    assert reply.diagnostic.source_unit == unit
+    assert reply.diagnostic.visible_location is not None
+    assert reply.diagnostic.visible_location.column == source.index("1") + 1
+    assert controller.main_sources == []
+
+
 def test_runtime_passes_mapped_worker_and_visible_context_to_production_builder(
     tmp_path: Path,
 ) -> None:

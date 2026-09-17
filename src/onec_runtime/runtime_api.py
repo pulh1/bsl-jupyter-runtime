@@ -129,6 +129,11 @@ from onec_runtime.errors import (
     StaleWorkerGeneration,
     WorkerPromotionOutcomeUnknown,
 )
+from onec_runtime.execution.common import NotebookCommonParser
+from onec_runtime.execution.contracts import (
+    OperationSourceMapBundle,
+    SourceDiagnostic,
+)
 from onec_runtime.breakpoint_workspace import (
     BreakpointWorkspaceController,
     BreakpointWorkspaceOutcomeUnknown,
@@ -318,15 +323,6 @@ class _PreparedMainExecutionAttempt:
             raise self.__error
         assert self.__reply is not None
         return self.__reply
-
-
-@dataclass(frozen=True, slots=True)
-class OperationSourceMapBundle:
-    """Private mapped branches bound to one visible operation identity."""
-
-    visible: SourceUnitRef
-    worker_candidate: MappedSource | None = field(repr=False)
-    statement_execution: MappedSource | None = field(repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -3631,36 +3627,31 @@ class PrototypeRuntimeApi:
                 raise ProtocolError("BSL cell is empty")
             lowerer = getattr(self._controller, "lowerer", None)
             cell_source = source
-            from onec_runtime.bsl.notebook_cells import split_notebook_cell
             from onec_runtime.bsl.parser_target import PythonParserTarget
 
             parser_target = getattr(lowerer, "parser_target", None)
             visible_unit = self._notebook_source_unit(source, source_unit)
-            visible_source = mapped_visible_source(source, visible_unit)
-            visible_source_context = VisibleSourceContext({visible_unit: source})
-            try:
-                cell = split_notebook_cell(
-                    parser_target
-                    if isinstance(parser_target, PythonParserTarget)
-                    else PythonParserTarget.from_generated(),
-                    source,
-                    source_unit=visible_unit,
-                )
-            except (BslLexError, BslParseError) as error:
+            common = NotebookCommonParser(
+                parser_target if isinstance(parser_target, PythonParserTarget) else None
+            ).prepare(source, visible_unit)
+            if isinstance(common, SourceDiagnostic):
+                if (
+                    common.error is None
+                    or common.mapped_source is None
+                    or common.visible_source_context is None
+                    or common.stage is None
+                ):
+                    raise ProtocolError("Common parser returned incomplete diagnostic")
                 return self._source_failure_reply(
-                    error,
-                    visible_source,
-                    stage=DiagnosticStage.PARSING,
-                    visible_source_context=visible_source_context,
+                    common.error,
+                    common.mapped_source,
+                    stage=common.stage,
+                    visible_source_context=common.visible_source_context,
                 )
-            mapped_visible = cell.visible.source_map.map_offset(0)
-            if mapped_visible.unit is None:
-                raise ProtocolError("Notebook cell has no visible source identity")
-            source_maps = OperationSourceMapBundle(
-                mapped_visible.unit,
-                cell.worker,
-                cell.statements,
-            )
+            cell = common.parsed_units
+            visible_source = cell.visible
+            visible_source_context = VisibleSourceContext({visible_unit: source})
+            source_maps = common.source_maps
             if source_maps.statement_execution is not None:
                 cell_source = source_maps.statement_execution.text
             method_set_candidate, worker_artifact, candidate_catalog = (

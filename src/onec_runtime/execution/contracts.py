@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
+
+from onec_runtime.bsl.diagnostics import DiagnosticStage, VisibleSourceContext
+from onec_runtime.bsl.source_maps import MappedSource, SourceUnitRef
 
 
 @dataclass(frozen=True, slots=True)
@@ -12,6 +15,15 @@ class CommonCell:
     parsed_units: object
     source_maps: object
     source_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class OperationSourceMapBundle:
+    """Private Worker and statement branches of one visible notebook cell."""
+
+    visible: SourceUnitRef
+    worker_candidate: MappedSource | None = field(repr=False)
+    statement_execution: MappedSource | None = field(repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +72,10 @@ class Current:
 @dataclass(frozen=True, slots=True)
 class SourceDiagnostic:
     message: str
+    error: Exception | None = field(default=None, repr=False)
+    mapped_source: MappedSource | None = field(default=None, repr=False)
+    visible_source_context: VisibleSourceContext | None = field(default=None, repr=False)
+    stage: DiagnosticStage | None = None
 
 
 @dataclass(frozen=True, slots=True)
