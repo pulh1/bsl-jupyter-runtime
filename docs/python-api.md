@@ -150,9 +150,11 @@ failed = runtime.execute_bsl('ВызватьИсключение "проверк
 assert not failed.succeeded
 assert capture.status().can_inspect
 
-# Тот же остановленный кадр доступен для проверки и исправленной ячейки.
-frame = capture.stack[0]
-local_names = [node.name for node in frame.locals[:20].items]
+# При остановке в пользовательском модуле его кадр доступен для проверки.
+frames = [frame for frame in capture.stack.native[:20].frames
+          if not frame.runtime_kernel]
+local_names = ([node.name for node in frames[0].locals[:20].items]
+               if frames else [])
 context_names = [node.name for node in capture.context.variables[:20].items]
 corrected = runtime.execute_bsl("РезультатИнструкции = 42;")
 assert corrected.succeeded
@@ -168,7 +170,7 @@ rows = proxy.to_df(refs="presentation")  # повтор с подходящим 
 reply = runtime.resume_capture()
 ```
 
-В реальной программе выбирайте лимит `max_items` по данным, а не полагайтесь на этот намеренно маленький лимит. Если после любой операции `status().phase` равна `evaluating` или `outcome_unknown`, не отправляйте повтор: используйте `capture.wait()` с `pending_evaluation_id`. Если фаза `recovery_required` или `stale`, frame и прокси больше не пригодны для нового чтения; следуйте `failure.recommended_action` либо откройте новый runtime. После `resume_capture()` старый `CaptureView` становится `stale`, а прокси, привязанные к прежнему контексту, нужно получить заново после следующей успешной публикации BSL-значений.
+В реальной программе выбирайте лимит `max_items` по данным, а не полагайтесь на этот намеренно маленький лимит. Если после любой операции `status().phase` равна `evaluating` или `outcome_unknown`, не отправляйте повтор: используйте `capture.wait()` с `pending_evaluation_id`. При `recovery_required` текущий API блокирует новые чтения до выяснения исхода и ремонта ресурса; сама эта фаза не доказывает потерю кадра. При `stale` старый `CaptureView` уже не относится к текущему stop. После `resume_capture()` прокси, привязанные к прежнему контексту, нужно получить заново после следующей успешной публикации BSL-значений.
 
 ## Прерывание ячейки и Stop
 
