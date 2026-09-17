@@ -4,6 +4,10 @@
 
 `RuntimeConfig` импортируется из `onec_runtime.config`, `RuntimeSessionConfig`, `ExtensionMode` и `RuntimeSession` — из `onec_runtime.session`, а `InteractiveRuntimeSession` — из `onec_runtime_jupyter`. В `RuntimeConfig` обязательный `platform_bin` указывает каталог исполняемых файлов платформы; `connection_string` выбирает файловую или серверную ИБ. `RuntimeSessionConfig(runtime=..., source_root=..., extension_mode=...)` связывает сеанс с выгрузкой исходников и режимом установки расширения (`AUTO` или `MANUAL`). `source_root` нужен для загрузки модулей и точек по пути к файлу. Дополнительные параметры, включая `workspace`, `chunk_size` и `evidence_root`, используются при настройке окружения и переноса данных.
 
+Типы ответов `RuntimeReply`, `RuntimeReplyKind`, `RuntimeStatus` и `RuntimeNamespaceSnapshot` находятся в `onec_runtime.runtime_api`; `CaptureView`, `DebugFrame` и `StackPage` — в `onec_runtime.capture_inspection`; `CaptureStatus`, `CapturePhase`, `CaptureEvaluationOutcome`, `CaptureEvaluationState`, `CaptureEvaluationKind`, `CaptureEvaluationTiming` и `CaptureFailureDiagnostic` — в `onec_runtime.capture_evaluation`. `RuntimeDebugStop` находится в `onec_runtime.worker_breakpoints`, а его `StopReason` — в `onec_runtime.stop_routing`. Обычно эти объекты не нужно создавать вручную: их возвращают методы сеанса и текущего CAPTURE view.
+
+`RuntimeSession` — пользовательская граница core runtime. Объект `runtime.runtime_api` сейчас имеет реализацию `PrototypeRuntimeApi` и собирается при запуске сеанса. Прямой вызов его методов в приложении может обойти блокировку и владение CAPTURE на уровне `RuntimeSession`; для обычного Python-кода используйте методы сеанса. `RdbgArbiter`, его `ExecutionTicket` и `StopRequestOutcome` относятся к внутреннему слою исполнения, а не к API notebook.
+
 ## Сеанс и выполнение
 
 ```python
@@ -28,15 +32,20 @@ runtime.close()
 | `runtime.namespace_snapshot() -> RuntimeNamespaceSnapshot` | Получить имена постоянных BSL-значений и поколения runtime/контекста. |
 | `runtime.current_capture() -> CaptureView` | Получить вид текущей остановки CAPTURE; при её отсутствии вызывается `NoActiveCaptureError`. |
 | `runtime.resume_capture(*, dirty_roots=(), continuation_attempt_id=None, timeout_s=None) -> RuntimeReply` | Продолжить выполнение остановленной MAIN-команды через текущий CAPTURE. `dirty_roots` добавляет имена корневых переменных для записи назад; обычный путь отслеживает их автоматически. `timeout_s` ограничивает ожидание вызывающего, а не BSL-код. В notebook доступно также `%bsl_resume`. |
+| `runtime.resume_debug_stop(*, timeout_s=None) -> RuntimeReply` | Продолжить остановку `debug_stopped` на пользовательской точке. Это отдельный путь от `resume_capture()`. |
+| `runtime.add_capture_point(path, line) -> ModuleLocation` / `runtime.clear_capture_points()` | Добавить точку по файлу внутри `source_root` и номеру строки от 1 / снять точки сеанса. |
+| `runtime.refresh_capture_sources()` | Повторно прочитать настроенный каталог исходников после внешних изменений. Требует настроенного каталога и отсутствия активной CAPTURE; ранее разрешённые точки нужно установить снова. |
 | `runtime.close()` | Завершить принадлежащий этому объекту сеанс. |
 
-`RuntimeReply` содержит `kind` (`RuntimeReplyKind`), `state` (`OperationState`), `operation_id`, `succeeded`, `result`, `messages`, `error` и, когда применимо, `location`, `debug_stop`, `diagnostic`. Успех BSL-ячейки и завершение всей MAIN-команды различаются: `kind == RuntimeReplyKind.CAPTURED` означает, что MAIN остановлена и может продолжиться через `resume_capture()`. Проверяйте `kind` и `succeeded`, а не только наличие `result`.
+`RuntimeReply` содержит `kind` (`RuntimeReplyKind`), `state` (`OperationState`), `operation_id`, `succeeded`, `result`, `messages`, `error` и, когда применимо, `location`, `debug_stop`, `diagnostic`, `stop_sequence`, `capture_ticket` и `changed_roots`. Успех BSL-ячейки и завершение всей MAIN-команды различаются: `kind == RuntimeReplyKind.CAPTURED` означает, что MAIN остановлена и может продолжиться через `resume_capture()`. Проверяйте `kind` и `succeeded`, а не только наличие `result`.
 
 `RuntimeStatus` содержит `state`, `runtime_generation`, `operation_id`, `worker_generation` и `capture_setup`. Последнее поле равно `None`, когда незавершённого открытия CAPTURE нет; иначе это снимок `CaptureSetupSnapshot` с `setup_stage`, `context_state`, `frame_identity` и безопасным `error_code`. `state == capture_setup_failed` после подтверждённой ошибки чтения locals, переноса, поиска kernel frame или начала контекста сохраняет остановленную MAIN-команду. До успешного открытия контекста новую CAPTURE-ячейку и `resume_capture()` выполнить нельзя; `CaptureView` в этой стадии ещё недоступен. Совпадение target и адреса строки само по себе не доказывает, что при повторной проверке это та же физическая остановка, поэтому публичного повтора setup пока нет.
 
 Во время ожидания остановки MAIN вызов `status()` из другого Python-потока возвращает `state == main_pending` и идентификатор текущей команды. Такое наблюдение не прерывает выполнение 1С и не занимает RDBG.
 
-`RuntimeNamespaceSnapshot` содержит `names`, `runtime_generation`, `context_generation`. Поколения используются для проверки актуальности прокси. Состав состояний `OperationState` включает `idle`, `main_pending`, `captured`, `capture_setup_failed`, `evaluating_capture`, `resuming`, `recovering`, `completed`, `failed` и другие диагностические состояния; не считайте любое состояние, отличное от `captured`, потерей target.
+`RuntimeNamespaceSnapshot` содержит `names`, `runtime_generation`, `context_generation`. Поколения используются для проверки актуальности прокси. Состав состояний `OperationState` включает `idle`, `main_pending`, `captured`, `capture_setup_failed`, `evaluating_capture`, `debug_stopped`, `resuming`, `recovering`, `completed`, `failed` и другие диагностические состояния; не считайте любое состояние, отличное от `captured`, потерей target. `main_pending` означает, что MAIN-команда ещё ждёт исхода или следующей остановки; `evaluating_capture` и `resuming` означают занятую CAPTURE-операцию. `status()` не сообщает, завершилось ли удалённое выполнение после прерывания одного лишь Python-ожидания.
+
+Если `reply.kind == RuntimeReplyKind.DEBUG_STOPPED`, поле `reply.debug_stop` содержит `RuntimeDebugStop`: `reason`, `origin`, `operation_id`, `location`, `frames` и `breakpoint_ids`. `reason` — значение `StopReason` (`user_breakpoint`, `pause`, `exception` и другие причины); `origin` указывает на MAIN или CAPTURE evaluation. Продолжайте такую остановку через `runtime.resume_debug_stop()`. Для `RuntimeReplyKind.CAPTURED` используйте `runtime.current_capture()` и `runtime.resume_capture()`.
 
 ## `%%bsl` и значения в Python
 
@@ -124,6 +133,16 @@ if status.can_wait:
 ```
 
 `CaptureEvaluationOutcome` содержит `evaluation_id`, `evaluation_kind`, `state` (`pending`, `completed`, `failed`, `unknown`), `result`, `messages`, `error`, `diagnostic` и `timing`. `wait()` наблюдает уже отправленную операцию. Он не является повторным `evalExpr`.
+
+`CaptureEvaluationKind` различает пользовательский BSL (`user_bsl`), чтение (`inspection`) и вспомогательную материализацию (`materialization_helper`). `CaptureFailureDiagnostic` содержит безопасные `code`, `message` и `recommended_action`. `CaptureEvaluationTiming` содержит время создания, отметки этапов в миллисекундах, `remote_step_count` и `poll_count`; отсутствующая отметка имеет значение `None`. Поля `failure` и `diagnostic` описывают состояние операции, но сами по себе не доказывают потерю остановленного target.
+
+## Прерывание ячейки и Stop
+
+`KeyboardInterrupt` или кнопка остановки notebook прерывают ожидание Python-ячейки. После отправки команды в 1С это само по себе **не подтверждает** прекращение BSL-кода. Сначала проверьте `runtime.status()` (в notebook — `%bsl_status`). Если сохранилась текущая CAPTURE-остановка, `runtime.current_capture().status()` показывает её фазу; `capture.wait(timeout_s=..., evaluation_id=...)` позволяет наблюдать уже принятую оценку без повторной отправки. Истечение `timeout_s` у `capture.wait()` возвращает `pending`, а у `resume_capture()` прекращает ожидание вызывающего; эти интервалы не служат сроком выполнения BSL.
+
+Для принятого CAPTURE `evalExpr` прерванный ожидающий вызов отвязывается от операции. Для принятого `resume_capture()` завершение также может прийти после ухода ожидающего Python-вызова. Новую CAPTURE-операцию отправляйте лишь после проверки текущего состояния: `evaluating_capture`, `resuming` и `recovering` не являются подтверждением нового свободного stop. При `main_pending` MAIN-команда ещё может исполняться или ждать debugger stop; `status()` показывает опубликованное состояние, не останавливая её.
+
+У `RuntimeSession` и `InteractiveRuntimeSession` пока нет публичного `request_stop()` или `abort_current()`. Внутренний `RdbgArbiter.request_stop(ticket)` возвращает `StopRequestOutcome`: `CANCELLED_BEFORE_EFFECT` означает локальную отмену до удалённого действия, `REQUESTED` означает принятую заявку и запрет новых действий этой операции, `ALREADY_SETTLED` означает, что ticket уже завершён. `REQUESTED` и поле `TicketStatus.stop_requested` **не являются** доказательством остановки или завершения target. Эти объекты предназначены для владельца исполнения; notebook-код не должен создавать tickets или вызывать arbiter напрямую.
 
 ## Ошибки и практические границы
 
