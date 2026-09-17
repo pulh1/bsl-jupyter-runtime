@@ -58,6 +58,16 @@ class CaptureStopIdentity:
             raise ValueError("capture stop identity has invalid sequence")
 
 
+@dataclass(frozen=True, slots=True)
+class CaptureSetupSnapshot:
+    """Bounded public evidence for an unfinished CAPTURE stop."""
+
+    setup_stage: CaptureSetupStage
+    context_state: CaptureContextState
+    frame_identity: CaptureFrameIdentity
+    error_code: str | None
+
+
 @dataclass(slots=True)
 class CaptureScope:
     """One recognized stop, including partial setup when opening fails."""
@@ -153,6 +163,14 @@ class CaptureScope:
     def fail_setup(self, error: BaseException) -> None:
         self.context_state = CaptureContextState.SETUP_FAILED
         self.setup_error_code = type(error).__name__
+
+    def setup_snapshot(self) -> CaptureSetupSnapshot:
+        return CaptureSetupSnapshot(
+            self.setup_stage,
+            self.context_state,
+            self.frame_identity,
+            self.setup_error_code,
+        )
 
     def note_setup_uncertain(self, error: BaseException) -> None:
         """A transport exception does not prove the remote setup step failed."""

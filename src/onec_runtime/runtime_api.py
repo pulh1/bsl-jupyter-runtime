@@ -129,6 +129,7 @@ from onec_runtime.errors import (
     StaleWorkerGeneration,
     WorkerPromotionOutcomeUnknown,
 )
+from onec_runtime.execution.capture import CaptureScope, CaptureSetupSnapshot
 from onec_runtime.execution.common import NotebookCommonParser
 from onec_runtime.execution.capture.preparation import CaptureCellPreparer
 from onec_runtime.execution.contracts import (
@@ -343,6 +344,7 @@ class RuntimeStatus:
     runtime_generation: int
     operation_id: int
     worker_generation: WorkerGenerationHandle | None
+    capture_setup: CaptureSetupSnapshot | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1122,6 +1124,12 @@ class PrototypeRuntimeApi:
     def status(self) -> RuntimeStatus:
         owner = self._capture_control_owner()
         capture_status = None if owner is None else owner.status(owner._fence)
+        scope = getattr(self._controller, "capture_scope", None)
+        setup = (
+            scope.setup_snapshot()
+            if isinstance(scope, CaptureScope) and not scope.published
+            else None
+        )
         capture_controls_state = (
             capture_status is not None
             and (
@@ -1148,6 +1156,7 @@ class PrototypeRuntimeApi:
                     self._controller.runtime_generation,
                     self._controller.operation_id,
                     self._worker_generation_handle,
+                    setup,
                 )
         state = self._controller.state
         assert capture_status is not None
@@ -1165,6 +1174,7 @@ class PrototypeRuntimeApi:
             capture_status.capture_generation,
             capture_status.operation_id,
             worker_generation,
+            setup,
         )
 
     def current_capture(self) -> CaptureView:
@@ -3569,6 +3579,11 @@ class PrototypeRuntimeApi:
     ) -> RuntimeReply:
         with self._capture_data_plane_writer():
             self._require_available()
+            if self._controller.state is OperationState.CAPTURE_SETUP_FAILED:
+                raise ProtocolError(
+                    "CAPTURE setup failed at the suspended stop; "
+                    "cell execution requires a ready capture scope"
+                )
             pin, shared_capture_pin = self._begin_user_operation_pin_locked()
             user_bsl_dispatched = False
             known_reply: RuntimeReply | None = None

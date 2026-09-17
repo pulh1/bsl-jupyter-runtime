@@ -1866,6 +1866,42 @@ def test_api_routes_main_then_capture_cell_and_preserves_operation() -> None:
     assert controller.resume_roots == [("Скаляр",)]
 
 
+def test_confirmed_local_read_failure_preserves_capture_stop_in_public_status() -> None:
+    """A failed local read must not claim that the suspended MAIN was lost."""
+    from onec_runtime.rdbg.models import LocalVariablesResult
+
+    class LocalReadFailureSession(ScriptedSession):
+        def local_variables(self, stack_level: int = 0) -> LocalVariablesResult:
+            if stack_level == 0:
+                self.calls.append(("local_variables", stack_level))
+                return LocalVariablesResult(uuid4(), (), True, "locals unavailable")
+            return super().local_variables(stack_level)
+
+    session = LocalReadFailureSession((CAPTURE_A,))
+    controller = PrototypeRuntimeController(session, SERVICE)
+    api = PrototypeRuntimeApi(controller, capture_points=(CAPTURE_A,))
+
+    with pytest.raises(ProtocolError, match="locals unavailable"):
+        api.execute_bsl("Результат = 1;")
+
+    status = api.status()
+    assert status.state.value == "capture_setup_failed"
+    assert status.capture_setup is not None
+    assert status.capture_setup.context_state.value == "setup_failed"
+    assert status.capture_setup.setup_stage.value == "stop_recognized"
+    assert status.capture_setup.frame_identity.value == "unverified"
+    assert controller.main_operation is not None
+    assert not controller.main_operation.terminal
+    assert controller.main_operation.pending_stop is controller.capture_scope.stop
+
+    before = tuple(session.calls)
+    with pytest.raises(ProtocolError):
+        api.execute_bsl("Результат = 2;")
+    with pytest.raises(ProtocolError):
+        api.resume_capture()
+    assert tuple(session.calls) == before
+
+
 def test_controller_selected_capture_preparer_rejects_before_target_dispatch() -> None:
     """A route policy may reject a cell without dispatching it to the stopped target."""
     controller = _PinnedOperationController()

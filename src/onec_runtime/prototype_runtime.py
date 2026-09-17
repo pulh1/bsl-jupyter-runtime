@@ -15,7 +15,11 @@ from threading import local
 from uuid import UUID, uuid4
 
 from onec_runtime.execution.main import MainExecutor, MainOperation, MainPhase
-from onec_runtime.execution.capture import CaptureFrameIdentity, CaptureScope
+from onec_runtime.execution.capture import (
+    CaptureFrameIdentity,
+    CaptureScope,
+    CaptureSetupStage,
+)
 from onec_runtime.execution.capture.executor import (
     CaptureCommandMismatchError,
     CaptureExecutor,
@@ -246,6 +250,7 @@ class OperationState(Enum):
     IDLE = "idle"
     MAIN_PENDING = "main_pending"
     CAPTURED = "captured"
+    CAPTURE_SETUP_FAILED = "capture_setup_failed"
     EVALUATING_CAPTURE = "evaluating_capture"
     DEBUG_STOPPED = "debug_stopped"
     FLUSHING = "flushing"
@@ -1794,6 +1799,7 @@ class PrototypeRuntimeController:
                 self.state = state_before_dispatch
             elif self.state not in {
                 OperationState.CAPTURED,
+                OperationState.CAPTURE_SETUP_FAILED,
                 OperationState.DEBUG_STOPPED,
                 OperationState.PARTIAL_WRITEBACK_FAILURE,
                 OperationState.BREAKPOINT_RESTORE_FAILURE,
@@ -1933,7 +1939,14 @@ class PrototypeRuntimeController:
         except Exception as error:
             if isinstance(error, CaptureCommandMismatchError) and self.main_operation is not None:
                 self.main_operation.mark_unknown()
-            if isinstance(error, (ProtocolError, BslExecutionError)):
+            if (
+                isinstance(error, ProtocolError)
+                and scope.setup_stage is CaptureSetupStage.STOP_RECOGNIZED
+            ):
+                # A confirmed local read failure has made no CAPTURE setup
+                # side effect. The original stop and MAIN operation still exist.
+                self.state = OperationState.CAPTURE_SETUP_FAILED
+            elif isinstance(error, (ProtocolError, BslExecutionError)):
                 self.state = OperationState.FAILED
             scope.fail_setup(error)
             raise
