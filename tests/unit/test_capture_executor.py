@@ -99,6 +99,24 @@ def test_executor_prepares_scope_in_order_without_publishing_it() -> None:
     assert port.calls[5][1][1] == 2
 
 
+def test_long_lived_capture_executor_uses_the_port_of_each_stop() -> None:
+    executor = CaptureExecutor(None, KERNEL, decode_command_id=evaluation_to_python)
+    first_port = SetupPort()
+    second_port = SetupPort()
+    first_scope = CaptureScope.from_stop(7, 42, STOP, 3)
+    second_scope = CaptureScope.from_stop(7, 42, STOP, 4)
+
+    executor.open_scope(first_scope, port=first_port)
+    assert len(first_port.calls) == 6
+    assert second_port.calls == []
+
+    executor.open_scope(second_scope, port=second_port)
+    assert len(first_port.calls) == 6
+    assert len(second_port.calls) == 6
+    assert first_scope.setup_stage is CaptureSetupStage.CONTEXT_BEGUN
+    assert second_scope.setup_stage is CaptureSetupStage.CONTEXT_BEGUN
+
+
 def test_executor_rejects_other_main_command_before_opening_context() -> None:
     port = SetupPort(command_id=41)
     scope = CaptureScope.from_stop(7, 42, STOP, 3)

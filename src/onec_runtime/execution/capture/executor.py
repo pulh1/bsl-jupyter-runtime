@@ -43,7 +43,7 @@ class CaptureExecutor:
 
     def __init__(
         self,
-        rdbg: CaptureRdbgPort,
+        rdbg: CaptureRdbgPort | None,
         kernel_location: ModuleLocation,
         *,
         decode_command_id: Callable[[EvaluationResult], object],
@@ -52,15 +52,18 @@ class CaptureExecutor:
         self._kernel_location = kernel_location
         self._decode_command_id = decode_command_id
 
-    def open_scope(self, scope: CaptureScope) -> CaptureSetupResult:
+    def open_scope(
+        self, scope: CaptureScope, *, port: CaptureRdbgPort | None = None
+    ) -> CaptureSetupResult:
         """Collect the business frame and confirm the suspended MAIN identity."""
 
-        local_result = self._rdbg.local_variables(stack_level=0)
+        rdbg = self._port(port)
+        local_result = rdbg.local_variables(stack_level=0)
         if local_result.error_occurred:
             raise ProtocolError(local_result.error_text)
         scope.record_locals(tuple(local_result.variables))
 
-        transfer = self._rdbg.evaluate(
+        transfer = rdbg.evaluate(
             build_capture_transfer_call(
                 variable.name for variable in local_result.variables
             )
@@ -72,9 +75,9 @@ class CaptureExecutor:
             raise ProtocolError("Capture temporary-storage address is invalid")
         scope.record_transfer(address)
 
-        stack_level = self._locate_kernel_context_frame(scope.stop)
+        stack_level = self._locate_kernel_context_frame(scope.stop, rdbg)
         scope.record_kernel_frame(stack_level)
-        command_evidence = self._rdbg.evaluate(
+        command_evidence = rdbg.evaluate(
             "ИдентификаторКоманды", stack_level=stack_level
         )
         if command_evidence.error_occurred:
@@ -86,7 +89,7 @@ class CaptureExecutor:
                 f"operation {scope.identity.main_command_id}"
             )
 
-        begin = self._rdbg.evaluate(
+        begin = rdbg.evaluate(
             build_live_capture_begin_call(address), stack_level=stack_level
         )
         if begin.error_occurred:
@@ -96,7 +99,15 @@ class CaptureExecutor:
         # owner. A successful remote begin alone cannot admit CAPTURE cells.
         return CaptureSetupResult(scope.frame_variables, observed_command_id)
 
-    def _locate_kernel_context_frame(self, stop: StopEvent) -> int:
+    def _port(self, port: CaptureRdbgPort | None) -> CaptureRdbgPort:
+        selected = self._rdbg if port is None else port
+        if selected is None:
+            raise RuntimeError("CAPTURE RDBG port is not bound")
+        return selected
+
+    def _locate_kernel_context_frame(
+        self, stop: StopEvent, rdbg: CaptureRdbgPort
+    ) -> int:
         required = {"контекст", "текущаяинструкция", "идентификаторкоманды"}
         stack = stop.stack
         frames = stop.stack_frames
@@ -115,7 +126,7 @@ class CaptureExecutor:
                 continue
             if not self._same_kernel_module(frame.location):
                 continue
-            local_result = self._rdbg.local_variables(stack_level=stack_level)
+            local_result = rdbg.local_variables(stack_level=stack_level)
             if local_result.error_occurred:
                 continue
             names = {variable.name.casefold() for variable in local_result.variables}
