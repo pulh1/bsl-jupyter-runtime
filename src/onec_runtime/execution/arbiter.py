@@ -15,7 +15,9 @@ from typing import Any, Callable, Protocol
 from uuid import uuid4
 
 from onec_runtime.errors import CommandTimeout, EvaluationDispatchUnknown, StopWaitIntervalElapsed
-from onec_runtime.rdbg.models import DebugTarget, EvaluationResult, ModuleLocation, ModifyResult, PendingEvaluation, StopEvent, TargetId
+from onec_runtime.execution.termination import FileTerminationConfirmed, ServerTerminationConfirmed
+from onec_runtime.rdbg.models import DebugTarget, EvaluationResult, LocalVariablesResult, ModuleLocation, ModifyResult, PendingEvaluation, StopEvent, TargetId
+from onec_runtime.rdbg.session import BoundServerTargetAbsence
 
 
 class EvaluationSession(Protocol):
@@ -25,6 +27,9 @@ class EvaluationSession(Protocol):
 
     def set_breakpoints(self, locations: tuple[ModuleLocation, ...], *,
                         on_transport_dispatch: Callable[[], None]) -> None: ...
+
+    def local_variables(self, stack_level: int = 0, *, timeout_s: float,
+                        on_transport_dispatch: Callable[[], None]) -> LocalVariablesResult: ...
 
     def modify(self, variable: str, value_expression: str, *,
                on_transport_dispatch: Callable[[], None]) -> ModifyResult: ...
@@ -72,6 +77,14 @@ class OutcomeUnknown(RuntimeError):
 
 class StopPendingTeardown(OutcomeUnknown):
     """Stop blocked a later effect after earlier remote work had started."""
+
+
+class TargetTerminated(RuntimeError):
+    """The exact old target was confirmed absent; its ticket cannot resume."""
+
+    def __init__(self, evidence: FileTerminationConfirmed | ServerTerminationConfirmed):
+        self.evidence = evidence
+        super().__init__('Target termination confirmed')
 
 
 class StaleRoute(RuntimeError):
@@ -123,6 +136,7 @@ class ExecutionTicket:
         self._stop_requested = False
         self._stop_blocked_after_effect = False
         self._stop_target: TargetId | None = None
+        self._effect_target: TargetId | None = None
         self._value: Any = None
         self._error: BaseException | None = None
 
@@ -220,6 +234,9 @@ class SessionPort:
                 raise CancelledBeforeEffect()
             self._ticket._entered = True
             self._ticket._ever_entered = True
+            target = self._owner._session.target
+            if target is not None:
+                self._ticket._effect_target = target.target_id
 
     def _stop_checkpoint(self) -> None:
         self._check()
@@ -238,6 +255,17 @@ class SessionPort:
         self._owner._session.set_breakpoints(locations, on_transport_dispatch=self._transport_entered)
         with self._owner._mailbox:
             self._ticket._entered = False
+
+    def local_variables(self, stack_level: int = 0, *, timeout_s: float = 30.0) -> LocalVariablesResult:
+        """Read a stopped frame while retaining ownership of ambiguous dispatch."""
+        self._require_idle()
+        result = self._owner._session.local_variables(
+            stack_level=stack_level, timeout_s=timeout_s,
+            on_transport_dispatch=self._transport_entered,
+        )
+        with self._owner._mailbox:
+            self._ticket._entered = False
+        return result
 
     def modify(self, variable: str, value_expression: str) -> ModifyResult:
         self._require_idle()
@@ -430,6 +458,52 @@ class RdbgArbiter:
             if self._active is not ticket or ticket._phase != 'unknown' or self._reconciliation is not None:
                 raise ArbiterBusy('Reconciliation requires the unknown owner')
             self._reconciliation = plan
+            self._mailbox.notify_all()
+
+    def retire_terminated_target(
+        self,
+        ticket: ExecutionTicket,
+        route: RouteToken,
+        evidence: FileTerminationConfirmed | ServerTerminationConfirmed,
+    ) -> None:
+        """Retire an unknown owner only after exact target termination proof.
+
+        The old arbiter closes to user dispatch; a replacement runtime needs a
+        new arbiter and incarnation. This method does not terminate a target.
+        """
+        with self._mailbox:
+            self._check_ticket(ticket)
+            if self._active is not ticket or ticket._phase != 'unknown' or self._reconciliation is not None:
+                raise ArbiterBusy('Target retirement requires the unknown owner')
+            if route != self._route:
+                raise StaleRoute('Termination evidence belongs to another route')
+            if type(evidence) not in (FileTerminationConfirmed, ServerTerminationConfirmed):
+                raise ValueError('confirmed target termination evidence is required')
+            expected = (ticket._pending.target_id if ticket._pending is not None else
+                        ticket._stop_target or ticket._effect_target)
+            if expected is None or evidence.expected_target != expected:
+                raise ValueError('Termination evidence belongs to another target')
+            if isinstance(evidence, ServerTerminationConfirmed):
+                absence = evidence.absence
+                if (
+                    not isinstance(absence, BoundServerTargetAbsence)
+                    or absence.expected_target != expected
+                    or absence.bound_client.infobase_alias.casefold() != expected.infobase_alias.casefold()
+                    or absence.bound_client.seance_id != expected.seance_id
+                    or (absence.bound_client.infobase_instance_id is not None
+                        and expected.infobase_instance_id is not None
+                        and absence.bound_client.infobase_instance_id != expected.infobase_instance_id)
+                ):
+                    raise ValueError('server absence evidence belongs to another target')
+
+            self._closed = True
+            while self._queue:
+                self._settle(self._queue.popleft(), error=CancelledBeforeEffect())
+            ticket._pending = None
+            ticket._stop_target = None
+            ticket._entered = False
+            self._settle(ticket, error=TargetTerminated(evidence))
+            self._active = None
             self._mailbox.notify_all()
 
     def close(self, timeout: float | None = None) -> None:

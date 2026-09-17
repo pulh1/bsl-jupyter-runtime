@@ -5,8 +5,9 @@ from uuid import uuid4
 
 import pytest
 
-from onec_runtime.errors import EvaluationDispatchUnknown
-from onec_runtime.rdbg.models import PendingEvaluation, TargetId, EvaluationResult
+import onec_runtime.execution.arbiter as arbiter_module
+from onec_runtime.errors import CommandTimeout, EvaluationDispatchUnknown
+from onec_runtime.rdbg.models import FrameVariable, LocalVariablesResult, PendingEvaluation, TargetId, EvaluationResult
 
 
 from onec_runtime.execution.arbiter import (
@@ -17,6 +18,7 @@ from onec_runtime.execution.arbiter import (
 
 class Session:
     def __init__(self):
+        self.target = None
         self.entered = Event()
         self.release = Event()
         self.calls = []
@@ -42,6 +44,13 @@ class Session:
         assert pending is self.pending
         self.record('event')
         return EvaluationResult(pending.result_id, 'String', self.expression, False)
+
+    def local_variables(self, stack_level=0, *, timeout_s, on_transport_dispatch):
+        on_transport_dispatch()
+        self.record('locals')
+        return LocalVariablesResult(
+            uuid4(), (FrameVariable(f'level{stack_level}', 'Number', '1'),)
+        )
 
     def record(self, name, block=False):
         with self.lock:
@@ -87,6 +96,192 @@ def test_ticket_precedes_dispatch_and_plans_share_one_reader(runtime):
     assert second.wait(3) == 'events'
     assert session.maximum == 1
     assert len({thread for _, thread in session.calls}) == 1
+
+
+def test_local_variables_result_retires_transport_entry_before_next_ticket(runtime):
+    session, route, arbiter = runtime
+    ticket = arbiter.submit(route, lambda port: Settlement(port.local_variables(stack_level=2, timeout_s=1)))
+    arbiter.dispatch(ticket)
+
+    result = ticket.wait(3)
+    assert [variable.name for variable in result.variables] == ['level2']
+    assert ticket.status().settled
+    later = arbiter.submit(route, lambda port: Settlement(evaluate(port, 'later')))
+    arbiter.dispatch(later)
+    assert later.wait(3) == 'later'
+    assert [name for name, _ in session.calls] == ['locals', 'later', 'event']
+
+
+def test_local_variables_rejects_outstanding_eval_before_transport(runtime):
+    session, route, arbiter = runtime
+
+    def plan(port):
+        pending = port.start_evaluation('first')
+        try:
+            with pytest.raises(ArbiterBusy):
+                port.local_variables(timeout_s=1)
+        finally:
+            result = port.wait_evaluation_event(pending, timeout_s=1)
+        return Settlement(result.presentation)
+
+    ticket = arbiter.submit(route, plan)
+    arbiter.dispatch(ticket)
+    assert ticket.wait(3) == 'first'
+    assert [name for name, _ in session.calls] == ['first', 'event']
+
+
+def test_local_variables_rejects_outstanding_continue_stop_before_transport(runtime):
+    from onec_runtime.rdbg.models import ModuleLocation, StopEvent
+
+    session, route, arbiter = runtime
+    target_id = TargetId(uuid4(), 'main')
+    session.target = SimpleNamespace(target_id=target_id)
+    stop = StopEvent(target_id, ModuleLocation('ExtensionModule', '', uuid4(), uuid4(), 1, 'Test'), 'breakpoint')
+
+    def continue_(*, on_transport_dispatch):
+        on_transport_dispatch()
+        session.record('continue')
+
+    def wait_for_any_stop(*, expected_target, on_transport_dispatch, **kwargs):
+        assert expected_target == target_id
+        on_transport_dispatch()
+        session.record('wait-stop')
+        return stop
+
+    session.continue_ = continue_
+    session.wait_for_any_stop = wait_for_any_stop
+
+    def plan(port):
+        port.continue_()
+        try:
+            with pytest.raises(ArbiterBusy):
+                port.local_variables(timeout_s=1)
+        finally:
+            observed_stop = port.wait_for_any_stop(timeout_s=1)
+        return Settlement(observed_stop)
+
+    ticket = arbiter.submit(route, plan)
+    arbiter.dispatch(ticket)
+    assert ticket.wait(3) is stop
+    assert [name for name, _ in session.calls] == ['continue', 'wait-stop']
+
+
+def test_local_variables_stop_before_first_transport_entry_sends_nothing(runtime):
+    session, route, arbiter = runtime
+    entered_plan = Event()
+    release_plan = Event()
+
+    def plan(port):
+        entered_plan.set()
+        assert release_plan.wait(3)
+        return Settlement(port.local_variables(timeout_s=1))
+
+    ticket = arbiter.submit(route, plan)
+    arbiter.dispatch(ticket)
+    assert entered_plan.wait(3)
+    try:
+        assert arbiter.request_stop(ticket).name == 'REQUESTED'
+    finally:
+        release_plan.set()
+    with pytest.raises(CancelledBeforeEffect):
+        ticket.wait(3)
+    assert session.calls == []
+
+
+def test_local_variables_timeout_after_dispatch_keeps_arbiter_owner():
+    from onec_runtime.execution.termination import FileTerminationConfirmed
+
+    session = Session()
+    target = TargetId(uuid4(), 'capture')
+    session.target = SimpleNamespace(target_id=target)
+    route = RouteToken('locals-timeout', 1, 0, 'capture-scope')
+    arbiter = RdbgArbiter(session, route)
+
+    def timed_out(*, stack_level, timeout_s, on_transport_dispatch):
+        on_transport_dispatch()
+        session.record('locals-request')
+        raise CommandTimeout('HTTP response missing after request entry')
+
+    session.local_variables = timed_out
+    ticket = arbiter.submit(route, lambda port: Settlement(port.local_variables(timeout_s=0.1)))
+    arbiter.dispatch(ticket)
+    assert ticket.wait_unknown(3)
+    assert not ticket.status().settled
+    assert arbiter.active_ticket is ticket
+    later = arbiter.submit(route, lambda port: Settlement(evaluate(port, 'unsafe')))
+    arbiter.dispatch(later)
+    with pytest.raises(TimeoutError):
+        later.wait(0)
+    assert [name for name, _ in session.calls] == ['locals-request']
+
+    proof = FileTerminationConfirmed(target, 1234, -15)
+    arbiter.retire_terminated_target(ticket, route, proof)
+    with pytest.raises(arbiter_module.TargetTerminated) as raised:
+        ticket.wait_settled(3)
+    assert raised.value.evidence is proof
+    with pytest.raises(CancelledBeforeEffect):
+        later.wait(3)
+    with pytest.raises(RuntimeError, match='closed'):
+        arbiter.submit(route, lambda port: Settlement('stale'))
+    arbiter.close(timeout=3)
+
+
+def test_termination_retirement_requires_exact_route_target_and_confirmed_evidence():
+    from onec_runtime.execution.termination import (
+        FileTerminationConfirmed, FileTerminationUnknown, ServerTerminationConfirmed,
+    )
+    from onec_runtime.rdbg.session import BoundServerTargetAbsence
+
+    session = Session()
+    route = RouteToken('pending-eval', 1, 0, 'capture-scope')
+    arbiter = RdbgArbiter(session, route)
+
+    def ambiguous(port):
+        port.start_evaluation('ambiguous')
+        return Settlement('unreachable')
+
+    ticket = arbiter.submit(route, ambiguous)
+    arbiter.dispatch(ticket)
+    assert ticket.wait_unknown(3)
+    pending = session.pending
+    assert ticket.status().pending_capability is pending
+    assert not ticket.status().awaiting_stop
+    stale_route = RouteToken(route.incarnation, 2, 0, 'another-scope')
+    other_target = TargetId(uuid4(), pending.target_id.infobase_alias)
+
+    with pytest.raises(StaleRoute):
+        arbiter.retire_terminated_target(
+            ticket, stale_route, FileTerminationConfirmed(pending.target_id, 1234, -15)
+        )
+    with pytest.raises(ValueError, match='target'):
+        arbiter.retire_terminated_target(
+            ticket, route, FileTerminationConfirmed(other_target, 1234, -15)
+        )
+    with pytest.raises(ValueError, match='confirmed'):
+        arbiter.retire_terminated_target(
+            ticket, route, FileTerminationUnknown(pending.target_id, 1234, 'ExitUnverified')
+        )
+    assert arbiter.active_ticket is ticket
+    assert ticket.status().pending_capability is pending
+    assert ticket.wait_unknown(0)
+
+    wrong_client = TargetId(uuid4(), 'another-infobase')
+    mismatched_absence = BoundServerTargetAbsence(wrong_client, pending.target_id, 1.0, 2)
+    with pytest.raises(ValueError, match='server'):
+        arbiter.retire_terminated_target(
+            ticket, route, ServerTerminationConfirmed(pending.target_id, mismatched_absence)
+        )
+
+    absence = BoundServerTargetAbsence(
+        TargetId(uuid4(), pending.target_id.infobase_alias), pending.target_id, 1.0, 2,
+    )
+    proof = ServerTerminationConfirmed(pending.target_id, absence)
+    arbiter.retire_terminated_target(ticket, route, proof)
+    with pytest.raises(arbiter_module.TargetTerminated) as raised:
+        ticket.wait_settled(3)
+    assert raised.value.evidence is proof
+    assert ticket.status().pending_capability is None
+    arbiter.close(timeout=3)
 
 
 def test_local_continue_callback_rejection_releases_pretransport_owner() -> None:
@@ -552,6 +747,8 @@ def test_session_port_cannot_escape_worker_plan(runtime):
     assert ticket.wait(3) == 'ok'
     with pytest.raises(RuntimeError, match='confined'):
         ports[0].start_evaluation('escaped')
+    with pytest.raises(RuntimeError, match='confined'):
+        ports[0].local_variables(timeout_s=1)
     assert session.calls == []
 
 
@@ -663,6 +860,48 @@ def test_real_session_validation_releases_queue_without_transport(collection):
         later = arbiter.submit(route, lambda port: Settlement('ready'))
         arbiter.dispatch(later)
         assert later.wait(3) == 'ready'
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_real_rdbg_local_variables_callback_flows_through_arbiter(monkeypatch):
+    from onec_runtime.rdbg.models import DebugTarget, ModuleLocation
+    from onec_runtime.rdbg.session import RdbgSession, SessionState
+    from onec_runtime.rdbg.xml_codec import CALC_NS, RDBG_NS
+
+    result_id = uuid4()
+
+    class Transport:
+        def __init__(self):
+            self.calls = []
+
+        def request(self, command, payload=b'', **kwargs):
+            self.calls.append(command)
+            assert command == 'evalLocalVariables'
+            return f'''<response xmlns="{RDBG_NS}"><result>
+              <expressionResultID xmlns="{CALC_NS}">{result_id}</expressionResultID>
+              <calculationResult xmlns="{CALC_NS}"><valueOfContextPropInfo>
+                <propInfo><propName>Переменная</propName></propInfo>
+                <valueInfo><typeName>Число</typeName><pres>MQ==</pres></valueInfo>
+              </valueOfContextPropInfo></calculationResult>
+            </result></response>'''.encode()
+
+    transport = Transport()
+    location = ModuleLocation('ExtensionModule', '', uuid4(), uuid4(), 1, 'Test')
+    session = RdbgSession(transport, location)
+    session.state = SessionState.READY
+    session.target = DebugTarget(TargetId(uuid4(), 'test'), 'Server', 'stopped')
+    monkeypatch.setattr('onec_runtime.rdbg.session.uuid4', lambda: result_id)
+    route = RouteToken('real-locals', 1, 0, 'capture-scope')
+    arbiter = RdbgArbiter(session, route)
+    try:
+        ticket = arbiter.submit(route, lambda port: Settlement(port.local_variables(stack_level=2, timeout_s=1)))
+        arbiter.dispatch(ticket)
+        result = ticket.wait(3)
+        assert result.result_id == result_id
+        assert [variable.name for variable in result.variables] == ['Переменная']
+        assert ticket.status().settled
+        assert transport.calls == ['evalLocalVariables']
     finally:
         arbiter.close(timeout=3)
 
