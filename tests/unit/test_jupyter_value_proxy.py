@@ -401,6 +401,51 @@ def test_reinstall_removes_only_old_runtime_proxies() -> None:
     assert shell.user_ns["ПользовательскоеИмя"] is user_value
 
 
+def test_reinstall_rejects_saved_old_proxy_and_bsl_alias_even_with_equal_generations() -> None:
+    shell = FakeShell()
+    first = FakeRuntime(names=("Данные",), runtime_generation=3, context_generation=7)
+    install_runtime(shell, first)
+    old_proxy = shell.user_ns["Данные"]
+    old_slice = old_proxy[:1]
+    old_section = old_proxy.tabular_section("Строки")
+    old_bsl = shell.user_ns[BSL_NAMESPACE_NAME]
+    shell.user_ns["СтарыйПрокси"] = old_proxy
+    shell.user_ns["СтарыйBSL"] = old_bsl
+
+    second = FakeRuntime(names=("Данные",), runtime_generation=3, context_generation=7)
+    install_runtime(shell, second)
+
+    with pytest.raises(ProtocolError, match="stale"):
+        old_proxy.to_df()
+    with pytest.raises(ProtocolError, match="stale"):
+        old_slice.materialize()
+    with pytest.raises(ProtocolError, match="stale"):
+        old_section.to_df()
+    with pytest.raises(ProtocolError, match="stale"):
+        getattr(old_bsl, "Данные")
+    assert first.materializations == []
+    assert shell.user_ns["СтарыйПрокси"] is old_proxy
+    assert shell.user_ns["СтарыйBSL"] is old_bsl
+    assert shell.user_ns["Данные"].to_df().to_dict("records") == [{"value": 1}]
+    assert len(second.materializations) == 1
+
+
+def test_detached_bridge_cannot_republish_old_runtime_proxies() -> None:
+    shell = FakeShell()
+    first = FakeRuntime(names=("Данные",), runtime_generation=3, context_generation=7)
+    install_runtime(shell, first)
+    old_bsl = shell.user_ns[BSL_NAMESPACE_NAME]
+
+    second = FakeRuntime(names=("Данные",), runtime_generation=3, context_generation=7)
+    install_runtime(shell, second)
+    current_proxy = shell.user_ns["Данные"]
+
+    with pytest.raises(ProtocolError, match="stale"):
+        old_bsl._bridge.sync(shell.user_ns)
+    assert shell.user_ns["Данные"] is current_proxy
+    assert dir(old_bsl) == []
+
+
 def test_proxy_fails_closed_after_generation_change_or_name_removal() -> None:
     shell = FakeShell()
     runtime = FakeRuntime()

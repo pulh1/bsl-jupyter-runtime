@@ -210,14 +210,23 @@ def _source_session_for_shell(
         ) from error
 
 
+class _ProxyBinding:
+    """Revocable notebook binding shared by a namespace and its proxies."""
+
+    __slots__ = ("active",)
+
+    def __init__(self) -> None:
+        self.active = True
+
+
 class OnecValueProxy:
     """A lazy symbolic reference to a persistent BSL context value.
 
     Obtain one from the notebook ``bsl`` namespace after a successful BSL
     cell. Constructing or displaying a proxy does not copy its value. Each
-    materialization checks the runtime and context generations; a proxy from
-    an old session or context raises ``ProtocolError`` instead of reading a
-    new value with the same name.
+    materialization checks the runtime and context generations and the active
+    notebook binding. A proxy saved under a Python alias becomes stale when
+    another runtime is installed, even if its generations and BSL name match.
     """
 
     __slots__ = (
@@ -226,6 +235,7 @@ class OnecValueProxy:
         "_context_generation",
         "_path",
         "_selection",
+        "_binding",
         "name",
     )
 
@@ -238,6 +248,7 @@ class OnecValueProxy:
         context_generation: int,
         path: tuple[str, ...] = (),
         selection: dict[str, int] | None = None,
+        _binding: _ProxyBinding | None = None,
     ) -> None:
         self._runtime_ref = weakref.ref(runtime)
         self.name = name
@@ -245,6 +256,7 @@ class OnecValueProxy:
         self._context_generation = context_generation
         self._path = tuple(path)
         self._selection = None if selection is None else dict(selection)
+        self._binding = _binding
 
     def __repr__(self) -> str:
         return (
@@ -382,6 +394,7 @@ class OnecValueProxy:
             context_generation=self._context_generation,
             path=self._path,
             selection={"offset": start, "limit": stop - start},
+            _binding=self._binding,
         )
 
     def tabular_section(self, name: str) -> OnecValueProxy:
@@ -403,9 +416,12 @@ class OnecValueProxy:
             runtime_generation=self._runtime_generation,
             context_generation=self._context_generation,
             path=self._path + (name,),
+            _binding=self._binding,
         )
 
     def _validated_runtime(self) -> object:
+        if self._binding is not None and not self._binding.active:
+            raise ProtocolError("1C value proxy is stale after runtime replacement")
         runtime = self._runtime_ref()
         if runtime is None:
             raise ProtocolError("1C runtime for this proxy is no longer available")
@@ -437,14 +453,17 @@ class OnecValueProxy:
 
 
 class _BslNamespaceBridge:
-    __slots__ = ("_runtime_ref", "_proxies", "_snapshot")
+    __slots__ = ("_runtime_ref", "_proxies", "_snapshot", "_binding")
 
     def __init__(self, runtime: object) -> None:
         self._runtime_ref = weakref.ref(runtime)
         self._proxies: dict[str, OnecValueProxy] = {}
         self._snapshot: RuntimeNamespaceSnapshot | None = None
+        self._binding = _ProxyBinding()
 
     def sync(self, user_ns: dict[str, object]) -> None:
+        if not self._binding.active:
+            raise ProtocolError("1C BSL namespace is stale after runtime replacement")
         runtime = self._runtime_ref()
         if runtime is None:
             raise ProtocolError("1C runtime is no longer available")
@@ -474,6 +493,7 @@ class _BslNamespaceBridge:
                     name,
                     runtime_generation=snapshot.runtime_generation,
                     context_generation=snapshot.context_generation,
+                    _binding=self._binding,
                 )
                 proposed[normalized] = proxy
 
@@ -505,11 +525,14 @@ class _BslNamespaceBridge:
                 name,
                 runtime_generation=self._snapshot.runtime_generation,
                 context_generation=self._snapshot.context_generation,
+                _binding=self._binding,
             )
             self._proxies[normalized] = proxy
         return proxy
 
     def get(self, name: str) -> OnecValueProxy:
+        if not self._binding.active:
+            raise ProtocolError("1C BSL namespace is stale after runtime replacement")
         if self._snapshot is None:
             raise AttributeError(name)
         actual = next(
@@ -521,9 +544,10 @@ class _BslNamespaceBridge:
         return self._proxy(actual)
 
     def names(self) -> tuple[str, ...]:
-        return () if self._snapshot is None else self._snapshot.names
+        return () if not self._binding.active or self._snapshot is None else self._snapshot.names
 
     def detach(self, user_ns: dict[str, object]) -> None:
+        self._binding.active = False
         for proxy in self._proxies.values():
             if user_ns.get(proxy.name) is proxy:
                 user_ns.pop(proxy.name, None)
