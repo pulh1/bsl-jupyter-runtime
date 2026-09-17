@@ -77,6 +77,17 @@ class _PendingEvaluationState:
     collection_start_index: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class BoundServerTargetAbsence:
+    """A fresh RDBG registry observation, not proof of process termination."""
+
+    bound_client: TargetId
+    expected_target: TargetId
+    observed_at_monotonic: float
+    observations: int
+    source: str = "getDbgAllTargetStates"
+
+
 class RdbgSession:
     def __init__(
         self,
@@ -256,7 +267,7 @@ class RdbgSession:
         return parse_targets(payload)
 
     def terminate_bound_server_session(self) -> bool:
-        """Stop our server calls, then client; return whether native client exit was requested."""
+        """Request native termination; the returned bool does not prove disappearance."""
         if self.server_target_type != "Server" or self._bound_client_target is None:
             return False
         payload = self._teardown_request(
@@ -294,6 +305,79 @@ class RdbgSession:
         )
         validate_command_acknowledgement(response, command="terminateDbgTarget")
         return True
+
+    def wait_for_bound_server_targets_absent(
+        self,
+        expected_target: TargetId,
+        *,
+        timeout_s: float = 30.0,
+        poll_interval_s: float = 0.1,
+    ) -> BoundServerTargetAbsence:
+        """Observe the old bound client's debugger targets disappear.
+
+        A termination acknowledgement alone is insufficient. This method
+        queries the target registry until the old client, the expected target,
+        and all visible targets of the bound client session are absent. The
+        evidence concerns debugger registry subjects, not OS process exit or
+        completion of all side effects. An expired verification deadline or
+        failed query leaves the remote termination outcome unknown.
+        """
+        client = self._bound_client_target
+        if self.server_target_type != "Server" or client is None:
+            raise ProtocolError("No bound client session can be verified")
+        if (
+            not isinstance(expected_target, TargetId)
+            or expected_target.infobase_alias.casefold() != client.infobase_alias.casefold()
+            or expected_target.seance_id != client.seance_id
+            or expected_target.id in self._preexisting_target_ids
+        ):
+            raise ProtocolError("Expected target does not belong to the bound client session")
+        if not isfinite(timeout_s) or timeout_s < 0:
+            raise ValueError("timeout_s must be finite and non-negative")
+        if not isfinite(poll_interval_s) or poll_interval_s < 0:
+            raise ValueError("poll_interval_s must be finite and non-negative")
+
+        deadline = monotonic() + timeout_s
+        observations = 0
+        while True:
+            remaining = max(0.0, deadline - monotonic())
+            payload = self._teardown_request(
+                "getDbgAllTargetStates",
+                build_get_targets_request(self.alias, self.ui_id),
+                timeout_s=min(10.0, max(0.001, remaining)),
+            )
+            targets = parse_targets(payload)
+            observations += 1
+            visible_ids = {target.target_id.id for target in targets}
+            bound_session_targets = (
+                target for target in targets
+                if target.target_id.infobase_alias.casefold()
+                == client.infobase_alias.casefold()
+                and target.target_id.seance_id == client.seance_id
+                and (
+                    client.infobase_instance_id is None
+                    or target.target_id.infobase_instance_id is None
+                    or target.target_id.infobase_instance_id
+                    == client.infobase_instance_id
+                )
+            )
+            if (
+                client.id not in visible_ids
+                and expected_target.id not in visible_ids
+                and not any(bound_session_targets)
+            ):
+                return BoundServerTargetAbsence(
+                    bound_client=client,
+                    expected_target=expected_target,
+                    observed_at_monotonic=monotonic(),
+                    observations=observations,
+                )
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise CommandTimeout(
+                    "Bound server target disappearance was not confirmed"
+                )
+            sleep(min(poll_interval_s, remaining))
 
     def discover_server_emulation_target(self, *, timeout_s: float = 30.0) -> DebugTarget:
         self._require(SessionState.ATTACHED)
