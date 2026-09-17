@@ -636,6 +636,27 @@ def test_pretransport_eval_admission_failure_releases_capability(
     assert session._pending_evaluation_states == {}
 
 
+def test_invalidation_after_eval_dispatch_reports_unknown_outcome() -> None:
+    class InvalidatingTransport(FakeTransport):
+        def request(self, command: str, payload: bytes = b"", **options: object) -> bytes:
+            response = super().request(command, payload, **options)
+            if command == "evalExpr":
+                session.invalidate()
+            return response
+
+    transport = InvalidatingTransport()
+    session = ready_session(transport)
+    entered: list[str] = []
+
+    with pytest.raises(EvaluationDispatchUnknown) as raised:
+        session.start_evaluation("1", on_transport_dispatch=lambda: entered.append("evalExpr"))
+
+    assert entered == ["evalExpr"]
+    assert raised.value.pending.target_id is not None
+    assert transport.calls.count("evalExpr") == 1
+    assert session.state is SessionState.FAILED
+
+
 def test_malformed_eval_ack_retains_capability_until_correlated_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

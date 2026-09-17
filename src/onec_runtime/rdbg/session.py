@@ -703,7 +703,9 @@ class RdbgSession:
             self._pending_evaluation_states.pop(id(pending), None)
             raise
         if self._requests_invalidated:
-            raise ProtocolError("RDBG session was invalidated during expression dispatch")
+            raise EvaluationDispatchUnknown(pending) from ProtocolError(
+                "RDBG session was invalidated during expression dispatch"
+            )
         if response.strip():
             try:
                 result = parse_eval_response(response)
