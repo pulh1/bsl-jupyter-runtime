@@ -2672,6 +2672,51 @@ def test_failed_command_write_requires_reconciliation_before_retry(monkeypatch) 
     assert controller.main_operation is operation
 
 
+def test_main_wait_intervals_do_not_end_a_running_command() -> None:
+    from onec_runtime.errors import StopWaitIntervalElapsed
+
+    class SlowSession(ScriptedSession):
+        remaining_intervals = 3
+
+        def wait_for_any_stop(self, *, timeout_s: float) -> StopEvent:
+            if self.remaining_intervals:
+                self.remaining_intervals -= 1
+                raise StopWaitIntervalElapsed("empty stop interval")
+            return super().wait_for_any_stop(timeout_s=timeout_s)
+
+    session = SlowSession((SERVICE,))
+    controller = runtime_module().PrototypeRuntimeController(
+        session, SERVICE, command_timeout_s=0.01
+    )
+
+    completed = controller.execute_main("Результат = 1;")
+
+    assert completed.operation.operation_id == 1
+    assert session.continue_count == 1
+    assert controller.main_operation.phase.value == "completed"
+
+
+def test_main_resume_preflight_failure_preserves_user_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = ScriptedSession((USER, SERVICE))
+    controller = runtime_module().PrototypeRuntimeController(session, SERVICE)
+    controller.execute_main("Результат = 1;", user_breakpoints=(USER,))
+    continue_count = session.continue_count
+
+    def rejected_workspace() -> None:
+        raise ProtocolError("workspace not ready")
+
+    monkeypatch.setattr(controller, "require_debug_workspace_ready", rejected_workspace)
+
+    with pytest.raises(ProtocolError, match="workspace not ready"):
+        controller.resume_debug_stop()
+
+    assert controller.state is runtime_module().OperationState.DEBUG_STOPPED
+    assert controller.main_operation.phase.value == "suspended_user"
+    assert session.continue_count == continue_count
+
+
 def test_failed_wait_does_not_allow_replacing_unresolved_main_operation() -> None:
     runtime = runtime_module()
     session = ScriptedSession((SERVICE,))

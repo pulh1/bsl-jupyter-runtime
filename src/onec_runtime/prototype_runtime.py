@@ -14,7 +14,7 @@ from functools import lru_cache
 from threading import local
 from uuid import UUID, uuid4
 
-from onec_runtime.execution.main import MainOperation, MainPhase
+from onec_runtime.execution.main import MainExecutor, MainOperation, MainPhase
 
 from onec_runtime.bsl import (
     DiagnosticStage,
@@ -480,6 +480,9 @@ class PrototypeRuntimeController:
         ):
             raise TypeError("capture value inspection builder must be callable")
         self.session = session
+        self.main_executor = MainExecutor(
+            session, poll_interval_s=command_timeout_s
+        )
         self.service_location = service_location
         self.kernel_location = kernel_location or service_location
         self.command_timeout_s = command_timeout_s
@@ -1626,22 +1629,31 @@ class PrototypeRuntimeController:
             self.stop_history.clear()
             self.last_debug_stop = None
             self.breakpoint_workspaces.clear()
-            self._set_workspace("full", self._allowed_locations)
-            command_write_attempted = True
-            instruction = self.session.modify(
-                "ТекущаяИнструкция", bsl_string_literal(lowered_text)
+
+            def before_command_write() -> None:
+                nonlocal command_write_attempted
+                command_write_attempted = True
+
+            def before_continue() -> None:
+                self.require_debug_workspace_ready()
+                previous_state = self.state
+                self.state = OperationState.MAIN_PENDING
+                if on_transport_dispatch is not None:
+                    try:
+                        on_transport_dispatch()
+                    except BaseException:
+                        self.state = previous_state
+                        raise
+
+            stop = self.main_executor.dispatch(
+                self.main_operation,
+                lowered_text,
+                install_workspace=lambda: self._set_workspace(
+                    "full", self._allowed_locations
+                ),
+                before_command_write=before_command_write,
+                before_continue=before_continue,
             )
-            self._checked_modify(instruction, "ТекущаяИнструкция")
-            command = self.session.modify(
-                "ИдентификаторКоманды", str(operation.operation_id)
-            )
-            self._checked_modify(command, "ИдентификаторКоманды")
-            self.state = OperationState.MAIN_PENDING
-            if on_transport_dispatch is not None:
-                on_transport_dispatch()
-            self.require_debug_workspace_ready()
-            self._continue_main_operation()
-            stop = self.session.wait_for_any_stop(timeout_s=self.command_timeout_s)
             return self._route_stop(stop)
         except BaseException as error:
             if self.main_operation.phase is MainPhase.ADMITTED:
@@ -1727,21 +1739,29 @@ class PrototypeRuntimeController:
             or self.last_debug_stop.reason is not StopReason.USER_BREAKPOINT
         ):
             raise ProtocolError("Only an explicit user breakpoint can be resumed")
-        self.state = OperationState.MAIN_PENDING
-        if on_transport_dispatch is not None:
-            on_transport_dispatch()
-        self.require_debug_workspace_ready()
-        self._continue_main_operation()
-        stop = self.session.wait_for_any_stop(timeout_s=self.command_timeout_s)
+        if self.main_operation is None:
+            raise ProtocolError("User breakpoint has no active MAIN operation")
+
+        def before_continue() -> None:
+            self.require_debug_workspace_ready()
+            previous_state = self.state
+            self.state = OperationState.MAIN_PENDING
+            if on_transport_dispatch is not None:
+                try:
+                    on_transport_dispatch()
+                except BaseException:
+                    self.state = previous_state
+                    raise
+
+        stop = self.main_executor.resume(
+            self.main_operation, before_continue=before_continue
+        )
         return self._route_stop(stop)
 
     def _continue_main_operation(self) -> None:
-        operation = self.main_operation
-        if operation is not None:
-            operation.continue_requested()
-        self.session.continue_()
-        if operation is not None:
-            operation.continue_acknowledged()
+        if self.main_operation is None:
+            raise ProtocolError("Continue has no active MAIN operation")
+        self.main_executor.continue_command(self.main_operation)
 
     def _begin_capture(self, stop: StopEvent) -> CapturedStop:
         if self.active_operation is None:
@@ -3950,6 +3970,9 @@ class PrototypeRuntimeController:
                 validate_paused_identity(checkpoint, reconnected.evidence)
                 old_session = self.session
                 self.session = reconnected.session
+                self.main_executor = MainExecutor(
+                    reconnected.session, poll_interval_s=self.command_timeout_s
+                )
                 self.breakpoint_workspace_owner._adopt_confirmed_session(
                     reconnected.session,
                     checkpoint.breakpoint_workspace,
@@ -3981,6 +4004,9 @@ class PrototypeRuntimeController:
                 raise ProtocolError("Recovered stop belongs to another target")
             old_session = self.session
             self.session = reconnected.session
+            self.main_executor = MainExecutor(
+                reconnected.session, poll_interval_s=self.command_timeout_s
+            )
             self.breakpoint_workspace_owner._adopt_confirmed_session(
                 reconnected.session,
                 checkpoint.breakpoint_workspace,
