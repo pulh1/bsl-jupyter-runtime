@@ -13,6 +13,7 @@ from onec_runtime.execution.contracts import (
     Rejected,
     ReplyPresenter,
     SourceDiagnostic,
+    StalePreparedDispatch,
     StalePreparation,
     SubmissionReceipt,
     Unavailable,
@@ -67,6 +68,8 @@ class CellExecutionPipeline:
                 if admission.ticket is not receipt.ticket:
                     raise RuntimeError("Accepted ticket was not adopted by submission receipt")
                 return admission.ticket.wait_initiator()
+            except StalePreparedDispatch:
+                continue
             except KeyboardInterrupt:
                 if receipt.ticket is not None:
                     self._controller.request_stop(receipt.ticket)

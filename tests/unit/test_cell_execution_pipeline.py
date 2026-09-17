@@ -12,6 +12,7 @@ from onec_runtime.execution.contracts import (
     PreparedCell,
     Rejected,
     SourceDiagnostic,
+    StalePreparedDispatch,
     StalePreparation,
     SubmissionReceipt,
     Unavailable,
@@ -144,6 +145,70 @@ def test_stale_preparation_retries_locally_without_dispatching_old_cell() -> Non
     assert parse_count == 1
     assert prepared_nonces == ["nonce-1", "nonce-2"]
     assert dispatched == ["nonce-2"]
+
+
+def test_stale_prepared_dispatch_reprepares_after_adoption_without_stopping_ticket() -> None:
+    prepared_nonces: list[str] = []
+    stopped: list[object] = []
+
+    class Parser:
+        def prepare(self, source, source_unit):
+            return CommonCell(source_unit, source, {}, "same-source")
+
+    class Policy:
+        def prepare(self, common, snapshots, context):
+            prepared_nonces.append(context.preparation_nonce)
+            return PreparedCell(context.route_token, context.preparation_nonce, common.parsed_units)
+
+    class Snapshots:
+        def read_for(self, capabilities):
+            return PreparationSnapshots({}, {}, "guard")
+
+    class Ticket:
+        def __init__(self, result):
+            self.result = result
+
+        def wait_initiator(self):
+            return self.result
+
+    stale_ticket = Ticket("must not be awaited")
+    accepted_ticket = Ticket("reprepared-result")
+
+    class Controller:
+        def __init__(self):
+            self.attempts = 0
+
+        def await_preparation_context(self):
+            self.attempts += 1
+            return PreparationContext(
+                f"route-{self.attempts}",
+                f"nonce-{self.attempts}",
+                Policy(),
+                (),
+            )
+
+        def submit_cell(self, context, prepared, guards, receipt):
+            if context.preparation_nonce == "nonce-1":
+                receipt.adopt(stale_ticket)
+                raise StalePreparedDispatch("guard changed before remote dispatch")
+            receipt.adopt(accepted_ticket)
+            return Accepted(accepted_ticket)
+
+        def request_stop(self, ticket):
+            stopped.append(ticket)
+
+    class Replies:
+        def diagnostic_reply(self, diagnostic):
+            raise AssertionError("unexpected source diagnostic")
+
+        def unavailable_reply(self, unavailable):
+            raise AssertionError("unexpected unavailable route")
+
+    pipeline = CellExecutionPipeline(Parser(), Controller(), Snapshots(), Replies())
+
+    assert pipeline.execute("source", unit("source")) == "reprepared-result"
+    assert prepared_nonces == ["nonce-1", "nonce-2"]
+    assert stopped == []
 
 
 def test_policy_diagnostic_is_published_only_after_guard_validation() -> None:

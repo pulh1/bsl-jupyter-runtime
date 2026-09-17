@@ -64,6 +64,10 @@ class StalePreparation:
     reason: str
 
 
+class StalePreparedDispatch(RuntimeError):
+    """An adopted ticket became stale before any remote side effect."""
+
+
 @dataclass(frozen=True, slots=True)
 class Current:
     """The route and snapshot guards still describe the current context."""

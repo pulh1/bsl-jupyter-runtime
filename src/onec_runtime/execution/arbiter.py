@@ -488,6 +488,12 @@ class RdbgArbiter:
         with self._mailbox:
             return self._active
 
+    @property
+    def has_pending_operations(self) -> bool:
+        """True while a queued or running ticket owns the admission boundary."""
+        with self._mailbox:
+            return self._active is not None or bool(self._queue)
+
     def submit(self, route: RouteToken, plan: Plan) -> ExecutionTicket:
         with self._mailbox:
             if self._closed:
