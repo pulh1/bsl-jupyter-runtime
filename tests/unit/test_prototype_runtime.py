@@ -1310,11 +1310,14 @@ def test_capture_rejects_absent_or_malformed_kernel_stack_mapping(
     with pytest.raises(ProtocolError, match="stack mapping|kernel context frame"):
         controller.execute_main("Результат = 1;", capture_points=(CAPTURE_A,))
 
-    assert controller.state is runtime_module().OperationState.FAILED
+    assert controller.state is runtime_module().OperationState.CAPTURE_SETUP_FAILED
     assert controller.capture_scope is not None
     assert controller.capture_scope.setup_stage.value == "context_transferred"
     assert controller.capture_scope.context_state.value == "setup_failed"
     assert controller.capture_scope.identity.target_id == TARGET
+    assert controller.main_operation is not None
+    assert not controller.main_operation.terminal
+    assert controller.main_operation.pending_stop is controller.capture_scope.stop
 
 
 @pytest.mark.parametrize(
@@ -1343,7 +1346,12 @@ def test_capture_rejects_duplicate_or_nonphysical_stack_levels(
     with pytest.raises(ProtocolError, match="stack mapping is incoherent"):
         controller.execute_main("Результат = 1;", capture_points=(CAPTURE_A,))
 
-    assert controller.state is runtime_module().OperationState.FAILED
+    assert controller.state is runtime_module().OperationState.CAPTURE_SETUP_FAILED
+    assert controller.capture_scope is not None
+    assert controller.capture_scope.setup_stage.value == "context_transferred"
+    assert controller.main_operation is not None
+    assert not controller.main_operation.terminal
+    assert controller.main_operation.pending_stop is controller.capture_scope.stop
 
 
 def test_capture_accepts_the_configured_kernel_module_stack_frame() -> None:
@@ -1393,7 +1401,12 @@ def test_capture_rejects_kernel_frame_with_different_extension_id() -> None:
     with pytest.raises(ProtocolError, match="kernel context frame"):
         controller.execute_main("Результат = 1;", capture_points=(CAPTURE_A,))
 
-    assert controller.state is runtime_module().OperationState.FAILED
+    assert controller.state is runtime_module().OperationState.CAPTURE_SETUP_FAILED
+    assert controller.capture_scope is not None
+    assert controller.capture_scope.setup_stage.value == "context_transferred"
+    assert controller.main_operation is not None
+    assert not controller.main_operation.terminal
+    assert controller.main_operation.pending_stop is controller.capture_scope.stop
 
 
 def test_raw_ping_stack_preserves_physical_kernel_level_across_unaddressable_frame() -> None:

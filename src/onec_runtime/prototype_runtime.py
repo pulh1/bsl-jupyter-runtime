@@ -18,7 +18,6 @@ from onec_runtime.execution.main import MainExecutor, MainOperation, MainPhase
 from onec_runtime.execution.capture import (
     CaptureFrameIdentity,
     CaptureScope,
-    CaptureSetupStage,
 )
 from onec_runtime.execution.capture.executor import (
     CaptureCommandMismatchError,
@@ -1917,8 +1916,10 @@ class PrototypeRuntimeController:
             self._next_capture_stop_sequence,
         )
         self.capture_scope = scope
+        remote_setup_complete = False
         try:
             setup = self.capture_executor.open_scope(scope)
+            remote_setup_complete = True
             self._replace_capture_evaluation_coordinator()
             scope.mark_ready()
             self._capture_manager_paths.clear()
@@ -1940,11 +1941,13 @@ class PrototypeRuntimeController:
             if isinstance(error, CaptureCommandMismatchError) and self.main_operation is not None:
                 self.main_operation.mark_unknown()
             if (
-                isinstance(error, ProtocolError)
-                and scope.setup_stage is CaptureSetupStage.STOP_RECOGNIZED
+                isinstance(error, (ProtocolError, BslExecutionError))
+                and not isinstance(error, CaptureCommandMismatchError)
+                and not remote_setup_complete
             ):
-                # A confirmed local read failure has made no CAPTURE setup
-                # side effect. The original stop and MAIN operation still exist.
+                # A confirmed setup rejection leaves the recognized stop owned
+                # by the suspended MAIN operation. The scope records the last
+                # proved stage; it is not ready for cells or Continue.
                 self.state = OperationState.CAPTURE_SETUP_FAILED
             elif isinstance(error, (ProtocolError, BslExecutionError)):
                 self.state = OperationState.FAILED
