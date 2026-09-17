@@ -7,10 +7,12 @@ result or the debugger protocol's pending evaluation capability.
 from dataclasses import dataclass, field
 from enum import Enum
 
+from onec_runtime.capture import build_live_capture_root_transfer_call
 from onec_runtime.execution.capture.resources import (
     TemporaryCleanupDebt,
     TemporaryCleanupState,
 )
+from onec_runtime.execution.capture.writeback import RootWritebackLedger
 from onec_runtime.rdbg.models import (
     FrameVariable,
     ModuleLocation,
@@ -99,6 +101,10 @@ class CaptureScope:
     _temporary_keys: dict[str, TemporaryCleanupState] = field(
         default_factory=dict, init=False, repr=False
     )
+    _dirty_roots: list[str] = field(default_factory=list, init=False, repr=False)
+    _writeback_ledger: RootWritebackLedger | None = field(
+        default=None, init=False, repr=False
+    )
 
     def __post_init__(self) -> None:
         if (
@@ -178,6 +184,51 @@ class CaptureScope:
             self.frame_identity,
             self.setup_error_code,
         )
+
+    def _require_ready_frame(self) -> None:
+        if (
+            self.context_state is not CaptureContextState.READY
+            or self.frame_identity is not CaptureFrameIdentity.CONFIRMED
+        ):
+            raise RuntimeError("capture frame is not ready")
+
+    def admit_cell_dirty_roots(self, roots: tuple[str, ...]) -> tuple[str, ...]:
+        """Commit a cell's static dirty roots before its remote dispatch.
+
+        A later confirmed cell error does not undo this registration: BSL may
+        already have changed an object by reference. Only the caller that owns
+        admission may invoke this method, before sending that cell to RDBG.
+        """
+
+        if self._writeback_ledger is not None:
+            raise RuntimeError("capture writeback has already begun")
+        self._require_ready_frame()
+        admitted = tuple(roots)
+        for root in admitted:
+            build_live_capture_root_transfer_call(root)
+        known = {root.casefold() for root in self._dirty_roots}
+        for root in admitted:
+            key = root.casefold()
+            if key not in known:
+                self._dirty_roots.append(root)
+                known.add(key)
+        return admitted
+
+    @property
+    def dirty_roots(self) -> tuple[str, ...]:
+        return tuple(self._dirty_roots)
+
+    @property
+    def writeback_ledger(self) -> RootWritebackLedger | None:
+        return self._writeback_ledger
+
+    def begin_writeback(self) -> RootWritebackLedger:
+        """Freeze the roots of this stop for one exact resume attempt."""
+
+        self._require_ready_frame()
+        if self._writeback_ledger is None:
+            self._writeback_ledger = RootWritebackLedger(self.dirty_roots)
+        return self._writeback_ledger
 
     def track_temporary_key(self, key: str) -> None:
         """Adopt a created key before any attempt to delete it."""
