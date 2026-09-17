@@ -77,6 +77,10 @@ Files: `src/onec_runtime/session.py`, arbiter/controller, `packages/jupyter/src/
 3. If termination outcome is unknown, retain the old owner for retry/inspection and do not expose a new ready session. If user merely detaches an internal waiter, keep polling the original ticket.
 4. Test concurrent old/new generation aliases and Python proxies, confirmed versus unknown termination, CAPTURE and MAIN Stop, and a long-running operation without an execution deadline. Live 1C verification is a separate opt-in gate.
 
+The arbiter worker checks a Stop request after each bounded MAIN stop or CAPTURE eval poll interval and before the next remote side effect. If the remote result arrives first, the ordinary operation may settle; otherwise the worker keeps the original ticket and pending capability, then performs target teardown on that same worker. No second event reader or concurrent RDBG writer is part of the normal Stop path. The 30-second grace period limits confirmation waiting and produces `stop_unknown` when evidence is unavailable; it does not limit BSL execution. An HTTP request still needs a genuine finite total deadline so a Stop checkpoint can eventually run.
+
+Server `terminateDbgTarget` acknowledgement alone is not target-loss evidence. Confirm absence of the bound client, expected target and related session targets in a fresh debugger registry (or exact RAC session absence). The existing Debug UI disappearance fallback in `RuntimeSession.close()` is insufficient for Stop success. In file mode, confirm exit of the owned debuggee process. Revoke old remote proxies at the Stop fence, keep the old owner through `stop_unknown`, and publish a new runtime only after target absence, old arbiter shutdown and cleanup are complete.
+
 ## 6. Finish migration
 
 - [ ] Remove `PrototypeRuntimeController`/`PrototypeRuntimeApi` names after callers use the new interfaces; retain compatibility aliases only where tested public imports need them.
