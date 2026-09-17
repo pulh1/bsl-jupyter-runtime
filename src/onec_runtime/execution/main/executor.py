@@ -25,7 +25,9 @@ class MainRdbgPort(Protocol):
 
 
 class MainExecutor:
-    def __init__(self, rdbg: MainRdbgPort, *, poll_interval_s: float = 6.0) -> None:
+    def __init__(
+        self, rdbg: MainRdbgPort | None = None, *, poll_interval_s: float = 6.0
+    ) -> None:
         if (
             isinstance(poll_interval_s, bool)
             or not isinstance(poll_interval_s, (int, float))
@@ -44,51 +46,64 @@ class MainExecutor:
         install_workspace: Callable[[], None],
         before_command_write: Callable[[], None],
         before_continue: Callable[[], None],
+        port: MainRdbgPort | None = None,
     ) -> StopEvent:
         """Write one command and wait for its next stop without an execution deadline."""
 
+        rdbg = self._port(port)
         install_workspace()
         before_command_write()
         self._checked_modify(
-            self._rdbg.modify("ТекущаяИнструкция", bsl_string_literal(instruction)),
+            rdbg.modify("ТекущаяИнструкция", bsl_string_literal(instruction)),
             "ТекущаяИнструкция",
         )
         self._checked_modify(
-            self._rdbg.modify("ИдентификаторКоманды", str(operation.command_id)),
+            rdbg.modify("ИдентификаторКоманды", str(operation.command_id)),
             "ИдентификаторКоманды",
         )
-        return self.resume(operation, before_continue=before_continue)
+        return self.resume(operation, before_continue=before_continue, port=rdbg)
 
     def resume(
         self,
         operation: MainOperation,
         *,
         before_continue: Callable[[], None] | None = None,
+        port: MainRdbgPort | None = None,
     ) -> StopEvent:
         """Continue the same MAIN command after a user or CAPTURE stop."""
 
+        rdbg = self._port(port)
         if before_continue is not None:
             before_continue()
-        self.continue_command(operation)
-        return self.await_stop()
+        self.continue_command(operation, port=rdbg)
+        return self.await_stop(port=rdbg)
 
-    def continue_command(self, operation: MainOperation) -> None:
+    def continue_command(
+        self, operation: MainOperation, *, port: MainRdbgPort | None = None
+    ) -> None:
         """Issue one Continue; its acknowledgement does not finish MAIN."""
 
         if operation.terminal:
             raise RuntimeError("MAIN operation is already terminal")
-        self._rdbg.continue_(on_transport_dispatch=operation.continue_requested)
+        self._port(port).continue_(on_transport_dispatch=operation.continue_requested)
         operation.continue_acknowledged()
 
-    def await_stop(self) -> StopEvent:
+    def await_stop(self, *, port: MainRdbgPort | None = None) -> StopEvent:
         """Observe the next stop over any number of bounded poll intervals."""
 
+        rdbg = self._port(port)
         while True:
             try:
-                return self._rdbg.wait_for_any_stop(timeout_s=self._poll_interval_s)
+                return rdbg.wait_for_any_stop(timeout_s=self._poll_interval_s)
             except StopWaitIntervalElapsed:
                 # A poll interval is not an execution deadline or target-loss proof.
                 continue
+
+    def _port(self, port: MainRdbgPort | None) -> MainRdbgPort:
+        selected = self._rdbg if port is None else port
+        if selected is None:
+            raise RuntimeError("MAIN RDBG port is not bound")
+        return selected
 
     @staticmethod
     def _checked_modify(result: object, variable: str) -> None:

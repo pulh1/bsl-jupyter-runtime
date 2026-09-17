@@ -10,7 +10,7 @@ ordered command protocol. The approved design is
 - A nonterminal MAIN operation blocks admission of a replacement command, even when the legacy controller state reports FAILED.
 - Local failure before command-field writes, or after confirmed writes but before Continue enters transport, becomes terminal `failed_before_dispatch`; an attempted command-field write with unresolved outcome remains `unknown`. Writes alone do not prove MAIN launch.
 - A matching remote completion ID closes MAIN before result/message decoding; presentation errors do not reopen the command or block the next admission.
-- `MainExecutor` writes the command fields, issues Continue, and waits across bounded RDBG poll intervals without an execution deadline. The controller still routes the returned stop.
+- `MainExecutor` writes the command fields, issues Continue, and waits across bounded RDBG poll intervals without an execution deadline. Its methods accept the port of the current operation; a default port exists only for the transitional controller. The controller still routes the returned stop.
 - This package does not import concrete controllers or `RdbgSession`. Protocol value models may be shared.
 
 The transitional controller still exposes `OperationHandle` and `OperationState` for existing clients. They are compatibility state, not the MAIN lifecycle authority. The controller still invokes the executor on its caller thread; arbiter ownership, typed completion contracts, status API integration and confirmed target termination remain separate migration steps.

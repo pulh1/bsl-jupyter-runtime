@@ -83,6 +83,29 @@ def test_main_executor_resume_uses_same_operation_and_does_not_rewrite_command()
     assert operation.phase is MainPhase.RUNNING
 
 
+def test_long_lived_main_executor_uses_the_port_of_each_operation() -> None:
+    first_port = MainPort()
+    second_port = MainPort()
+    executor = MainExecutor()
+    operation = MainOperation(17, TARGET)
+
+    assert executor.dispatch(
+        operation,
+        "Результат = 17;",
+        port=first_port,
+        install_workspace=lambda: None,
+        before_command_write=lambda: None,
+        before_continue=lambda: None,
+    ) is STOP
+    operation.stopped(STOP, MainPhase.SUSPENDED_CAPTURE)
+
+    assert executor.resume(operation, port=second_port) is STOP
+    assert [call[0] for call in first_port.calls] == [
+        "modify", "modify", "continue", "wait"
+    ]
+    assert second_port.calls == [("continue",), ("wait", 6.0)]
+
+
 def test_main_executor_does_not_continue_after_rejected_command_write() -> None:
     class RejectedPort(MainPort):
         def modify(self, variable: str, value_expression: str) -> object:
