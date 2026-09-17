@@ -100,8 +100,9 @@ class RouteSession:
         self.pending = PendingEvaluation(TARGET, UUID(int=self.next_result_id), self)
         return self.pending
 
-    def wait_evaluation_event(self, pending, *, timeout_s):
+    def wait_evaluation_event(self, pending, *, timeout_s, on_transport_dispatch):
         assert pending is self.pending
+        on_transport_dispatch()
         self._record("wait_eval")
         expression = self.expression
         self.pending = None

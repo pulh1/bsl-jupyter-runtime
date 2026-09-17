@@ -5,9 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Protocol
 
-from onec_runtime.capture import build_capture_transfer_call, build_live_capture_begin_call
+from onec_runtime.capture import (
+    build_capture_transfer_call,
+    build_live_capture_begin_call,
+    build_live_capture_end_call,
+)
 from onec_runtime.errors import BslExecutionError, ProtocolError
-from onec_runtime.execution.capture.scope import CaptureScope
+from onec_runtime.execution.capture.scope import CaptureContextState, CaptureScope
 from onec_runtime.rdbg.models import (
     EvaluationResult,
     FrameVariable,
@@ -98,6 +102,22 @@ class CaptureExecutor:
         # The controller publishes READY only after installing the operation
         # owner. A successful remote begin alone cannot admit CAPTURE cells.
         return CaptureSetupResult(scope.frame_variables, observed_command_id)
+
+    def end_scope(
+        self, scope: CaptureScope, *, port: CaptureRdbgPort | None = None
+    ) -> None:
+        """End the live context; controller releases the frame after Continue."""
+
+        if (
+            scope.context_state is not CaptureContextState.READY
+            or scope.kernel_stack_level is None
+        ):
+            raise ProtocolError("A ready CAPTURE context is required")
+        result = self._port(port).evaluate(
+            build_live_capture_end_call(), stack_level=scope.kernel_stack_level
+        )
+        if result.error_occurred:
+            raise BslExecutionError(result.error_text)
 
     def _port(self, port: CaptureRdbgPort | None) -> CaptureRdbgPort:
         selected = self._rdbg if port is None else port

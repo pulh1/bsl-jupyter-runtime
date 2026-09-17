@@ -47,9 +47,10 @@ def evaluated(type_name: str, presentation: str, error: str = "") -> EvaluationR
 
 
 class SetupPort:
-    def __init__(self, command_id: int = 42, *, begin_error: str = "") -> None:
+    def __init__(self, command_id: int = 42, *, begin_error: str = "", end_error: str = "") -> None:
         self.command_id = command_id
         self.begin_error = begin_error
+        self.end_error = end_error
         self.calls: list[tuple[str, object]] = []
 
     def local_variables(self, stack_level: int = 0) -> LocalVariablesResult:
@@ -76,6 +77,8 @@ class SetupPort:
             return evaluated("Число", str(self.command_id))
         if "НачатьКонтекстОтладки" in expression:
             return evaluated("Булево", "Истина", self.begin_error)
+        if "ЗавершитьКонтекстОтладки" in expression:
+            return evaluated("Булево", "Истина", self.end_error)
         raise AssertionError(expression)
 
 
@@ -151,3 +154,32 @@ def test_executor_requires_exact_stack_mapping() -> None:
         CaptureExecutor(port, KERNEL, decode_command_id=evaluation_to_python).open_scope(scope)
 
     assert scope.setup_stage is CaptureSetupStage.CONTEXT_TRANSFERRED
+
+
+def test_executor_closes_ready_context_before_controller_resumes_main() -> None:
+    port = SetupPort()
+    scope = CaptureScope.from_stop(7, 42, STOP, 3)
+    executor = CaptureExecutor(port, KERNEL, decode_command_id=evaluation_to_python)
+    executor.open_scope(scope)
+    scope.mark_ready()
+
+    executor.end_scope(scope)
+
+    assert port.calls[-1][0] == "eval"
+    assert "ЗавершитьКонтекстОтладки" in port.calls[-1][1][0]
+    assert port.calls[-1][1][1] == scope.kernel_stack_level
+    assert scope.context_state is CaptureContextState.READY
+
+
+def test_executor_reports_context_end_failure_without_releasing_frame() -> None:
+    port = SetupPort(end_error="planned end failure")
+    scope = CaptureScope.from_stop(7, 42, STOP, 3)
+    executor = CaptureExecutor(port, KERNEL, decode_command_id=evaluation_to_python)
+    executor.open_scope(scope)
+    scope.mark_ready()
+
+    with pytest.raises(BslExecutionError, match="planned end failure"):
+        executor.end_scope(scope)
+
+    assert scope.context_state is CaptureContextState.READY
+    assert scope.frame_identity is CaptureFrameIdentity.CONFIRMED
