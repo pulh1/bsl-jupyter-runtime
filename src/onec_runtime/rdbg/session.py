@@ -11,6 +11,7 @@ from uuid import UUID, uuid4
 
 from onec_runtime.errors import (
     CommandTimeout,
+    EvaluationDispatchUnknown,
     ProtocolError,
     RdbgDebugUiNotRegistered,
     TransportRecoveryError,
@@ -127,6 +128,8 @@ class RdbgSession:
         self,
         command: str,
         payload: bytes = b"",
+        *,
+        on_transport_entry: Callable[[], None] | None = None,
         **options: object,
     ) -> bytes:
         """Admit one normal request atomically against session invalidation.
@@ -138,6 +141,8 @@ class RdbgSession:
         with self._request_admission_lock:
             if self._requests_invalidated:
                 raise ProtocolError("RDBG session was invalidated")
+        if on_transport_entry is not None:
+            on_transport_entry()
         return self.transport.request(command, payload, **options)
 
     def _teardown_request(
@@ -677,26 +682,35 @@ class RdbgSession:
             pending,
             collection_start_index=collection_start_index,
         )
-        try:
+        entered_transport = False
+
+        def mark_transport_entry() -> None:
+            nonlocal entered_transport
             if on_transport_dispatch is not None:
                 on_transport_dispatch()
+            entered_transport = True
+
+        try:
             response = self._request(
                 "evalExpr",
                 request,
+                on_transport_entry=mark_transport_entry,
                 timeout_s=timeout_s,
             )
-        except BaseException:
+        except BaseException as error:
+            if entered_transport:
+                raise EvaluationDispatchUnknown(pending) from error
             self._pending_evaluation_states.pop(id(pending), None)
             raise
+        if self._requests_invalidated:
+            raise ProtocolError("RDBG session was invalidated during expression dispatch")
         if response.strip():
             try:
                 result = parse_eval_response(response)
-            except ProtocolError:
-                self._pending_evaluation_states.pop(id(pending), None)
-                raise
-            if result is not None and result.result_id != result_id:
-                self._pending_evaluation_states.pop(id(pending), None)
-                raise ProtocolError("RDBG evaluation result ID mismatch")
+                if result is not None and result.result_id != result_id:
+                    raise ProtocolError("RDBG evaluation result ID mismatch")
+            except ProtocolError as error:
+                raise EvaluationDispatchUnknown(pending) from error
             if result is not None:
                 self._event_queue.append(result)
         return pending

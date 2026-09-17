@@ -10,6 +10,7 @@ if TYPE_CHECKING:
         CaptureFailureDiagnostic,
         CapturePhase,
     )
+    from onec_runtime.rdbg.models import PendingEvaluation
 
 
 class RuntimeProbeError(Exception):
@@ -381,6 +382,16 @@ class RdbgTransportError(ProtocolError):
 
 class RdbgTransportTimeout(RdbgTransportError, CommandTimeout):
     """The HTTP/RDBG transport exceeded a caller-supplied finite deadline."""
+
+
+class EvaluationDispatchUnknown(RdbgTransportError):
+    """An evalExpr request entered transport without a confirmed outcome."""
+
+    __slots__ = ("pending",)
+
+    def __init__(self, pending: PendingEvaluation) -> None:
+        super().__init__("RDBG expression dispatch outcome is unknown")
+        self.pending = pending
 
 
 class TransportRecoveryError(RuntimeProbeError):

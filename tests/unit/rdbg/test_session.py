@@ -6,7 +6,13 @@ from xml.etree import ElementTree
 import pytest
 
 import onec_runtime.rdbg.session as session_module
-from onec_runtime.errors import CommandTimeout, ProtocolError, TargetLost, UnexpectedStop
+from onec_runtime.errors import (
+    CommandTimeout,
+    EvaluationDispatchUnknown,
+    ProtocolError,
+    TargetLost,
+    UnexpectedStop,
+)
 from onec_runtime.performance_profile import PhaseRecorder
 from onec_runtime.rdbg.models import (
     DebugTarget,
@@ -146,7 +152,7 @@ def test_invalidate_fences_breakpoint_request_after_validation_and_build(
     assert session._breakpoint_installed is False
 
 
-def test_invalidate_fences_eval_request_after_dispatch_marker() -> None:
+def test_invalidate_after_eval_admission_allows_only_the_admitted_request() -> None:
     transport = FakeTransport()
     session = ready_session(transport)
     dispatch_entered = Event()
@@ -178,7 +184,7 @@ def test_invalidate_fences_eval_request_after_dispatch_marker() -> None:
     assert not worker.is_alive()
     assert len(errors) == 1
     assert isinstance(errors[0], ProtocolError)
-    assert transport.calls == []
+    assert transport.calls == ["evalExpr"]
     assert session._pending_evaluation_states == {}
 
 
@@ -579,15 +585,88 @@ def test_start_evaluation_accepts_empty_xml_acknowledgement() -> None:
     assert session.state is SessionState.READY
 
 
-def test_start_evaluation_rejects_nonempty_xml_without_result() -> None:
+def test_ambiguous_eval_transport_keeps_one_capability_for_late_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TimedOutEvalTransport(FakeTransport):
+        def request(self, command: str, payload: bytes = b"", **options: object) -> bytes:
+            if command == "evalExpr":
+                self.calls.append(command)
+                raise CommandTimeout("evalExpr HTTP response was lost")
+            return super().request(command, payload, **options)
+
+    transport = TimedOutEvalTransport()
+    session = ready_session(transport)
+    entered: list[str] = []
+
+    with pytest.raises(EvaluationDispatchUnknown) as raised:
+        session.start_evaluation("1", on_transport_dispatch=lambda: entered.append("evalExpr"))
+
+    pending = raised.value.pending
+    assert entered == ["evalExpr"]
+    assert len(session._pending_evaluation_states) == 1
+    with pytest.raises(ProtocolError, match="already pending"):
+        session.start_evaluation("2")
+
+    result = EvaluationResult(pending.result_id, "Число", "1", False)
+    monkeypatch.setattr(session, "_poll", lambda _timeout: ([], [result]))
+    assert session.wait_evaluation_event(pending, timeout_s=1) is result
+    assert transport.calls.count("evalExpr") == 1
+    assert session._pending_evaluation_states == {}
+
+
+def test_pretransport_eval_admission_failure_releases_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = FakeTransport()
+    session = ready_session(transport)
+    original_request = session._request
+    entered: list[str] = []
+
+    def invalidate_before_request(command: str, payload: bytes = b"", **options: object) -> bytes:
+        session.invalidate()
+        return original_request(command, payload, **options)
+
+    monkeypatch.setattr(session, "_request", invalidate_before_request)
+    with pytest.raises(ProtocolError, match="invalidated"):
+        session.start_evaluation("1", on_transport_dispatch=lambda: entered.append("evalExpr"))
+
+    assert entered == []
+    assert transport.calls == []
+    assert session._pending_evaluation_states == {}
+
+
+def test_malformed_eval_ack_retains_capability_until_correlated_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = FakeTransport()
+    transport.responses["evalExpr"].append(b"<broken")
+    session = ready_session(transport)
+
+    with pytest.raises(EvaluationDispatchUnknown) as raised:
+        session.start_evaluation("1")
+
+    pending = raised.value.pending
+    assert isinstance(raised.value.__cause__, ProtocolError)
+    result = EvaluationResult(pending.result_id, "Число", "1", False)
+    monkeypatch.setattr(session, "_poll", lambda _timeout: ([], [result]))
+    assert session.wait_evaluation_event(pending, timeout_s=1) is result
+    assert transport.calls.count("evalExpr") == 1
+
+
+def test_start_evaluation_treats_nonempty_xml_without_result_as_unknown() -> None:
     transport = FakeTransport()
     transport.responses["evalExpr"].append(
         f'<response xmlns="{RDBG_NS}"><unexpected/></response>'.encode()
     )
     session = ready_session(transport)
 
-    with pytest.raises(ProtocolError, match="missing required result"):
+    with pytest.raises(EvaluationDispatchUnknown) as raised:
         session.start_evaluation("1")
+
+    assert isinstance(raised.value.__cause__, ProtocolError)
+    assert "missing required result" in str(raised.value.__cause__)
+    assert len(session._pending_evaluation_states) == 1
 
 
 def test_pending_evaluation_rejects_copied_capability() -> None:
