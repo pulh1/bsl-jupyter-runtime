@@ -82,7 +82,7 @@ def _new_public_capture_evaluation_id() -> str:
 
 @dataclass(frozen=True, slots=True)
 class AdmissionEnvelopeV1:
-    """The sole bounded admission result carried by extension protocol 2."""
+    """The sole bounded admission result carried by extension protocol 3."""
 
     runtime_generation: int
     context_generation: int

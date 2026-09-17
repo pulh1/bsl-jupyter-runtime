@@ -68,7 +68,7 @@ from onec_runtime.capture_value_protocol import (
     CaptureValueInspectionEnvelope,
     MAX_CAPTURE_VALUE_NATIVE_CANDIDATES,
     NativeCandidatePage,
-    build_capture_value_inspection_envelope,
+    build_capture_value_inline_expression,
 )
 from onec_runtime.capture_values import (
     CaptureValuePolicy,
@@ -2444,7 +2444,7 @@ class PrototypeRuntimeController:
                 deadline=deadline,
             )
         )
-        envelope = build_capture_value_inspection_envelope(
+        inline = build_capture_value_inline_expression(
             action=action,
             path=path,
             request=request,
@@ -2456,7 +2456,10 @@ class PrototypeRuntimeController:
             native_page=native_selection.page,
             policy=CaptureValuePolicy(),
         )
-        return CaptureValueInspectionPlan(envelope.source, lambda _result: None, envelope)
+        return CaptureValueInspectionPlan(
+            inline.source,
+            lambda result: inline.decode(evaluation_to_python(result)),
+        )
 
     def _capture_value_native_candidates(
         self,

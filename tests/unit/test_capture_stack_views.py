@@ -794,12 +794,10 @@ def test_runtime_native_frame_uses_the_production_envelope_without_inventory_met
     from hashlib import sha256
     import json
 
-    class EnvelopeNativeSession(FreshStackSession):
+    class InlineNativeSession(FreshStackSession):
         def __init__(self) -> None:
             super().__init__()
             self.projection_sources: list[str] = []
-            self.payload_reads = 0
-            self.cleanups = 0
             document = {
                 "v": 1,
                 "action": "project",
@@ -839,18 +837,12 @@ def test_runtime_native_frame_uses_the_production_envelope_without_inventory_met
                 expression if stack_level == 0 else (expression, stack_level)
             )
             self.calls.append(("evaluate", call_value))
-            if "СпроецироватьЗначенияИнспекции" in expression:
+            if "СериализоватьИнспекциюДляОтладки" in expression:
                 self.projection_sources.append(expression)
-                return evaluation("Строка", f'"{self.admission}"')
-            if "ЗабратьКомпактнуюМатериализациюИзКонтекста" in expression:
-                self.payload_reads += 1
-                return evaluation("Строка", f'"{self.payload}"')
-            if "УдалитьМатериализациюИзКонтекста" in expression:
-                self.cleanups += 1
-                return evaluation("Булево", "Истина")
+                return evaluation("Строка", f'"{self.admission}|{self.payload}"')
             return super().evaluate(expression, **kwargs)
 
-    session = EnvelopeNativeSession()
+    session = InlineNativeSession()
     controller = captured_controller(session)
     runtime = PrototypeRuntimeApi(controller)
     owner = controller._capture_evaluation_coordinator
@@ -859,12 +851,11 @@ def test_runtime_native_frame_uses_the_production_envelope_without_inventory_met
         page = runtime.current_capture().stack.native[1].variables[:1]
 
         assert [item.name for item in page.items] == ["Оклад"]
-        assert session.payload_reads == session.cleanups == 1
         assert len(session.projection_sources) == 1
         source = session.projection_sources[0]
         assert "PRIVATE_NATIVE_TYPE" not in source
         assert "PRIVATE_NATIVE_PRESENTATION" not in source
-        assert "RuntimeContextStoreServer.ПолучитьКонтекст()" in source
+        assert 'Новый Структура("Оклад", Оклад)' in source
         assert any(
             name == "local_variables" and level == 1
             for name, level in session.calls
@@ -874,7 +865,77 @@ def test_runtime_native_frame_uses_the_production_envelope_without_inventory_met
         assert owner.join(2)
 
 
-def test_runtime_native_frame_pages_wide_private_inventory_before_envelope_projection():
+@pytest.mark.parametrize("failure", ("admission", "rdbg"))
+def test_native_frame_inspection_failure_can_retry_on_the_same_capture_stop(failure: str):
+    """A confirmed value error must leave the physical frame usable."""
+    from base64 import b64encode
+    from hashlib import sha256
+    import json
+
+    from onec_runtime.capture_evaluation import CapturePhase
+    from onec_runtime.errors import CaptureValueCheckError
+
+    document = {
+        "v": 1, "action": "project",
+        "entries": [{
+            "name": "Оклад", "denied": False, "type_name": "Число",
+            "preview": "55000", "size": None, "shape": "scalar", "cycle": False,
+        }],
+        "total": 1, "next": None,
+    }
+    payload = json.dumps(document, ensure_ascii=False, separators=(",", ":")).encode()
+    encoded = b64encode(payload).decode("ascii")
+    valid = "R|1|1|{}|{}|{}|{}".format(
+        len(payload), sha256(payload).hexdigest(), len(encoded), encoded,
+    )
+
+    class ErrorThenSuccessNativeSession(FreshStackSession):
+        def __init__(self) -> None:
+            super().__init__()
+            self.projection_levels: list[int] = []
+
+        def local_variables(self, stack_level: int = 0) -> LocalVariablesResult:
+            if stack_level == 1:
+                return LocalVariablesResult(uuid4(), (
+                    FrameVariable("Оклад", "PRIVATE_TYPE", "PRIVATE_VALUE"),
+                ))
+            return super().local_variables(stack_level)
+
+        def evaluate(self, expression: str, **kwargs: object):  # type: ignore[no-untyped-def]
+            if "СериализоватьИнспекциюДляОтладки" in expression:
+                self.projection_levels.append(kwargs.get("stack_level", -1))
+                if len(self.projection_levels) == 1:
+                    if failure == "admission":
+                        return evaluation("Строка", '"E|value_admission_failed"')
+                    return evaluation("Строка", '""', error="synthetic native eval error")
+                return evaluation("Строка", f'"{valid}"')
+            return super().evaluate(expression, **kwargs)
+
+    session = ErrorThenSuccessNativeSession()
+    controller = captured_controller(session)
+    runtime = PrototypeRuntimeApi(controller)
+    owner = controller._capture_evaluation_coordinator
+    assert owner is not None
+    try:
+        capture = runtime.current_capture()
+        frame = capture.stack.native[1]
+
+        with pytest.raises(CaptureValueCheckError):
+            frame.variables[:1]
+
+        assert capture.status().phase is CapturePhase.PAUSED
+        page = frame.variables[:1]
+        assert [item.name for item in page.items] == ["Оклад"]
+        assert page.items[0].preview == "55000"
+        assert capture.status().phase is CapturePhase.PAUSED
+        assert session.projection_levels == [1, 1]
+        assert owner.status(owner._fence).can_inspect
+    finally:
+        owner.begin_close()
+        assert owner.join(2)
+
+
+def test_runtime_native_frame_pages_wide_private_inventory_before_inline_projection():
     """Only the requested native roots may cross into one inspection source."""
     from base64 import b64encode
     from hashlib import sha256
@@ -888,14 +949,12 @@ def test_runtime_native_frame_pages_wide_private_inventory_before_envelope_proje
     names[99] = "ParamA"
     local_names = tuple(name for name in names if name not in {"ParamA", "ParamB"})
 
-    class WideEnvelopeNativeSession(FreshStackSession):
+    class WideInlineNativeSession(FreshStackSession):
         def __init__(self) -> None:
             super().__init__()
             self.private_inventory_reads = 0
             self.projection_sources: list[str] = []
             self.projection_roots: list[tuple[str, ...]] = []
-            self.payload_reads = 0
-            self.cleanups = 0
             self.payload = ""
             self.admission = ""
 
@@ -917,10 +976,10 @@ def test_runtime_native_frame_pages_wide_private_inventory_before_envelope_proje
                 expression if stack_level == 0 else (expression, stack_level)
             )
             self.calls.append(("evaluate", call_value))
-            if "СпроецироватьЗначенияИнспекции" in expression:
+            if "СериализоватьИнспекциюДляОтладки" in expression:
                 roots = tuple(name for name, value in re.findall(
-                    r'\.Вставить\("([^"\\]+)", '
-                    r'([A-Za-zА-Яа-яЁё_][0-9A-Za-zА-Яа-яЁё_]*)\);',
+                    r'Новый Структура\("([^"\\]+)", '
+                    r'([A-Za-zА-Яа-яЁё_][0-9A-Za-zА-Яа-яЁё_]*)\)',
                     expression,
                 ) if name == value)
                 self.projection_sources.append(expression)
@@ -947,16 +1006,10 @@ def test_runtime_native_frame_pages_wide_private_inventory_before_envelope_proje
                 self.admission = "R|1|1|{}|{}|{}".format(
                     len(payload), sha256(payload).hexdigest(), len(self.payload),
                 )
-                return evaluation("Строка", f'"{self.admission}"')
-            if "ЗабратьКомпактнуюМатериализациюИзКонтекста" in expression:
-                self.payload_reads += 1
-                return evaluation("Строка", f'"{self.payload}"')
-            if "УдалитьМатериализациюИзКонтекста" in expression:
-                self.cleanups += 1
-                return evaluation("Булево", "Истина")
+                return evaluation("Строка", f'"{self.admission}|{self.payload}"')
             return super().evaluate(expression, **kwargs)
 
-    session = WideEnvelopeNativeSession()
+    session = WideInlineNativeSession()
     controller = captured_controller(session)
     runtime = PrototypeRuntimeApi(controller)
     owner = controller._capture_evaluation_coordinator
@@ -1002,11 +1055,10 @@ def test_runtime_native_frame_pages_wide_private_inventory_before_envelope_proje
             ("V50",), ("V51",), ("V0",), ("V50",),
             ("ParamA",), (local_names[50],),
         ]
-        assert session.payload_reads == session.cleanups == 6
         first_page_source = session.projection_sources[2]
-        assert 'Вставить("V0", V0);' in first_page_source
-        assert 'Вставить("V1", V1);' not in first_page_source
-        assert 'Вставить("ParamB", ParamB);' not in first_page_source
+        assert 'Новый Структура("V0", V0)' in first_page_source
+        assert 'Новый Структура("V1", V1)' not in first_page_source
+        assert 'Новый Структура("ParamB", ParamB)' not in first_page_source
         assert 'PRIVATE_NATIVE_TYPE' not in first_page_source
         assert 'PRIVATE_NATIVE_PRESENTATION' not in first_page_source
     finally:

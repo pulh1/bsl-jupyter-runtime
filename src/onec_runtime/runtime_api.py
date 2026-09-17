@@ -5993,6 +5993,11 @@ class PrototypeRuntimeApi:
             raise ProtocolError("materialization payload route is invalid") from error
         if not isinstance(header, dict) or header.get("version") != 1:
             raise ProtocolError("materialization payload route is invalid")
+        if set(header) == {"version", "error"}:
+            # The typed value decoder owns the target's bounded limit/cycle
+            # errors. They have no root node, so route selection must preserve
+            # the envelope for that decoder instead of raising ProtocolError.
+            return "value"
         if "root" in header:
             return "value"
         if {"columns", "kinds", "reference_modes"} <= header.keys():

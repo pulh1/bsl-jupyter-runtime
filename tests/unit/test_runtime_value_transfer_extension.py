@@ -60,6 +60,7 @@ def test_value_transfer_module_parses_and_exports_only_public_boundary() -> None
         "ДопуститьЗначение",
         "СериализоватьЗначение",
         "СпроецироватьЗначенияИнспекции",
+        "СериализоватьИнспекциюДляОтладки",
     }
 
 
@@ -92,6 +93,51 @@ def test_value_inspection_projector_is_a_closed_inline_admission_protocol() -> N
     assert 'Новый Структура("name,denied", Имя, Истина)' in entry
     assert "ЭтоСтрокаТаблицыИнспекции" in projector
     assert "Значение.Колонки.Количество() >= ЛимитКолонок" in names
+
+
+def test_debugger_inspection_helper_returns_one_bounded_inline_envelope() -> None:
+    """One eval result contains the admitted projection, with no private key."""
+    source = MODULE.read_text(encoding="utf-8-sig")
+    helper = source.split("Функция СериализоватьИнспекциюДляОтладки(", 1)[1].split(
+        "КонецФункции", 1
+    )[0]
+
+    assert helper.startswith("Корни, ЗапросJSON) Экспорт")
+    assert "СтрДлина(ЗапросJSON) > 65536" in helper
+    assert "ПрочитатьJSON(ЧтениеJSON, Ложь)" in helper
+    assert "ПроверитьЗапросИнспекцииДляОтладки(Запрос)" in helper
+    assert "СпроецироватьЗначенияИнспекции(" in helper
+    assert helper.index("ПроверитьЗапросИнспекцииДляОтладки") < helper.index(
+        "СпроецироватьЗначенияИнспекции("
+    )
+    assert 'Возврат "D|worker_generation_value"' in helper
+    assert 'Возврат "E|value_admission_failed"' in helper
+    assert 'Возврат "R|"' in helper
+    assert "Проекция.Base64" in helper
+    assert "Проекция.Размер" in helper
+    assert "Проекция.Хеш" in helper
+    assert "RuntimeContextStoreServer" not in helper
+    assert "ВременноеХранилище" not in helper
+
+
+def test_debugger_inspection_request_has_closed_schema_and_budgets() -> None:
+    source = MODULE.read_text(encoding="utf-8-sig")
+    validator = source.split("Процедура ПроверитьЗапросИнспекцииДляОтладки(", 1)[1].split(
+        "КонецПроцедуры", 1
+    )[0]
+    fields = {
+        "action", "path", "view", "start", "stop", "role", "parameters",
+        "exact", "registrations", "column_limit", "max_items", "max_bytes",
+        "runtime_generation", "context_generation",
+    }
+    assert all(f'Запрос.Свойство("{field}")' in validator for field in fields)
+    assert "Запрос.Количество() <> 14" in validator
+    assert "Запрос.max_items > 100" in validator
+    assert "Запрос.max_bytes > 65536" in validator
+    assert "Запрос.column_limit > 101" in validator
+    assert "Запрос.path.Количество() > 17" in validator
+    assert "Запрос.registrations.Количество() > 32" in validator
+    assert "СтрДлина(РегистрацияWorker) > 4096" in validator
 
 
 def test_value_inspection_projector_marks_cycles_only_after_admission() -> None:

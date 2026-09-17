@@ -389,7 +389,7 @@ def test_runtime_context_projection_uses_the_checked_in_target_plan_without_inje
 
         starts = [call for call in transport.calls if call[0] == "start_evaluation"]
         assert len(starts) == 1
-        assert "СпроецироватьЗначенияИнспекции" in starts[0][1][0]
+        assert "RuntimeValueTransferServer.СериализоватьИнспекциюДляОтладки" in starts[0][1][0]
     finally:
         close_owner(controller, transport)
 
@@ -563,8 +563,8 @@ def test_runtime_value_binding_preserves_a_pending_coordinator_outcome():
         close_owner(controller, transport)
 
 
-def test_runtime_value_binding_uses_the_checked_in_envelope_without_an_injected_builder():
-    """The normal runtime path owns admission, payload read and cleanup together."""
+def test_runtime_value_binding_uses_the_checked_in_inline_transfer_without_an_injected_builder():
+    """The normal runtime receives one bounded inspection result inline."""
     from base64 import b64encode
     from hashlib import sha256
     import json
@@ -597,19 +597,11 @@ def test_runtime_value_binding_uses_the_checked_in_envelope_without_an_injected_
         def __init__(self):
             super().__init__((CAPTURE_A,))
             self.projections = 0
-            self.payload_reads = 0
-            self.cleanups = 0
 
         def evaluate(self, expression, **kwargs):  # type: ignore[no-untyped-def]
-            if "СпроецироватьЗначенияИнспекции" in expression:
+            if "СериализоватьИнспекциюДляОтладки" in expression:
                 self.projections += 1
-                return evaluation("Строка", f'"{envelope}"')
-            if "ЗабратьКомпактнуюМатериализациюИзКонтекста" in expression:
-                self.payload_reads += 1
-                return evaluation("Строка", f'"{base64_payload}"')
-            if "УдалитьМатериализациюИзКонтекста" in expression:
-                self.cleanups += 1
-                return evaluation("Булево", "Истина")
+                return evaluation("Строка", f'"{envelope}|{base64_payload}"')
             return super().evaluate(expression, **kwargs)
 
     session = EnvelopeSession()
@@ -622,7 +614,7 @@ def test_runtime_value_binding_uses_the_checked_in_envelope_without_an_injected_
 
         assert [item.name for item in page.items] == ["Оклад"]
         assert page.items[0].preview == "55000"
-        assert session.projections == session.payload_reads == session.cleanups == 1
+        assert session.projections == 1
         assert owner.status(owner._fence).can_inspect
     finally:
         owner.begin_close()
@@ -636,10 +628,10 @@ def test_runtime_value_binding_uses_the_checked_in_envelope_without_an_injected_
         pytest.param("E|value_admission_failed", CaptureValueCheckError, id="invalid"),
     ),
 )
-def test_runtime_value_envelope_cleans_private_context_after_denial_or_invalid_metadata(
+def test_runtime_value_inline_transfer_rejects_denial_or_invalid_metadata(
     admission, error_type,
 ):
-    """Cleanup is registered before the first helper dispatch in all outcomes."""
+    """A denied inline result cannot trigger a second target expression."""
     from onec_runtime.runtime_api import PrototypeRuntimeApi
     from test_prototype_runtime import CAPTURE_A, ScriptedSession, captured_controller, evaluation
 
@@ -647,19 +639,11 @@ def test_runtime_value_envelope_cleans_private_context_after_denial_or_invalid_m
         def __init__(self) -> None:
             super().__init__((CAPTURE_A,))
             self.projections = 0
-            self.payload_reads = 0
-            self.cleanups = 0
 
         def evaluate(self, expression, **kwargs):  # type: ignore[no-untyped-def]
-            if "СпроецироватьЗначенияИнспекции" in expression:
+            if "СериализоватьИнспекциюДляОтладки" in expression:
                 self.projections += 1
                 return evaluation("Строка", f'"{admission}"')
-            if "ЗабратьКомпактнуюМатериализациюИзКонтекста" in expression:
-                self.payload_reads += 1
-                raise AssertionError("a rejected envelope cannot fetch its payload")
-            if "УдалитьМатериализациюИзКонтекста" in expression:
-                self.cleanups += 1
-                return evaluation("Булево", "Истина")
             return super().evaluate(expression, **kwargs)
 
     session = RejectedEnvelopeSession()
@@ -671,15 +655,77 @@ def test_runtime_value_envelope_cleans_private_context_after_denial_or_invalid_m
         with pytest.raises(error_type):
             runtime.current_capture().context.variables[:1]
 
-        assert session.projections == session.cleanups == 1
-        assert session.payload_reads == 0
+        assert session.projections == 1
     finally:
         owner.begin_close()
         assert owner.join(2)
 
 
-def test_runtime_value_envelope_cleans_private_context_after_a_detached_late_result():
-    """An acknowledged waiter may detach; its INSPECTION record still cleans up."""
+def test_confirmed_inline_decoder_failure_leaves_capture_paused_for_next_inspection():
+    """One bad inline payload does not poison the stopped frame or add cleanup work."""
+    from base64 import b64encode
+    from hashlib import sha256
+    import json
+
+    from onec_runtime.capture_evaluation import CapturePhase
+    from onec_runtime.runtime_api import PrototypeRuntimeApi
+    from test_prototype_runtime import CAPTURE_A, ScriptedSession, captured_controller, evaluation
+
+    document = {
+        "v": 1,
+        "action": "project",
+        "entries": [],
+        "total": 0,
+        "next": None,
+    }
+    payload = json.dumps(document, separators=(",", ":")).encode("utf-8")
+    encoded = b64encode(payload).decode("ascii")
+    valid = "R|1|1|{}|{}|{}|{}".format(
+        len(payload), sha256(payload).hexdigest(), len(encoded), encoded,
+    )
+    malformed = "R|1|1|1|{}|4|abcd".format("0" * 64)
+
+    class InlineFailureThenSuccessSession(ScriptedSession):
+        def __init__(self) -> None:
+            super().__init__((CAPTURE_A,))
+            self.inline_expressions: list[str] = []
+
+        def evaluate(self, expression, **kwargs):  # type: ignore[no-untyped-def]
+            if "СериализоватьИнспекциюДляОтладки" in expression:
+                self.inline_expressions.append(expression)
+                result = malformed if len(self.inline_expressions) == 1 else valid
+                return evaluation("Строка", f'"{result}"')
+            if "ЗабратьКомпактнуюМатериализациюИзКонтекста" in expression:
+                raise AssertionError("inline inspection must not fetch a payload")
+            if "УдалитьМатериализациюИзКонтекста" in expression:
+                raise AssertionError("inline inspection must not schedule cleanup")
+            return super().evaluate(expression, **kwargs)
+
+    session = InlineFailureThenSuccessSession()
+    controller = captured_controller(session)
+    runtime = PrototypeRuntimeApi(controller)
+    owner = controller._capture_evaluation_coordinator
+    assert owner is not None
+    try:
+        capture = runtime.current_capture()
+        with pytest.raises(CaptureValueCheckError):
+            capture.context.variables[:1]
+
+        assert capture.status().phase is CapturePhase.PAUSED
+        assert capture.context.variables[:1].items == ()
+        assert len(session.inline_expressions) == 2
+        assert all(
+            "СериализоватьИнспекциюДляОтладки" in expression
+            for expression in session.inline_expressions
+        )
+        assert owner.status(owner._fence).can_inspect
+    finally:
+        owner.begin_close()
+        assert owner.join(2)
+
+
+def test_runtime_value_inline_transfer_settles_after_a_detached_late_result():
+    """An acknowledged waiter may detach while its one inline request settles."""
     from base64 import b64encode
     from hashlib import sha256
     import json
@@ -708,17 +754,14 @@ def test_runtime_value_envelope_cleans_private_context_after_a_detached_late_res
         with pytest.raises(CaptureEvaluationPendingError):
             capture.context.variables[:1]
 
-        transport.complete(f'"{admission}"', type_name="Строка")
-        eventually(lambda: sum(
-            call[0] == "start_evaluation" for call in transport.calls
-        ) == 2)
-        transport.complete("Истина", type_name="Булево")
+        transport.complete(f'"{admission}|{encoded}"', type_name="Строка")
         eventually(lambda: capture.status().phase.value == "paused")
 
         steps = [call[1][0] for call in transport.calls if call[0] == "start_evaluation"]
-        assert len(steps) == 2  # creating projection + mandatory cleanup
-        assert not any("ЗабратьКомпактнуюМатериализациюИзКонтекста" in step for step in steps)
-        assert any("УдалитьМатериализациюИзКонтекста" in step for step in steps)
+        assert len(steps) == 1
+        assert "СериализоватьИнспекциюДляОтладки" in steps[0]
+        assert "ЗабратьКомпактнуюМатериализациюИзКонтекста" not in steps[0]
+        assert "УдалитьМатериализациюИзКонтекста" not in steps[0]
     finally:
         close_owner(controller, transport)
 

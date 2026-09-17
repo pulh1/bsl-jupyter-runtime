@@ -110,6 +110,8 @@ for frame in page.frames:
 
 `StackPage` содержит `frames`, `total`, `next_cursor`; `with_methods()` добавляет разрешённые по исходникам имена и сигнатуры методов. `DebugFrame` содержит `source`, `line`, `native_level`, `source_status`, `method_status`; `frame.variables`, `frame.parameters`, `frame.locals` открывают переменные этого кадра. Страницы переменных содержат `items`, `total`, `next_cursor`. `ValueNode` показывает `name`, `type_name`, `preview`, `size`, `shape`, `expandable` и разрешает ограниченное чтение через `children`, `fields`, `items`, `columns`, `rows`. Выбор страницы требует конечного среза; бесконечная итерация намеренно недоступна. Некоторые значения или сведения об исходниках могут быть недоступны; это отражается диагностикой чтения, а не обязательной потерей CAPTURE.
 
+`capture.context.variables` читает поля `КонтекстОтладки`, перенесённые из остановленного кадра. Новое имя, присвоенное в CAPTURE-ячейке без префикса `КонтекстОтладки`, попадает в постоянный notebook `Контекст` и доступно через `bsl`/`namespace_snapshot()`, но не появляется в staged кадре. Присваивание `КонтекстОтладки.Имя = ...` меняет существующий корень staged кадра. Для вложенных значений массив и строки таблицы выбираются индексом, а поля структуры и колонки строки — именем: `node.rows[0].fields["Сумма"]`.
+
 ```python
 frame = capture.stack[0]
 for node in frame.locals[:10].items:

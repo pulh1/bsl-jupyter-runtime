@@ -2,11 +2,11 @@
   "schema_version": 1,
   "product_id": "onec-interactive-runtime",
   "extension_name": "OnecInteractiveRuntime",
-  "artifact_version": "0.1.5",
-  "protocol_version": "2",
+  "artifact_version": "0.1.6",
+  "protocol_version": "3",
   "cfe_filename": "OnecInteractiveRuntime.cfe",
-  "cfe_size": 25454,
-  "cfe_sha256": "224fe1bccb488bdea84c62b7a4233dc90ac3528404f66099e739fa9fd5782178",
+  "cfe_size": 27056,
+  "cfe_sha256": "e9e8c020128f5d628c430aa84512b51dae115408456fbabb56643234c8ed5c3d",
   "fingerprints": {
     "identity": {
       "product_id": "onec-interactive-runtime",
@@ -23,8 +23,8 @@
       "vendor": "onec-interactive-runtime"
     },
     "artifact": {
-      "artifact_version": "0.1.5",
-      "protocol_version": "2",
+      "artifact_version": "0.1.6",
+      "protocol_version": "3",
       "language_bound_by_name": false,
       "metadata": [
         {
@@ -69,14 +69,14 @@
         }
       ],
       "source_sha256": {
-        "CommonModules/RuntimeKernelServer/Ext/Module.bsl": "04434999af896abe2130e86759f6b67868068362fad6cd489515fb0e09e5a615",
+        "CommonModules/RuntimeKernelServer/Ext/Module.bsl": "5774daa7e87af818c806018ff67b2badc8c9335bf97dd89e780dd729049a8d28",
         "CommonModules/RuntimeTableTransferServer/Ext/Module.bsl": "e49ad674ee0d191658f2fa0fca8af9b9637e424447df617489f2dc1a7d6bef11",
-        "CommonModules/RuntimeValueTransferServer/Ext/Module.bsl": "8e435611a61c1c7f14e62a7690d0aed1c09179fe0da2dfd314d7ba5611ace12a",
-        "Ext/ManagedApplicationModule.bsl": "ad111cd20d959632977c2bef5f47f0895a6325bb7dfea170430ae86e0f0750db"
+        "CommonModules/RuntimeValueTransferServer/Ext/Module.bsl": "28e4e7a7ca6bcac38825765010a58b8c0e15fec9d5b236ca11962ba8aa43fe16",
+        "Ext/ManagedApplicationModule.bsl": "601fd05471fa6d208c03fd031972775b9d965ff4c6f9fabf81c443ccc9ec8618"
       }
     },
     "identity_sha256": "726065a5d3c6f5472e24a83fc0c474fd5f13c42eace441b90c7eba1b404df496",
-    "artifact_sha256": "0f73a9f8eff2a1b2bf202ea8c229484b4d26dfaa3ad01c674acc45bed087b212"
+    "artifact_sha256": "6fc6bab92588a1c6479bfafa238bdcd8721e7db8e4110ad7f2573881c2a07f27"
   },
   "breakpoints": {
     "managed": {
