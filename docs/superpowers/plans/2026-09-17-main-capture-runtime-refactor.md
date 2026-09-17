@@ -12,10 +12,10 @@ Files: `src/onec_runtime/rdbg/session.py`, `src/onec_runtime/errors.py`, `src/on
 
 - [x] Make a stop wait interval preserve the RDBG target and EXECUTING state.
 - [x] Keep the exact pending eval capability after an ambiguous transport/response outcome; reject another eval.
-- [ ] Let the CAPTURE owner poll the retained capability and expose outcome uncertainty until a correlated result arrives, including inline resume steps.
-- [ ] Track one MAIN command through CAPTURE, multiple stops, completion and uncertain Continue.
-- [ ] Distinguish a safe local pre-Continue failure from target loss, and record proven command completion before result decoding.
-- [ ] Verify RDBG, MAIN, CAPTURE and notebook replacement focused tests together.
+- [x] Let the CAPTURE owner poll the retained capability and expose outcome uncertainty until a correlated result arrives, including inline resume steps.
+- [x] Track one MAIN command through CAPTURE, multiple stops, completion and uncertain Continue.
+- [x] Distinguish a safe local pre-Continue failure from target loss, and record proven command completion before result decoding.
+- [x] Verify RDBG, MAIN, CAPTURE and notebook replacement focused tests together. The initial combined run passed 385 tests; notebook replacement passed 60.
 
 These are vertical compatibility changes. They do not complete the architecture below.
 
