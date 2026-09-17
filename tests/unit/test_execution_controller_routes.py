@@ -1,11 +1,12 @@
 """The controller keeps one MAIN operation across a CAPTURE stop."""
 
 from collections import deque
+from threading import Event
 from uuid import UUID
 
 import pytest
 
-from onec_runtime.execution.arbiter import RdbgArbiter, RouteToken
+from onec_runtime.execution.arbiter import RdbgArbiter, RouteToken, Settlement
 from onec_runtime.execution.capture.cell_evaluator import CaptureCellEvaluator
 from onec_runtime.execution.capture.executor import CaptureExecutor
 from onec_runtime.execution.main import MainExecutor, MainPhase
@@ -326,4 +327,49 @@ def test_user_breakpoint_resumes_same_main_operation_on_owned_worker() -> None:
         assert finished.operation.phase is MainPhase.COMPLETED
         assert len({thread for _, thread in session.calls}) == 1
     finally:
+        arbiter.close(timeout=3)
+
+
+def test_resume_admission_fences_later_capture_cell_before_worker_runs() -> None:
+    from onec_runtime.errors import ProtocolError
+    from onec_runtime.execution.controller.controller import ExecutionController
+
+    session = CompleteSession()
+    arbiter = RdbgArbiter(session, RouteToken("runtime-1", 1, 0, "main"))
+    controller = ExecutionController(
+        arbiter,
+        MainExecutor(poll_interval_s=0.1),
+        CaptureExecutor(None, KERNEL, decode_command_id=evaluation_to_python),
+        CaptureCellEvaluator(),
+        BreakpointRegistry(KERNEL, (BUSINESS,)),
+        runtime_generation=1,
+    )
+    entered = Event()
+    release = Event()
+    try:
+        scope = controller.submit_main("Результат = 1;").wait(3).scope
+
+        def hold_worker(port):
+            entered.set()
+            assert release.wait(3)
+            return Settlement(None)
+
+        blocker = arbiter.submit(arbiter.current_route, hold_worker)
+        arbiter.dispatch(blocker)
+        assert entered.wait(3)
+        resume_ticket = controller.submit_resume()
+
+        with pytest.raises(ProtocolError, match="resume"):
+            controller.submit_capture_cell(
+                "Результат = 4;", dirty_roots=("Результат",)
+            )
+        assert scope.dirty_roots == ()
+
+        release.set()
+        blocker.wait(3)
+        assert resume_ticket.wait(3).kind.value == "completed"
+    finally:
+        release.set()
+        if "resume_ticket" in locals():
+            resume_ticket.wait_settled(3)
         arbiter.close(timeout=3)

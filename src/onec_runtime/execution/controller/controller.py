@@ -77,6 +77,7 @@ class ExecutionController:
         self.main_operation: MainOperation | None = None
         self.capture_scope: CaptureScope | None = None
         self._capture_route: RouteToken | None = None
+        self._resume_ticket: ExecutionTicket | None = None
 
     def submit_main(self, instruction: str) -> ExecutionTicket:
         """Admit one MAIN command and return its first-stop ticket."""
@@ -92,6 +93,7 @@ class ExecutionController:
             self.main_operation = operation
             self.capture_scope = None
             self._capture_route = None
+            self._resume_ticket = None
 
             def plan(port: SessionPort) -> Settlement:
                 stop = self._main_executor.dispatch(
@@ -125,6 +127,8 @@ class ExecutionController:
         """Run one cell inside the current stop; policy interprets its result."""
 
         with self._lock:
+            if self._resume_in_flight():
+                raise ProtocolError("CAPTURE resume has already been admitted")
             scope = self.capture_scope
             operation = self.main_operation
             route = self._capture_route
@@ -162,6 +166,8 @@ class ExecutionController:
         """Write dirty roots, close CAPTURE, and resume the same MAIN command."""
 
         with self._lock:
+            if self._resume_in_flight():
+                raise ProtocolError("CAPTURE resume has already been admitted")
             scope = self.capture_scope
             operation = self.main_operation
             route = self._capture_route
@@ -195,12 +201,14 @@ class ExecutionController:
                 with self._lock:
                     self.capture_scope = None
                     self._capture_route = None
+                    self._resume_ticket = None
                 next_route = self._next_route("main")
                 port.handoff_route(next_route)
                 stop = self._main_executor.await_stop(port=port)
                 return self._route_stop(port, operation, stop)
 
             ticket = self._arbiter.submit(route, plan)
+            self._resume_ticket = ticket
             self._arbiter.dispatch(ticket)
             return ticket
 
@@ -210,6 +218,8 @@ class ExecutionController:
         """Read one user-frame variable in the current CAPTURE stop."""
 
         with self._lock:
+            if self._resume_in_flight():
+                raise ProtocolError("CAPTURE resume has already been admitted")
             scope = self.capture_scope
             operation = self.main_operation
             route = self._capture_route
@@ -231,6 +241,15 @@ class ExecutionController:
             ticket = self._arbiter.submit(route, plan)
             self._arbiter.dispatch(ticket)
             return ticket
+
+    def _resume_in_flight(self) -> bool:
+        ticket = self._resume_ticket
+        if ticket is None:
+            return False
+        if ticket.status().settled:
+            self._resume_ticket = None
+            return False
+        return True
 
     def submit_resume_debug_stop(self) -> ExecutionTicket:
         """Continue the current user breakpoint in the same MAIN command."""
