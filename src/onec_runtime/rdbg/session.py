@@ -507,7 +507,6 @@ class RdbgSession:
             polled = self._poll(remaining)
             self._ingest_poll_events(*polled)
             sleep(0.05)
-        self.state = SessionState.FAILED
         raise CommandTimeout("Timed out waiting for a runtime stop")
 
     def read_current_stack(self, *, timeout_s: float = 5.0) -> StopEvent:

@@ -341,6 +341,26 @@ def test_wait_for_any_stop_returns_unregistered_location_paused() -> None:
     assert transport.calls.count("step") == 0
 
 
+def test_wait_for_any_stop_interval_expiry_preserves_running_target() -> None:
+    transport = FakeTransport()
+    session = ready_session(transport)
+    original_target = session.target
+    session.state = SessionState.EXECUTING
+
+    with pytest.raises(CommandTimeout, match="waiting for a runtime stop"):
+        session.wait_for_any_stop(timeout_s=0.001)
+
+    assert session.state is SessionState.EXECUTING
+    assert session.target is original_target
+
+    transport.responses["pingDebugUIParams"].append(stopped_payload(CAPTURE_A))
+    stop = session.wait_for_any_stop(timeout_s=1)
+
+    assert stop.location == CAPTURE_A
+    assert session.state is SessionState.READY
+    assert session.target is original_target
+
+
 def test_wait_for_any_stop_aborts_when_owned_client_exits_between_polls() -> None:
     transport = FakeTransport()
     session = ready_session(transport)
