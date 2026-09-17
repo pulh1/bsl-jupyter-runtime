@@ -14,7 +14,7 @@ from threading import Condition, Thread, get_ident
 from typing import Any, Callable, Protocol
 from uuid import uuid4
 
-from onec_runtime.errors import EvaluationDispatchUnknown
+from onec_runtime.errors import CommandTimeout, EvaluationDispatchUnknown, StopWaitIntervalElapsed
 from onec_runtime.rdbg.models import DebugTarget, EvaluationResult, ModuleLocation, ModifyResult, PendingEvaluation, StopEvent, TargetId
 
 
@@ -221,6 +221,13 @@ class SessionPort:
             self._ticket._entered = True
             self._ticket._ever_entered = True
 
+    def _stop_checkpoint(self) -> None:
+        self._check()
+        with self._owner._mailbox:
+            if self._ticket._stop_requested:
+                self._ticket._stop_blocked_after_effect = True
+                raise StopPendingTeardown('Stop requested while remote work remains outstanding')
+
     def _require_idle(self) -> None:
         self._check()
         if self._ticket._pending is not None or self._ticket._stop_target is not None or self._ticket._entered:
@@ -269,8 +276,12 @@ class SessionPort:
         expected = self._ticket._stop_target
         if expected is None:
             raise ValueError('No Continue stop is outstanding')
-        stop = self._owner._session.wait_for_any_stop(
-            timeout_s=timeout_s, expected_target=expected, on_transport_dispatch=self._transport_entered)
+        try:
+            stop = self._owner._session.wait_for_any_stop(
+                timeout_s=timeout_s, expected_target=expected, on_transport_dispatch=self._transport_entered)
+        except StopWaitIntervalElapsed:
+            self._stop_checkpoint()
+            raise
         if stop.target_id != expected:
             raise OutcomeUnknown('Stop belongs to a different target')
         with self._owner._mailbox:
@@ -311,7 +322,13 @@ class SessionPort:
     def wait_evaluation_event(self, pending: PendingEvaluation, *, timeout_s: float
                               ) -> EvaluationResult | StopEvent:
         self._require_pending(pending)
-        event = self._owner._session.wait_evaluation_event(pending, timeout_s=timeout_s)
+        try:
+            event = self._owner._session.wait_evaluation_event(pending, timeout_s=timeout_s)
+        except CommandTimeout as error:
+            if type(error) is not CommandTimeout:
+                raise OutcomeUnknown('Evaluation wait failed before its remote outcome was proven') from error
+            self._stop_checkpoint()
+            raise
         if isinstance(event, EvaluationResult):
             if event.result_id != pending.result_id:
                 raise OutcomeUnknown('Session returned a mismatched evaluation result')

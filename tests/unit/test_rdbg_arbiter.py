@@ -760,6 +760,224 @@ def test_main_stop_intervals_preserve_one_logical_owner(runtime):
     assert len(polls) == 3
 
 
+def test_stop_after_empty_main_wait_interval_yields_owner_to_reconciliation(runtime):
+    from onec_runtime.errors import StopWaitIntervalElapsed
+    from onec_runtime.rdbg.models import DebugTarget, ModuleLocation, StopEvent
+
+    session, route, arbiter = runtime
+    target = TargetId(uuid4(), 'main')
+    session.target = DebugTarget(target, 'Server', 'stopped')
+    stop = StopEvent(target, ModuleLocation('ExtensionModule', '', uuid4(), uuid4(), 1, 'Test'), 'breakpoint')
+    entered_wait = Event()
+    release_wait = Event()
+    wait_threads = []
+
+    def continue_(*, on_transport_dispatch):
+        on_transport_dispatch()
+        session.record('continue')
+
+    def wait_for_any_stop(*, expected_target, on_transport_dispatch, **kwargs):
+        assert expected_target == target
+        wait_threads.append(get_ident())
+        if len(wait_threads) == 1:
+            on_transport_dispatch()
+            entered_wait.set()
+            assert release_wait.wait(3)
+            raise StopWaitIntervalElapsed('empty interval')
+        return stop  # Already queued: no new transport dispatch.
+
+    session.continue_ = continue_
+    session.wait_for_any_stop = wait_for_any_stop
+
+    def main(port):
+        port.continue_()
+        while True:
+            try:
+                return Settlement(port.wait_for_any_stop(timeout_s=0.01))
+            except StopWaitIntervalElapsed:
+                continue
+
+    ticket = arbiter.submit(route, main)
+    arbiter.dispatch(ticket)
+    assert entered_wait.wait(3)
+    queued = arbiter.submit(route, lambda port: Settlement(evaluate(port, 'unsafe')))
+    arbiter.dispatch(queued)
+    try:
+        assert arbiter.request_stop(ticket).name == 'REQUESTED'
+        with pytest.raises(CancelledBeforeEffect):
+            queued.wait(3)
+        with pytest.raises(ArbiterBusy):
+            arbiter.submit(route, lambda port: Settlement('unsafe'))
+    finally:
+        release_wait.set()
+
+    assert ticket.wait_unknown(3)
+    assert len(wait_threads) == 1
+    assert ticket.status().awaiting_stop
+    assert arbiter.active_ticket is ticket
+    arbiter.reconcile(ticket, lambda port: Settlement(port.wait_for_any_stop(timeout_s=0.01)))
+    assert ticket.wait_settled(3) is stop
+    assert len(wait_threads) == 2
+    assert wait_threads[0] == wait_threads[1] == session.calls[0][1]
+    assert [name for name, _ in session.calls] == ['continue']
+
+
+def test_stop_after_empty_capture_eval_interval_retains_capability_for_reconciliation(runtime):
+    from onec_runtime.errors import CommandTimeout
+
+    session, route, arbiter = runtime
+    entered_wait = Event()
+    release_wait = Event()
+    wait_threads = []
+
+    def wait_evaluation_event(pending, *, timeout_s):
+        assert pending is session.pending
+        wait_threads.append(get_ident())
+        if len(wait_threads) == 1:
+            entered_wait.set()
+            assert release_wait.wait(3)
+            raise CommandTimeout('empty interval')
+        return EvaluationResult(pending.result_id, 'String', 'late-result', False)
+
+    session.wait_evaluation_event = wait_evaluation_event
+
+    def capture(port):
+        pending = port.start_evaluation('long-running')
+        while True:
+            try:
+                return Settlement(port.wait_evaluation_event(pending, timeout_s=0.01).presentation)
+            except CommandTimeout:
+                continue
+
+    ticket = arbiter.submit(route, capture)
+    arbiter.dispatch(ticket)
+    assert entered_wait.wait(3)
+    queued = arbiter.submit(route, lambda port: Settlement(evaluate(port, 'unsafe')))
+    arbiter.dispatch(queued)
+    try:
+        assert arbiter.request_stop(ticket).name == 'REQUESTED'
+        with pytest.raises(CancelledBeforeEffect):
+            queued.wait(3)
+        with pytest.raises(ArbiterBusy):
+            arbiter.submit(route, lambda port: Settlement('unsafe'))
+    finally:
+        release_wait.set()
+
+    assert ticket.wait_unknown(3)
+    assert len(wait_threads) == 1
+    assert ticket.status().pending_capability is session.pending
+    assert arbiter.active_ticket is ticket
+    arbiter.reconcile(ticket, lambda port: Settlement(
+        port.wait_evaluation_event(session.pending, timeout_s=0.01).presentation))
+    assert ticket.wait_settled(3) == 'late-result'
+    assert len(wait_threads) == 2
+    assert wait_threads[0] == wait_threads[1] == session.calls[0][1]
+    assert [name for name, _ in session.calls] == ['long-running']
+
+
+def test_eval_transport_timeout_escapes_broad_interval_retry_with_pending_owner(runtime):
+    from onec_runtime.errors import CommandTimeout, RdbgTransportTimeout
+
+    session, route, arbiter = runtime
+    waits = []
+
+    def wait_evaluation_event(pending, *, timeout_s):
+        assert pending is session.pending
+        waits.append(get_ident())
+        if len(waits) == 1:
+            raise RdbgTransportTimeout('RDBG poll outcome is unknown')
+        return EvaluationResult(pending.result_id, 'String', 'confirmed-result', False)
+
+    session.wait_evaluation_event = wait_evaluation_event
+
+    def capture(port):
+        pending = port.start_evaluation('long-running')
+        while True:
+            try:
+                return Settlement(port.wait_evaluation_event(pending, timeout_s=0.01).presentation)
+            except CommandTimeout:
+                continue  # Existing broad executor loops must not absorb transport failure.
+
+    ticket = arbiter.submit(route, capture)
+    arbiter.dispatch(ticket)
+    assert ticket.wait_unknown(3)
+    assert len(waits) == 1
+    assert ticket.status().pending_capability is session.pending
+    assert arbiter.active_ticket is ticket
+    arbiter.reconcile(ticket, lambda port: Settlement(
+        port.wait_evaluation_event(session.pending, timeout_s=0.01).presentation))
+    assert ticket.wait_settled(3) == 'confirmed-result'
+    assert len(waits) == 2
+    assert waits[0] == waits[1] == session.calls[0][1]
+
+
+def test_matching_main_stop_wins_stop_request_during_wait(runtime):
+    from onec_runtime.rdbg.models import DebugTarget, ModuleLocation, StopEvent
+
+    session, route, arbiter = runtime
+    target = TargetId(uuid4(), 'main')
+    session.target = DebugTarget(target, 'Server', 'stopped')
+    stop = StopEvent(target, ModuleLocation('ExtensionModule', '', uuid4(), uuid4(), 1, 'Test'), 'breakpoint')
+    entered_wait = Event()
+    release_wait = Event()
+    session.continue_ = lambda *, on_transport_dispatch: on_transport_dispatch()
+
+    def wait_for_any_stop(*, expected_target, on_transport_dispatch, **kwargs):
+        assert expected_target == target
+        on_transport_dispatch()
+        entered_wait.set()
+        assert release_wait.wait(3)
+        return stop
+
+    session.wait_for_any_stop = wait_for_any_stop
+
+    def main(port):
+        port.continue_()
+        return Settlement(port.wait_for_any_stop(timeout_s=0.01))
+
+    ticket = arbiter.submit(route, main)
+    arbiter.dispatch(ticket)
+    assert entered_wait.wait(3)
+    try:
+        assert arbiter.request_stop(ticket).name == 'REQUESTED'
+    finally:
+        release_wait.set()
+    assert ticket.wait_settled(3) is stop
+    assert ticket.status().settled
+    assert not ticket.status().awaiting_stop
+    assert arbiter.active_ticket is None
+
+
+def test_matching_capture_result_wins_stop_request_during_wait(runtime):
+    session, route, arbiter = runtime
+    entered_wait = Event()
+    release_wait = Event()
+
+    def wait_evaluation_event(pending, *, timeout_s):
+        assert pending is session.pending
+        entered_wait.set()
+        assert release_wait.wait(3)
+        return EvaluationResult(pending.result_id, 'String', 'completed', False)
+
+    session.wait_evaluation_event = wait_evaluation_event
+
+    def capture(port):
+        pending = port.start_evaluation('long-running')
+        return Settlement(port.wait_evaluation_event(pending, timeout_s=0.01).presentation)
+
+    ticket = arbiter.submit(route, capture)
+    arbiter.dispatch(ticket)
+    assert entered_wait.wait(3)
+    try:
+        assert arbiter.request_stop(ticket).name == 'REQUESTED'
+    finally:
+        release_wait.set()
+    assert ticket.wait_settled(3) == 'completed'
+    assert ticket.status().settled
+    assert ticket.status().pending_capability is None
+    assert arbiter.active_ticket is None
+
+
 def test_continue_settlement_without_stop_is_quarantined(runtime):
     from onec_runtime.rdbg.models import DebugTarget, ModuleLocation, StopEvent
     session, route, arbiter = runtime
