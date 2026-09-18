@@ -183,6 +183,11 @@ def test_runtime_session_routes_main_capture_resume_and_heartbeat_through_one_ow
             capture_fence, level=0, cursor=0, limit=10,
         )
         assert frame_page["frame"]["level"] == 0
+        nested_page = runtime.capture_frame(
+            capture_fence, level=1, cursor=0, limit=10,
+        )
+        assert nested_page["frame"]["level"] == 1
+        assert nested_page["variables"] == ()
         session.hold_variable_read = True
         variable_reply: list[object] = []
         variable_errors: list[BaseException] = []

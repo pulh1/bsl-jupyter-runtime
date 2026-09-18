@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from onec_runtime.errors import CaptureSourceUnavailableError, ProtocolError, StaleCaptureError
+from onec_runtime.errors import ProtocolError, StaleCaptureError
 from onec_runtime.execution.arbiter import RdbgArbiter, RouteToken, Settlement
 from onec_runtime.execution.capture.public_inspection import CaptureInspectionBridge
 from onec_runtime.rdbg.models import FrameVariable
@@ -206,17 +206,43 @@ def test_named_variable_result_is_rejected_after_stop_release() -> None:
         adapter.capture_frame(level=3, cursor=0, limit=1, name="Rows")
 
 
-def test_non_root_unnamed_frame_requires_typed_page_port() -> None:
+def test_non_root_unnamed_frame_uses_owned_typed_page_without_presentation() -> None:
     from onec_runtime.execution.capture.session_inspection_adapter import (
         SessionCaptureInspectionAdapter,
     )
+    from onec_runtime.execution.capture.inspection import (
+        TypedNativeVariable, TypedNativeVariablePage,
+    )
+
+    class Ticket:
+        def wait_initiator(self, timeout=None):
+            return TypedNativeVariablePage(
+                (TypedNativeVariable("Rows", "Массив", 4),), 2, 1,
+            )
+
+    class TypedController(Controller):
+        def __init__(self, scope):
+            super().__init__(scope)
+            self.requests = []
+
+        def submit_capture_typed_variable_page(self, *, stack_level, start, stop):
+            self.requests.append((stack_level, start, stop))
+            return Ticket()
 
     scope = ready_scope()
-    controller = Controller(scope)
+    controller = TypedController(scope)
     adapter = SessionCaptureInspectionAdapter(controller, CaptureInspectionBridge(controller))
 
-    with pytest.raises(CaptureSourceUnavailableError, match="typed frame variable page"):
-        adapter.capture_frame(level=3, cursor=0, limit=10)
+    result = adapter.capture_frame(level=3, cursor=0, limit=1)
+
+    assert result["frame"]["level"] == 3
+    assert result["variables"] == ({
+        "name": "Rows", "type_name": "Массив", "collection_size": 4,
+    },)
+    assert result["total"] == 2
+    assert result["next_cursor"] == 1
+    assert controller.requests == [(3, 0, 1)]
+    assert "presentation" not in str(result)
 
 
 def test_named_frame_rejects_mismatched_ticket_result() -> None:

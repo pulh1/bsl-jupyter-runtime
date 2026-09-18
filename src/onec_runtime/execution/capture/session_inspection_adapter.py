@@ -8,8 +8,12 @@ from time import monotonic
 from typing import Protocol
 
 from onec_runtime.capture_inspection import DebugFrame
+from onec_runtime.capture_values import MAX_TYPE_CHARS
 from onec_runtime.errors import (
-    CaptureSourceUnavailableError, ProtocolError, StaleCaptureError,
+    ProtocolError, StaleCaptureError,
+)
+from onec_runtime.execution.capture.inspection import (
+    MAX_NATIVE_VARIABLE_INVENTORY, TypedNativeVariable, TypedNativeVariablePage,
 )
 from onec_runtime.execution.capture.public_inspection import (
     CaptureInspection, CaptureInspectionBridge,
@@ -32,6 +36,10 @@ class _CaptureScopeOwner(Protocol):
 
     def submit_capture_variable(
         self, name: str, *, stack_level: int = 0,
+    ) -> _CaptureTicket: ...
+
+    def submit_capture_typed_variable_page(
+        self, *, stack_level: int, start: int, stop: int,
     ) -> _CaptureTicket: ...
 
 
@@ -125,8 +133,8 @@ class SessionCaptureInspectionAdapter:
                 scope, inspection, frame, name, cursor, deadline,
             )
         if level != scope.frame_stack_level:
-            raise CaptureSourceUnavailableError(
-                "typed frame variable page projection is unavailable"
+            return self._typed_frame_page(
+                scope, inspection, frame, cursor, limit, deadline,
             )
         variables = scope.frame_variables
         if cursor > len(variables):
@@ -191,6 +199,52 @@ class SessionCaptureInspectionAdapter:
             "variables": (variable,),
             "total": 1,
             "next_cursor": None,
+        }
+
+    def _typed_frame_page(
+        self,
+        scope: CaptureScope,
+        inspection: CaptureInspection,
+        frame: DebugFrame,
+        cursor: int,
+        limit: int,
+        deadline: float | None,
+    ) -> Mapping[str, object]:
+        self._require_scope(scope)
+        ticket = self._controller.submit_capture_typed_variable_page(
+            stack_level=frame.native_level, start=cursor, stop=cursor + limit,
+        )
+        try:
+            remaining = self._remaining(deadline)
+        except TimeoutError:
+            if not ticket.status().settled:
+                ticket.detach_waiter()
+            raise
+        result = wait_initiator_locally(
+            ticket, timeout_s=remaining, wait_handoff=self._wait_handoff,
+        )
+        inspection.frame(frame.native_level)
+        self._require_scope(scope)
+        self._check_deadline(deadline)
+        if (
+            not isinstance(result, TypedNativeVariablePage)
+            or type(result.total) is not int
+            or not 0 <= result.total <= MAX_NATIVE_VARIABLE_INVENTORY
+            or cursor > result.total
+            or type(result.variables) is not tuple
+            or len(result.variables) > limit
+        ):
+            raise ProtocolError("capture typed frame page is invalid")
+        variables = tuple(_typed_variable_wire(item) for item in result.variables)
+        next_cursor = cursor + len(variables)
+        expected_next = next_cursor if next_cursor < result.total else None
+        if result.next_cursor != expected_next:
+            raise ProtocolError("capture typed frame page is invalid")
+        return {
+            "frame": _frame_wire(frame),
+            "variables": variables,
+            "total": result.total,
+            "next_cursor": expected_next,
         }
 
     def _scope(self) -> CaptureScope:
@@ -265,3 +319,27 @@ def _variable_wire(variable: FrameVariable) -> Mapping[str, object]:
     ):
         raise ProtocolError("capture frame variable metadata is invalid")
     return {"name": variable.name, "type_name": variable.type_name}
+
+
+def _typed_variable_wire(variable: TypedNativeVariable) -> Mapping[str, object]:
+    if (
+        not isinstance(variable, TypedNativeVariable)
+        or not isinstance(variable.name, str)
+        or not variable.name.isidentifier()
+        or len(variable.name) > 256
+        or not isinstance(variable.type_name, str)
+        or not 0 < len(variable.type_name) <= MAX_TYPE_CHARS
+        or variable.collection_size is not None
+        and (
+            type(variable.collection_size) is not int
+            or not 0 <= variable.collection_size <= MAX_NATIVE_VARIABLE_INVENTORY
+        )
+    ):
+        raise ProtocolError("capture typed frame variable is invalid")
+    result: dict[str, object] = {
+        "name": variable.name,
+        "type_name": variable.type_name,
+    }
+    if variable.collection_size is not None:
+        result["collection_size"] = variable.collection_size
+    return result
