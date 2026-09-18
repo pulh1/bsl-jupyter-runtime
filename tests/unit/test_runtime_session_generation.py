@@ -1,28 +1,36 @@
-from __future__ import annotations
+"""A replacement bootstrap gives runtime bound references a fresh epoch."""
 
-import onec_runtime.session as session_module
+from pathlib import Path
+
+import pytest
+
+from onec_runtime.session import RuntimeSession
+
+from test_extension_session import (
+    FakeLifecycle, fast_decision, patch_successful_runtime_attempt, session_config,
+)
 
 
-def test_bootstrap_controller_assigns_monotonically_advancing_runtime_generations(
-    monkeypatch,
-) -> None:  # type: ignore[no-untyped-def]
-    calls: list[dict[str, object]] = []
-
-    def controller(*_args: object, **kwargs: object) -> object:
-        calls.append(dict(kwargs))
-        return object()
-
-    monkeypatch.setattr(session_module, "PrototypeRuntimeController", controller)
-
-    first = session_module._bootstrap_runtime_controller(
-        object(), object(), object()  # type: ignore[arg-type]
+def test_successive_public_bootstraps_advance_runtime_generation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    patch_successful_runtime_attempt(
+        monkeypatch,
+        FakeLifecycle(decisions=[fast_decision(), fast_decision()]),
     )
-    second = session_module._bootstrap_runtime_controller(
-        object(), object(), object()  # type: ignore[arg-type]
-    )
+    config = session_config(tmp_path)
 
-    assert first is not second
-    assert [call["command_timeout_s"] for call in calls] == [90.0, 90.0]
-    generations = [call["runtime_generation"] for call in calls]
-    assert all(type(generation) is int for generation in generations)
-    assert generations[1] > generations[0]
+    first = RuntimeSession.start(config)
+    try:
+        first_generation = first.namespace_snapshot().runtime_generation
+    finally:
+        first.close()
+
+    second = RuntimeSession.start(config)
+    try:
+        second_generation = second.namespace_snapshot().runtime_generation
+    finally:
+        second.close()
+
+    assert type(first_generation) is int
+    assert second_generation > first_generation

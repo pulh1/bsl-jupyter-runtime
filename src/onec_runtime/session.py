@@ -85,6 +85,7 @@ from onec_runtime.execution.arbiter import ArbiterBusy
 from onec_runtime.execution.post_bootstrap import (
     FreshPostBootstrapExecution, compose_fresh_post_bootstrap_execution,
 )
+from onec_runtime.execution.termination import FileTargetProcessLease
 from onec_runtime.execution.public_facade import PublicExecutionFacade
 from onec_runtime.performance_profile import PhaseRecorder
 from onec_runtime.processes import FileModeProcesses
@@ -1227,6 +1228,13 @@ class RuntimeSession:
                 target_profile="runtime-session-server-v1",
             )
             stage = "execution-composition"
+            file_target_lease = None
+            if not runtime.is_server_infobase:
+                if processes.debuggee is None:
+                    raise ProtocolError("Runtime bootstrap has no owned file debuggee")
+                file_target_lease = FileTargetProcessLease(
+                    server_target.target_id, processes.debuggee,
+                )
             execution = compose_fresh_post_bootstrap_execution(
                 rdbg,
                 service_location,
@@ -1236,6 +1244,7 @@ class RuntimeSession:
                 notebook_builder=notebook_worker_builder,
                 target_profile="runtime-session-server-v1",
                 worker_module_builder=worker_module_builder,
+                file_target_lease=file_target_lease,
             )
             runtime_session = cls(
                 config, processes, transport, rdbg, execution.execution.facade,
