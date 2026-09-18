@@ -33,6 +33,37 @@ def _mapped(source: str, unit_id: str, revision: int) -> MappedSource:
     )
 
 
+def test_old_context_names_are_ordinary_notebook_variables(
+    parser_target: PythonParserTarget,
+) -> None:
+    from onec_runtime.bsl import LoweringMode, SemanticNotebookLowerer
+
+    result = SemanticNotebookLowerer(parser_target).lower(
+        "Контекст = 1; КонтекстОтладки = 2; "
+        "Результат = Контекст + КонтекстОтладки;",
+        mode=LoweringMode.MAIN,
+    )
+
+    assert result.context_names == ("Контекст", "КонтекстОтладки")
+    assert 'e1cRuntimeКонтекст.Вставить("Контекст", 1)' in result.source
+    assert 'e1cRuntimeКонтекст.Вставить("КонтекстОтладки", 2)' in result.source
+    assert 'e1cRuntimeКонтекст.Контекст + e1cRuntimeКонтекст.КонтекстОтладки' in result.source
+
+
+def test_capture_namespace_uses_new_runtime_name(
+    parser_target: PythonParserTarget,
+) -> None:
+    from onec_runtime.bsl import LoweringMode, SemanticNotebookLowerer
+
+    result = SemanticNotebookLowerer(parser_target).lower(
+        "e1cRuntimeКонтекстОтладки.Счетчик = 2;",
+        mode=LoweringMode.CAPTURE,
+    )
+
+    assert result.dirty_roots == ("Счетчик",)
+    assert result.source == "e1cRuntimeКонтекстОтладки.Счетчик = 2;"
+
+
 def test_lowers_persistent_assignment_worker_export_and_message_sink(
     parser_target: PythonParserTarget,
 ) -> None:
@@ -57,8 +88,8 @@ def test_lowers_persistent_assignment_worker_export_and_message_sink(
     )
 
     assert result.source == (
-        'Контекст.Вставить("ГДФЛ", Контекст.RuntimeWorker.Посчитать()); '
-        "Контекст.__onec_cell_messages.Добавить(Строка(Контекст.ГДФЛ));"
+        'e1cRuntimeКонтекст.Вставить("ГДФЛ", e1cRuntimeКонтекст.RuntimeWorker.Посчитать()); '
+        "e1cRuntimeКонтекст.__onec_cell_messages.Добавить(Строка(e1cRuntimeКонтекст.ГДФЛ));"
     )
     assert result.context_names == ("ГДФЛ",)
     assert result.dirty_roots == ()
@@ -79,7 +110,7 @@ def test_message_interception_preserves_optional_status_argument(
     )
 
     assert result.source == (
-        'Контекст.__onec_cell_messages.Добавить(Строка("готово"));'
+        'e1cRuntimeКонтекст.__onec_cell_messages.Добавить(Строка("готово"));'
     )
 
 
@@ -92,9 +123,9 @@ def test_binds_persistent_and_captured_contexts_without_aliasing(
     )
 
     source = (
-        'КонтекстОтладки.Результат.Добавить("x"); '
-        "Скаляр = КонтекстОтладки.Скаляр; "
-        "КонтекстОтладки.Скаляр = Скаляр + 1;"
+        'e1cRuntimeКонтекстОтладки.Результат.Добавить("x"); '
+        "Скаляр = e1cRuntimeКонтекстОтладки.Скаляр; "
+        "e1cRuntimeКонтекстОтладки.Скаляр = Скаляр + 1;"
     )
     result = SemanticNotebookLowerer(parser_target).lower(
         source,
@@ -102,14 +133,64 @@ def test_binds_persistent_and_captured_contexts_without_aliasing(
     )
 
     assert result.source == (
-        'КонтекстОтладки.Результат.Добавить("x"); '
-        'Контекст.Вставить("Скаляр", КонтекстОтладки.Скаляр); '
-        "КонтекстОтладки.Скаляр = Контекст.Скаляр + 1;"
+        'e1cRuntimeКонтекстОтладки.Результат.Добавить("x"); '
+        'e1cRuntimeКонтекст.Вставить("Скаляр", e1cRuntimeКонтекстОтладки.Скаляр); '
+        "e1cRuntimeКонтекстОтладки.Скаляр = e1cRuntimeКонтекст.Скаляр + 1;"
     )
     assert result.context_names == ("Скаляр",)
     assert result.dirty_roots == ("Скаляр",)
     assert result.persistent_write_roots == ("Скаляр",)
     parser_target.parse(result.source, "БлокНоутбука")
+
+
+def test_lowering_profiles_define_route_specific_result_capture_and_map_behavior(
+    parser_target: PythonParserTarget,
+) -> None:
+    """Break caught: a route profile must control every route-specific lowering choice."""
+    from onec_runtime.bsl.semantic_lowering import (
+        CAPTURE_LOWERING_PROFILE,
+        MAIN_LOWERING_PROFILE,
+        CaptureNamespaceRule,
+        LoweringProfile,
+        SemanticNotebookLowerer,
+    )
+
+    main = SemanticNotebookLowerer(parser_target).lower(
+        "Результат = 1;",
+        profile=MAIN_LOWERING_PROFILE,
+    )
+    capture = SemanticNotebookLowerer(parser_target).lower(
+        "РезультатИнструкции = e1cRuntimeКонтекстОтладки.Скаляр;",
+        profile=CAPTURE_LOWERING_PROFILE,
+    )
+    preview_profile = LoweringProfile(
+        result_channel="Итог",
+        capture_namespace_rule=CaptureNamespaceRule.MEMBER_ROOT,
+        source_map_tag="preview",
+    )
+    preview = SemanticNotebookLowerer(parser_target).lower(
+        "Итог = e1cRuntimeКонтекстОтладки.Скаляр;",
+        profile=preview_profile,
+    )
+
+    assert main.source == "Результат = 1;"
+    assert main.mapped_source.artifact.mode == "main"
+    assert capture.source == "РезультатИнструкции = e1cRuntimeКонтекстОтладки.Скаляр;"
+    assert capture.dirty_roots == ()
+    assert capture.mapped_source.artifact.mode == "capture"
+    assert preview.source == "Итог = e1cRuntimeКонтекстОтладки.Скаляр;"
+    assert preview.mapped_source.artifact.mode == "preview"
+    assert preview_profile == LoweringProfile(
+        result_channel="Итог",
+        capture_namespace_rule=CaptureNamespaceRule.MEMBER_ROOT,
+        source_map_tag="preview",
+    )
+
+    with pytest.raises(TypeError, match="LoweringMode"):
+        SemanticNotebookLowerer(parser_target).lower(
+            "Результат = 1;",
+            mode="other",  # type: ignore[arg-type]
+        )
 
 
 def test_persistent_name_catalog_preserves_first_committed_bsl_spelling(
@@ -151,12 +232,12 @@ def test_capture_namespace_is_rejected_outside_capture_and_as_bare_alias(
     lowerer = SemanticNotebookLowerer(parser_target)
     with pytest.raises(SemanticLoweringError, match="only available in CAPTURE"):
         lowerer.lower(
-            "Результат = КонтекстОтладки.Скаляр;",
+            "Результат = e1cRuntimeКонтекстОтладки.Скаляр;",
             mode=LoweringMode.MAIN,
         )
     with pytest.raises(SemanticLoweringError, match="bare capture namespace"):
         lowerer.lower(
-            "Результат = КонтекстОтладки;",
+            "Результат = e1cRuntimeКонтекстОтладки;",
             mode=LoweringMode.CAPTURE,
         )
 
@@ -176,7 +257,7 @@ def test_span_edits_preserve_comments_and_member_access(
     ).lower(source, mode=LoweringMode.MAIN)
 
     assert result.source == (
-        "Результат // lhs\n= // rhs\nКонтекст.Таблица.Количество();"
+        "Результат // lhs\n= // rhs\ne1cRuntimeКонтекст.Таблица.Количество();"
     )
     assert isinstance(result.source_map, SourceMap)
     assert result.source_map is result.mapped_source.source_map
@@ -195,7 +276,7 @@ def test_platform_globals_and_nested_capture_mutation_are_not_rebound(
 
     source = (
         "Строка(Значение); Таблица.Добавить(Значение); "
-        "КонтекстОтладки.Таблица[0] = Значение;"
+        "e1cRuntimeКонтекстОтладки.Таблица[0] = Значение;"
     )
     result = SemanticNotebookLowerer(
         parser_target,
@@ -204,9 +285,9 @@ def test_platform_globals_and_nested_capture_mutation_are_not_rebound(
     ).lower(source, mode=LoweringMode.CAPTURE)
 
     assert result.source == (
-        "Строка(Контекст.Значение); "
-        "Контекст.Таблица.Добавить(Контекст.Значение); "
-        "КонтекстОтладки.Таблица[0] = Контекст.Значение;"
+        "Строка(e1cRuntimeКонтекст.Значение); "
+        "e1cRuntimeКонтекст.Таблица.Добавить(e1cRuntimeКонтекст.Значение); "
+        "e1cRuntimeКонтекстОтладки.Таблица[0] = e1cRuntimeКонтекст.Значение;"
     )
     assert result.dirty_roots == ()
 
@@ -227,7 +308,7 @@ def test_long_notebook_block_is_bound_without_python_recursion(
     )
 
     assert len(result.context_names) == 2_000
-    assert result.source.count("Контекст.Вставить(") == 2_000
+    assert result.source.count("e1cRuntimeКонтекст.Вставить(") == 2_000
 
 
 def test_context_name_catalog_persists_across_cells(
@@ -245,7 +326,7 @@ def test_context_name_catalog_persists_across_cells(
 
     assert second.context_names == ("Первый", "Второй")
     assert second.source == (
-        'Контекст.Вставить("Второй", Контекст.Первый);'
+        'e1cRuntimeКонтекст.Вставить("Второй", e1cRuntimeКонтекст.Первый);'
     )
 
 
@@ -268,7 +349,7 @@ def test_unknown_bare_read_remains_for_platform_resolution(
         mode=LoweringMode.MAIN,
     )
     assert second.source == (
-        "Результат = Контекст.Оклад + НеизвестноеПлатформенноеИмя.Свойство;"
+        "Результат = e1cRuntimeКонтекст.Оклад + НеизвестноеПлатформенноеИмя.Свойство;"
     )
     assert second.context_names == ("Оклад",)
 
@@ -324,7 +405,7 @@ def test_module_binding_registers_scopes_without_lowering_worker_source(
     assert binding.method_scopes[0].local_names == ("ЛокальноеИмя",)
     assert binding.source == module_source
     assert cell.source == (
-        "МодульноеИмя = Контекст.Значение; Сообщить(Контекст.Значение);"
+        "МодульноеИмя = e1cRuntimeКонтекст.Значение; Сообщить(e1cRuntimeКонтекст.Значение);"
     )
     assert cell.messages_intercepted == 0
 
@@ -345,7 +426,7 @@ def test_worker_export_shadows_platform_message_interception(
         worker_exports=(WorkerExport("Сообщить", "Показать"),),
     ).lower("Сообщить(Значение);", mode=LoweringMode.MAIN)
 
-    assert result.source == "Контекст.RuntimeWorker.Показать(Контекст.Значение);"
+    assert result.source == "e1cRuntimeКонтекст.RuntimeWorker.Показать(e1cRuntimeКонтекст.Значение);"
     assert result.worker_dependencies == ("Сообщить",)
     assert result.messages_intercepted == 0
 
@@ -433,10 +514,10 @@ def test_module_binding_resolves_parameter_and_local_shadows_before_lower_scopes
 @pytest.mark.parametrize(
     "source",
     (
-        "КонтекстОтладки[0];",
-        "КонтекстОтладки[0] = Значение;",
-        "КонтекстОтладки.Получить();",
-        "КонтекстОтладки()[0];",
+        "e1cRuntimeКонтекстОтладки[0];",
+        "e1cRuntimeКонтекстОтладки[0] = Значение;",
+        "e1cRuntimeКонтекстОтладки.Получить();",
+        "e1cRuntimeКонтекстОтладки()[0];",
     ),
 )
 def test_capture_namespace_rejects_non_member_root_forms(
@@ -467,7 +548,7 @@ def test_bare_capture_assignment_is_rejected(
 
     with pytest.raises(SemanticLoweringError, match="reserved"):
         SemanticNotebookLowerer(parser_target).lower(
-            "КонтекстОтладки = Значение;",
+            "e1cRuntimeКонтекстОтладки = Значение;",
             mode=LoweringMode.CAPTURE,
         )
 
@@ -491,10 +572,10 @@ def test_platform_calls_stay_unqualified_but_known_context_call_chains_lower(
     ).lower(source, mode=LoweringMode.MAIN)
 
     assert result.source == (
-        'Контекст.Вставить("Дата", ТекущаяДата()); '
-        'Контекст.Вставить("Строковое", Строка(Контекст.Значение)); '
-        'Контекст.Вставить("Элемент", Справочники.Номенклатура.СоздатьЭлемент()); '
-        "Результат = Контекст.Расчет.Ндфл.Посчитать();"
+        'e1cRuntimeКонтекст.Вставить("Дата", ТекущаяДата()); '
+        'e1cRuntimeКонтекст.Вставить("Строковое", Строка(e1cRuntimeКонтекст.Значение)); '
+        'e1cRuntimeКонтекст.Вставить("Элемент", Справочники.Номенклатура.СоздатьЭлемент()); '
+        "Результат = e1cRuntimeКонтекст.Расчет.Ндфл.Посчитать();"
     )
     assert result.context_names == (
         "Расчет",
@@ -538,7 +619,7 @@ def test_worker_export_overrides_a_platform_manager_root(
     )
 
     assert result.source == (
-        'Контекст.Вставить("Элемент", Контекст.RuntimeWorker.Создать());'
+        'e1cRuntimeКонтекст.Вставить("Элемент", e1cRuntimeКонтекст.RuntimeWorker.Создать());'
     )
     assert result.worker_dependencies == ("Справочники.Номенклатура.СоздатьЭлемент",)
 
@@ -559,18 +640,18 @@ def test_loop_variables_are_cell_local_while_loop_inputs_remain_persistent(
     ).lower(source, mode=LoweringMode.MAIN)
 
     assert result.source == (
-        "Для Каждого Строка Из Контекст.Таблица Цикл Строка.Добавить(); КонецЦикла; "
-        "Для Счетчик = Контекст.Начало По Контекст.Конец Цикл Счетчик = Счетчик + 1; КонецЦикла; "
-        'Контекст.Вставить("После", Строка + Счетчик);'
+        "Для Каждого Строка Из e1cRuntimeКонтекст.Таблица Цикл Строка.Добавить(); КонецЦикла; "
+        "Для Счетчик = e1cRuntimeКонтекст.Начало По e1cRuntimeКонтекст.Конец Цикл Счетчик = Счетчик + 1; КонецЦикла; "
+        'e1cRuntimeКонтекст.Вставить("После", Строка + Счетчик);'
     )
 
 
 @pytest.mark.parametrize(
     ("source", "position"),
     (
-        ("Контекст = Значение;", 0),
-        ("КонтекстОтладки = Значение;", 0),
-        ("Контекст.КонтекстОтладки.Получить();", 8),
+        ("e1cRuntimeКонтекст = Значение;", 0),
+        ("e1cRuntimeКонтекстОтладки = Значение;", 0),
+        ("e1cRuntimeКонтекст.e1cRuntimeКонтекстОтладки.Получить();", 18),
     ),
 )
 def test_runtime_namespaces_cannot_be_rebound_or_used_as_capture_aliases(
@@ -629,7 +710,7 @@ def test_message_sink_constructor_option_is_not_a_second_interception_contract(
     from onec_runtime.bsl.semantic_lowering import SemanticNotebookLowerer
 
     with pytest.raises(TypeError, match="message_sink"):
-        SemanticNotebookLowerer(parser_target, message_sink="Контекст.СтарыйSink")
+        SemanticNotebookLowerer(parser_target, message_sink="e1cRuntimeКонтекст.СтарыйSink")
 
 
 def test_bare_statement_call_after_index_and_member_chain_is_valid(
@@ -695,7 +776,7 @@ def test_worker_export_overrides_a_known_persistent_root(
         worker_exports=(WorkerExport("Расчет.Ндфл.Посчитать", "Посчитать"),),
     ).lower("Результат = Расчет.Ндфл.Посчитать();", mode=LoweringMode.MAIN)
 
-    assert result.source == "Результат = Контекст.RuntimeWorker.Посчитать();"
+    assert result.source == "Результат = e1cRuntimeКонтекст.RuntimeWorker.Посчитать();"
 
 
 def test_runtime_result_channels_stay_local_while_worker_calls_are_lowered(
@@ -720,8 +801,8 @@ def test_runtime_result_channels_stay_local_while_worker_calls_are_lowered(
         mode=LoweringMode.CAPTURE,
     )
 
-    assert main.source == "Результат = Контекст.RuntimeWorker.Посчитать();"
-    assert capture.source == "РезультатИнструкции = Контекст.RuntimeWorker.Посчитать();"
+    assert main.source == "Результат = e1cRuntimeКонтекст.RuntimeWorker.Посчитать();"
+    assert capture.source == "РезультатИнструкции = e1cRuntimeКонтекст.RuntimeWorker.Посчитать();"
 
 
 def test_direct_assignment_roots_are_persistent_before_their_first_use(
@@ -734,7 +815,7 @@ def test_direct_assignment_roots_are_persistent_before_their_first_use(
         mode=LoweringMode.MAIN,
     )
 
-    assert result.source == 'Контекст.До(); Контекст.Вставить("До", 1); Контекст.До();'
+    assert result.source == 'e1cRuntimeКонтекст.До(); e1cRuntimeКонтекст.Вставить("До", 1); e1cRuntimeКонтекст.До();'
 
 
 @pytest.mark.parametrize(
@@ -761,7 +842,7 @@ def test_standard_manager_roots_are_non_call_platform_globals(
         mode=LoweringMode.MAIN,
     )
 
-    assert f"Контекст.{root}" not in result.source
+    assert f"e1cRuntimeКонтекст.{root}" not in result.source
 
 
 def test_document_write_mode_is_a_platform_global(
@@ -778,7 +859,7 @@ def test_document_write_mode_is_a_platform_global(
     )
 
     assert result.source == (
-        "Контекст.Прием.Записать(РежимЗаписиДокумента.Проведение);"
+        "e1cRuntimeКонтекст.Прием.Записать(РежимЗаписиДокумента.Проведение);"
     )
 
 
@@ -800,10 +881,10 @@ def test_persistent_assignment_uses_derived_name_and_fragment_mappings(
 
     assert result.mapped_source.artifact.kind is SourceArtifactKind.SEMANTIC_LOWERING
     assert result.source == (
-        'Контекст.Вставить("Ответ",\n'
-        "Контекст.Делитель / Контекст.Делитель);"
+        'e1cRuntimeКонтекст.Вставить("Ответ",\n'
+        "e1cRuntimeКонтекст.Делитель / e1cRuntimeКонтекст.Делитель);"
     )
-    prefix = result.source.index("Контекст.Вставить")
+    prefix = result.source.index("e1cRuntimeКонтекст.Вставить")
     assert result.source_map.map_offset(prefix).relation is MappingRelation.SYNTHETIC
     key = result.source.index("Ответ")
     mapped_key = result.source_map.map_offset(key)
@@ -863,7 +944,7 @@ def test_persistent_references_keep_repeated_identifiers_and_main_result_exact(
         mapped = result.source_map.map_offset(generated)
         assert mapped.relation is MappingRelation.EXACT
         assert mapped.origin_span == SourceSpan(origin, origin + 1)
-        prefix = generated - len("Контекст.")
+        prefix = generated - len("e1cRuntimeКонтекст.")
         assert result.source_map.map_offset(prefix).relation is MappingRelation.SYNTHETIC
 
 
@@ -880,7 +961,7 @@ def test_worker_receiver_is_synthetic_while_call_and_arguments_keep_coordinates(
         worker_exports=(WorkerExport("Удвоить", "Выполнить"),),
     ).lower_mapped(visible, mode=LoweringMode.MAIN)
 
-    receiver = result.source.index("Контекст.RuntimeWorker")
+    receiver = result.source.index("e1cRuntimeКонтекст.RuntimeWorker")
     assert result.source_map.map_offset(receiver).relation is MappingRelation.SYNTHETIC
     method = result.source.index("Выполнить")
     mapped_method = result.source_map.map_offset(method)
@@ -918,8 +999,8 @@ def test_same_name_worker_export_callee_is_an_exact_visible_copy(
         worker_exports=(WorkerExport("Удвоить", "Удвоить"),),
     ).lower_mapped(visible, mode=LoweringMode.MAIN)
 
-    assert result.source == "Результат = Контекст.RuntimeWorker.Удвоить(1);"
-    receiver = result.source.index("Контекст.RuntimeWorker")
+    assert result.source == "Результат = e1cRuntimeКонтекст.RuntimeWorker.Удвоить(1);"
+    receiver = result.source.index("e1cRuntimeКонтекст.RuntimeWorker")
     callee = result.source.index("Удвоить")
     assert result.source_map.map_offset(receiver).relation is MappingRelation.SYNTHETIC
     for generated_offset, visible_offset in (
@@ -945,7 +1026,7 @@ def test_message_and_nested_worker_preserve_argument_mapping(
         worker_exports=(WorkerExport("Удвоить", "Выполнить"),),
     ).lower_mapped(visible, mode=LoweringMode.MAIN)
 
-    message_open = result.source.index("Контекст.__onec_cell_messages")
+    message_open = result.source.index("e1cRuntimeКонтекст.__onec_cell_messages")
     assert result.source_map.map_offset(message_open).relation is MappingRelation.SYNTHETIC
     generated = result.source.rindex("Исходное")
     mapped = result.source_map.map_offset(generated)
@@ -972,10 +1053,10 @@ def test_empty_message_is_synthetic_but_statement_separator_is_exact(
     )
 
     assert result.source == (
-        "Контекст.__onec_cell_messages.Добавить(Строка(Неопределено));"
+        "e1cRuntimeКонтекст.__onec_cell_messages.Добавить(Строка(Неопределено));"
     )
     for generated in (
-        result.source.index("Контекст"),
+        result.source.index("e1cRuntimeКонтекст"),
         result.source.index("Неопределено"),
         result.source.rindex(")"),
     ):
@@ -993,8 +1074,8 @@ def test_capture_namespace_and_result_channel_remain_exact_unicode_multiline(
     from onec_runtime.bsl import LoweringMode, SemanticNotebookLowerer
 
     source = (
-        "КонтекстОтладки.Счётчик = КонтекстОтладки.Счётчик + 1;\n"
-        "РезультатИнструкции = КонтекстОтладки.Счётчик;"
+        "e1cRuntimeКонтекстОтладки.Счётчик = e1cRuntimeКонтекстОтладки.Счётчик + 1;\n"
+        "РезультатИнструкции = e1cRuntimeКонтекстОтладки.Счётчик;"
     )
     visible = _mapped(source, "cell-capture-unicode", 8)
     result = SemanticNotebookLowerer(parser_target).lower_mapped(
@@ -1005,7 +1086,7 @@ def test_capture_namespace_and_result_channel_remain_exact_unicode_multiline(
     assert result.source == source
     assert result.dirty_roots == ("Счётчик",)
     assert result.persistent_write_roots == ()
-    for needle in ("КонтекстОтладки", "Счётчик", "РезультатИнструкции", "\n"):
+    for needle in ("e1cRuntimeКонтекстОтладки", "Счётчик", "РезультатИнструкции", "\n"):
         generated = result.source.index(needle)
         origin = source.index(needle)
         mapped = result.source_map.map_offset(generated)
@@ -1026,9 +1107,9 @@ def test_plain_string_lowering_wraps_anonymous_mapped_source_without_repr_text(
     )
 
     assert isinstance(result.mapped_source, MappedSource)
-    assert result.source == 'Контекст.Вставить("СовершенноСекретное", 1);'
+    assert result.source == 'e1cRuntimeКонтекст.Вставить("СовершенноСекретное", 1);'
     assert source not in repr(result)
-    mapped_one = result.source_map.map_offset(result.source.index("1"))
+    mapped_one = result.source_map.map_offset(result.source.rindex("1"))
     assert mapped_one.unit is not None
     assert mapped_one.unit.kind is SourceUnitKind.NOTEBOOK_CELL
     assert mapped_one.unit.source_sha256 == source_sha256(source)
@@ -1190,7 +1271,7 @@ def test_dynamic_context_slot_overwrite_is_rejected_before_worker_lowering(
     )
 
     source = (
-        'Выполнить("Контекст.Вставить(""RuntimeWorkerPinnedOperationGeneration"", '
+        'Выполнить("e1cRuntimeКонтекст.Вставить(""RuntimeWorkerPinnedOperationGeneration"", '
         'Неопределено);"); '
         "РезультатИнструкции = МодульРасчета.Рассчитать();"
     )
@@ -1240,16 +1321,16 @@ def test_kernel_worker_handoff_locals_are_reserved_from_user_source(
 @pytest.mark.parametrize(
     "source",
     (
-        "Контекст.RuntimeWorkerActiveGeneration = Неопределено;",
-        "Контекст.RuntimeWorkerPinnedOperationGeneration = Неопределено;",
-        'Контекст["RuntimeWorkerActiveGeneration"] = Неопределено;',
-        'Контекст.Вставить("RuntimeWorkerActiveGeneration", Неопределено);',
-        'Контекст.Insert("RuntimeWorkerActiveGeneration", Неопределено);',
-        "Контекст.Вставить(ИмяСвойства, Неопределено);",
-        'Контекст.Удалить("RuntimeWorkerActiveGeneration");',
-        'Контекст.Delete("RuntimeWorkerActiveGeneration");',
-        "Контекст.Удалить(ИмяСвойства);",
-        "Контекст.Delete(PropertyName);",
+        "e1cRuntimeКонтекст.RuntimeWorkerActiveGeneration = Неопределено;",
+        "e1cRuntimeКонтекст.RuntimeWorkerPinnedOperationGeneration = Неопределено;",
+        'e1cRuntimeКонтекст["RuntimeWorkerActiveGeneration"] = Неопределено;',
+        'e1cRuntimeКонтекст.Вставить("RuntimeWorkerActiveGeneration", Неопределено);',
+        'e1cRuntimeКонтекст.Insert("RuntimeWorkerActiveGeneration", Неопределено);',
+        "e1cRuntimeКонтекст.Вставить(ИмяСвойства, Неопределено);",
+        'e1cRuntimeКонтекст.Удалить("RuntimeWorkerActiveGeneration");',
+        'e1cRuntimeКонтекст.Delete("RuntimeWorkerActiveGeneration");',
+        "e1cRuntimeКонтекст.Удалить(ИмяСвойства);",
+        "e1cRuntimeКонтекст.Delete(PropertyName);",
     ),
 )
 def test_worker_generation_context_protocol_member_is_reserved(
@@ -1275,14 +1356,14 @@ def test_worker_generation_context_protocol_member_is_reserved(
 @pytest.mark.parametrize(
     "source",
     (
-        "Алиас = Контекст;",
-        'Контекст.Вставить("Алиас", Контекст);',
-        "Контекст.Алиас = Контекст;",
-        "Массив[0] = Контекст;",
-        "Обработать(Контекст);",
-        "Массив.Добавить(Контекст);",
-        "Возврат Контекст;",
-        "Return Контекст;",
+        "Алиас = e1cRuntimeКонтекст;",
+        'e1cRuntimeКонтекст.Вставить("Алиас", e1cRuntimeКонтекст);',
+        "e1cRuntimeКонтекст.Алиас = e1cRuntimeКонтекст;",
+        "Массив[0] = e1cRuntimeКонтекст;",
+        "Обработать(e1cRuntimeКонтекст);",
+        "Массив.Добавить(e1cRuntimeКонтекст);",
+        "Возврат e1cRuntimeКонтекст;",
+        "Return e1cRuntimeКонтекст;",
     ),
 )
 def test_bare_context_cannot_escape_to_persistent_or_opaque_state(
@@ -1353,7 +1434,7 @@ def test_chained_module_context_aliases_cannot_mutate_active_root(
 
     with pytest.raises(SemanticLoweringError) as raised:
         lowerer.lower(
-            f"Алиас = Контекст; Второй = Алиас; {mutation}",
+            f"Алиас = e1cRuntimeКонтекст; Второй = Алиас; {mutation}",
             mode=LoweringMode.MAIN,
         )
 
@@ -1384,7 +1465,7 @@ def test_chained_context_alias_cannot_escape_through_unknown_sink(
 
     with pytest.raises(SemanticLoweringError) as raised:
         lowerer.lower(
-            f"Алиас = Контекст; Второй = Алиас; {escape}",
+            f"Алиас = e1cRuntimeКонтекст; Второй = Алиас; {escape}",
             mode=LoweringMode.MAIN,
         )
 
@@ -1403,7 +1484,7 @@ def test_context_alias_taint_merges_across_conditional_control_flow(
     lowerer = SemanticNotebookLowerer(parser_target, context_names=("Флаг",))
     lowerer.bind_module("Перем Алиас;")
     source = (
-        "Если Флаг Тогда Алиас = Контекст; "
+        "Если Флаг Тогда Алиас = e1cRuntimeКонтекст; "
         "Иначе Алиас = Новый Структура; КонецЕсли; "
         'Алиас.Delete("RuntimeWorkerActiveGeneration");'
     )
@@ -1425,7 +1506,7 @@ def test_context_module_alias_taint_survives_cells_and_safe_reassignment_clears_
 
     lowerer = SemanticNotebookLowerer(parser_target)
     lowerer.bind_module("Перем Алиас;")
-    lowerer.lower("Алиас = Контекст;", mode=LoweringMode.MAIN)
+    lowerer.lower("Алиас = e1cRuntimeКонтекст;", mode=LoweringMode.MAIN)
 
     with pytest.raises(SemanticLoweringError) as raised:
         lowerer.lower(
@@ -1458,7 +1539,7 @@ def test_context_alias_cannot_install_g19_manifest_over_g17_modules_spoof(
     )
     lowerer.bind_module("Перем Алиас;")
     source = (
-        "Алиас = Контекст; "
+        "Алиас = e1cRuntimeКонтекст; "
         'Алиас.Insert("RuntimeWorkerActiveGeneration", '
         'Новый ФиксированнаяСтруктура("ManifestSha256,Modules,Exports", '
         "ManifestG19, ModulesG17, ExportsG19));"
@@ -1487,7 +1568,7 @@ def test_loop_local_context_alias_is_checked_flow_sensitively(
     with pytest.raises(SemanticLoweringError) as raised:
         lowerer.lower(
             "Для Каждого Алиас Из Коллекция Цикл "
-            "Алиас = Контекст; "
+            "Алиас = e1cRuntimeКонтекст; "
             'Алиас.Delete("RuntimeWorkerActiveGeneration"); '
             "КонецЦикла;",
             mode=LoweringMode.MAIN,
@@ -1500,24 +1581,24 @@ def test_loop_local_context_alias_is_checked_flow_sensitively(
     "source",
     (
         (
-            "Алиас = Контекст; Перейти ~После; "
+            "Алиас = e1cRuntimeКонтекст; Перейти ~После; "
             "Алиас = Новый Структура; ~После: "
             'Алиас.Delete("RuntimeWorkerActiveGeneration");'
         ),
         (
-            "Попытка Алиас = Контекст; "
+            "Попытка Алиас = e1cRuntimeКонтекст; "
             'ВызватьИсключение "stop"; '
             "Алиас = Новый Структура; Исключение "
             'Алиас.Delete("RuntimeWorkerActiveGeneration"); '
             "КонецПопытки;"
         ),
         (
-            "Если Истина Тогда Алиас = Контекст; Перейти ~После; "
+            "Если Истина Тогда Алиас = e1cRuntimeКонтекст; Перейти ~После; "
             "КонецЕсли; Алиас = Новый Структура; ~После: "
             'Алиас.Delete("RuntimeWorkerActiveGeneration");'
         ),
         (
-            "Пока Истина Цикл Если Истина Тогда Алиас = Контекст; "
+            "Пока Истина Цикл Если Истина Тогда Алиас = e1cRuntimeКонтекст; "
             "Прервать; КонецЕсли; Алиас = Новый Структура; "
             "КонецЦикла; "
             'Алиас.Delete("RuntimeWorkerActiveGeneration");'
@@ -1547,25 +1628,25 @@ def test_control_transfer_cannot_skip_context_alias_reassignment(
     "source",
     (
         (
-            "Пока Флаг Цикл Если Номер = 1 Тогда Алиас = Контекст; "
+            "Пока Флаг Цикл Если Номер = 1 Тогда Алиас = e1cRuntimeКонтекст; "
             "Иначе Алиас.Delete(\"RuntimeWorkerActiveGeneration\"); "
             "КонецЕсли; Номер = Номер + 1; КонецЦикла;"
         ),
         (
             "Для Каждого Элемент Из Коллекция Цикл "
-            "Если Элемент = 1 Тогда Алиас = Контекст; "
+            "Если Элемент = 1 Тогда Алиас = e1cRuntimeКонтекст; "
             "Иначе Алиас.Удалить(\"RuntimeWorkerActiveGeneration\"); "
             "КонецЕсли; КонецЦикла;"
         ),
         (
             "Для Номер = 1 По 2 Цикл "
-            "Если Номер = 1 Тогда Алиас = Контекст; "
+            "Если Номер = 1 Тогда Алиас = e1cRuntimeКонтекст; "
             "Иначе Алиас.Delete(\"RuntimeWorkerActiveGeneration\"); "
             "КонецЕсли; КонецЦикла;"
         ),
         (
             "Для Внешний = 1 По 2 Цикл Пока Флаг Цикл "
-            "Если Внешний = 1 Тогда Алиас = Контекст; "
+            "Если Внешний = 1 Тогда Алиас = e1cRuntimeКонтекст; "
             "Иначе Алиас.Delete(\"RuntimeWorkerActiveGeneration\"); "
             "КонецЕсли; Флаг = Ложь; КонецЦикла; КонецЦикла;"
         ),
@@ -1573,7 +1654,7 @@ def test_control_transfer_cannot_skip_context_alias_reassignment(
             "Для Номер = 1 По 2 Цикл "
             "Если Номер = 2 Тогда "
             "Алиас.Delete(\"RuntimeWorkerActiveGeneration\"); Прервать; "
-            "КонецЕсли; Алиас = Контекст; Продолжить; КонецЦикла;"
+            "КонецЕсли; Алиас = e1cRuntimeКонтекст; Продолжить; КонецЦикла;"
         ),
     ),
 )
@@ -1613,7 +1694,7 @@ def test_backward_goto_reaches_fixed_point_before_reserved_mutation(
     source = (
         "Алиас = Новый Структура; ~Повтор: "
         'Алиас.Delete("RuntimeWorkerActiveGeneration"); '
-        "Алиас = Контекст; Перейти ~Повтор;"
+        "Алиас = e1cRuntimeКонтекст; Перейти ~Повтор;"
     )
 
     with pytest.raises(SemanticLoweringError) as raised:
@@ -1626,12 +1707,12 @@ def test_backward_goto_reaches_fixed_point_before_reserved_mutation(
     "source",
     (
         (
-            "Пока Флаг Цикл Алиас = Контекст; Алиас = Новый Структура; "
+            "Пока Флаг Цикл Алиас = e1cRuntimeКонтекст; Алиас = Новый Структура; "
             'Алиас.Delete("RuntimeWorkerActiveGeneration"); '
             "Флаг = Ложь; КонецЦикла;"
         ),
         (
-            "Для Номер = 1 По 2 Цикл Алиас = Контекст; "
+            "Для Номер = 1 По 2 Цикл Алиас = e1cRuntimeКонтекст; "
             "Алиас = Новый Структура; "
             'Алиас.Delete("RuntimeWorkerActiveGeneration"); КонецЦикла;'
         ),
@@ -1667,8 +1748,8 @@ def test_ordinary_context_member_reads_writes_and_literal_mutations_remain_valid
     )
 
     source = (
-        "Контекст.Обычное = 1; Значение = Контекст.Обычное; "
-        'Контекст.Insert("Другое", Значение); Контекст.Delete("Другое");'
+        "e1cRuntimeКонтекст.Обычное = 1; Значение = e1cRuntimeКонтекст.Обычное; "
+        'e1cRuntimeКонтекст.Insert("Другое", Значение); e1cRuntimeКонтекст.Delete("Другое");'
     )
 
     result = SemanticNotebookLowerer(parser_target).lower(
@@ -1676,8 +1757,8 @@ def test_ordinary_context_member_reads_writes_and_literal_mutations_remain_valid
         mode=LoweringMode.MAIN,
     )
 
-    assert 'Контекст.Insert("Другое", Контекст.Значение)' in result.source
-    assert 'Контекст.Delete("Другое")' in result.source
+    assert 'e1cRuntimeКонтекст.Insert("Другое", e1cRuntimeКонтекст.Значение)' in result.source
+    assert 'e1cRuntimeКонтекст.Delete("Другое")' in result.source
 
 
 @pytest.mark.parametrize("mode", ("main", "capture"))

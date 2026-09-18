@@ -16,9 +16,9 @@ from onec_runtime_mcp.agent.runtime_backend import CaptureHypothesisPreparationE
 from onec_runtime_mcp.agent.observation import ManagerOrigin, ObservationItem, ObservationPlan, ObservationResult, ObservationSource, ObservationSourceKind
 from onec_runtime_mcp.agent.proxies import SizeAccuracy, ValueSize
 from onec_runtime_mcp.agent.service import AgentWorkspaceService, _AdmittedRuntime
-from onec_runtime.prototype_runtime import OperationState
+from onec_runtime.runtime_models import OperationState
 from onec_runtime.errors import ProtocolError
-from onec_runtime.runtime_api import RuntimeNamespaceSnapshot, RuntimeReply, RuntimeReplyKind
+from onec_runtime.runtime_models import RuntimeNamespaceSnapshot, RuntimeReply, RuntimeReplyKind
 
 
 def _request() -> dict[str, object]:
@@ -385,7 +385,7 @@ def _capture() -> CaptureView:
 
 
 def _captured_service(
-    tmp_path: Path, *, source: str = "КонтекстОтладки.Сумма = 3;"
+    tmp_path: Path, *, source: str = "e1cRuntimeКонтекстОтладки.Сумма = 3;"
 ) -> tuple[AgentWorkspaceService, _Runtime, dict[str, object]]:
     digest = sha256(source.encode()).hexdigest()
     cell = nbformat.v4.new_code_cell(source=source, id="cell-hypothesis")
@@ -529,7 +529,7 @@ def test_hypothesis_executes_the_exact_capture_revision_and_remains_paused(tmp_p
         )
         assert view.capture.dirty_roots == ("Сумма",)
         assert view.messages == ("hypothesis message",)
-        assert runtime.sources == ["КонтекстОтладки.Сумма = 3;"]
+        assert runtime.sources == ["e1cRuntimeКонтекстОтладки.Сумма = 3;"]
         assert runtime.continue_calls == 0
     finally:
         service.close()
@@ -599,7 +599,7 @@ def test_hypothesis_request_journal_failure_terminates_submission_and_releases_l
 def test_hypothesis_stages_multiple_roots_and_keeps_message_and_event_cursors_separate(
     tmp_path: Path,
 ) -> None:
-    source = "КонтекстОтладки.Сумма = 3; КонтекстОтладки.Итого = 4;"
+    source = "e1cRuntimeКонтекстОтладки.Сумма = 3; e1cRuntimeКонтекстОтладки.Итого = 4;"
     service, runtime, request = _captured_service(tmp_path, source=source)
     try:
         response = service.call("capture.hypothesis", request)
@@ -654,7 +654,7 @@ def test_capture_execution_failure_keeps_partial_facts_and_predispatch_provenanc
     tmp_path: Path,
 ) -> None:
     """Break caught: CAPTURE failure drops its pause or calls preparation unprovenanced."""
-    source = "КонтекстОтладки.Сумма = 3;"
+    source = "e1cRuntimeКонтекстОтладки.Сумма = 3;"
     service, runtime, request = _captured_service(tmp_path, source=source)
     runtime.fail_execution = True
     runtime.execution_diagnostic = _capture_execution_diagnostic(source)
@@ -709,8 +709,8 @@ def test_capture_acceptance_remaps_second_line_and_never_continues(
 ) -> None:
     """Break caught: CAPTURE remapping resumes the target or loses line two."""
     source = (
-        "КонтекстОтладки.Сумма = 3;\n"
-        "РезультатИнструкции = КонтекстОтладки.Сумма;"
+        "e1cRuntimeКонтекстОтладки.Сумма = 3;\n"
+        "РезультатИнструкции = e1cRuntimeКонтекстОтладки.Сумма;"
     )
     service, runtime, request = _captured_service(tmp_path, source=source)
     runtime.fail_execution = True
@@ -729,27 +729,27 @@ def test_capture_acceptance_remaps_second_line_and_never_continues(
         assert runtime.continue_calls == 0
         assert view.failure["diagnostic"] == {
             "diagnostic_id": (
-                "79fc35bf09c79cc010aa83154fc037403ba9ddaba6411e76ca7322a5bbf1b67a"
+                "d7dee10a4cf5f3ddbe9e19758c7f57eac39e56e0c121d0e2d788ea1b0f898864"
             ),
             "stage": "execution",
             "mapping_confidence": "exact",
             "visible_location": {
                 "line": 2,
                 "column": 23,
-                "span": {"start": 49, "end": 50},
+                "span": {"start": 59, "end": 60},
             },
             "related_visible_span": None,
             "excerpt": None,
             "synthetic_region": None,
         }
         assert view.execution_provenance.visible_source_sha256 == (
-            "6672655e5860350ccf31d4a29ec09829c939eda1378fa2832e5856dac626f9e6"
+            "0df8aa9bfc2ee25b659f598bc63fbc7ec7964dea4f44c68b7cebade9f9033912"
         )
         assert view.execution_provenance.executed_source_sha256 == (
-            "6672655e5860350ccf31d4a29ec09829c939eda1378fa2832e5856dac626f9e6"
+            "0df8aa9bfc2ee25b659f598bc63fbc7ec7964dea4f44c68b7cebade9f9033912"
         )
         assert view.execution_provenance.source_map_sha256 == (
-            "686390169edb0c721ec32591be7d603a73742aa48c7f129f50d05a8f66490ca1"
+            "fc8db7bd0d12c30d5166caade85433d60f2b32e1cc53829535a005e8ba8df743"
         )
 
         public_path = (
@@ -812,7 +812,7 @@ def test_capture_lowering_failure_remains_paused_without_continue(
     """Break caught: known CAPTURE preparation failures must be admitted."""
     service, runtime, request = _captured_service(
         tmp_path,
-        source="КонтекстОтладки;",
+        source="e1cRuntimeКонтекстОтладки;",
     )
     try:
         response = service.call("capture.hypothesis", request)
@@ -849,7 +849,7 @@ def test_parse_error_leaves_the_same_fence_paused_for_a_valid_hypothesis(tmp_pat
         assert runtime.sources == []
         assert invalid._capture.current_capture(_fence()).paused is True
 
-        source = "КонтекстОтладки.Сумма = 4;"
+        source = "e1cRuntimeКонтекстОтладки.Сумма = 4;"
         digest = sha256(source.encode()).hexdigest()
         invalid._inline["inline-good"] = CodeRevision(
             "inline-good", 1, source, digest, digest, CodeLanguage.BSL, CodeMode.CAPTURE
@@ -870,7 +870,7 @@ def test_parse_error_leaves_the_same_fence_paused_for_a_valid_hypothesis(tmp_pat
 
 
 def test_semantic_lowering_error_is_distinct_from_parsing_and_never_executes(tmp_path: Path) -> None:
-    service, runtime, request = _captured_service(tmp_path, source="КонтекстОтладки = 1;")
+    service, runtime, request = _captured_service(tmp_path, source="e1cRuntimeКонтекстОтладки = 1;")
     try:
         response = service.call("capture.hypothesis", request)
 
@@ -1024,7 +1024,7 @@ def test_hypothesis_request_replay_executes_once(tmp_path: Path) -> None:
 
         assert first.ok and replay.ok
         assert first.value.operation.operation_id == replay.value.operation.operation_id
-        assert runtime.sources == ["КонтекстОтладки.Сумма = 3;"]
+        assert runtime.sources == ["e1cRuntimeКонтекстОтладки.Сумма = 3;"]
     finally:
         service.close()
 
@@ -1504,13 +1504,13 @@ def test_zup_backend_marks_a_successful_capture_cell_as_paused_captured() -> Non
     # diagnostics while the controller remains paused.
     class Session:
         def execute_bsl(self, source: str) -> RuntimeReply:
-            assert source == "КонтекстОтладки.Сумма = 3;"
+            assert source == "e1cRuntimeКонтекстОтладки.Сумма = 3;"
             return RuntimeReply(
                 RuntimeReplyKind.CAPTURE_CELL, 9, OperationState.CAPTURED,
                 result=3, succeeded=True,
             )
 
-    outcome = OnecRuntimeBackend("runtime-zup", Session()).execute_bsl("КонтекстОтладки.Сумма = 3;")  # type: ignore[arg-type]
+    outcome = OnecRuntimeBackend("runtime-zup", Session()).execute_bsl("e1cRuntimeКонтекстОтладки.Сумма = 3;")  # type: ignore[arg-type]
 
     assert outcome.terminal_state is AgentOperationState.CAPTURED
     assert outcome.runtime_state == "captured"

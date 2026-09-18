@@ -1,0 +1,185 @@
+"""Exact target termination and proof on the arbiter's single worker.
+
+The caller must have fenced ordinary dispatch before invoking this helper.
+It does not read debugger events or create another RDBG writer.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from math import isfinite
+from typing import Literal, Protocol
+
+from onec_runtime.rdbg.models import TargetId
+from onec_runtime.rdbg.session import BoundServerTargetAbsence
+
+
+class ServerTerminationPort(Protocol):
+    def terminate_bound_server_session(self) -> bool: ...
+
+    def wait_for_bound_server_targets_absent(
+        self, expected_target: TargetId, *, timeout_s: float
+    ) -> BoundServerTargetAbsence: ...
+
+
+class _PollableProcess(Protocol):
+    def poll(self) -> int | None: ...
+
+
+class FileTerminationPort(Protocol):
+    """The exact owned 1C debuggee process, excluding the private dbgs."""
+
+    pid: int
+    process: _PollableProcess
+
+    def close(self, timeout_s: float) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class FileTargetProcessLease:
+    """Bind one verified file target to its owned 1C debuggee, never dbgs."""
+
+    expected_target: TargetId
+    process: FileTerminationPort = field(repr=False)
+    pid: int = field(init=False)
+
+    def __post_init__(self) -> None:
+        if type(self.expected_target) is not TargetId:
+            raise TypeError("file target identity is required")
+        if self.process is None:
+            raise TypeError("owned file debuggee process is required")
+        pid = self.process.pid
+        if type(pid) is not int or pid <= 0:
+            raise ValueError("owned debuggee PID must be positive")
+        object.__setattr__(self, "pid", pid)
+
+
+@dataclass(frozen=True, slots=True)
+class ServerTerminationConfirmed:
+    expected_target: TargetId
+    absence: BoundServerTargetAbsence
+
+
+@dataclass(frozen=True, slots=True)
+class TerminationUnknown:
+    """The old target may still run; callers must retain its ownership fence."""
+
+    expected_target: TargetId
+    stage: Literal["request", "confirmation"]
+    error_type: str
+    client_termination_requested: bool | None
+
+
+@dataclass(frozen=True, slots=True)
+class FileTerminationConfirmed:
+    expected_target: TargetId
+    pid: int
+    returncode: int
+
+
+@dataclass(frozen=True, slots=True)
+class FileTerminationUnknown:
+    """The owned debuggee has not been proven to exit."""
+
+    expected_target: TargetId
+    pid: int
+    error_type: str
+
+
+def terminate_file_target(
+    process: FileTerminationPort,
+    expected_target: TargetId,
+    *,
+    grace_s: float = 30.0,
+    request_termination: bool = True,
+) -> FileTerminationConfirmed | FileTerminationUnknown:
+    """Terminate the owned debuggee or only probe after an uncertain request."""
+
+    if (
+        isinstance(grace_s, bool)
+        or not isinstance(grace_s, (int, float))
+        or not isfinite(float(grace_s))
+        or grace_s < 0
+    ):
+        raise ValueError("grace_s must be finite and non-negative")
+    if type(request_termination) is not bool:
+        raise TypeError("request_termination must be a boolean")
+    pid = process.pid
+    close_error_type: str | None = None
+    if request_termination:
+        try:
+            process.close(timeout_s=float(grace_s))
+        except Exception as error:
+            # Closing owned streams may fail after the debuggee has exited.
+            # Only process exit proves the Stop outcome.
+            close_error_type = type(error).__name__
+    try:
+        returncode = process.process.poll()
+    except Exception as error:
+        return FileTerminationUnknown(expected_target, pid, type(error).__name__)
+    if returncode is None:
+        return FileTerminationUnknown(
+            expected_target, pid, close_error_type or "ExitUnverified"
+        )
+    return FileTerminationConfirmed(expected_target, pid, returncode)
+
+
+def terminate_server_target(
+    port: ServerTerminationPort,
+    expected_target: TargetId,
+    *,
+    grace_s: float = 30.0,
+    request_termination: bool = True,
+) -> ServerTerminationConfirmed | TerminationUnknown:
+    """Request teardown and require absence within a confirmation interval.
+
+    ``grace_s`` limits proof gathering, never execution of the BSL command.
+    An expired interval preserves unknown target ownership. After an earlier
+    uncertain request, ``request_termination=False`` probes only the registry
+    and never repeats the remote termination command.
+    """
+
+    if (
+        isinstance(grace_s, bool)
+        or not isinstance(grace_s, (int, float))
+        or not isfinite(float(grace_s))
+        or grace_s < 0
+    ):
+        raise ValueError("grace_s must be finite and non-negative")
+    if type(request_termination) is not bool:
+        raise TypeError("request_termination must be a boolean")
+
+    requested: bool | None = None
+    if request_termination:
+        try:
+            requested = port.terminate_bound_server_session()
+        except Exception:
+            # A failed request does not prove that teardown was rejected. Query
+            # the registry anyway: exact absence is stronger evidence than the
+            # request response.
+            pass
+    try:
+        absence = port.wait_for_bound_server_targets_absent(
+            expected_target, timeout_s=float(grace_s)
+        )
+    except Exception as error:
+        return TerminationUnknown(
+            expected_target, "confirmation", type(error).__name__, requested
+        )
+    if (
+        not isinstance(absence, BoundServerTargetAbsence)
+        or absence.expected_target != expected_target
+        or absence.bound_client.infobase_alias.casefold()
+        != expected_target.infobase_alias.casefold()
+        or absence.bound_client.seance_id != expected_target.seance_id
+        or (
+            absence.bound_client.infobase_instance_id is not None
+            and expected_target.infobase_instance_id is not None
+            and absence.bound_client.infobase_instance_id
+            != expected_target.infobase_instance_id
+        )
+    ):
+        return TerminationUnknown(
+            expected_target, "confirmation", "EvidenceMismatch", requested
+        )
+    return ServerTerminationConfirmed(expected_target, absence)

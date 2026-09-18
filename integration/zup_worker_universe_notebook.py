@@ -328,7 +328,7 @@ def build_notebook() -> NotebookNode:
         _code(
             "performance-results",
             "if live_ready:\n"
-            "    assert evidence[\"schema\"] == \"onec-worker-universe-zup-acceptance-v2\"\n"
+            "    assert evidence[\"schema\"] == \"onec-worker-universe-zup-acceptance-v3\"\n"
             "    assert evidence[\"status\"] == \"PASS\"\n"
             "    assert evidence[\"sla_claimed\"] is True\n"
             "    assert evidence[\"measured_iterations\"] == 60\n"
@@ -345,7 +345,7 @@ def build_notebook() -> NotebookNode:
             "        \"xml_reads\": 2,\n"
             "        \"revision_delta\": 1,\n"
             "        \"runtime_dispatches\": 1,\n"
-            "        \"unchanged\": {phase: 0 for phase in extension_build_phases},\n"
+            "        \"unchanged\": {phase: (2 if phase == \"dependency_analysis\" else 0) for phase in extension_build_phases},\n"
             "        \"new\": {phase: 2 for phase in extension_build_phases},\n"
             "    }\n"
             "    assert catalog_extension[\"rollback\"] == {\n"
@@ -355,8 +355,8 @@ def build_notebook() -> NotebookNode:
             "        \"runtime_dispatches\": 0,\n"
             "        \"catalog_unchanged\": True,\n"
             "        \"active_generation_unchanged\": True,\n"
-            "        \"artifact_cache_delta\": 0,\n"
-            "        \"build\": {phase: 0 for phase in extension_build_phases},\n"
+            "        \"confirmed_units_unchanged\": True,\n"
+            "        \"build\": {phase: (4 if phase == \"semantic_parse\" else 0) for phase in extension_build_phases},\n"
             "    }\n"
             "    assert all(\n"
             "        len(values) == 60\n"

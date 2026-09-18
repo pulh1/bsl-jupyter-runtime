@@ -23,6 +23,7 @@ from onec_runtime.capture_inspection import (
 from onec_runtime.capture_values import (
     DeniedValueNode,
     SafeValuePath,
+    UnavailableValueNode,
     ValueNode,
     ValuePathSegmentKind,
     ValueRoot,
@@ -31,7 +32,7 @@ from onec_runtime.capture_values import (
     ValuePage,
 )
 from onec_runtime.rdbg.session import RdbgSession
-from onec_runtime.runtime_api import PrototypeRuntimeApi
+from onec_runtime.execution.public_facade import PublicExecutionFacade
 from onec_runtime.session import RuntimeSession
 from onec_runtime_jupyter.capture_display import (
     CaptureSnapshotDisplay,
@@ -301,7 +302,7 @@ def test_value_page_renders_hierarchy_redaction_cycles_and_pagination() -> None:
     text = render_capture_text(page)
     html = render_capture_html(page)
 
-    assert "КонтекстОтладки.Структура.structure_fields [0:3]" in text
+    assert "e1cRuntimeКонтекстОтладки.Структура.structure_fields [0:3]" in text
     assert "├─ Оклад: Число = 150000" in text
     assert "├─ Данные: Структура = 2 элемента <unsafe> [size=2] ▸ ↻" in text
     assert "└─ СлужебноеЗначение: <private runtime value>" in text
@@ -341,6 +342,64 @@ def test_denied_value_node_renders_from_its_exact_closed_contract_only() -> None
     assert CaptureSnapshotDisplay(node)._repr_html_() == html
 
 
+def test_mixed_value_page_and_unavailable_node_render_without_value_metadata() -> None:
+    path = _context_path()
+    page = ValuePage(
+        (
+            UnavailableValueNode("Неподдерживаемое"),
+            DeniedValueNode("Закрытое"),
+            ValueNode(
+                "Доступное", "Число", "42", None, False,
+                ValueShape.SCALAR,
+                path.child(ValuePathSegmentKind.FIELD, "Доступное"),
+            ),
+        ),
+        3, None, path, "structure_fields", 0, 3,
+    )
+
+    text = render_capture_text(page)
+    html = render_capture_html(page)
+
+    assert "Неподдерживаемое: <unavailable>" in text
+    assert "Закрытое: <private runtime value>" in text
+    assert "Доступное: Число = 42" in text
+    assert "onec-capture-unavailable" in html
+    assert "Неподдерживаемое: &lt;unavailable&gt;" in html
+    assert "Неподдерживаемое" in render_capture_text(
+        UnavailableValueNode("Неподдерживаемое")
+    )
+    assert "onec-capture-unavailable" in CaptureSnapshotDisplay(
+        UnavailableValueNode("Неподдерживаемое")
+    )._repr_html_()
+    assert "type_name" not in html
+
+
+def test_ipython_formatters_render_mixed_value_page_without_formatter_errors() -> None:
+    plain = PlainTextFormatter()
+    html = HTMLFormatter()
+
+    class Shell:
+        pass
+
+    shell = Shell()
+    shell.display_formatter = type(
+        "DisplayFormatter", (),
+        {"formatters": {"text/plain": plain, "text/html": html}},
+    )()
+    path = _context_path()
+    page = ValuePage(
+        (UnavailableValueNode("Неподдерживаемое"), DeniedValueNode("Закрытое")),
+        2, None, path, "variables", 0, 2,
+    )
+
+    install_capture_formatters(shell)
+    try:
+        assert "Неподдерживаемое: <unavailable>" in plain(page)
+        assert "onec-capture-unavailable" in html(page)
+    finally:
+        remove_capture_formatters(shell)
+
+
 def test_rendering_saved_pages_twice_is_byte_identical_and_has_zero_io(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -354,8 +413,8 @@ def test_rendering_saved_pages_twice_is_byte_identical_and_has_zero_io(
         return fail
 
     monkeypatch.setattr(
-        PrototypeRuntimeApi,
-        "_require_available",
+        PublicExecutionFacade,
+        "capture_inspection",
         contacted("runtime"),
     )
     monkeypatch.setattr(RuntimeSession, "status", contacted("runtime_session"))

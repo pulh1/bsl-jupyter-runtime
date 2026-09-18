@@ -14,7 +14,7 @@ from onec_runtime_mcp.agent.contracts import (
     RuntimeDescriptor,
 )
 from onec_runtime_mcp.agent.service import AgentWorkspaceService, OwnershipUncertain
-from onec_runtime.runtime_api import RuntimeNamespaceSnapshot
+from onec_runtime.runtime_models import RuntimeNamespaceSnapshot
 
 
 class _Backend:

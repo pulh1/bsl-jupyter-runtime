@@ -10,8 +10,8 @@ from onec_runtime.processes import FileModeProcesses
 from onec_runtime.rdbg.session import RdbgSession, SessionState
 
 
-INIT_COUNTER = 'Контекст.Вставить("Счетчик", 0); Результат = Контекст.Счетчик;'
-INCREMENT = 'Контекст.Счетчик = Контекст.Счетчик + 1; Результат = Контекст.Счетчик;'
+INIT_COUNTER = 'e1cRuntimeКонтекст.Вставить("Счетчик", 0); Результат = e1cRuntimeКонтекст.Счетчик;'
+INCREMENT = 'e1cRuntimeКонтекст.Счетчик = e1cRuntimeКонтекст.Счетчик + 1; Результат = e1cRuntimeКонтекст.Счетчик;'
 RAISE_ERROR = 'ВызватьИсключение "planned-kernel-error";'
 
 
@@ -82,7 +82,7 @@ class KernelExperiment:
         completed = self._int(self.session.evaluate("ЗавершеннаяКоманда").presentation)
         result = self.session.evaluate("Результат").presentation
         error = self.session.evaluate("Ошибка").presentation.strip('"')
-        counter_eval = self.session.evaluate("Контекст.Счетчик")
+        counter_eval = self.session.evaluate("e1cRuntimeКонтекст.Счетчик")
         observed_counter = (
             None if counter_eval.error_occurred else self._int(counter_eval.presentation)
         )

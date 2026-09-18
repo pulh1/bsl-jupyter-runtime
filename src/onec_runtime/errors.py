@@ -10,6 +10,7 @@ if TYPE_CHECKING:
         CaptureFailureDiagnostic,
         CapturePhase,
     )
+    from onec_runtime.rdbg.models import PendingEvaluation
 
 
 class RuntimeProbeError(Exception):
@@ -346,6 +347,14 @@ class CommandTimeout(RuntimeProbeError):
     """A command did not complete by its monotonic deadline."""
 
 
+class LocalVariablesResultTimeout(CommandTimeout):
+    """A read-only local-variable request returned no matching result in time."""
+
+
+class StopWaitIntervalElapsed(CommandTimeout):
+    """A stop polling interval ended normally without a matching stop event."""
+
+
 class BslExecutionError(RuntimeProbeError):
     """The kernel captured a BSL execution exception."""
 
@@ -381,6 +390,16 @@ class RdbgTransportError(ProtocolError):
 
 class RdbgTransportTimeout(RdbgTransportError, CommandTimeout):
     """The HTTP/RDBG transport exceeded a caller-supplied finite deadline."""
+
+
+class EvaluationDispatchUnknown(RdbgTransportError):
+    """An evalExpr request entered transport without a confirmed outcome."""
+
+    __slots__ = ("pending",)
+
+    def __init__(self, pending: PendingEvaluation) -> None:
+        super().__init__("RDBG expression dispatch outcome is unknown")
+        self.pending = pending
 
 
 class TransportRecoveryError(RuntimeProbeError):

@@ -73,7 +73,7 @@ def test_dump_fingerprint_separates_permanent_identity_from_exact_artifact(
         tmp_path,
         extension_name="OnecInteractiveRuntime",
         artifact_version="0.1.3",
-        protocol_version="2",
+        protocol_version="4",
     )
 
     fingerprints = fingerprint_extension_dump(dump)
@@ -82,7 +82,7 @@ def test_dump_fingerprint_separates_permanent_identity_from_exact_artifact(
     assert fingerprints.identity.extension_name == "OnecInteractiveRuntime"
     assert fingerprints.identity.purpose == "AddOn"
     assert fingerprints.artifact.language_bound_by_name is False
-    assert fingerprints.artifact.protocol_version == "2"
+    assert fingerprints.artifact.protocol_version == "4"
     assert fingerprints.artifact.metadata
     assert fingerprints.artifact.source_sha256 == tuple(
         sorted(fingerprints.artifact.source_sha256)
@@ -222,14 +222,27 @@ def test_dump_fingerprint_binds_each_protocol_serializer(
     assert after.artifact_sha256 != before.artifact_sha256
 
 
-def test_manifest_parser_rejects_predecessor_protocol_one(tmp_path: Path) -> None:
+def test_manifest_parser_accepts_protocol_five(tmp_path: Path) -> None:
     path = write_manifest_fixture(
         tmp_path,
         cfe_sha256="0" * 64,
-        protocol_version="1",
+        protocol_version="5",
     )
 
-    with pytest.raises(ExtensionBundleError, match="protocol 2"):
+    assert read_extension_manifest(path).protocol_version == "5"
+
+
+@pytest.mark.parametrize("predecessor", ["1", "2", "3", "4"])
+def test_manifest_parser_rejects_predecessor_protocol(
+    tmp_path: Path, predecessor: str
+) -> None:
+    path = write_manifest_fixture(
+        tmp_path,
+        cfe_sha256="0" * 64,
+        protocol_version=predecessor,
+    )
+
+    with pytest.raises(ExtensionBundleError, match="protocol 5"):
         read_extension_manifest(path)
 
 
@@ -333,7 +346,7 @@ def test_dump_fingerprint_rejects_handshake_disagreement(tmp_path: Path) -> None
     source = server.read_text(encoding="utf-8-sig")
     server.write_text(
         source.replace(
-            'ВерсияПротоколаRuntime = "2";', 'ВерсияПротоколаRuntime = "1";'
+            'ВерсияПротоколаRuntime = "5";', 'ВерсияПротоколаRuntime = "1";'
         ),
         encoding="utf-8-sig",
     )

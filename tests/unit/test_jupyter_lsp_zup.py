@@ -163,31 +163,33 @@ def test_initial_population_timeout_cannot_be_revived_by_late_end():
         probe.admit()
 
 
-def test_full_counterbalanced_loop_releases_real_runtime_handles_outside_timer(tmp_path):
+def test_full_counterbalanced_loop_releases_public_runtime_handles_outside_timer(tmp_path):
     async def run():
         from types import SimpleNamespace
-        from test_runtime_api import _semantic_snapshot_runtime, _common_module_catalog, _worker_module_unit
+        from tools.lsp_public_fixture import (
+            LspFailureTarget, make_lsp_session, worker_module_source_unit,
+        )
         from onec_runtime.performance_profile import PhaseRecorder
-        from onec_runtime.session import RuntimeSessionConfig
         from hashlib import sha256
         m = api()
         assert hasattr(m, 'run_pairs'), 'full off/on lifecycle loop is missing'
-        catalog = _common_module_catalog('ModuleA', 'ModuleB')
-        runtime = _semantic_snapshot_runtime(tmp_path, catalog)
-        units = tuple(_worker_module_unit(name, 1, catalog) for name in ('ModuleA', 'ModuleB'))
         root = Path(__file__).resolve().parents[1] / 'fixtures/onec/JupyterBslTestFixture'
+        runtime = make_lsp_session(tmp_path / 'runtime', root, LspFailureTarget())
+        units = (worker_module_source_unit(
+            'JupyterBslFixtureCalleeServer', 1,
+            'Функция Версия() Экспорт\nВозврат 1;\nКонецФункции\n',
+        ),)
         module = root / 'CommonModules/JupyterBslFixtureCalleeServer/Ext/Module.bsl'
         def tree():
             return {p.relative_to(root).as_posix(): sha256(p.read_bytes()).hexdigest() if p.is_file() else None
                     for p in root.rglob('*')}
         original = tree()
-        configured = SimpleNamespace(config=RuntimeSessionConfig(None, tmp_path / 'evidence', source_root=root))
         state = {'prepared': None, 'held': None, 'loads': 0, 'releases': 0}
         schedule, closed = [], []
         checkpoints = []
         class Arm(m.LspArm):
             def __init__(self, enabled):
-                super().__init__(enabled, configured, [sys.executable, '-c', FAKE_LS, module.as_uri()], 'Probe', 'DiskMethod')
+                    super().__init__(enabled, runtime, [sys.executable, '-c', FAKE_LS, module.as_uri()], 'Probe', 'DiskMethod')
             async def prepare(self):
                 assert state['prepared'] is None and state['held'] is None
                 state['prepared'] = self.enabled
@@ -205,16 +207,15 @@ def test_full_counterbalanced_loop_releases_real_runtime_handles_outside_timer(t
             assert state['prepared'] in (True, False) and state['held'] is None
             assert candidate is units and isinstance(profiler, PhaseRecorder)
             state['loads'] += 1
-            state['held'] = runtime.load_worker_modules(candidate, common_modules=catalog, profiler=profiler)
+            state['held'] = runtime.load_worker_modules(candidate, profiler=profiler)
+            assert runtime.status().worker_generation is state['held']
             return state['held']
         def release(handle):
             assert handle is state['held']
             runtime.release_worker_generation(handle)
             state['held'] = None
             state['releases'] += 1
-            inventory = runtime._worker_universe._confirmed_live_inventory()
-            assert len(inventory.manifest_sha256s) == 1
-            assert len(inventory.artifact_identities) == 2
+            assert len(runtime.runtime_api.confirmed_worker_module_units(handle)) == 1
         try:
             results = await m.run_pairs(SimpleNamespace(load_worker_modules=load, release_worker_generation=release),
                                         units, Arm, progress=checkpoints.append)

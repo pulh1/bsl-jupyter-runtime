@@ -196,7 +196,7 @@ class CaptureRunOutcome:
     stop: CaptureStop | None = None
     partial_results: Mapping[str, str] = ()  # controller-derived, public root statuses
     continuation: CaptureContinuationEvidence | None = None
-    user_main_dispatched: bool = False
+    user_main_dispatched: bool | None = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,7 +206,7 @@ class CaptureRunResult:
     failure: dict[str, object] | None = None
     recovery: tuple[RecoveryAction, ...] = ()
     quarantine_runtime: bool = False
-    user_main_dispatched: bool = False
+    user_main_dispatched: bool | None = False
 
 
 class CaptureSuccessorPreparationError(RuntimeError):
@@ -1154,7 +1154,7 @@ class CaptureService:
         return replace(
             result,
             user_main_dispatched=(
-                outcome.user_main_dispatched is True or outcome.stop is not None
+                True if outcome.stop is not None else outcome.user_main_dispatched
             ),
         )
 
@@ -1639,6 +1639,14 @@ class CaptureService:
                 ),
                 failure={"stage": "capture_correlation", "partial_results": {}},
                 recovery=_capture_operation_recovery(intent.operation_id),
+            )
+        if outcome.user_main_dispatched is None:
+            # An accepted MAIN ticket may still enter Continue. Disarming its
+            # capture points here would race the late debugger stop.
+            return CaptureRunResult(
+                outcome.execution,
+                failure={"stage": "capture_pending", "partial_results": {}},
+                recovery=(RecoveryAction("workspace.status", {}),),
             )
         try:
             backend.disarm_capture(policy="terminal_no_stop")

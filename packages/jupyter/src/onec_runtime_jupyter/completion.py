@@ -67,7 +67,7 @@ def _receiver(context: CompletionContext) -> tuple[str, bool, str] | None:
         ".", "]", ")", "ID", "NUMBER", "STRING", "DATETIME", "НОВЫЙ",
     }:
         return None
-    return "Контекст." + ".".join(reversed(path)), table_row, prefix
+    return "e1cRuntimeКонтекст." + ".".join(reversed(path)), table_row, prefix
 
 
 def install_completion_matcher(shell: object) -> None:

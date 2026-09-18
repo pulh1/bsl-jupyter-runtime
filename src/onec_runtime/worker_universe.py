@@ -83,7 +83,7 @@ _FIXED_UNQUALIFIED_WORKER_IDENTIFIERS = frozenset(
     value.casefold()
     for value in (
         "Результат",
-        "Контекст",
+        "e1cRuntimeКонтекст",
         "ВнешниеОбработки",
         "ПоместитьВоВременноеХранилище",
         "Base64Значение",
@@ -2049,6 +2049,16 @@ class WorkerUniverseRegistry:
                 )
             )
 
+    def retained_source_units(self) -> tuple[SourceUnitRef, ...]:
+        """Read source identities from generations still owned by this registry."""
+
+        return tuple(
+            unit
+            for view in self._retained_debug_views()
+            for module in view.modules
+            for unit in module.source_units
+        )
+
     def _require_generation(
         self,
         handle: WorkerGenerationHandle,
@@ -2277,7 +2287,7 @@ def prepare_worker_root_instruction(
             f"{prepare_finished_variable} - {prepare_started_variable});",
             f"{prepared_variable} = Новый ФиксированнаяСтруктура("
             f"{prepared_data_variable});",
-            f"Контекст.Вставить({_bsl_string(_prepared_root_context_key(transaction_id))}, "
+            f"e1cRuntimeКонтекст.Вставить({_bsl_string(_prepared_root_context_key(transaction_id))}, "
             f"{prepared_variable});",
             "Результат = "
             f"{_bsl_string(_PREPARED_ROOT_RECEIPT_PREFIX + '|' + str(transaction_id) + '|')} + "
@@ -2299,11 +2309,11 @@ def swap_worker_root_instruction(prepared: WorkerPreparedRootReceipt) -> str:
     previous = prepared.previous_root_key
     lines = [
         "Результат = Неопределено;",
-        f"Если Не Контекст.Свойство({_bsl_string(outcome_key)}, Результат) Тогда",
+        f"Если Не e1cRuntimeКонтекст.Свойство({_bsl_string(outcome_key)}, Результат) Тогда",
         "    ПодготовленныйКореньWorker = Неопределено;",
         "    ТекущийКореньWorker = Неопределено;",
         "    Попытка",
-        f"        Если Не Контекст.Свойство({_bsl_string(prepared_key)}, "
+        f"        Если Не e1cRuntimeКонтекст.Свойство({_bsl_string(prepared_key)}, "
         "ПодготовленныйКореньWorker) Тогда",
         '            ВызватьИсключение "prepared root is unavailable";',
         "        КонецЕсли;",
@@ -2323,7 +2333,7 @@ def swap_worker_root_instruction(prepared: WorkerPreparedRootReceipt) -> str:
     if previous:
         lines.extend(
             (
-                '        Если Не Контекст.Свойство("RuntimeWorkerActiveGeneration", '
+                '        Если Не e1cRuntimeКонтекст.Свойство("RuntimeWorkerActiveGeneration", '
                 "ТекущийКореньWorker) Или ТекущийКореньWorker.RootKey <> "
                 f"{_bsl_string(previous)} Тогда",
                 '            ВызватьИсключение "previous root identity mismatch";',
@@ -2333,7 +2343,7 @@ def swap_worker_root_instruction(prepared: WorkerPreparedRootReceipt) -> str:
     else:
         lines.extend(
             (
-                '        Если Контекст.Свойство("RuntimeWorkerActiveGeneration", '
+                '        Если e1cRuntimeКонтекст.Свойство("RuntimeWorkerActiveGeneration", '
                 "ТекущийКореньWorker) Тогда",
                 '            ВызватьИсключение "unexpected previous root";',
                 "        КонецЕсли;",
@@ -2348,9 +2358,9 @@ def swap_worker_root_instruction(prepared: WorkerPreparedRootReceipt) -> str:
             "    КонецПопытки;",
             "    НачалоСменыКорняWorker = "
             "ТекущаяУниверсальнаяДатаВМиллисекундах();",
-            '    Контекст.Вставить("RuntimeWorkerActiveGeneration", '
+            '    e1cRuntimeКонтекст.Вставить("RuntimeWorkerActiveGeneration", '
             "ПодготовленныйКореньWorker.Root);",
-            f"    Контекст.Удалить({_bsl_string(prepared_key)});",
+            f"    e1cRuntimeКонтекст.Удалить({_bsl_string(prepared_key)});",
             "    КонецСменыКорняWorker = "
             "ТекущаяУниверсальнаяДатаВМиллисекундах();",
             "    Результат = "
@@ -2361,7 +2371,7 @@ def swap_worker_root_instruction(prepared: WorkerPreparedRootReceipt) -> str:
             '"ЧГ=0; ЧДЦ=0; ЧН=0") + "|" + '
             "Формат(КонецСменыКорняWorker - НачалоСменыКорняWorker, "
             '"ЧГ=0; ЧДЦ=0; ЧН=0");',
-            f"    Контекст.Вставить({_bsl_string(outcome_key)}, Результат);",
+            f"    e1cRuntimeКонтекст.Вставить({_bsl_string(outcome_key)}, Результат);",
             "КонецЕсли;",
         )
     )
@@ -2377,10 +2387,10 @@ def discard_worker_root_instruction(prepared: WorkerPreparedRootReceipt) -> str:
     return "\n".join(
         (
             "Результат = Неопределено;",
-            f"Если Не Контекст.Свойство({_bsl_string(outcome_key)}, Результат) Тогда",
+            f"Если Не e1cRuntimeКонтекст.Свойство({_bsl_string(outcome_key)}, Результат) Тогда",
             "    ПодготовленныйКореньWorker = Неопределено;",
             "    Попытка",
-            f"        Если Не Контекст.Свойство({_bsl_string(prepared_key)}, "
+            f"        Если Не e1cRuntimeКонтекст.Свойство({_bsl_string(prepared_key)}, "
             "ПодготовленныйКореньWorker) Тогда",
             '            ВызватьИсключение "prepared root is unavailable";',
             "        КонецЕсли;",
@@ -2397,10 +2407,10 @@ def discard_worker_root_instruction(prepared: WorkerPreparedRootReceipt) -> str:
             '        ВызватьИсключение "onec-worker-root-discard-stage=guard" '
             "+ Символы.ПС + ОшибкаУдаленияКорняWorker;",
             "    КонецПопытки;",
-            f"    Контекст.Удалить({_bsl_string(prepared_key)});",
+            f"    e1cRuntimeКонтекст.Удалить({_bsl_string(prepared_key)});",
             "    Результат = "
             f"{_bsl_string(_ROOT_DISCARD_RECEIPT_PREFIX + '|' + str(prepared.transaction_id) + '|' + str(prepared.generation) + '|' + prepared.manifest_sha256 + '|' + prepared.candidate_root_key)};",
-            f"    Контекст.Вставить({_bsl_string(outcome_key)}, Результат);",
+            f"    e1cRuntimeКонтекст.Вставить({_bsl_string(outcome_key)}, Результат);",
             "КонецЕсли;",
         )
     )

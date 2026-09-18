@@ -9,7 +9,7 @@ from enum import StrEnum
 from hashlib import sha256
 from math import isfinite
 from pathlib import Path
-from threading import Event, RLock, Thread, current_thread
+from threading import Event, Lock, RLock, Thread, current_thread
 from time import sleep
 from typing import Iterator, cast
 from uuid import UUID, uuid4
@@ -81,20 +81,25 @@ from onec_runtime.extension_lifecycle import (
     LifecycleMode,
 )
 from onec_runtime.extension_state import ExtensionStateStore
+from onec_runtime.execution.arbiter import ArbiterBusy
+from onec_runtime.execution.post_bootstrap import (
+    FreshPostBootstrapExecution, compose_fresh_post_bootstrap_execution,
+)
+from onec_runtime.execution.termination import (
+    FileTargetProcessLease, FileTerminationConfirmed, ServerTerminationConfirmed,
+)
+from onec_runtime.execution.public_facade import PublicExecutionFacade
 from onec_runtime.performance_profile import PhaseRecorder
 from onec_runtime.processes import FileModeProcesses
-from onec_runtime.prototype_runtime import (
+from onec_runtime.execution.continuation_models import (
     ContinuationAttemptEvidence,
     ContinuationAttemptSpec,
-    OperationState,
-    PrototypeRuntimeController,
 )
 from onec_runtime.rdbg.models import ModuleLocation, StackFrame, TargetId
 from onec_runtime.rdbg.session import RdbgSession
 from onec_runtime.rdbg.transport import RdbgTransport, TranscriptEntry
-from onec_runtime.recovery_journal import RecoveryJournal
-from onec_runtime.runtime_api import (
-    PrototypeRuntimeApi,
+from onec_runtime.runtime_models import (
+    OperationState,
     RuntimeNamespaceSnapshot,
     RuntimeReply,
     RuntimeStatus,
@@ -120,6 +125,22 @@ from onec_runtime.toolchain import (
     dump_target_extension_cfe,
     dump_target_extension_files,
 )
+
+
+# Runtime-bound references use this process-local epoch to remain stale after
+# a replacement bootstrap, even when the controller's internal generations
+# would otherwise restart from their constructor default.
+_runtime_generation_lock = Lock()
+_next_runtime_generation = 0
+
+
+def _allocate_runtime_generation() -> int:
+    """Return the next unique runtime generation for this Python process."""
+
+    global _next_runtime_generation
+    with _runtime_generation_lock:
+        _next_runtime_generation += 1
+        return _next_runtime_generation
 
 
 class ExtensionMode(StrEnum):
@@ -151,7 +172,14 @@ class _RuntimeSessionShutdownState:
 
 @dataclass(frozen=True, slots=True, repr=False)
 class RuntimeSessionConfig:
-    """Configuration owned by the headless runtime session."""
+    """Inputs for one headless 1C session.
+
+    ``runtime`` supplies platform and infobase settings. ``source_root`` is
+    the local configuration export used for module lookup and file capture
+    points. ``extension_mode`` selects automatic or manual extension setup;
+    ``chunk_size`` bounds transfer requests. ``evidence_root`` and
+    ``startup_profiler`` are optional local diagnostics settings.
+    """
 
     runtime: RuntimeConfig
     evidence_root: Path | str | None = None
@@ -265,6 +293,27 @@ def _expose_startup_cleanup_retry(
         error.add_note(_STARTUP_CLEANUP_RETRY_NOTE)
 
 
+def _bound_server_cleanup_target(rdbg: RdbgSession | None) -> TargetId | None:
+    """Keep the original bound session identity even if the active target changes."""
+    if rdbg is None:
+        return None
+    client = getattr(rdbg, "_bound_client_target", None)
+    if client is None:
+        # Startup can fail before the managed client is bound to a server
+        # session. There is then no bound server target for RDBG to verify.
+        return None
+    if not isinstance(client, TargetId):
+        raise ProtocolError("Bound client target identity is invalid")
+    current = getattr(getattr(rdbg, "target", None), "target_id", None)
+    if (
+        isinstance(current, TargetId)
+        and current.infobase_alias.casefold() == client.infobase_alias.casefold()
+        and current.seance_id == client.seance_id
+    ):
+        return current
+    return client
+
+
 class _StartupAttemptCleanup:
     def __init__(
         self,
@@ -279,6 +328,8 @@ class _StartupAttemptCleanup:
         self._rdbg = rdbg
         self._server_session_terminated = not self._server_mode or rdbg is None
         self._native_client_termination_requested = False
+        self._native_termination_acknowledged = False
+        self._bound_server_expected_target = _bound_server_cleanup_target(rdbg)
         self._processes_closed = False
         self._debug_ui_detached = not self._server_mode or rdbg is None
         self._transport_closed = transport is None
@@ -300,17 +351,18 @@ class _StartupAttemptCleanup:
         self.cleanup_error_types = ()
         if self._server_mode:
             if not self._server_session_terminated:
-                try:
-                    assert self._rdbg is not None
-                    self._native_client_termination_requested = self._rdbg.terminate_bound_server_session()
-                except RdbgDebugUiNotRegistered:
-                    # Native termination cannot use a UI the server has lost.
-                    # Close only our client, then finish deregistration.
-                    self._server_session_terminated = True
-                except BaseException as error:
-                    errors.append(error)
-                else:
-                    self._server_session_terminated = True
+                if not self._native_termination_acknowledged:
+                    try:
+                        assert self._rdbg is not None
+                        self._native_client_termination_requested = self._rdbg.terminate_bound_server_session()
+                    except RdbgDebugUiNotRegistered:
+                        # Native termination cannot use a UI the server has lost.
+                        # Close only our client, then finish deregistration.
+                        self._server_session_terminated = True
+                    except BaseException as error:
+                        errors.append(error)
+                    else:
+                        self._native_termination_acknowledged = True
                 self._raise_cleanup_error(errors)
             if not self._processes_closed:
                 try:
@@ -322,6 +374,22 @@ class _StartupAttemptCleanup:
                     errors.append(error)
                 else:
                     self._processes_closed = True
+                self._raise_cleanup_error(errors)
+            if not self._server_session_terminated:
+                if self._bound_server_expected_target is None:
+                    # No bound server session was established before startup
+                    # failed; the owned client has now been closed.
+                    self._server_session_terminated = True
+                else:
+                    try:
+                        assert self._rdbg is not None
+                        self._rdbg.wait_for_bound_server_targets_absent(
+                            self._bound_server_expected_target
+                        )
+                    except BaseException as error:
+                        errors.append(error)
+                    else:
+                        self._server_session_terminated = True
                 self._raise_cleanup_error(errors)
             if not self._debug_ui_detached:
                 try:
@@ -573,7 +641,13 @@ def _handshake_summary(evidence: ExtensionHandshakeEvidence) -> dict[str, object
 
 
 class RuntimeSession:
-    """Own one headless 1C runtime/debugger pair."""
+    """Own one headless 1C runtime and debugger session.
+
+    Use :meth:`start` to create an owned session and :meth:`close` to release it.
+    BSL execution, CAPTURE inspection and value transfer all operate on this
+    session's current runtime generation. The Jupyter wrapper installs
+    ``%%bsl`` and value proxies on top of this core API.
+    """
 
     def __init__(
         self,
@@ -581,7 +655,7 @@ class RuntimeSession:
         processes: FileModeProcesses,
         transport: RdbgTransport,
         rdbg: RdbgSession,
-        runtime_api: PrototypeRuntimeApi,
+        runtime_api: PublicExecutionFacade,
         artifacts: ArtifactWriter,
         *,
         heartbeat_interval_s: float = 15.0,
@@ -615,6 +689,8 @@ class RuntimeSession:
         self._debug_ui_detached = not config.runtime.is_server_infobase
         self._server_session_terminated = not config.runtime.is_server_infobase
         self._native_client_termination_requested = False
+        self._native_termination_acknowledged = False
+        self._bound_server_expected_target = _bound_server_cleanup_target(rdbg)
         self._operation_lock = RLock()
         self._capture_locations: dict[tuple[str, int], object] = {}
         self._capture_source_catalog: CaptureSourceCatalog | None = None
@@ -652,18 +728,16 @@ class RuntimeSession:
             return
         lost_debug_ui = False
         lost_owned_process = False
+        heartbeat_ticket: object | None = None
         try:
             if not self._closed:
-                if not self.runtime_api.owns_debug_ui_stream():
-                    try:
-                        self._rdbg.heartbeat()
-                    except RdbgDebugUiNotRegistered:
-                        lost_debug_ui = True
-                    except Exception:
-                        # A transient transport failure must not permanently
-                        # disable later keepalives. The next notebook command
-                        # remains the authoritative place to surface it.
-                        pass
+                try:
+                    heartbeat_ticket = self.runtime_api.try_heartbeat_ticket()
+                except RdbgDebugUiNotRegistered:
+                    lost_debug_ui = True
+                except Exception:
+                    # The owning arbiter surfaces operational failures.
+                    pass
                 ensure_running = getattr(self._processes, "ensure_running", None)
                 if callable(ensure_running):
                     try:
@@ -675,6 +749,18 @@ class RuntimeSession:
                         pass
         finally:
             self._operation_lock.release()
+        if heartbeat_ticket is not None:
+            try:
+                # A transport-ambiguous keepalive retains the arbiter owner;
+                # it cannot settle until an explicit reconciliation or target
+                # teardown. The request itself has a bounded transport wait.
+                if not heartbeat_ticket.wait_unknown():
+                    heartbeat_ticket.wait_settled(timeout=0)
+            except RdbgDebugUiNotRegistered:
+                lost_debug_ui = True
+            except Exception:
+                # A transient keepalive failure cannot terminate the runtime.
+                pass
         if lost_debug_ui or lost_owned_process:
             try:
                 self.close()
@@ -695,6 +781,12 @@ class RuntimeSession:
         *,
         progress: Callable[[str], None] | None = None,
     ) -> "RuntimeSession":
+        """Start one owned runtime from ``config``.
+
+        ``progress``, when supplied, receives human-readable startup stage
+        messages. Returns a session that the caller must eventually close.
+        Startup errors are raised to the caller after cleanup is attempted.
+        """
         runtime = config.runtime
         artifacts = ArtifactWriter(config.evidence_root, "runtime-session")
         profiler = config.startup_profiler or PhaseRecorder()
@@ -984,6 +1076,7 @@ class RuntimeSession:
         rdbg: RdbgSession | None = None
         registration_candidates: list[RdbgSession] = []
         runtime_session: RuntimeSession | None = None
+        execution: FreshPostBootstrapExecution | None = None
         stage = "process-start"
         try:
             managed_location, entry_location, service_location = (
@@ -1118,13 +1211,6 @@ class RuntimeSession:
                     progress("Проверка безопасного режима расширения 1С")
                 verify_extension_safe_mode_disabled(rdbg)
 
-            journal = RecoveryJournal(artifacts.append_jsonl)
-            controller = PrototypeRuntimeController(
-                rdbg,
-                service_location,
-                command_timeout_s=90.0,
-                journal=journal,
-            )
             notebook_worker_builder = NotebookWorkerArtifactBuilder(runtime)
             worker_module_builder = WorkerModuleArtifactBuilder(
                 notebook_worker_builder,
@@ -1132,13 +1218,30 @@ class RuntimeSession:
                 packer_version="worker-epf-v1",
                 target_profile="runtime-session-server-v1",
             )
-            api = PrototypeRuntimeApi(
-                controller,
-                journal=journal,
-                notebook_worker_builder=notebook_worker_builder,
+            stage = "execution-composition"
+            file_target_lease = None
+            if not runtime.is_server_infobase:
+                if processes.debuggee is None:
+                    raise ProtocolError("Runtime bootstrap has no owned file debuggee")
+                file_target_lease = FileTargetProcessLease(
+                    server_target.target_id, processes.debuggee,
+                )
+            execution = compose_fresh_post_bootstrap_execution(
+                rdbg,
+                service_location,
+                runtime_generation=_allocate_runtime_generation(),
+                stopped_target=server_target,
+                bootstrap_stop=service_stop,
+                capture_locations=(),
+                notebook_builder=notebook_worker_builder,
+                target_profile="runtime-session-server-v1",
                 worker_module_builder=worker_module_builder,
+                file_target_lease=file_target_lease,
             )
-            runtime_session = cls(config, processes, transport, rdbg, api, artifacts)
+            runtime_session = cls(
+                config, processes, transport, rdbg, execution.execution.facade,
+                artifacts,
+            )
             runtime_session._attempt_bootstrap_evidence = _AttemptBootstrapEvidence(
                 managed_stop=_stop_summary(
                     managed_stop,
@@ -1180,6 +1283,11 @@ class RuntimeSession:
                     cleanup_errors.append(cleanup_error)
                     cleanup_retry = runtime_session.close
             else:
+                if execution is not None:
+                    try:
+                        execution.execution.facade.close()
+                    except BaseException as cleanup_error:
+                        cleanup_errors.append(cleanup_error)
                 cleanup = _StartupAttemptCleanup(
                     runtime, processes, transport, rdbg
                 )
@@ -1234,6 +1342,14 @@ class RuntimeSession:
             Callable[[OperationExecutionProvenance], None] | None
         ) = None,
     ) -> RuntimeReply:
+        """Execute one BSL cell in the current MAIN or CAPTURE route.
+
+        ``source`` is the visible cell text. ``source_unit`` and
+        ``on_execution_provenance`` let notebook adapters correlate diagnostics
+        with that cell. Returns a :class:`RuntimeReply`; a CAPTURE stop may
+        suspend the MAIN command without completing it. Transport and
+        admission failures may raise instead of returning a reply.
+        """
         with self._operation_lock:
             arguments: dict[str, object] = {}
             if source_unit is not None:
@@ -1242,14 +1358,9 @@ class RuntimeSession:
                 arguments["on_execution_provenance"] = (
                     on_execution_provenance
                 )
-            bind = getattr(
-                self.runtime_api,
-                "capture_session_caller_handoff",
-                None,
-            )
-            if not callable(bind):
-                return self.runtime_api.execute_bsl(source, **arguments)  # type: ignore[arg-type]
-            with bind(self._release_operation_lock_for_capture_wait):
+            with self.runtime_api.execution_caller_handoff(
+                self._release_operation_lock_for_capture_wait
+            ):
                 return self.runtime_api.execute_bsl(source, **arguments)  # type: ignore[arg-type]
 
     @contextmanager
@@ -1262,8 +1373,8 @@ class RuntimeSession:
 
     @contextmanager
     def _capture_materialization_caller_handoff(self) -> Iterator[None]:
-        """Let the coordinator wait without retaining the Session operation lock."""
-        with self.runtime_api.capture_session_caller_handoff(
+        """Let the execution owner wait without retaining the Session lock."""
+        with self.runtime_api.execution_caller_handoff(
             self._release_operation_lock_for_capture_wait
         ):
             yield
@@ -1291,13 +1402,15 @@ class RuntimeSession:
                 native_metadata or config.layer != SourceLayer.AUTO or extension_name is not None
             ) else None
             resolver = CommonModuleCaptureResolver(project, source_root)
+            stack_resolver = (
+                None if catalog is None else ConfigurationFrameResolver(catalog)
+            )
             self.runtime_api.configure_capture_points(())
+            self.runtime_api.configure_capture_source_resolver(stack_resolver)
             self._file_capture_points = ()
             self._capture_source_resolver = resolver
             self._capture_source_catalog = catalog
-            self._capture_stack_source_resolver = (
-                None if catalog is None else ConfigurationFrameResolver(catalog)
-            )
+            self._capture_stack_source_resolver = stack_resolver
             self._capture_source_bindings = {}
             self._capture_locations = {}
 
@@ -1308,6 +1421,7 @@ class RuntimeSession:
                     "capture source cannot change during an active capture"
                 )
             self.runtime_api.configure_capture_points(())
+            self.runtime_api.configure_capture_source_resolver(None)
             self._file_capture_points = ()
             self._capture_source_resolver = None
             self._capture_source_catalog = None
@@ -1379,16 +1493,15 @@ class RuntimeSession:
         with self._operation_lock:
             if self._closed:
                 raise ProtocolError("ZUP demo runtime session is closed")
-            return self.runtime_api.prepare_main_for_capture(
-                source,
-                source_unit=source_unit,
-            )
+            return self.runtime_api.prepare_bsl(source, source_unit=source_unit)
 
     def activate_prepared_main_for_capture(self, prepared: object) -> object:
         with self._operation_lock:
             if self._closed:
                 raise ProtocolError("ZUP demo runtime session is closed")
-            return self.runtime_api.activate_prepared_main_for_capture(prepared)
+            # Worker publication belongs to the accepted arbiter ticket.
+            # Preparation activation is a local handoff only.
+            return prepared
 
     def prepared_main_execution_provenance(
         self,
@@ -1397,21 +1510,22 @@ class RuntimeSession:
         with self._operation_lock:
             if self._closed:
                 raise ProtocolError("ZUP demo runtime session is closed")
-            return self.runtime_api.prepared_main_execution_provenance(
-                prepared
-            )
+            return self.runtime_api.prepared_bsl_execution_provenance(prepared)
 
     def execute_prepared_main_for_capture(self, prepared: object) -> object:
         with self._operation_lock:
             if self._closed:
                 raise ProtocolError("ZUP demo runtime session is closed")
-            return self.runtime_api._attempt_prepared_main_for_capture(prepared)
+            with self.runtime_api.execution_caller_handoff(
+                self._release_operation_lock_for_capture_wait
+            ):
+                return self.runtime_api.attempt_prepared_main_for_capture(prepared)
 
     def discard_prepared_main_for_capture(self, prepared: object) -> None:
         with self._operation_lock:
             if self._closed:
                 raise ProtocolError("ZUP demo runtime session is closed")
-            self.runtime_api.discard_prepared_main_for_capture(prepared)
+            self.runtime_api.discard_prepared_bsl(prepared)
 
     def prepare_capture_hypothesis(
         self, source: str, capture: object
@@ -1420,7 +1534,9 @@ class RuntimeSession:
             if self._closed:
                 raise ProtocolError("ZUP demo runtime session is closed")
             self._require_capture_fence(capture)
-            return self.runtime_api.prepare_capture_hypothesis(source)
+            prepared = self.runtime_api.prepare_bsl(source)
+            self._require_capture_fence(capture)
+            return prepared
 
     def execute_prepared_capture_hypothesis(
         self, prepared: object, capture: object
@@ -1429,15 +1545,10 @@ class RuntimeSession:
             if self._closed:
                 raise ProtocolError("ZUP demo runtime session is closed")
             self._require_capture_fence(capture)
-            bind = getattr(
-                self.runtime_api,
-                "capture_session_caller_handoff",
-                None,
-            )
-            if not callable(bind):
-                return self.runtime_api.execute_prepared_capture_hypothesis(prepared)
-            with bind(self._release_operation_lock_for_capture_wait):
-                return self.runtime_api.execute_prepared_capture_hypothesis(prepared)
+            with self.runtime_api.execution_caller_handoff(
+                self._release_operation_lock_for_capture_wait
+            ):
+                return self.runtime_api.execute_prepared_bsl(prepared)
 
     def prepared_capture_hypothesis_provenance(
         self,
@@ -1446,9 +1557,7 @@ class RuntimeSession:
         with self._operation_lock:
             if self._closed:
                 raise ProtocolError("ZUP demo runtime session is closed")
-            return self.runtime_api.prepared_capture_hypothesis_provenance(
-                prepared
-            )
+            return self.runtime_api.prepared_bsl_execution_provenance(prepared)
 
     def quarantine_capture_inspection(self, capture: object) -> None:
         """Revoke every inspection route when preparation ownership is uncertain."""
@@ -1669,6 +1778,14 @@ class RuntimeSession:
         continuation_attempt_id: str | None = None,
         timeout_s: float | None = None,
     ) -> RuntimeReply:
+        """Continue the currently captured MAIN command.
+
+        ``dirty_roots`` adds root bindings that must be written back before
+        Continue. ``continuation_attempt_id`` is an optional orchestration
+        token. ``timeout_s`` limits the initiating caller's wait; it is not a
+        deadline for BSL execution. Returns the next runtime reply, which may
+        represent another stop or MAIN completion. Requires an active CAPTURE.
+        """
         with self._operation_lock:
             active = self._active_capture_ticket
             completion_seen = False
@@ -1719,11 +1836,6 @@ class RuntimeSession:
                 ).start()
 
             try:
-                bind = getattr(
-                    self.runtime_api,
-                    "capture_session_caller_handoff",
-                    None,
-                )
                 arguments = {
                     "dirty_roots": dirty_roots,
                     "continuation_attempt_id": continuation_attempt_id,
@@ -1732,13 +1844,10 @@ class RuntimeSession:
                 }
                 if timeout_s is not None:
                     arguments["timeout_s"] = timeout_s
-                if not callable(bind):
-                    arguments.pop("on_completion")
-                    arguments.pop("on_detached_completion")
+                with self.runtime_api.execution_caller_handoff(
+                    self._release_operation_lock_for_capture_wait
+                ):
                     reply = self.runtime_api.resume_capture(**arguments)
-                else:
-                    with bind(self._release_operation_lock_for_capture_wait):
-                        reply = self.runtime_api.resume_capture(**arguments)
             except CaptureBusyError:
                 # The coordinator still owns this exact capture. A rejected
                 # resume does not end the Session fence or notify listeners.
@@ -1783,7 +1892,10 @@ class RuntimeSession:
     ) -> RuntimeReply:
         with self._operation_lock:
             active = self._active_capture_ticket
-            reply = self.runtime_api.resume_debug_stop(timeout_s=timeout_s)
+            with self.runtime_api.execution_caller_handoff(
+                self._release_operation_lock_for_capture_wait
+            ):
+                reply = self.runtime_api.resume_debug_stop(timeout_s=timeout_s)
             if active is None or reply.state in {
                 OperationState.CAPTURED,
                 OperationState.DEBUG_STOPPED,
@@ -1858,10 +1970,13 @@ class RuntimeSession:
     def capture_frame(self, capture: object, *, level: int, cursor: int, limit: int, name: str | None = None, timeout_s: float | None = None) -> Mapping[str, object]:
         with self._operation_lock:
             self._require_capture_fence(capture)
-            return self.runtime_api.capture_frame(
-                level=level, cursor=cursor, limit=limit, name=name,
-                timeout_s=timeout_s,
-            )
+            with self.runtime_api.execution_caller_handoff(
+                self._release_operation_lock_for_capture_wait
+            ):
+                return self.runtime_api.capture_frame(
+                    level=level, cursor=cursor, limit=limit, name=name,
+                    timeout_s=timeout_s,
+                )
 
     def resolve_manager_origin(self, capture: object, origin: object, *, timeout_s: float | None = None) -> Mapping[str, object]:
         with self._operation_lock:
@@ -2039,7 +2154,11 @@ class RuntimeSession:
             self._file_capture_points = tuple(locations)
 
     def add_capture_point(self, path: str, line: int) -> ModuleLocation:
-        """Arm a common-module breakpoint using only a source path and line."""
+        """Arm a common-module capture point by path and one-based line.
+
+        ``path`` names a module inside ``config.source_root``. Returns the
+        resolved debugger location. A configured source root is required.
+        """
         if not isinstance(path, str) or not path:
             raise ValueError("capture point path must be a non-empty string")
         if type(line) is not int or line < 1:
@@ -2058,6 +2177,7 @@ class RuntimeSession:
             return location
 
     def clear_capture_points(self) -> None:
+        """Remove capture points configured for this session."""
         self.configure_capture_points(())
 
     def to_df(
@@ -2070,15 +2190,32 @@ class RuntimeSession:
         chunk_size: int | None = None,
         profiler: PhaseRecorder | None = None,
     ) -> pd.DataFrame:
+        """Copy a persistent BSL table at ``handle`` into a DataFrame.
+
+        A handle has a form such as ``e1cRuntimeКонтекст.Таблица``. ``refs`` selects
+        presentation, UUID or both for references; ``ref_columns`` overrides
+        that policy by column, and ``uuid_suffix`` names added UUID columns.
+        ``chunk_size`` is an advisory hint on the composed execution route;
+        that route transfers one bounded payload (at most 100,000 rows and
+        64 MiB). ``profiler`` records its overall routed transfer phase.
+        A failed transfer does not establish that a CAPTURE frame was lost.
+        """
         with self._operation_lock:
             self.validate_value_reference(handle)
             with self._capture_materialization_caller_handoff():
-                return self.runtime_api.materialize_table(
+                transfer = getattr(
+                    self.runtime_api, "materialize_session_table", None,
+                )
+                if not callable(transfer):
+                    transfer = self.runtime_api.materialize_table
+                return transfer(
                     handle,
                     refs=refs,
                     ref_columns=ref_columns,
                     uuid_suffix=uuid_suffix,
-                    chunk_size=chunk_size or self.config.chunk_size,
+                    chunk_size=(
+                        self.config.chunk_size if chunk_size is None else chunk_size
+                    ),
                     profiler=profiler,
                 )
 
@@ -2108,13 +2245,24 @@ class RuntimeSession:
         timeout_s: float | None = None,
         profiler: PhaseRecorder | None = None,
     ) -> object:
+        """Copy a supported persistent BSL value at ``handle`` into Python.
+
+        Reference options match :meth:`to_df`. ``max_depth``, ``max_items``
+        and ``max_bytes`` bound the result. ``chunk_size`` is an advisory
+        hint on the composed route, which transfers one bounded payload.
+        ``timeout_s`` limits the local caller's wait; the runtime retains
+        ownership of a dispatched operation. The Python result type depends
+        on the BSL value's shape.
+        """
         with self._operation_lock:
             self.validate_value_reference(handle)
             options: dict[str, object] = {
                 "refs": refs,
                 "ref_columns": ref_columns,
                 "uuid_suffix": uuid_suffix,
-                "chunk_size": chunk_size or self.config.chunk_size,
+                "chunk_size": (
+                    self.config.chunk_size if chunk_size is None else chunk_size
+                ),
                 "max_depth": max_depth,
                 "max_items": max_items,
                 "max_bytes": max_bytes,
@@ -2123,7 +2271,7 @@ class RuntimeSession:
             if timeout_s is not None:
                 options["timeout_s"] = timeout_s
             with self._capture_materialization_caller_handoff():
-                return self.runtime_api.materialize_value(
+                return self.runtime_api.materialize_session_value(
                     handle,
                     **options,
                 )
@@ -2187,15 +2335,33 @@ class RuntimeSession:
             return self.runtime_api.validate_value_reference(handle)
 
     def status(self) -> RuntimeStatus:
+        """Return the current runtime state and generation identifiers."""
         return self.runtime_api.status()
 
+    @property
+    def confirmed_target_termination(
+        self,
+    ) -> FileTerminationConfirmed | ServerTerminationConfirmed | None:
+        """Proof that Stop ended this session's exact execution target."""
+
+        return self.runtime_api.confirmed_target_termination
+
     def current_capture(self) -> CaptureView:
-        return self.runtime_api._current_capture(
-            resolve_sources=getattr(self, "_capture_stack_source_resolver", None),
-            bind_frame=getattr(self, "_capture_stack_frame_binder", None),
-        )
+        """Return a view fenced to the current CAPTURE stop.
+
+        Raises ``NoActiveCaptureError`` if no capture is available. Keep the
+        returned view only for this stop; its status becomes stale after
+        continuation or a different stop.
+        """
+        return self.runtime_api.current_capture()
 
     def namespace_snapshot(self) -> RuntimeNamespaceSnapshot:
+        """Return persistent BSL names and the generations fencing proxies.
+
+        Notebook value proxies use this snapshot to reject access after the
+        runtime or context generation changes. A closed session cannot supply
+        a live snapshot.
+        """
         with self._operation_lock:
             if self._closed:
                 raise ProtocolError("ZUP demo runtime session is closed")
@@ -2225,6 +2391,11 @@ class RuntimeSession:
         return self._closed
 
     def close(self) -> None:
+        """Release the owned session and its local resources.
+
+        If cleanup cannot finish, the owner retains incomplete work so a
+        later ``close()`` call can retry it.
+        """
         self._close(shutdown=False)
 
     def close_for_kernel_shutdown(self) -> None:
@@ -2254,56 +2425,41 @@ class RuntimeSession:
             self._close_lock.release()
 
     def _close_locked(self, *, shutdown: bool, operation_owned: bool) -> None:
+        if self.config.runtime.is_server_infobase:
+            # Some owners are constructed before these teardown fields exist;
+            # capture the bound identity once before the first close attempt.
+            if not hasattr(self, "_native_termination_acknowledged"):
+                self._native_termination_acknowledged = False
+            if not hasattr(self, "_bound_server_expected_target"):
+                self._bound_server_expected_target = _bound_server_cleanup_target(
+                    self._rdbg
+                )
         state = self._refresh_shutdown_state()
         if state.terminal:
             return
         self._heartbeat_stop.set()
         if current_thread() is not self._heartbeat_thread:
-            self._heartbeat_thread.join(timeout=2.0)
+            # Stop admission first, then let a bounded keepalive request retire
+            # before asking the arbiter to close. A fixed local join interval
+            # can otherwise leave an active heartbeat ticket at close.
+            self._heartbeat_thread.join()
         errors: list[BaseException] = []
-        if (
-            shutdown
-            and state.capture_publication_finalized is not _ShutdownAxis.COMPLETE
-        ):
-            close_capture = getattr(
-                self.runtime_api,
-                "_close_capture_control_plane",
-                None,
-            )
-            if callable(close_capture):
-                try:
-                    close_capture()
-                except BaseException as error:
-                    errors.append(error)
-                else:
-                    if not self._runtime_api_has_shutdown_axes():
-                        self._mark_shutdown_axes(
-                            capture_publication_finalized=True,
-                        )
+        if state.runtime_api_data_plane_finalized is not _ShutdownAxis.COMPLETE:
+            try:
+                # The arbiter must retire every ticket before target teardown.
+                self.runtime_api.close()
+            except ArbiterBusy:
+                # A pending ticket still owns the debugger event stream.
+                raise
+            except BaseException as error:
+                if shutdown:
+                    raise
+                errors.append(error)
             else:
-                self._mark_shutdown_axes(capture_publication_finalized=True)
-        elif (
-            not shutdown
-            and state.runtime_api_data_plane_finalized
-            is not _ShutdownAxis.COMPLETE
-        ):
-            close_runtime_api = getattr(self.runtime_api, "close", None)
-            if not callable(close_runtime_api):
                 self._mark_shutdown_axes(
                     capture_publication_finalized=True,
                     runtime_api_data_plane_finalized=True,
                 )
-            else:
-                try:
-                    close_runtime_api()
-                except BaseException as error:
-                    errors.append(error)
-                else:
-                    if not self._runtime_api_has_shutdown_axes():
-                        self._mark_shutdown_axes(
-                            capture_publication_finalized=True,
-                            runtime_api_data_plane_finalized=True,
-                        )
         self._refresh_shutdown_state()
         acquired_operation = operation_owned or self._operation_lock.acquire(
             timeout=self._close_operation_timeout_s()
@@ -2319,18 +2475,19 @@ class RuntimeSession:
         try:
             if self.config.runtime.is_server_infobase:
                 if not self._server_session_terminated:
-                    try:
-                        self._native_client_termination_requested = self._rdbg.terminate_bound_server_session()
-                    except RdbgDebugUiNotRegistered:
-                        # The UI is gone; fall back to closing our owned client.
-                        self._server_session_terminated = True
-                    except BaseException as error:
-                        errors.append(error)
-                    else:
-                        self._server_session_terminated = True
+                    if not self._native_termination_acknowledged:
+                        try:
+                            self._native_client_termination_requested = self._rdbg.terminate_bound_server_session()
+                        except RdbgDebugUiNotRegistered:
+                            # The UI is gone; fall back to closing our owned client.
+                            self._server_session_terminated = True
+                        except BaseException as error:
+                            errors.append(error)
+                        else:
+                            self._native_termination_acknowledged = True
                 # Server termination needs the owned client connection alive.
                 # The cluster debugger belongs to the service, not this session.
-                if self._server_session_terminated and not self._processes_closed:
+                if (self._server_session_terminated or self._native_termination_acknowledged) and not self._processes_closed:
                     try:
                         if self._native_client_termination_requested:
                             self._processes.close(graceful_client_timeout_s=3.0)
@@ -2340,7 +2497,20 @@ class RuntimeSession:
                         errors.append(error)
                     else:
                         self._processes_closed = True
-                if self._processes_closed and not self._debug_ui_detached:
+                if self._processes_closed and not self._server_session_terminated:
+                    if self._bound_server_expected_target is None:
+                        # Startup never established a bound server session.
+                        self._server_session_terminated = True
+                    else:
+                        try:
+                            self._rdbg.wait_for_bound_server_targets_absent(
+                                self._bound_server_expected_target
+                            )
+                        except BaseException as error:
+                            errors.append(error)
+                        else:
+                            self._server_session_terminated = True
+                if self._server_session_terminated and self._processes_closed and not self._debug_ui_detached:
                     try:
                         self._rdbg.detach()
                     except BaseException as error:
@@ -2364,46 +2534,6 @@ class RuntimeSession:
                     errors.append(error)
                 else:
                     self._processes_closed = True
-            state = self._refresh_shutdown_state()
-            if state.local_resources_terminal is _ShutdownAxis.COMPLETE:
-                mark_target_terminated = getattr(
-                    self.runtime_api,
-                    "_mark_target_terminated",
-                    None,
-                )
-                if callable(mark_target_terminated):
-                    try:
-                        mark_target_terminated()
-                    except BaseException as error:
-                        errors.append(error)
-            if (
-                state.local_resources_terminal is _ShutdownAxis.COMPLETE
-                and state.capture_publication_finalized is _ShutdownAxis.COMPLETE
-                and state.runtime_api_data_plane_finalized
-                is not _ShutdownAxis.COMPLETE
-            ):
-                close_after_target_termination = getattr(
-                    self.runtime_api,
-                    "_close_after_target_termination",
-                    None,
-                )
-                if callable(close_after_target_termination):
-                    try:
-                        close_after_target_termination()
-                    except BaseException as error:
-                        errors.append(error)
-                    else:
-                        if not self._runtime_api_has_shutdown_axes():
-                            self._mark_shutdown_axes(
-                                runtime_api_data_plane_finalized=True,
-                            )
-                else:
-                    # Compatibility runtimes have no target-side state of
-                    # their own. Their local owner is complete once Session
-                    # has killed the target and closed the transport.
-                    self._mark_shutdown_axes(
-                        runtime_api_data_plane_finalized=True,
-                    )
             self._refresh_shutdown_state()
         finally:
             if not operation_owned:
@@ -2415,26 +2545,7 @@ class RuntimeSession:
             ) from None
 
     def _refresh_shutdown_state(self) -> _RuntimeSessionShutdownState:
-        state = getattr(self, "_shutdown_state", None)
-        if not isinstance(state, _RuntimeSessionShutdownState):
-            legacy_closed = bool(getattr(self, "_closed", False))
-            state = _RuntimeSessionShutdownState(
-                local_resources_terminal=(
-                    _ShutdownAxis.COMPLETE
-                    if legacy_closed
-                    else _ShutdownAxis.PENDING
-                ),
-                capture_publication_finalized=(
-                    _ShutdownAxis.COMPLETE
-                    if legacy_closed
-                    else _ShutdownAxis.PENDING
-                ),
-                runtime_api_data_plane_finalized=(
-                    _ShutdownAxis.COMPLETE
-                    if legacy_closed
-                    else _ShutdownAxis.PENDING
-                ),
-            )
+        state = self._shutdown_state
         local_resources_closed = (
             self._debug_ui_detached
             and self._transport_closed
@@ -2444,30 +2555,12 @@ class RuntimeSession:
                 or self._server_session_terminated
             )
         )
-        capture_publication_finalized = (
-            getattr(self.runtime_api, "_capture_shutdown_finished", False)
-            is True
-        )
-        runtime_api_data_plane_finalized = (
-            getattr(self.runtime_api, "_data_plane_finalized", False) is True
-            or self._runtime_api_closed
-        )
         state = replace(
             state,
             local_resources_terminal=(
                 _ShutdownAxis.COMPLETE
                 if local_resources_closed
                 else state.local_resources_terminal
-            ),
-            capture_publication_finalized=(
-                _ShutdownAxis.COMPLETE
-                if capture_publication_finalized
-                else state.capture_publication_finalized
-            ),
-            runtime_api_data_plane_finalized=(
-                _ShutdownAxis.COMPLETE
-                if runtime_api_data_plane_finalized
-                else state.runtime_api_data_plane_finalized
             ),
         )
         return self._store_shutdown_state(state)
@@ -2504,20 +2597,6 @@ class RuntimeSession:
         )
         self._closed = state.terminal
         return state
-
-    def _runtime_api_has_shutdown_axes(self) -> bool:
-        """Keep legacy test/runtime adapters on their existing close contract."""
-
-        return (
-            isinstance(
-                getattr(self.runtime_api, "_capture_shutdown_finished", None),
-                bool,
-            )
-            and isinstance(
-                getattr(self.runtime_api, "_data_plane_finalized", None),
-                bool,
-            )
-        )
 
     def _close_operation_timeout_s(self) -> float:
         controller = getattr(self.runtime_api, "_controller", None)

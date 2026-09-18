@@ -12,7 +12,7 @@ from onec_runtime.table_materialization import (
 )
 
 
-_HANDLE = re.compile(r"Контекст\.[^\W\d]\w*\Z", re.UNICODE)
+_HANDLE = re.compile(r"e1cRuntimeКонтекст\.[^\W\d]\w*\Z", re.UNICODE)
 
 
 def _require_handle(value: str) -> str:
@@ -49,8 +49,8 @@ def start_transfer_instruction(
         "СсылкиМатериализации);\n"
         f"МатериализацияТаблицы = RuntimeTableTransferServer.СериализоватьТаблицу("
         f"{handle}, {chunk_size}, ПредставленияМатериализации);\n"
-        'Если Не Контекст.Свойство("RuntimeTableTransfers") Тогда\n'
-        '    Контекст.Вставить("RuntimeTableTransfers", Новый Соответствие);\n'
+        'Если Не e1cRuntimeКонтекст.Свойство("RuntimeTableTransfers") Тогда\n'
+        '    e1cRuntimeКонтекст.Вставить("RuntimeTableTransfers", Новый Соответствие);\n'
         "КонецЕсли;\n"
         "ТокенМатериализации = Строка(Новый УникальныйИдентификатор());\n"
         "АдресМатериализации = ПоместитьВоВременноеХранилище("
@@ -70,7 +70,7 @@ def start_transfer_instruction(
         f"{runtime_generation});\n"
         f'ОписаниеМатериализации.Вставить("КонтекстПоколение", '
         f"{context_generation});\n"
-        "Контекст.RuntimeTableTransfers.Вставить(ТокенМатериализации, "
+        "e1cRuntimeКонтекст.RuntimeTableTransfers.Вставить(ТокенМатериализации, "
         "ОписаниеМатериализации);\n"
         "Результат = ТокенМатериализации;"
     )
@@ -80,7 +80,7 @@ def get_manifest_instruction(token: str) -> str:
     literal = bsl_string_literal(_token(token))
     return (
         f"ТокенМатериализации = {literal};\n"
-        "ОписаниеМатериализации = Контекст.RuntimeTableTransfers.Получить("
+        "ОписаниеМатериализации = e1cRuntimeКонтекст.RuntimeTableTransfers.Получить("
         "ТокенМатериализации);\n"
         "Если ОписаниеМатериализации = Неопределено Тогда\n"
         '    ВызватьИсключение "unknown table transfer token";\n'
@@ -102,7 +102,7 @@ def get_chunk_instruction(token: str, sequence: int) -> str:
     literal = bsl_string_literal(_token(token))
     return (
         f"ТокенМатериализации = {literal};\n"
-        "ОписаниеМатериализации = Контекст.RuntimeTableTransfers.Получить("
+        "ОписаниеМатериализации = e1cRuntimeКонтекст.RuntimeTableTransfers.Получить("
         "ТокенМатериализации);\n"
         "Если ОписаниеМатериализации = Неопределено Тогда\n"
         '    ВызватьИсключение "unknown table transfer token";\n'
@@ -119,12 +119,12 @@ def close_transfer_instruction(token: str) -> str:
     literal = bsl_string_literal(_token(token))
     return (
         f"ТокенМатериализации = {literal};\n"
-        "Если Контекст.Свойство(\"RuntimeTableTransfers\") Тогда\n"
-        "    ОписаниеМатериализации = Контекст.RuntimeTableTransfers.Получить("
+        "Если e1cRuntimeКонтекст.Свойство(\"RuntimeTableTransfers\") Тогда\n"
+        "    ОписаниеМатериализации = e1cRuntimeКонтекст.RuntimeTableTransfers.Получить("
         "ТокенМатериализации);\n"
         "    Если ОписаниеМатериализации <> Неопределено Тогда\n"
         "        УдалитьИзВременногоХранилища(ОписаниеМатериализации.Адрес);\n"
-        "        Контекст.RuntimeTableTransfers.Удалить(ТокенМатериализации);\n"
+        "        e1cRuntimeКонтекст.RuntimeTableTransfers.Удалить(ТокенМатериализации);\n"
         "    КонецЕсли;\n"
         "КонецЕсли;\n"
         "Результат = Истина;"

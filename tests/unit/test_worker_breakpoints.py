@@ -21,11 +21,7 @@ from onec_runtime.worker_breakpoints import (
     map_worker_stop,
     resolve_source_line,
 )
-from test_runtime_api import (
-    _common_module_catalog,
-    _semantic_snapshot_runtime,
-    _worker_module_unit,
-)
+from worker_debug_fixtures import worker_debug_view
 
 
 def _debug_module(tmp_path: Path):
@@ -33,14 +29,7 @@ def _debug_module(tmp_path: Path):
 
 
 def _debug_view(tmp_path: Path, *, name: str = "МодульА", revision: int = 17):
-    catalog = _common_module_catalog(name)
-    unit = _worker_module_unit(name, revision, catalog)
-    api = _semantic_snapshot_runtime(tmp_path, catalog)
-    api.load_worker_modules((unit,), common_modules=catalog)
-    pin = api._worker_universe.pin_active()
-    view = api._worker_universe._operation_debug_view(pin)
-    api._worker_universe.release_pin(pin)
-    return view
+    return worker_debug_view(tmp_path, name=name, revision=revision)
 
 
 def test_source_line_roundtrips_to_one_generated_worker_line(

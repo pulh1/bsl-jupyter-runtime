@@ -22,7 +22,11 @@ from onec_runtime.bsl.module_syntax import (
     ModuleSyntaxRegistry,
 )
 from onec_runtime.bsl.semantic_lowering import (
+    CAPTURE_LOWERING_PROFILE,
+    MAIN_LOWERING_PROFILE,
+    CaptureNamespaceRule,
     LoweringMode,
+    LoweringProfile,
     MethodScope,
     ModuleBinding,
     NameBinding,
@@ -62,6 +66,10 @@ __all__ = [
     "DiagnosticStage",
     "LoweredSourceLocation",
     "LoweringMode",
+    "LoweringProfile",
+    "CaptureNamespaceRule",
+    "MAIN_LOWERING_PROFILE",
+    "CAPTURE_LOWERING_PROFILE",
     "MappingConfidence",
     "MethodScope",
     "ModuleUniverseAdmissionError",

@@ -303,6 +303,59 @@ def test_denied_child_uses_the_exact_three_field_wire_model_without_a_guard_call
         adapter.context.variables[0]
 
 
+def test_unavailable_entry_keeps_siblings_visible_and_exact_lookup_can_be_retried():
+    adapter, backend = setup_values(roots={
+        "Недоступное": scalar("hidden"), "Доступное": scalar("42"),
+    })
+    original_project = backend.project_values
+    def with_unavailable(fence, request):
+        projection = original_project(fence, request)
+        entries = tuple(
+            api().PrivateProjectedValue(
+                entry.name,
+                lambda: (_ for _ in ()).throw(AssertionError("must not describe")),
+                unavailable=True,
+            ) if entry.name == "Недоступное" else entry
+            for entry in projection.entries
+        )
+        return api().PrivateValueProjection(entries, projection.total, projection.next_cursor)
+    backend.project_values = with_unavailable
+
+    page = adapter.context.variables[:2]
+    unavailable, available = page.items
+    assert type(unavailable).__name__ == "UnavailableValueNode"
+    assert unavailable.name == "Недоступное"
+    assert unavailable.access == "unavailable"
+    assert unavailable.expandable is False
+    assert available.preview == "42"
+    assert public_artifact_value(unavailable) == {
+        "name": "Недоступное", "access": "unavailable", "expandable": False,
+    }
+    with pytest.raises(CaptureValueCheckError, match="unavailable"):
+        adapter.context.variables["Недоступное"]
+    backend.project_values = original_project
+    assert adapter.context.variables["Недоступное"].preview == "hidden"
+
+
+def test_saved_value_cannot_expand_when_fresh_resolve_is_unavailable():
+    adapter, backend = setup_values(roots={"Значение": Value(
+        "Структура", "ignored", "structure", [("Поле", scalar())],
+    )})
+    saved = adapter.context.variables["Значение"]
+    backend.resolve_value = lambda fence, path: api().PrivateProjectedValue(
+        "Значение", lambda: (_ for _ in ()).throw(AssertionError("must not describe")),
+        unavailable=True,
+    )
+
+    with pytest.raises(CaptureValueCheckError, match="unavailable"):
+        saved.fields[:1]
+
+
+def test_unavailable_public_node_rejects_unsafe_name():
+    with pytest.raises(CapturePathError):
+        api().UnavailableValueNode("Значение);Опасно()")
+
+
 def test_backend_admission_redacts_alias_and_nested_descendant_before_metadata():
     shared = scalar("secret", identity="worker-generation")
     roots = {

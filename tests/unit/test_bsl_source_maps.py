@@ -159,7 +159,7 @@ def test_transform_composes_exact_derived_and_synthetic_fragments() -> None:
     source = "Ответ = 1;"
     visible = mapped_visible_source(source, _unit(source))
     builder = SourceTransformBuilder(visible)
-    builder.synthetic('Контекст.Вставить("', SourceSpan(0, 6), "persistent_assignment")
+    builder.synthetic('e1cRuntimeКонтекст.Вставить("', SourceSpan(0, 6), "persistent_assignment")
     builder.derived("Ответ", SourceSpan(0, 5), "persistent_name")
     builder.synthetic('", ', SourceSpan(0, 7), "persistent_assignment")
     builder.copy(SourceSpan(8, 9))
@@ -167,10 +167,10 @@ def test_transform_composes_exact_derived_and_synthetic_fragments() -> None:
     builder.copy(SourceSpan(9, 10))
     lowered = builder.build(SourceArtifactKind.SEMANTIC_LOWERING)
 
-    one = lowered.text.index("1")
+    one = lowered.text.rindex("1")
     assert lowered.source_map.map_offset(one).origin_span == SourceSpan(8, 9)
     assert lowered.source_map.map_offset(one).relation is MappingRelation.EXACT
-    runtime_prefix = lowered.text.index("Контекст")
+    runtime_prefix = lowered.text.index("e1cRuntimeКонтекст")
     synthetic = lowered.source_map.map_offset(runtime_prefix)
     assert synthetic.relation is MappingRelation.SYNTHETIC
     assert synthetic.unit is None

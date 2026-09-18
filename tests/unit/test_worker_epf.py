@@ -255,6 +255,62 @@ def test_prepared_worker_module_normalizes_crlf_split_between_exact_segments() -
     assert newline.origin_span == SourceSpan(2, 3)
 
 
+@pytest.mark.parametrize("first_relation", (MappingRelation.EXACT, MappingRelation.SYNTHETIC))
+def test_adjacent_crlf_across_parent_segments_preserves_each_origin(
+    first_relation: MappingRelation,
+) -> None:
+    """Break caught: adjacent newlines must not merge into a multi-parent edit."""
+    source = "A\r\n\r\nB"
+    unit = SourceUnitRef(
+        SourceUnitKind.MODULE, "AdjacentLineEndings", 1, source_sha256(source)
+    )
+    artifact = SourceArtifactRef(
+        SourceArtifactKind.WORKER_PROJECTION,
+        source_sha256(source),
+        len(source),
+        "crlf",
+    )
+    first = (
+        SourceMapSegment(
+            SourceSpan(0, 3), unit, SourceSpan(0, 3), MappingRelation.EXACT,
+        )
+        if first_relation is MappingRelation.EXACT
+        else SourceMapSegment(
+            SourceSpan(0, 3), None, None, MappingRelation.SYNTHETIC,
+            "worker_dependency_field", unit, SourceSpan(0, 1),
+        )
+    )
+    parent_map = SourceMap(
+        artifact,
+        (
+            first,
+            SourceMapSegment(
+                SourceSpan(3, 6), unit, SourceSpan(3, 6), MappingRelation.EXACT,
+            ),
+        ),
+    )
+
+    prepared = worker_epf.prepare_worker_module_source(
+        MappedSource(source, artifact, parent_map)
+    )
+
+    assert prepared.text == "A\n\nB"
+    first_newline = prepared.source_map.map_offset(1)
+    assert first_newline.relation is first_relation
+    if first_relation is MappingRelation.SYNTHETIC:
+        assert first_newline.synthetic_region == "worker_dependency_field"
+    else:
+        assert first_newline.origin_span == SourceSpan(2, 3)
+    second_newline = prepared.source_map.map_offset(2)
+    assert second_newline.relation is MappingRelation.EXACT
+    assert second_newline.unit == unit
+    assert second_newline.origin_span == SourceSpan(4, 5)
+    recomposed = parent_map
+    for local in prepared.lineage:
+        recomposed = compose_source_maps(local, recomposed)
+    assert recomposed == prepared.source_map
+
+
 def test_prepared_worker_module_preserves_derived_metadata_across_crlf_seam() -> None:
     """Break caught: seam handling must retain adjacent derived/exact provenance."""
     source = "A\r\nB"

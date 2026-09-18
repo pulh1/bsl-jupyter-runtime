@@ -86,12 +86,8 @@ def test_observer_shared_baseline_and_real_saved_file(tmp_path):
 
 @pytest.mark.skipif(os.name != 'nt', reason='Windows native API')
 def test_native_signal_real_wait_rearm_close_and_exact_handles(tmp_path):
+    import ctypes
     from onec_runtime_jupyter.lsp_workspace_notify import WindowsChangeSignal
-    from windows_owned_handles import WindowsOwnedHandles
-    # Warm ctypes/Windows resource loading before exact handle accounting.
-    signal = WindowsChangeSignal(tmp_path); signal.close()
-    handles = WindowsOwnedHandles()
-    before = handles.sample().counted
     for i in range(10):
         signal = WindowsChangeSignal(tmp_path)
         assert signal.wait(1) is False
@@ -101,8 +97,13 @@ def test_native_signal_real_wait_rearm_close_and_exact_handles(tmp_path):
         module.write_text('second')
         assert signal.wait(1000) is True
         signal.rearm()
+        native_handle = signal.handle
         signal.close(); signal.close()
-    assert handles.sample().counted == before
+        assert signal.handle is None
+        # Check this notification handle itself: unrelated Jupyter threads
+        # can change the process-wide handle count during the full suite.
+        assert signal.api.WaitForSingleObject(native_handle, 0) == 0xFFFFFFFF
+        assert ctypes.get_last_error() == 6  # ERROR_INVALID_HANDLE
 
 
 def test_edits_during_scan_are_observed_by_a_following_pass(tmp_path):

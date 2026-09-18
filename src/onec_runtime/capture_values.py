@@ -109,7 +109,7 @@ class ValueRoot:
 
     def __repr__(self) -> str:
         return (
-            "КонтекстОтладки"
+            "e1cRuntimeКонтекстОтладки"
             if self.kind is ValueRootKind.CONTEXT
             else f"frame[{self.native_level}]"
         )
@@ -187,12 +187,13 @@ class ValueMetadata:
 
 @dataclass(frozen=True, slots=True, repr=False)
 class PrivateProjectedValue:
-    """One backend-admitted result; metadata is absent for a denied value."""
+    """One backend-admitted result; denied/unavailable have no metadata."""
 
     name: str | int
     describe: Callable[[], ValueMetadata] = field(repr=False, compare=False)
     denied: bool = False
     cycle: bool = False
+    unavailable: bool = False
 
     def __post_init__(self) -> None:
         if type(self.name) is int:
@@ -204,8 +205,12 @@ class PrivateProjectedValue:
             raise CaptureValueCheckError("projected metadata reader is invalid")
         if type(self.denied) is not bool:
             raise CaptureValueCheckError("projected admission state is invalid")
+        if type(self.unavailable) is not bool or self.denied and self.unavailable:
+            raise CaptureValueCheckError("projected availability state is invalid")
         if type(self.cycle) is not bool:
             raise CaptureValueCheckError("projected cycle marker is invalid")
+        if self.unavailable and self.cycle:
+            raise CaptureValueCheckError("unavailable value cannot be cyclic")
 
 
 @dataclass(frozen=True, slots=True)
@@ -345,8 +350,29 @@ class DeniedValueNode:
 
 
 @dataclass(frozen=True, slots=True, repr=False)
+class UnavailableValueNode:
+    """Name-only public marker for a value whose metadata could not be read."""
+
+    name: str | int
+    access: str = field(init=False, default="unavailable")
+    expandable: bool = field(init=False, default=False)
+
+    def __post_init__(self) -> None:
+        if type(self.name) is int:
+            if self.name < 0:
+                raise CaptureValueCheckError("projected index is invalid")
+        else:
+            _identifier(self.name, what="projected name")
+
+    def __str__(self) -> str:
+        return f"{self.name}: <unavailable>"
+
+    __repr__ = __str__
+
+
+@dataclass(frozen=True, slots=True, repr=False)
 class ValuePage:
-    items: tuple[ValueNode | DeniedValueNode, ...]
+    items: tuple[ValueNode | DeniedValueNode | UnavailableValueNode, ...]
     total: int
     next_cursor: int | None
     path: SafeValuePath
@@ -356,7 +382,8 @@ class ValuePage:
 
     def __post_init__(self) -> None:
         if type(self.items) is not tuple or any(
-            not isinstance(item, (ValueNode, DeniedValueNode)) for item in self.items
+            not isinstance(item, (ValueNode, DeniedValueNode, UnavailableValueNode))
+            for item in self.items
         ):
             raise TypeError("value page items must be an immutable tuple")
 
@@ -658,6 +685,8 @@ class LocalCaptureValueAdapter:
         root_record = self._backend.resolve_value(self._fence, node.path)
         if root_record.denied:
             raise CaptureValueAccessDeniedError("capture value is private")
+        if root_record.unavailable:
+            raise CaptureValueCheckError("capture value is unavailable")
         root_metadata = self._describe(root_record)
         if not isinstance(root_metadata, ValueMetadata) or root_metadata.shape is not node.shape:
             raise CaptureValueCheckError("capture value shape changed during inspection")
@@ -776,7 +805,7 @@ class LocalCaptureValueAdapter:
         exact_access: bool,
         segment_kind: ValuePathSegmentKind = ValuePathSegmentKind.VARIABLE,
     ) -> ValuePage:
-        nodes: list[ValueNode | DeniedValueNode] = []
+        nodes: list[ValueNode | DeniedValueNode | UnavailableValueNode] = []
         for entry in projection.entries:
             name = entry.name
             if segment_kind in {
@@ -793,6 +822,10 @@ class LocalCaptureValueAdapter:
                 if exact_access:
                     raise CaptureValueAccessDeniedError("capture value is private")
                 node = DeniedValueNode(checked_name)
+            elif entry.unavailable:
+                if exact_access:
+                    raise CaptureValueCheckError("capture value is unavailable")
+                node = UnavailableValueNode(checked_name)
             else:
                 path = request.path.child(segment_kind, checked_name)
                 metadata = self._describe(entry)
@@ -849,7 +882,7 @@ class LocalCaptureValueAdapter:
     @staticmethod
     def _preview(metadata: ValueMetadata) -> str:
         preview = metadata.preview
-        if metadata.shape is not ValueShape.SCALAR and metadata.size is not None:
+        if metadata.shape not in {ValueShape.SCALAR, ValueShape.UNDOCUMENTED} and metadata.size is not None:
             preview = f"{metadata.size} elements"
         if len(preview) > MAX_PREVIEW_CHARS:
             preview = preview[: MAX_PREVIEW_CHARS - 1] + "…"
@@ -897,4 +930,6 @@ class LocalCaptureValueAdapter:
         item = page.items[0]
         if isinstance(item, DeniedValueNode):
             raise CaptureValueAccessDeniedError("capture value is private")
+        if isinstance(item, UnavailableValueNode):
+            raise CaptureValueCheckError("capture value is unavailable")
         return item

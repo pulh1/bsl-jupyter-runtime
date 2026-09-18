@@ -4,7 +4,7 @@ from xml.etree import ElementTree
 
 import pytest
 
-from onec_runtime.errors import ProtocolError
+from onec_runtime.errors import CommandTimeout, ProtocolError, RdbgTransportTimeout
 from onec_runtime.rdbg.models import DebugTarget, EvaluationResult, ModuleLocation, StopEvent, TargetId
 from onec_runtime.rdbg.session import RdbgSession, SessionState
 from onec_runtime.rdbg.xml_codec import BASE_NS, RDBG_NS, build_terminate_request
@@ -271,6 +271,88 @@ def test_absent_bound_client_requires_no_native_termination() -> None:
     session = bound_session(transport)
     assert session.terminate_bound_server_session() is False
     assert not any(command == "terminateDbgTarget" for command, _ in transport.calls)
+
+
+def test_termination_ack_does_not_prove_bound_targets_disappeared() -> None:
+    transport = Transport()
+    session = bound_session(transport)
+    transport.responses["getDbgAllTargetStates"].extend([
+        states((SERVER, "Server"), (CLIENT, "ManagedClient")),
+        states((CLIENT, "ManagedClient")),
+        states((SERVER, "Server"), (CLIENT, "ManagedClient")),
+    ])
+
+    assert session.terminate_bound_server_session() is True
+    with pytest.raises(CommandTimeout, match="disappearance was not confirmed"):
+        session.wait_for_bound_server_targets_absent(SERVER, timeout_s=0)
+    assert [command for command, _ in transport.calls].count("terminateDbgTarget") == 2
+
+
+def test_bound_target_absence_evidence_requires_client_and_new_server_targets_absent() -> None:
+    transport = Transport()
+    session = bound_session(transport)
+    next_server = TargetId(UUID(int=15), CLIENT.infobase_alias, CLIENT.seance_id)
+    transport.responses["getDbgAllTargetStates"].extend([
+        states((SERVER, "Server"), (CLIENT, "ManagedClient")),
+        states((CLIENT, "ManagedClient")),
+        states((next_server, "Server"), (FOREIGN, "Server")),
+        states((FOREIGN, "Server")),
+    ])
+
+    assert session.terminate_bound_server_session() is True
+    evidence = session.wait_for_bound_server_targets_absent(
+        SERVER, timeout_s=0.1, poll_interval_s=0
+    )
+    assert evidence.bound_client == CLIENT
+    assert evidence.expected_target == SERVER
+    assert evidence.source == "getDbgAllTargetStates"
+    assert evidence.observations == 2
+    assert evidence.observed_at_monotonic > 0
+
+
+def test_bound_target_absence_rejects_foreign_identity() -> None:
+    transport = Transport()
+    session = bound_session(transport)
+    with pytest.raises(ProtocolError, match="bound client session"):
+        session.wait_for_bound_server_targets_absent(FOREIGN, timeout_s=0)
+    assert transport.calls == []
+
+
+def test_bound_target_absence_rejects_replacement_client_in_same_session() -> None:
+    transport = Transport()
+    session = bound_session(transport)
+    replacement = TargetId(UUID(int=16), CLIENT.infobase_alias, CLIENT.seance_id)
+    transport.responses["getDbgAllTargetStates"].append(
+        states((replacement, "ManagedClient"))
+    )
+    with pytest.raises(CommandTimeout, match="disappearance was not confirmed"):
+        session.wait_for_bound_server_targets_absent(SERVER, timeout_s=0)
+
+
+def test_bound_target_absence_requires_other_target_types_in_same_session_to_disappear() -> None:
+    transport = Transport()
+    session = bound_session(transport)
+    other = TargetId(UUID(int=17), CLIENT.infobase_alias, CLIENT.seance_id)
+    transport.responses["getDbgAllTargetStates"].append(
+        states((other, "BackgroundJob"))
+    )
+    with pytest.raises(CommandTimeout, match="disappearance was not confirmed"):
+        session.wait_for_bound_server_targets_absent(SERVER, timeout_s=0)
+
+
+def test_bound_target_absence_probe_transport_failure_is_unknown() -> None:
+    class FailingProbeTransport(Transport):
+        def request(self, command: str, payload: bytes = b"", **kwargs: object) -> bytes:
+            if command == "getDbgAllTargetStates" and fail_probe[0]:
+                raise RdbgTransportTimeout("probe timed out")
+            return super().request(command, payload, **kwargs)
+
+    fail_probe = [False]
+    transport = FailingProbeTransport()
+    session = bound_session(transport)
+    fail_probe[0] = True
+    with pytest.raises(RdbgTransportTimeout, match="probe timed out"):
+        session.wait_for_bound_server_targets_absent(SERVER, timeout_s=0)
 
 
 @pytest.mark.parametrize("payload", [

@@ -123,6 +123,64 @@ def test_production_value_wire_parser_rejects_unknown_or_duplicate_layout_withou
         envelope.decode(admission, content)
 
 
+def test_value_wire_accepts_name_only_unavailable_entry_without_metadata():
+    envelope = _project_envelope()
+    document = {
+        "v": 1, "action": "project",
+        "entries": [{"name": "СложныйОбъект", "unavailable": True}],
+        "total": 1, "next": None,
+    }
+    payload = json.dumps(document, ensure_ascii=False, separators=(",", ":")).encode()
+    admission, content = _admission(envelope, payload)
+
+    projection = envelope.decode(admission, content)
+
+    assert projection.entries[0].name == "СложныйОбъект"
+    assert projection.entries[0].unavailable is True
+    assert projection.entries[0].denied is False
+
+
+@pytest.mark.parametrize("entry", [
+    {"name": "Значение", "unavailable": False},
+    {"name": "Значение", "unavailable": True, "preview": "SECRET"},
+    {"name": "Значение", "unavailable": True, "denied": True},
+    {"name": "Значение);Опасно()", "unavailable": True},
+])
+def test_value_wire_rejects_malformed_unavailable_entry(entry):
+    envelope = _project_envelope()
+    document = {
+        "v": 1, "action": "project", "entries": [entry],
+        "total": 1, "next": None,
+    }
+    payload = json.dumps(document, ensure_ascii=False, separators=(",", ":")).encode()
+    admission, content = _admission(envelope, payload)
+
+    with pytest.raises(CaptureValueCheckError) as rejected:
+        envelope.decode(admission, content)
+
+    assert "SECRET" not in str(rejected.value)
+
+
+def test_value_wire_resolve_can_report_unavailable_without_a_value():
+    path = SafeValuePath(ValueRoot(ValueRootKind.CONTEXT)).child(
+        ValuePathSegmentKind.VARIABLE, "СложныйОбъект",
+    )
+    envelope = build_capture_value_inspection_envelope(
+        action="resolve", path=path, request=None, limit=None,
+        runtime_generation=7, context_generation=11,
+        worker_type_registrations=(),
+    )
+    payload = json.dumps({
+        "v": 1, "action": "resolve",
+        "entry": {"name": "СложныйОбъект", "unavailable": True},
+    }, ensure_ascii=False, separators=(",", ":")).encode()
+    admission, content = _admission(envelope, payload)
+
+    entry = envelope.decode(admission, content)
+
+    assert entry.name == "СложныйОбъект" and entry.unavailable is True
+
+
 @pytest.mark.parametrize(
     "shape",
     (

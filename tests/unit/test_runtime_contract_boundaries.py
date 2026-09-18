@@ -17,7 +17,7 @@ def guarded(name, *args, **kwargs):
 
 builtins.__import__ = guarded
 
-import onec_runtime.runtime_api
+import onec_runtime.execution.public_facade
 import onec_runtime.privacy
 import onec_runtime.session
 """

@@ -51,6 +51,7 @@ from onec_runtime.rdbg.models import (
     StopEvent,
     TargetId,
 )
+from onec_runtime.rdbg.session import SessionState
 from onec_runtime.session import (
     ExtensionMode,
     RuntimeSession,
@@ -316,6 +317,9 @@ class _SessionModuleRuntimeApi:
 
     def owns_debug_ui_stream(self) -> bool:
         return False
+
+    def close(self) -> None:
+        """Retire the fake public execution owner during Session teardown."""
 
 
 class _IdleRdbg:
@@ -929,6 +933,7 @@ def patch_successful_runtime_attempt(
         on_entry(rdbg)
         service_target_id = probe.service_target_id or probe.server_target_id
         rdbg.target = DebugTarget(service_target_id, server_target_type, "stopped")
+        rdbg.state = SessionState.READY
         error = probe.service_errors.get(rdbg.attempt)
         if error is not None:
             raise error
@@ -952,29 +957,6 @@ def patch_successful_runtime_attempt(
         session_module,
         "enable_server_kernel_loop",
         lambda _rdbg: SimpleNamespace(as_dict=lambda: {"guard": "sanitized"}),
-    )
-    monkeypatch.setattr(
-        session_module,
-        "PrototypeRuntimeController",
-        lambda *_args, **_kwargs: object(),
-    )
-    def runtime_api(*_args: object, **kwargs: object) -> object:
-        probe.runtime_api_kwargs.append(dict(kwargs))
-        return SimpleNamespace()
-
-    monkeypatch.setattr(session_module, "PrototypeRuntimeApi", runtime_api)
-    monkeypatch.setattr(
-        session_module, "NotebookWorkerArtifactBuilder", lambda _runtime: object()
-    )
-    def module_builder(packer: object, **kwargs: object) -> object:
-        probe.module_builder_args.append((packer, dict(kwargs)))
-        return SimpleNamespace(kind="worker-module-builder")
-
-    monkeypatch.setattr(
-        session_module,
-        "WorkerModuleArtifactBuilder",
-        module_builder,
-        raising=False,
     )
     return probe
 
@@ -1038,14 +1020,8 @@ def test_fast_session_starts_without_designer_and_commits_after_two_handshakes(
     ]
     assert lifecycle.tool_calls == []
     assert started.attempt_count == 1
-    assert len(started.module_builder_args) == 1
-    packer, module_builder_kwargs = started.module_builder_args[0]
-    assert packer is started.runtime_api_kwargs[0]["notebook_worker_builder"]
-    assert module_builder_kwargs["packer_version"] == "worker-epf-v1"
-    assert module_builder_kwargs["target_profile"] == "runtime-session-server-v1"
-    assert started.runtime_api_kwargs[0]["worker_module_builder"].kind == (
-        "worker-module-builder"
-    )
+    assert isinstance(session.runtime_api, session_module.PublicExecutionFacade)
+    assert session.runtime_api._arbiter._session is session._rdbg
     bootstrap_text = (session.artifacts.run_dir / "bootstrap.json").read_text(
         encoding="utf-8"
     )

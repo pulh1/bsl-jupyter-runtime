@@ -48,31 +48,39 @@ def test_write_oracle_planned_rename_create_delete_preserves_exact_bytes(tmp_pat
 
 
 def test_browser_reload_code_uses_public_generations_and_releases_handles(tmp_path):
-    pytest.importorskip('playwright.sync_api')
-    from types import SimpleNamespace
-    from test_runtime_api import (_semantic_snapshot_runtime, _common_module_catalog,
-                                  _SemanticSnapshotFailureTarget, _worker_module_source_unit)
-    browser = import_module('tools.check_jupyter_lsp_runtime')
-    catalog = _common_module_catalog('JupyterBslFixtureCalleeServer')
-    target = _SemanticSnapshotFailureTarget()
-    runtime = _semantic_snapshot_runtime(tmp_path, catalog, target=target)
-    session = SimpleNamespace(runtime_api=runtime,
-        load_worker_modules=lambda units: runtime.load_worker_modules(units, common_modules=catalog),
-        release_worker_generation=runtime.release_worker_generation)
-    namespace = {'_lsp_runtime': session, '_lsp_target': target, '_worker_module_source_unit': _worker_module_source_unit}
+    from tools.lsp_public_fixture import (
+        LspFailureTarget, make_lsp_session, reload_code,
+        worker_module_source_unit,
+    )
+    source_root = tmp_path / 'project'
+    modules = source_root / 'CommonModules'
+    modules.mkdir(parents=True)
+    (modules / 'JupyterBslFixtureCalleeServer.xml').write_text(
+        '<MetaDataObject><CommonModule><Properties>'
+        '<Name>JupyterBslFixtureCalleeServer</Name><Global>false</Global>'
+        '<Server>true</Server><ClientManagedApplication>false</ClientManagedApplication>'
+        '<ClientOrdinaryApplication>false</ClientOrdinaryApplication>'
+        '</Properties></CommonModule></MetaDataObject>', encoding='utf-8',
+    )
+    target = LspFailureTarget()
+    session = make_lsp_session(tmp_path / 'work', source_root, target)
+    namespace = {
+        '_lsp_runtime': session, '_lsp_target': target,
+        '_worker_module_source_unit': worker_module_source_unit,
+    }
     try:
-        exec(browser.reload_code('InMemoryA', 1), namespace)
-        first = runtime.worker_generation_handle
+        exec(reload_code('InMemoryA', 1), namespace)
+        first = session.status().worker_generation
         assert first is not None
-        exec(browser.reload_code('InMemoryB', 2), namespace)
-        second = runtime.worker_generation_handle
+        exec(reload_code('InMemoryB', 2), namespace)
+        second = session.status().worker_generation
         assert second is not first
-        exec(browser.reload_code('Failed', 3, failure='swap_guard'), namespace)
-        assert runtime.worker_generation_handle is second
+        exec(reload_code('Failed', 3, failure='swap_guard'), namespace)
+        assert session.status().worker_generation is second
         assert target.failure is None
-        assert len(runtime._worker_universe._confirmed_live_inventory().manifest_sha256s) == 1
+        assert session.runtime_api.confirmed_worker_module_units(second)
     finally:
-        runtime.close()
+        session.close()
 
 
 @pytest.mark.parametrize('layout', ['designer', 'edt-parent', 'edt-src'])

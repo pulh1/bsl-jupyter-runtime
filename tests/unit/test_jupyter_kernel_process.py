@@ -19,8 +19,7 @@ def test_failed_bsl_cell_stops_nbclient_unless_explicitly_allowed(
 ) -> None:
     """Exercise real kernel transport; only the external 1C backend is replaced."""
     setup = '''from onec_runtime_jupyter import install_runtime, load_ipython_extension
-from onec_runtime.runtime_api import RuntimeNamespaceSnapshot, RuntimeReply, RuntimeReplyKind, RuntimeStatus
-from onec_runtime.prototype_runtime import OperationState
+from onec_runtime.runtime_models import OperationState, RuntimeNamespaceSnapshot, RuntimeReply, RuntimeReplyKind, RuntimeStatus
 class FailedRuntime:
     def execute_bsl(self, source, *, source_unit):
         return RuntimeReply(KIND, 1, STATE, succeeded=False,
@@ -115,8 +114,7 @@ def test_real_ipykernel_runs_python_and_bsl_cells_in_one_namespace() -> None:
         client.wait_for_ready(timeout=20)
         setup = r'''
 from onec_runtime_jupyter.extension import MACHINE_MIME_TYPE, install_runtime
-from onec_runtime.prototype_runtime import OperationState
-from onec_runtime.runtime_api import RuntimeNamespaceSnapshot, RuntimeReply, RuntimeReplyKind, RuntimeStatus
+from onec_runtime.runtime_models import OperationState, RuntimeNamespaceSnapshot, RuntimeReply, RuntimeReplyKind, RuntimeStatus
 
 class StubRuntime:
     def __init__(self):

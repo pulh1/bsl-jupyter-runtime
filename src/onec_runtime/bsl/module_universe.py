@@ -15,16 +15,17 @@ from typing import Any, Literal
 from weakref import ReferenceType, WeakKeyDictionary, ref
 
 from onec_runtime.bsl.lexer import BslLexError, tokenize
-from onec_runtime.bsl.parser_target import (
-    BslParseError,
-    PythonParserTarget,
-    parse_raw_module,
-)
 from onec_runtime.bsl.module_catalog import (
     CommonModuleCatalogSnapshot,
     CommonModuleDescriptor,
     CommonModuleScope,
 )
+from onec_runtime.bsl.parser_target import (
+    BslParseError,
+    PythonParserTarget,
+    parse_raw_module,
+)
+from onec_runtime.bsl.platform_globals import WORKER_PLATFORM_GLOBALS
 from onec_runtime.bsl.source_maps import (
     MappedSource,
     SourceArtifactKind,
@@ -61,41 +62,7 @@ DEPENDENCY_ALIAS_DECLARATION_REGION = "worker_dependency_alias_declaration"
 DEPENDENCY_ALIAS_INITIALIZER_REGION = "worker_dependency_alias_initializer"
 IMPLICIT_LOCAL_DECLARATION_REGION = "worker_implicit_local_declaration"
 
-_PLATFORM_GLOBALS = frozenset(
-    {
-        "статуссообщения",
-        "символы",
-        "кодировкатекста",
-        "справочники",
-        "документы",
-        "журналыдокументов",
-        "регистрысведений",
-        "регистрынакопления",
-        "регистрыбухгалтерии",
-        "регистрырасчета",
-        "планывидовхарактеристик",
-        "планысчетов",
-        "планывидоврасчета",
-        "планыобмена",
-        "бизнеспроцессы",
-        "задачи",
-        "критерииотбора",
-        "последовательности",
-        "константы",
-        "перечисления",
-        "внешниеобработки",
-        "внешниеотчеты",
-        "обработки",
-        "отчеты",
-        "метаданные",
-        "параметрысеанса",
-        "частидаты",
-        "обходрезультатазапроса",
-        "видсравнениякомпоновкиданных",
-        "типгруппыэлементовотборакомпоновкиданных",
-        "цветастиля",
-    }
-)
+_PLATFORM_GLOBALS = WORKER_PLATFORM_GLOBALS
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -673,12 +640,6 @@ def _analyze_parsed_worker_module(
                         _source_span(node.span),
                         MODULE_SCOPE_DEPENDENCY,
                     )
-                if node.Postfix:
-                    raise _analysis_error(
-                        "qualified module dependency cannot be resolved",
-                        _source_span(node.span),
-                        AMBIGUOUS_BINDING,
-                    )
         elements = elements.Rest
 
     for method in methods:
@@ -744,14 +705,6 @@ def _analyze_parsed_worker_module(
                 continue
             descriptor = catalog_by_name.get(normalized)
             if descriptor is None:
-                if node.Arguments is not None and not node.Postfix:
-                    continue
-                if node.Postfix:
-                    raise _analysis_error(
-                        "qualified module dependency cannot be resolved",
-                        _source_span(node.span),
-                        AMBIGUOUS_BINDING,
-                    )
                 continue
 
             category = _dependency_category(node)
@@ -963,16 +916,6 @@ def _prepare_isolated_worker_method(
                 continue
             descriptor = catalog_by_name.get(normalized)
             if descriptor is None:
-                if node.Arguments is not None and not node.Postfix:
-                    continue
-                if node.Postfix:
-                    raise _analysis_error(
-                        "qualified module dependency cannot be resolved",
-                        _offset_source_span(
-                            _source_span(node.span), method_span.start
-                        ),
-                        AMBIGUOUS_BINDING,
-                    )
                 continue
             try:
                 category = _dependency_category(node)

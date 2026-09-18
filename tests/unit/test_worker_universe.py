@@ -1227,7 +1227,7 @@ class _PreSwapTimestampFailureExecutor(_UniverseTargetExecutor):
         immutable_root = source.index(
             "Новый ФиксированнаяСтруктура(ДанныеКорня"
         )
-        seal = source.index('Контекст.Вставить("__OnecWorkerPrepared_')
+        seal = source.index('e1cRuntimeКонтекст.Вставить("__OnecWorkerPrepared_')
         timer = timestamps[self.timer_index]
         if self.timer_index == 0:
             assert try_start < timer < create < catch_start < seal
@@ -1736,7 +1736,7 @@ def _prepared_instruction(candidate) -> str:
         previous,
     )
 
-    assert 'Контекст.Вставить("RuntimeWorkerActiveGeneration"' not in source
+    assert 'e1cRuntimeКонтекст.Вставить("RuntimeWorkerActiveGeneration"' not in source
     assert f"__OnecWorkerPrepared_{transaction_id.hex}" in source
     assert source.rindex("ВнешниеОбработки.Создать") < source.index(
         "__OnecDependency_"
@@ -1751,10 +1751,10 @@ def _prepared_instruction(candidate) -> str:
     )
     swap = worker_universe.swap_worker_root_instruction(prepared)
 
-    assert swap.count('Контекст.Вставить("RuntimeWorkerActiveGeneration"') == 1
+    assert swap.count('e1cRuntimeКонтекст.Вставить("RuntimeWorkerActiveGeneration"') == 1
     assert 'ТекущийКореньWorker.RootKey <> "generation-6"' in swap
     assert swap.index("previous root identity mismatch") < swap.index(
-        'Контекст.Вставить("RuntimeWorkerActiveGeneration"'
+        'e1cRuntimeКонтекст.Вставить("RuntimeWorkerActiveGeneration"'
     )
 
 
@@ -1784,16 +1784,16 @@ def test_prepare_and_swap_instructions_time_separate_phases(
     )
     create = source.index("Новый Соответствие")
     immutable_root = source.index("Новый ФиксированнаяСтруктура(ДанныеКорня")
-    seal = source.index('Контекст.Вставить("__OnecWorkerPrepared_')
+    seal = source.index('e1cRuntimeКонтекст.Вставить("__OnecWorkerPrepared_')
     result = source.index(
         'Результат = "onec-worker-prepared-root-receipt-v1|'
     )
     assert len(timestamps) == 2
     assert timestamps[0] < create
     assert immutable_root < timestamps[1] < seal < result
-    assert 'Контекст.Вставить("RuntimeWorkerActiveGeneration"' not in source
+    assert 'e1cRuntimeКонтекст.Вставить("RuntimeWorkerActiveGeneration"' not in source
     assert swap_source.count(
-        'Контекст.Вставить("RuntimeWorkerActiveGeneration"'
+        'e1cRuntimeКонтекст.Вставить("RuntimeWorkerActiveGeneration"'
     ) == 1
     assert swap_source.count("ТекущаяУниверсальнаяДатаВМиллисекундах()") == 2
 
@@ -1982,7 +1982,7 @@ def test_server_promotion_stages_then_confirms_and_returns_only_handle(
         for source in target.calls[:-1]
     )
     assert target.calls[-1].count(
-        'Контекст.Вставить("RuntimeWorkerActiveGeneration", '
+        'e1cRuntimeКонтекст.Вставить("RuntimeWorkerActiveGeneration", '
         "ПодготовленныйКореньWorker.Root);"
     ) == 1
 
@@ -3555,9 +3555,9 @@ def test_promotion_instruction_wires_original_and_overloaded_targets_and_probes_
     assert "Новый ФиксированноеСоответствие" in source
     assert "Новый ФиксированнаяСтруктура" in source
     assert candidate.manifest.sha256 in source
-    assert 'Контекст.Вставить("RuntimeWorkerActiveGeneration"' not in source
+    assert 'e1cRuntimeКонтекст.Вставить("RuntimeWorkerActiveGeneration"' not in source
     assert source.index(
-        'Контекст.Вставить("__OnecWorkerPrepared_'
+        'e1cRuntimeКонтекст.Вставить("__OnecWorkerPrepared_'
     ) < source.index(
         'Результат = "onec-worker-prepared-root-receipt-v1|'
     )
@@ -3750,7 +3750,7 @@ def test_fixed_result_dependency_is_rejected_before_candidate_or_source_generati
     (
         "Результат",
         "рЕзУлЬтАт",
-        "Контекст",
+        "e1cRuntimeКонтекст",
         "ВнешниеОбработки",
         "ПоместитьВоВременноеХранилище",
         "Base64Значение",
@@ -5543,3 +5543,191 @@ def test_notebook_descriptor_repr_never_exposes_source_binary_or_paths(
     assert SOURCE not in rendered
     assert "notebook-worker-binary" not in rendered
     assert str(tmp_path.resolve()) not in rendered
+
+
+def test_worker_activation_adapter_promotes_over_supplied_port_and_retains_methods(
+    tmp_path: Path,
+) -> None:
+    """An activation must keep omitted methods and use only its admitted port."""
+    from onec_runtime.execution.common import NotebookCommonParser
+    from onec_runtime.execution.snapshot_binding import (
+        RoutePreparationSnapshot, SnapshotRouteBinding,
+    )
+    from onec_runtime.execution.worker_activation import WorkerUniverseActivationAdapter
+
+    parser = PythonParserTarget.from_generated()
+    owner = object()
+    host = worker_universe.WorkerUniverseRegistry(
+        runtime_generation=7, context_generation=3,
+    )
+    target = _UniverseTargetExecutor()
+    port = object()
+    observed_ports: list[object] = []
+    worker_breakpoints = [False]
+
+    def execute(supplied_port: object, source: str) -> object:
+        observed_ports.append(supplied_port)
+        assert supplied_port is port
+        candidate = host._pending
+        assert candidate is not None
+        target.acknowledge(candidate)
+        return target(source)
+
+    adapter = WorkerUniverseActivationAdapter(
+        host,
+        notebook_builder=_notebook_builder(tmp_path),
+        instruction_runner=execute,
+        target_profile="server-test",
+        worker_breakpoints_present=lambda: worker_breakpoints[0],
+    )
+
+    def intent(source: str, revision: int):
+        unit = SourceUnitRef(
+            SourceUnitKind.NOTEBOOK_CELL, "activation", revision,
+            source_sha256(source),
+        )
+        common = NotebookCommonParser(parser).prepare(source, unit)
+        snapshot = RoutePreparationSnapshot(
+            owner, revision, (), adapter.worker_exports, adapter.active_methods,
+        )
+        return SnapshotRouteBinding(
+            parser, owner=owner, version=revision,
+        ).worker_intent(common, snapshot.for_pipeline())
+
+    first = adapter.activate(intent(
+        "Функция Первый() Экспорт\nВозврат 1;\nКонецФункции\nИтог = Первый();", 1,
+    ), port=port)
+    old_pin = first.pin
+    first_snapshot = adapter.snapshot()
+    assert first_snapshot.revision == 1
+    assert first_snapshot.active_handle is first.handle
+    assert first_snapshot.active_methods is adapter.active_methods
+    assert first_snapshot.worker_exports is adapter.worker_exports
+
+    second_intent = intent(
+        "Функция Второй() Экспорт\nВозврат 2;\nКонецФункции", 2,
+    )
+    old_release = adapter._target.release
+    release_entered = Event()
+    allow_release = Event()
+
+    def delayed_release(handle):
+        release_entered.set()
+        assert allow_release.wait(3)
+        old_release(handle)
+
+    adapter._target.release = delayed_release
+    promoted: list[object] = []
+    failures: list[BaseException] = []
+
+    def promote_second():
+        try:
+            promoted.append(adapter.activate(second_intent, port=port))
+        except BaseException as error:
+            failures.append(error)
+
+    worker = Thread(target=promote_second)
+    worker.start()
+    try:
+        assert release_entered.wait(3)
+        assert adapter.snapshot() is first_snapshot
+    finally:
+        allow_release.set()
+        worker.join(3)
+    assert not failures
+    assert not worker.is_alive()
+    second = promoted[0]
+    second_snapshot = adapter.snapshot()
+    assert second_snapshot.revision == 2
+    assert second_snapshot.active_handle is second.handle
+    assert second_snapshot.active_methods is adapter.active_methods
+    assert second_snapshot.worker_exports is adapter.worker_exports
+    assert second_snapshot is not first_snapshot
+
+    assert observed_ports and set(observed_ports) == {port}
+    assert {export.method for export in adapter.active_methods.exports} == {
+        "Первый", "Второй",
+    }
+    assert host.active_handle is second.handle
+    assert old_pin.handle is first.handle
+    ordinary = adapter.pin_active(port=port)
+    assert ordinary is not None and ordinary.pin.handle is second.handle
+    worker_breakpoints[0] = True
+    with pytest.raises(ProtocolError, match="workspace transaction"):
+        adapter.pin_active(port=port)
+    with pytest.raises(ProtocolError, match="workspace transaction"):
+        ordinary.release(port=port)
+    assert host.active_handle is second.handle
+    worker_breakpoints[0] = False
+    ordinary.release(port=port)
+    first.release(port=port)
+    second.release(port=port)
+    assert host.active_handle is second.handle
+
+
+def test_worker_activation_adapter_retains_unknown_stage_without_replay(
+    tmp_path: Path,
+) -> None:
+    """An ambiguous stage must keep its owner even if the host is already broken."""
+    from onec_runtime.execution.common import NotebookCommonParser
+    from onec_runtime.execution.snapshot_binding import (
+        RoutePreparationSnapshot, SnapshotRouteBinding,
+    )
+    from onec_runtime.execution.worker import WorkerActivationUnknown
+    from onec_runtime.execution.worker_activation import WorkerUniverseActivationAdapter
+
+    host = worker_universe.WorkerUniverseRegistry(
+        runtime_generation=7, context_generation=3,
+    )
+    target = _UniverseTargetExecutor()
+    target.fault = "connect"
+    port = object()
+    calls = 0
+
+    def execute(supplied_port: object, source: str) -> object:
+        nonlocal calls
+        assert supplied_port is port
+        calls += 1
+        candidate = host._pending
+        assert candidate is not None
+        target.acknowledge(candidate)
+        return target(source)
+
+    adapter = WorkerUniverseActivationAdapter(
+        host, notebook_builder=_notebook_builder(tmp_path),
+        instruction_runner=execute, target_profile="server-test",
+        worker_breakpoints_present=lambda: False,
+    )
+    parser = PythonParserTarget.from_generated()
+    source = "Функция Первый() Экспорт\nВозврат 1;\nКонецФункции"
+    unit = SourceUnitRef(
+        SourceUnitKind.NOTEBOOK_CELL, "unknown", 1, source_sha256(source),
+    )
+    common = NotebookCommonParser(parser).prepare(source, unit)
+    owner = object()
+    intent = SnapshotRouteBinding(parser, owner=owner, version=1).worker_intent(
+        common, RoutePreparationSnapshot(owner, 1, (), ()).for_pipeline(),
+    )
+
+    with pytest.raises(WorkerActivationUnknown) as caught:
+        adapter.activate(intent, port=port)
+    caught.value.lease.retain_outcome_unknown(port=port)
+    assert host.state is worker_universe.WorkerUniverseState.BROKEN
+    assert calls == 1
+
+
+def test_worker_activation_adapter_requires_breakpoint_inventory(
+    tmp_path: Path,
+) -> None:
+    """Promotion cannot silently omit the Worker breakpoint workspace transaction."""
+    from onec_runtime.execution.worker_activation import WorkerUniverseActivationAdapter
+
+    host = worker_universe.WorkerUniverseRegistry(
+        runtime_generation=7, context_generation=3,
+    )
+    with pytest.raises(TypeError, match="breakpoint"):
+        WorkerUniverseActivationAdapter(
+            host,
+            notebook_builder=_notebook_builder(tmp_path),
+            instruction_runner=lambda _port, _source: None,
+        )

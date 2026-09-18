@@ -103,7 +103,7 @@ def test_server_extension_exposes_debug_context_execution_method() -> None:
     source = SERVER_EXTENSION_MODULE.read_text(encoding="utf-8-sig")
 
     assert (
-        "Функция ВыполнитьВКонтекстеОтладки(КонтекстОтладки, Код) Экспорт" in source
+        "Функция ВыполнитьВКонтекстеОтладки(e1cRuntimeКонтекстОтладки, Код) Экспорт" in source
     )
     assert "Выполнить(Код);" in source
     assert "Возврат РезультатИнструкции;" in source
@@ -118,13 +118,13 @@ def test_capture_execution_wrappers_snapshot_bind_and_restore_worker_pin() -> No
 
     for signature in (
         "Функция ВыполнитьКодТекущегоКонтекстаОтладки(Код) Экспорт",
-        "Функция ВыполнитьКодВКонтекстеОтладки(Контекст, Код) Экспорт",
+        "Функция ВыполнитьКодВКонтекстеОтладки(e1cRuntimeКонтекст, Код) Экспорт",
     ):
         start = source.index(signature)
         end = source.index("КонецФункции", start)
         wrapper = source[start:end]
         snapshot = (
-            f"Контекст.Свойство({slot}, "
+            f"e1cRuntimeКонтекст.Свойство({slot}, "
             "__OnecPinnedWorkerGenerationOriginal)"
         )
         bind = (
@@ -133,7 +133,7 @@ def test_capture_execution_wrappers_snapshot_bind_and_restore_worker_pin() -> No
         )
         execute = "Выполнить(Код);"
         restore = (
-            "ВосстановитьПинПоколенияWorker(Контекст, "
+            "ВосстановитьПинПоколенияWorker(e1cRuntimeКонтекст, "
             "__OnecPinnedWorkerGenerationSlotExists, "
             "__OnecPinnedWorkerGenerationOriginal);"
         )
@@ -149,18 +149,18 @@ def test_capture_execution_wrappers_snapshot_bind_and_restore_worker_pin() -> No
 def test_capture_worker_pin_restore_reinstates_or_removes_the_original_slot() -> None:
     source = SERVER_EXTENSION_MODULE.read_text(encoding="utf-8-sig")
     start = source.index(
-        "Процедура ВосстановитьПинПоколенияWorker(Контекст, "
+        "Процедура ВосстановитьПинПоколенияWorker(e1cRuntimeКонтекст, "
         "СлотСуществовал, ИсходноеЗначение)"
     )
     end = source.index("КонецПроцедуры", start)
     restore = source[start:end]
 
     assert (
-        'Контекст.Вставить("RuntimeWorkerPinnedOperationGeneration", '
+        'e1cRuntimeКонтекст.Вставить("RuntimeWorkerPinnedOperationGeneration", '
         "ИсходноеЗначение);"
     ) in restore
     assert (
-        'Контекст.Удалить("RuntimeWorkerPinnedOperationGeneration");'
+        'e1cRuntimeКонтекст.Удалить("RuntimeWorkerPinnedOperationGeneration");'
         in restore
     )
     assert "Если СлотСуществовал Тогда" in restore
@@ -170,11 +170,11 @@ def test_extension_exposes_manifest_checked_worker_pin_install_and_clear() -> No
     source = SERVER_EXTENSION_MODULE.read_text(encoding="utf-8-sig")
 
     assert (
-        "Функция УстановитьПинПоколенияWorker(Контекст, "
+        "Функция УстановитьПинПоколенияWorker(e1cRuntimeКонтекст, "
         "ОжидаемыйManifestSha256) Экспорт"
     ) in source
     assert (
-        'Контекст.Свойство("RuntimeWorkerActiveGeneration", '
+        'e1cRuntimeКонтекст.Свойство("RuntimeWorkerActiveGeneration", '
         "АктивноеПоколениеWorker)"
     ) in source
     assert (
@@ -182,11 +182,11 @@ def test_extension_exposes_manifest_checked_worker_pin_install_and_clear() -> No
         "ОжидаемыйManifestSha256"
     ) in source
     assert (
-        'Контекст.Вставить("RuntimeWorkerPinnedOperationGeneration", '
+        'e1cRuntimeКонтекст.Вставить("RuntimeWorkerPinnedOperationGeneration", '
         "АктивноеПоколениеWorker);"
     ) in source
-    assert "Функция ОчиститьПинПоколенияWorker(Контекст) Экспорт" in source
-    assert 'Контекст.Удалить("RuntimeWorkerPinnedOperationGeneration");' in source
+    assert "Функция ОчиститьПинПоколенияWorker(e1cRuntimeКонтекст) Экспорт" in source
+    assert 'e1cRuntimeКонтекст.Удалить("RuntimeWorkerPinnedOperationGeneration");' in source
 
 
 def test_server_extension_batches_reference_presentations() -> None:
@@ -309,7 +309,7 @@ def test_server_kernel_has_executable_entry_before_tight_loop() -> None:
     entry_line = server_extension_entry_breakpoint_line(SERVER_EXTENSION_MODULE)
 
     assert (
-        "Контекст = Новый Структура; "
+        "e1cRuntimeКонтекст = Новый Структура; "
         "// @runtime-server-extension-entry-breakpoint"
     ) in lines[
         entry_line - 1
@@ -327,7 +327,7 @@ def test_server_kernel_has_executable_entry_before_tight_loop() -> None:
 def test_server_kernel_rebinds_evicted_context_from_live_kernel_frame() -> None:
     source = SERVER_EXTENSION_MODULE.read_text(encoding="utf-8-sig")
 
-    assert "Функция НачатьКонтекстОтладки(КонтекстОтладки) Экспорт" in source
+    assert "Функция НачатьКонтекстОтладки(e1cRuntimeКонтекстОтладки) Экспорт" in source
     assert (
         "Функция ВосстановитьКонтекстВыполнения(КонтекстВыполнения) Экспорт"
     ) in source
@@ -335,26 +335,26 @@ def test_server_kernel_rebinds_evicted_context_from_live_kernel_frame() -> None:
     assert "СнимокКонтекста = Новый Структура;" in source
     assert "Для Каждого ЭлементКонтекста Из КонтекстВыполнения Цикл" in source
     assert "СнимокКонтекста.Вставить(" in source
-    assert "Контекст.Очистить();" in source
+    assert "e1cRuntimeКонтекст.Очистить();" in source
     assert "Для Каждого ЭлементКонтекста Из СнимокКонтекста Цикл" in source
-    assert 'Если Не Контекст.Свойство("__onec_runtime_context_id"' not in source
-    assert "Контекст = СинхронизироватьКонтекст(Контекст);" not in source
+    assert 'Если Не e1cRuntimeКонтекст.Свойство("__onec_runtime_context_id"' not in source
+    assert "e1cRuntimeКонтекст = СинхронизироватьКонтекст(e1cRuntimeКонтекст);" not in source
 
 
 def test_server_kernel_owns_context_and_capture_uses_temporary_transfer() -> None:
     source = SERVER_EXTENSION_MODULE.read_text(encoding="utf-8-sig")
 
     assert (
-        "Контекст = Новый Структура; "
+        "e1cRuntimeКонтекст = Новый Структура; "
         "// @runtime-server-extension-entry-breakpoint"
     ) in source
     assert "Функция НачатьКонтекстОтладкиВКонтексте(" in source
     assert "ПолучитьИзВременногоХранилища(АдресКонтекстаОтладки)" in source
-    assert "Функция ВыполнитьКодВКонтекстеОтладки(Контекст, Код) Экспорт" in source
-    assert "Функция ПоместитьЗначениеКонтекстаОтладки(Контекст, Имя) Экспорт" in source
+    assert "Функция ВыполнитьКодВКонтекстеОтладки(e1cRuntimeКонтекст, Код) Экспорт" in source
+    assert "Функция ПоместитьЗначениеКонтекстаОтладки(e1cRuntimeКонтекст, Имя) Экспорт" in source
     assert "ПоместитьВоВременноеХранилище(Значение)" in source
     assert (
-        "Функция ЗавершитьКонтекстОтладкиВКонтексте(Контекст) Экспорт"
+        "Функция ЗавершитьКонтекстОтладкиВКонтексте(e1cRuntimeКонтекст) Экспорт"
     ) in source
 
 
@@ -397,8 +397,8 @@ def test_message_helpers_follow_platform_compatible_bootstrap_prefix() -> None:
     assert source.index("@runtime-server-extension-service-breakpoint") < source.index(
         "Процедура ДобавитьСообщение("
     )
-    assert 'Контекст.Вставить("__onec_cell_messages_result_key", Ключ);' in source
-    assert 'Контекст.Вставить("__onec_cell_messages_result", Сообщения);' in source
+    assert 'e1cRuntimeКонтекст.Вставить("__onec_cell_messages_result_key", Ключ);' in source
+    assert 'e1cRuntimeКонтекст.Вставить("__onec_cell_messages_result", Сообщения);' in source
 
 
 def test_context_store_uses_session_cache_for_cross_request_debug_evaluation() -> None:
@@ -427,7 +427,7 @@ def test_context_store_uses_session_cache_for_cross_request_debug_evaluation() -
 def test_server_extension_persists_and_releases_capture_structure() -> None:
     source = SERVER_EXTENSION_MODULE.read_text(encoding="utf-8-sig")
 
-    assert "Функция НачатьКонтекстОтладки(КонтекстОтладки) Экспорт" in source
+    assert "Функция НачатьКонтекстОтладки(e1cRuntimeКонтекстОтладки) Экспорт" in source
     assert (
         "Функция ВосстановитьКонтекстВыполнения(КонтекстВыполнения) Экспорт"
     ) in source
@@ -435,7 +435,7 @@ def test_server_extension_persists_and_releases_capture_structure() -> None:
     assert "Функция ПолучитьЗначениеКонтекстаОтладки(Имя) Экспорт" in source
     assert "Функция ЗавершитьКонтекстОтладки() Экспорт" in source
     assert "\tВозврат Истина;\nКонецФункции" in source
-    assert source.count("КонтекстОтладки = Неопределено;") >= 2
+    assert source.count("e1cRuntimeКонтекстОтладки = Неопределено;") >= 2
     assert "РезультатКонтекста = Неопределено;" in source
     assert "Значение = Неопределено;" in source
 

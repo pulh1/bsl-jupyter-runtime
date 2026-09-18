@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import asdict, replace
 from base64 import b64encode
-from collections import deque
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -13,9 +12,7 @@ import pytest
 from onec_runtime.errors import ProtocolError
 from onec_runtime.artifacts import ArtifactWriter
 import onec_runtime_jupyter.extension as jupyter
-from onec_runtime.prototype_runtime import MainCompletion, OperationHandle, OperationState
 from onec_runtime.recovery_journal import RecoveryJournal
-from onec_runtime.runtime_api import PrototypeRuntimeApi
 from onec_runtime.bsl import WorkerExport
 from onec_runtime.server_worker import (
     WorkerArtifact,
@@ -70,35 +67,6 @@ def _byte_values(value: object):
     elif isinstance(value, (tuple, list, set, frozenset)):
         for item in value:
             yield from _byte_values(item)
-
-
-class _NoInstructionController:
-    runtime_generation = 1
-    operation_id = 0
-    state = OperationState.COMPLETED
-
-    def __init__(self) -> None:
-        self.instructions: list[str] = []
-
-    def execute_system_main(self, source: str) -> MainCompletion:
-        self.instructions.append(source)
-        raise AssertionError("unvalidated artifacts must not execute")
-
-
-class _SnapshotController:
-    runtime_generation = 1
-    operation_id = 0
-    state = OperationState.COMPLETED
-
-    def __init__(self) -> None:
-        self.instructions: list[str] = []
-        self.results = deque(("v1",))
-
-    def execute_system_main(self, source: str) -> MainCompletion:
-        self.instructions.append(source)
-        self.operation_id += 1
-        operation = OperationHandle(self.operation_id, source, source)
-        return MainCompletion(operation, self.results.popleft(), "", True)
 
 
 def _private_artifact(tmp_path: Path) -> tuple[WorkerArtifact, tuple[str, ...]]:

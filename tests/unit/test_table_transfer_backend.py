@@ -15,15 +15,15 @@ from onec_runtime.table_transfer_backend import (
 
 
 def test_builds_privileged_transfer_commands_without_arbitrary_expression() -> None:
-    start = start_transfer_instruction("Контекст.Таблица", 65_536, 3, 5)
+    start = start_transfer_instruction("e1cRuntimeКонтекст.Таблица", 65_536, 3, 5)
     manifest = get_manifest_instruction("01234567-89ab-cdef-0123-456789abcdef")
     chunk = get_chunk_instruction("01234567-89ab-cdef-0123-456789abcdef", 2)
     close = close_transfer_instruction("01234567-89ab-cdef-0123-456789abcdef")
 
-    assert "RuntimeTableTransferServer.СериализоватьТаблицу(Контекст.Таблица" in start
-    assert "RuntimeTableTransferServer.СобратьСсылки(Контекст.Таблица)" in start
+    assert "RuntimeTableTransferServer.СериализоватьТаблицу(e1cRuntimeКонтекст.Таблица" in start
+    assert "RuntimeTableTransferServer.СобратьСсылки(e1cRuntimeКонтекст.Таблица)" in start
     assert "RuntimeTableTransferServer.ПолучитьПредставленияСсылок" in start
-    assert 'Контекст.Вставить("RuntimeTableTransfers", Новый Соответствие)' in start
+    assert 'e1cRuntimeКонтекст.Вставить("RuntimeTableTransfers", Новый Соответствие)' in start
     assert "ПоместитьВоВременноеХранилище" in start
     assert "RuntimeWorker" not in start
     assert "МодульПоколение" not in start
@@ -43,7 +43,7 @@ def test_manifest_formats_integer_fields_without_locale_grouping() -> None:
 
 
 def test_manifest_command_publishes_schema_byte_count() -> None:
-    start = start_transfer_instruction("Контекст.Таблица", 65_536, 3, 5)
+    start = start_transfer_instruction("e1cRuntimeКонтекст.Таблица", 65_536, 3, 5)
     manifest = get_manifest_instruction("01234567-89ab-cdef-0123-456789abcdef")
 
     assert 'ОписаниеМатериализации.Вставить("РазмерСхемы", ' in start
@@ -53,10 +53,10 @@ def test_manifest_command_publishes_schema_byte_count() -> None:
 @pytest.mark.parametrize(
     "value",
     [
-        "Контекст.Таблица; ВызватьИсключение",
-        "Контекст[\"Таблица\"]",
+        "e1cRuntimeКонтекст.Таблица; ВызватьИсключение",
+        "e1cRuntimeКонтекст[\"Таблица\"]",
         "Таблица",
-        "Контекст.Таблица.Количество()",
+        "e1cRuntimeКонтекст.Таблица.Количество()",
     ],
 )
 def test_rejects_untrusted_table_handle(value: str) -> None:
@@ -88,7 +88,7 @@ def test_backend_parses_manifest_and_chunks_and_closes() -> None:
         context_generation=5,
     )
 
-    token = backend.start("Контекст.Таблица", 65_536)
+    token = backend.start("e1cRuntimeКонтекст.Таблица", 65_536)
     manifest = backend.manifest(token)
     chunk = backend.chunk(token, 1)
     backend.close(token)
@@ -115,7 +115,7 @@ def test_backend_rejects_stale_runtime_before_sending_instruction() -> None:
     generation = 4
 
     with pytest.raises(ProtocolError, match="runtime generation is stale"):
-        backend.start("Контекст.Таблица", 1_024)
+        backend.start("e1cRuntimeКонтекст.Таблица", 1_024)
 
     assert calls == []
 

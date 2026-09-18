@@ -28,8 +28,8 @@ from onec_runtime.capture_evaluation import (
     is_public_capture_evaluation_id,
 )
 from onec_runtime.errors import CaptureEvaluationPendingError, ProtocolError
-from onec_runtime.runtime_api import (
-    MAX_PROJECTION_POSITION,
+from onec_runtime.execution.value_transfer_plan import MAX_PROJECTION_POSITION
+from onec_runtime.runtime_models import (
     RuntimeNamespaceSnapshot,
     RuntimeReply,
     RuntimeReplyKind,
@@ -210,8 +210,24 @@ def _source_session_for_shell(
         ) from error
 
 
+class _ProxyBinding:
+    """Revocable notebook binding shared by a namespace and its proxies."""
+
+    __slots__ = ("active",)
+
+    def __init__(self) -> None:
+        self.active = True
+
+
 class OnecValueProxy:
-    """A lazy symbolic reference to one persistent BSL context value."""
+    """A lazy symbolic reference to a persistent BSL context value.
+
+    Obtain one from the notebook ``bsl`` namespace after a successful BSL
+    cell. Constructing or displaying a proxy does not copy its value. Each
+    materialization checks the runtime and context generations and the active
+    notebook binding. A proxy saved under a Python alias becomes stale when
+    another runtime is installed, even if its generations and BSL name match.
+    """
 
     __slots__ = (
         "_runtime_ref",
@@ -219,6 +235,7 @@ class OnecValueProxy:
         "_context_generation",
         "_path",
         "_selection",
+        "_binding",
         "name",
     )
 
@@ -231,6 +248,7 @@ class OnecValueProxy:
         context_generation: int,
         path: tuple[str, ...] = (),
         selection: dict[str, int] | None = None,
+        _binding: _ProxyBinding | None = None,
     ) -> None:
         self._runtime_ref = weakref.ref(runtime)
         self.name = name
@@ -238,6 +256,7 @@ class OnecValueProxy:
         self._context_generation = context_generation
         self._path = tuple(path)
         self._selection = None if selection is None else dict(selection)
+        self._binding = _binding
 
     def __repr__(self) -> str:
         return (
@@ -253,6 +272,15 @@ class OnecValueProxy:
         uuid_suffix: str = "__uuid",
         chunk_size: int | None = None,
     ) -> Any:
+        """Copy a BSL value table into a pandas DataFrame.
+
+        ``refs`` selects ``presentation``, ``uuid`` or ``both`` for reference
+        values. ``ref_columns`` overrides that choice by column;
+        ``uuid_suffix`` names additional UUID columns in ``both`` mode.
+        ``chunk_size`` bounds transfer requests. On a sliced proxy, only the
+        selected rows are transferred. Raises ``ProtocolError`` for a stale
+        proxy or a runtime without table transfer support.
+        """
         runtime = self._validated_runtime()
         if self._selection is not None:
             project = getattr(runtime, "project_to_df", None)
@@ -290,6 +318,14 @@ class OnecValueProxy:
         max_items: int = 100_000,
         max_bytes: int = 64 * 1024 * 1024,
     ) -> Any:
+        """Copy a supported BSL value into an ordinary Python value.
+
+        Reference options match :meth:`to_df`. ``max_depth``, ``max_items``
+        and ``max_bytes`` bound the recursive result; ``chunk_size`` bounds
+        transfer requests. A sliced proxy transfers only its selected range.
+        The return type depends on the BSL value's shape. A stale proxy or a
+        runtime without transfer support raises ``ProtocolError``.
+        """
         runtime = self._validated_runtime()
         if self._selection is not None:
             project = getattr(runtime, "project_value", None)
@@ -321,11 +357,17 @@ class OnecValueProxy:
         )
 
     def head(self, limit: int) -> OnecValueProxy:
+        """Return a lazy proxy for the first positive ``limit`` items."""
         if type(limit) is not int or limit <= 0:
             raise ProtocolError("bounded slice limit must be a positive integer")
         return self[:limit]
 
     def __getitem__(self, selection: object) -> OnecValueProxy:
+        """Return a lazy proxy for a finite, nonnegative ``start:stop`` slice.
+
+        Steps and repeated slicing of an already selected proxy are rejected.
+        No remote data is copied until :meth:`materialize` or :meth:`to_df`.
+        """
         if (
             not isinstance(selection, slice)
             or selection.step is not None
@@ -352,9 +394,15 @@ class OnecValueProxy:
             context_generation=self._context_generation,
             path=self._path,
             selection={"offset": start, "limit": stop - start},
+            _binding=self._binding,
         )
 
     def tabular_section(self, name: str) -> OnecValueProxy:
+        """Return a lazy proxy for the named tabular section of this value.
+
+        ``name`` must be one BSL identifier. The returned proxy retains the
+        same runtime and context generation fence as its parent.
+        """
         if self._selection is not None:
             raise ProtocolError("bounded projection cannot extend a nested path")
         if not isinstance(name, str) or not re.fullmatch(
@@ -368,9 +416,12 @@ class OnecValueProxy:
             runtime_generation=self._runtime_generation,
             context_generation=self._context_generation,
             path=self._path + (name,),
+            _binding=self._binding,
         )
 
     def _validated_runtime(self) -> object:
+        if self._binding is not None and not self._binding.active:
+            raise ProtocolError("1C value proxy is stale after runtime replacement")
         runtime = self._runtime_ref()
         if runtime is None:
             raise ProtocolError("1C runtime for this proxy is no longer available")
@@ -395,21 +446,24 @@ class OnecValueProxy:
 
     def _context_handle(self) -> str:
         suffix = "".join(f".{item}" for item in self._path)
-        return f"Контекст.{self.name}{suffix}"
+        return f"e1cRuntimeКонтекст.{self.name}{suffix}"
 
     def _display_name(self) -> str:
         return ".".join((self.name, *self._path))
 
 
 class _BslNamespaceBridge:
-    __slots__ = ("_runtime_ref", "_proxies", "_snapshot")
+    __slots__ = ("_runtime_ref", "_proxies", "_snapshot", "_binding")
 
     def __init__(self, runtime: object) -> None:
         self._runtime_ref = weakref.ref(runtime)
         self._proxies: dict[str, OnecValueProxy] = {}
         self._snapshot: RuntimeNamespaceSnapshot | None = None
+        self._binding = _ProxyBinding()
 
     def sync(self, user_ns: dict[str, object]) -> None:
+        if not self._binding.active:
+            raise ProtocolError("1C BSL namespace is stale after runtime replacement")
         runtime = self._runtime_ref()
         if runtime is None:
             raise ProtocolError("1C runtime is no longer available")
@@ -422,7 +476,7 @@ class _BslNamespaceBridge:
         guard = getattr(runtime, "validate_value_reference", None)
         if not callable(guard):
             raise ProtocolError("1C runtime does not expose local reference validation")
-        handles = tuple(f"Контекст.{name}" for name in snapshot.names)
+        handles = tuple(f"e1cRuntimeКонтекст.{name}" for name in snapshot.names)
         for handle in handles:
             guard(handle)
 
@@ -439,6 +493,7 @@ class _BslNamespaceBridge:
                     name,
                     runtime_generation=snapshot.runtime_generation,
                     context_generation=snapshot.context_generation,
+                    _binding=self._binding,
                 )
                 proposed[normalized] = proxy
 
@@ -470,11 +525,14 @@ class _BslNamespaceBridge:
                 name,
                 runtime_generation=self._snapshot.runtime_generation,
                 context_generation=self._snapshot.context_generation,
+                _binding=self._binding,
             )
             self._proxies[normalized] = proxy
         return proxy
 
     def get(self, name: str) -> OnecValueProxy:
+        if not self._binding.active:
+            raise ProtocolError("1C BSL namespace is stale after runtime replacement")
         if self._snapshot is None:
             raise AttributeError(name)
         actual = next(
@@ -486,15 +544,23 @@ class _BslNamespaceBridge:
         return self._proxy(actual)
 
     def names(self) -> tuple[str, ...]:
-        return () if self._snapshot is None else self._snapshot.names
+        return () if not self._binding.active or self._snapshot is None else self._snapshot.names
 
     def detach(self, user_ns: dict[str, object]) -> None:
+        self._binding.active = False
         for proxy in self._proxies.values():
             if user_ns.get(proxy.name) is proxy:
                 user_ns.pop(proxy.name, None)
 
 
 class BslNamespace:
+    """Look up persistent BSL values as lazy Python proxies.
+
+    The Jupyter adapter installs this object as ``bsl``. Use ``bsl.Name`` or
+    ``bsl["Name"]``; bracket lookup is useful when a BSL name conflicts with
+    an existing Python binding.
+    """
+
     __slots__ = ("_bridge",)
 
     def __init__(self, bridge: _BslNamespaceBridge) -> None:
@@ -553,6 +619,16 @@ def install_runtime(
         # Language support is optional and cannot undo a started runtime.
         import logging
         logging.getLogger(__name__).warning('BSL project bridge unavailable')
+
+
+def detach_runtime_namespace(shell: object, runtime: object) -> None:
+    """Invalidate proxies owned by ``runtime`` before its core cleanup starts."""
+    user_ns = getattr(shell, "user_ns", None)
+    if not isinstance(user_ns, dict):
+        return
+    bridge = user_ns.get(_NAMESPACE_BRIDGE_NAME)
+    if isinstance(bridge, _BslNamespaceBridge) and bridge._runtime_ref() is runtime:
+        bridge.detach(user_ns)
 
 
 def synchronize_bsl_namespace(shell: object) -> None:
@@ -614,6 +690,10 @@ class OnecRuntimeMagics(Magics):
         return _display_status(self._runtime().status())
 
     def _runtime(self) -> NotebookRuntime:
+        owner = getattr(self.shell, "_onec_interactive_runtime_owner", None)
+        recover = getattr(owner, "_recover_confirmed_stop", None)
+        if callable(recover):
+            recover()
         runtime = self.shell.user_ns.get(RUNTIME_NAMESPACE_NAME)
         if runtime is None:
             raise UsageError(

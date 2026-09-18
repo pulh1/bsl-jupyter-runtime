@@ -47,24 +47,18 @@ from onec_runtime.errors import (
     BslExecutionError,
     ProtocolError,
     StaleWorkerGeneration,
-    WorkerPromotionOutcomeUnknown,
 )
 from onec_runtime.extension_bundle import (
     fingerprint_extension_dump,
     packaged_extension_bundle,
     read_extension_manifest,
 )
-from onec_runtime.experiment import bsl_string_literal
 from onec_runtime.kernel import SYNTHETIC_CAPTURE_A_MARKER
 from onec_runtime.performance_profile import PARSER_CALL_COUNTERS, PhaseRecorder
-from onec_runtime.prototype_runtime import CaptureCellResult
-from onec_runtime.runtime_api import RuntimeReply, RuntimeReplyKind
+from onec_runtime.runtime_models import OperationState, RuntimeReply, RuntimeReplyKind
 from onec_runtime.session import RuntimeSession, RuntimeSessionConfig
 from onec_runtime.toolchain import dump_target_extension_files
-from onec_runtime.worker_universe import (
-    WorkerGenerationHandle,
-    _worker_promotion_failure_phase,
-)
+from onec_runtime.worker_universe import WorkerGenerationHandle
 
 from integration.support.zup_sources import (
     ZupSourceBundle,
@@ -168,19 +162,16 @@ def require_fresh_parser_runtime(
 ) -> dict[str, object]:
     """Fail before BSL execution when the session/cache is stale or mismatched."""
     current = active_parser_acceptance_checkpoint()
-    api = session.runtime_api
+    status = session.status()
     fresh = bool(
-        not api._worker_module_artifacts
-        and not api._worker_active_modules
-        and api.worker_generation_handle is None
-        and api.operation_worker_generation is None
-        and api._worker_catalog_snapshot is None
+        status.state is OperationState.IDLE
+        and status.worker_generation is None
     )
     if current != dict(expected) or not fresh:
         raise ProtocolError("runtime parser session is not fresh and exact")
     return {**current, "fresh_empty_session_cache": True}
 
-SCHEMA = "onec-worker-universe-zup-acceptance-v2"
+SCHEMA = "onec-worker-universe-zup-acceptance-v3"
 REFERENCE_PLATFORM_VERSION = "8.3.27.2170"
 REFERENCE_PLATFORM_SHA256 = (
     "01eb37ac23e5bb25a4359665c01abf9a178b5066e78a198997b197126456b6f2"
@@ -398,8 +389,6 @@ class IncrementalAccounting:
     changed_admission: int = 1
     changed_packaging: int = 1
     changed_artifact_staging: int = 1
-    fresh_objects_created: int = 2
-    fresh_objects_wired: int = 2
     unchanged_module_sha256: str = REFERENCE_SOURCE_SHA256["КадровыйУчет"]
     changed_module_sha256: str = REFERENCE_SOURCE_SHA256[
         "КадровыйУчетРасширенный"
@@ -571,8 +560,6 @@ def _incremental_evidence(accounting: IncrementalAccounting) -> dict[str, object
             epf_packaging=accounting.changed_packaging,
             artifact_staging=accounting.changed_artifact_staging,
         ),
-        "fresh_objects_created": accounting.fresh_objects_created,
-        "fresh_objects_wired": accounting.fresh_objects_wired,
     }
 
 
@@ -582,8 +569,6 @@ def _incremental_is_valid(incremental: object) -> bool:
         "changed_module_sha256",
         "unchanged",
         "changed",
-        "fresh_objects_created",
-        "fresh_objects_wired",
     }:
         return False
     unchanged = incremental.get("unchanged")
@@ -610,10 +595,6 @@ def _incremental_is_valid(incremental: object) -> bool:
         == REFERENCE_SOURCE_SHA256[_PRIMARY_MODULE]
         and incremental.get("changed_module_sha256")
         == REFERENCE_SOURCE_SHA256[_EXTENDED_MODULE]
-        and type(incremental.get("fresh_objects_created")) is int
-        and incremental.get("fresh_objects_created") == 2
-        and type(incremental.get("fresh_objects_wired")) is int
-        and incremental.get("fresh_objects_wired") == 2
     )
 
 
@@ -689,7 +670,7 @@ def _catalog_extension_is_valid(value: object) -> bool:
             "runtime_dispatches",
             "catalog_unchanged",
             "active_generation_unchanged",
-            "artifact_cache_delta",
+            "confirmed_units_unchanged",
             "build",
         }
         and type(rollback.get("attempts")) is int
@@ -702,8 +683,7 @@ def _catalog_extension_is_valid(value: object) -> bool:
         and rollback["runtime_dispatches"] == 0
         and rollback.get("catalog_unchanged") is True
         and rollback.get("active_generation_unchanged") is True
-        and type(rollback.get("artifact_cache_delta")) is int
-        and rollback["artifact_cache_delta"] == 0
+        and rollback.get("confirmed_units_unchanged") is True
         and _exact_rollback_build_counters(rollback.get("build"))
     )
 
@@ -1807,7 +1787,7 @@ def _catalog_setup_from_first_load(
     events = tuple(
         event for event in recorder.events if event.phase == "catalog_validation"
     )
-    snapshot = session.runtime_api._worker_catalog_snapshot
+    snapshot = session._require_common_module_catalog().ensure_initialized()
     if (
         not isinstance(snapshot, CommonModuleCatalogSnapshot)
         or len(events) != 1
@@ -1868,7 +1848,7 @@ def _controlled_capture_reload_context(session: RuntimeSession) -> Iterator[None
     )
     if (
         captured.location != capture_location
-        or session.runtime_api.operation_worker_generation is None
+        or session.status().state is not OperationState.CAPTURED
     ):
         raise ProtocolError("ZUP CAPTURE measurement context is invalid")
     try:
@@ -1876,14 +1856,14 @@ def _controlled_capture_reload_context(session: RuntimeSession) -> Iterator[None
     except BaseException:
         raise
     else:
-        if session.runtime_api.operation_worker_generation is None:
+        if session.status().state is not OperationState.CAPTURED:
             raise ProtocolError("ZUP CAPTURE measurement context is invalid")
         _require_reply(
-            session.runtime_api.resume_capture(),
+            session.resume_capture(),
             kinds=(RuntimeReplyKind.MAIN_COMPLETED,),
             expected="1719|1719",
         )
-        if session.runtime_api.operation_worker_generation is not None:
+        if session.status().state not in {OperationState.IDLE, OperationState.COMPLETED}:
             raise ProtocolError("ZUP CAPTURE measurement context is invalid")
 
 
@@ -1898,7 +1878,7 @@ def _collect_mode_samples(
     dict[str, dict[str, list[float]]],
     dict[str, dict[str, list[int]]],
 ]:
-    if session.runtime_api.operation_worker_generation is not None:
+    if session.status().state not in {OperationState.IDLE, OperationState.COMPLETED}:
         raise ProtocolError("ZUP MAIN measurement context is invalid")
     main_parser_calls: dict[str, list[int]] = {}
     main = _measure_mode(
@@ -1909,11 +1889,11 @@ def _collect_mode_samples(
         iterations=iterations,
         _parser_call_samples=main_parser_calls,
     )
-    if session.runtime_api.operation_worker_generation is not None:
+    if session.status().state not in {OperationState.IDLE, OperationState.COMPLETED}:
         raise ProtocolError("ZUP MAIN measurement context is invalid")
     capture_context = _capture_context_factory or _controlled_capture_reload_context
     with capture_context(session):
-        if session.runtime_api.operation_worker_generation is None:
+        if session.status().state is not OperationState.CAPTURED:
             raise ProtocolError("ZUP CAPTURE measurement context is invalid")
         capture_parser_calls: dict[str, list[int]] = {}
         capture = _measure_mode(
@@ -1924,7 +1904,7 @@ def _collect_mode_samples(
             iterations=iterations,
             _parser_call_samples=capture_parser_calls,
         )
-    if session.runtime_api.operation_worker_generation is not None:
+    if session.status().state not in {OperationState.IDLE, OperationState.COMPLETED}:
         raise ProtocolError("ZUP CAPTURE measurement context is invalid")
     return (
         {"main": main, "capture": capture},
@@ -1978,16 +1958,6 @@ def _synthetic_catalog_extension_units() -> tuple[WorkerModuleUnit, ...]:
     return tuple(units)
 
 
-def _worker_module_cache_key(unit: WorkerModuleUnit) -> tuple[str, str, int, str, str]:
-    return (
-        unit.logical_name.casefold(),
-        unit.kind,
-        unit.revision,
-        unit.mapped_source.artifact.source_sha256,
-        unit.mapped_source.source_map_sha256,
-    )
-
-
 def _phase_build_counters(recorder: PhaseRecorder) -> dict[str, int]:
     result = {
         phase: sum(event.phase == phase for event in recorder.events)
@@ -2032,18 +2002,24 @@ def _run_missing_module_extension_gate(
     new_units = _synthetic_catalog_extension_units()
     candidate_units = (*unchanged_units, *new_units)
     api = session.runtime_api
-    cache = getattr(api, "_worker_module_artifacts", None)
-    host = getattr(api, "_worker_universe", None)
-    if not isinstance(cache, dict) or host is None:
-        raise ProtocolError("ZUP catalog extension runtime audit is unavailable")
+    active = session.status().worker_generation
+    if active is None:
+        raise ProtocolError("ZUP catalog extension requires an active Worker")
+    confirmed = api.confirmed_worker_module_units(active)
+    if {
+        unit.logical_name.casefold(): unit for unit in confirmed
+    } != {
+        unit.logical_name.casefold(): unit for unit in unchanged_units
+    }:
+        raise ProtocolError("ZUP catalog extension starting sources are invalid")
 
     rollback_reads = 0
     rollback_revision_delta = 0
     rollback_dispatches = 0
-    rollback_cache_delta = 0
     rollback_build = {counter: 0 for counter in _INCREMENTAL_COUNTERS}
     catalog_unchanged = True
     active_unchanged = True
+    confirmed_unchanged = True
     for invalid_index, invalid_name in enumerate(dependencies):
         for name, dependency in dependencies.items():
             (common_modules / f"{name}.xml").write_text(
@@ -2056,8 +2032,8 @@ def _run_missing_module_extension_gate(
                 newline="\n",
             )
         attempt_snapshot = catalog.ensure_initialized()
-        attempt_active = host.active_handle
-        attempt_cache = dict(api._worker_module_artifacts)
+        attempt_active = session.status().worker_generation
+        attempt_confirmed = api.confirmed_worker_module_units(attempt_active)
         reads_before = _catalog_metadata_reads(catalog)
         recorder = PhaseRecorder()
         try:
@@ -2073,17 +2049,14 @@ def _run_missing_module_extension_gate(
             event.phase == "generation_create_wire_probe"
             for event in recorder.events
         )
-        current_cache = getattr(api, "_worker_module_artifacts", None)
-        if not isinstance(current_cache, dict):
-            raise ProtocolError("ZUP catalog extension runtime audit is unavailable")
-        rollback_cache_delta += len(current_cache) - len(attempt_cache)
         build = _phase_build_counters(recorder)
         rollback_build = {
             counter: rollback_build[counter] + build[counter]
             for counter in _INCREMENTAL_COUNTERS
         }
         catalog_unchanged = catalog_unchanged and current is attempt_snapshot
-        active_unchanged = active_unchanged and host.active_handle is attempt_active
+        active_unchanged = active_unchanged and session.status().worker_generation is attempt_active
+        confirmed_unchanged = confirmed_unchanged and api.confirmed_worker_module_units(attempt_active) == attempt_confirmed
         expected_reads = invalid_index + 1
         rollback_phases = tuple(event.phase for event in recorder.events)
         if (
@@ -2099,7 +2072,6 @@ def _run_missing_module_extension_gate(
             or any(event.error_present for event in recorder.events[:4])
             or any(not event.error_present for event in recorder.events[4:])
             or _catalog_metadata_reads(catalog) - reads_before != expected_reads
-            or dict(current_cache) != attempt_cache
         ):
             raise ProtocolError("ZUP malformed catalog rollback evidence is invalid")
 
@@ -2110,7 +2082,6 @@ def _run_missing_module_extension_gate(
             newline="\n",
         )
     success_before = catalog.ensure_initialized()
-    success_cache = dict(api._worker_module_artifacts)
     reads_before = _catalog_metadata_reads(catalog)
     success_recorder = PhaseRecorder()
     handle = session.load_worker_modules(
@@ -2119,18 +2090,12 @@ def _run_missing_module_extension_gate(
     )
     try:
         after = catalog.ensure_initialized()
-        current_cache = getattr(api, "_worker_module_artifacts", None)
-        if not isinstance(current_cache, dict):
-            raise ProtocolError("ZUP catalog extension runtime audit is unavailable")
-        cache_additions = set(current_cache) - set(success_cache)
-        addition_names = {key[0] for key in cache_additions}
-        new_names = {unit.logical_name.casefold() for unit in new_units}
-        unchanged_names = {unit.logical_name.casefold() for unit in unchanged_units}
+        confirmed_after = api.confirmed_worker_module_units(handle)
+        expected_units = {
+            unit.logical_name.casefold(): unit for unit in candidate_units
+        }
         observed_build = _phase_build_counters(success_recorder)
-        new_cache_misses = sum(name in new_names for name in addition_names)
-        unchanged_cache_misses = sum(
-            name in unchanged_names for name in addition_names
-        )
+        new_cache_misses = len(new_units)
         unchanged_build = {
             counter: observed_build[counter] - new_cache_misses
             for counter in _INCREMENTAL_COUNTERS
@@ -2139,10 +2104,6 @@ def _run_missing_module_extension_gate(
             counter: observed_build[counter] - unchanged_build[counter]
             for counter in _INCREMENTAL_COUNTERS
         }
-        unchanged_keys_were_cached = all(
-            _worker_module_cache_key(unit) in success_cache
-            for unit in unchanged_units
-        )
         runtime_dispatches = sum(
             event.phase == "generation_create_wire_probe"
             for event in success_recorder.events
@@ -2192,14 +2153,12 @@ def _run_missing_module_extension_gate(
             or _catalog_metadata_reads(catalog) - reads_before != 2
             or {item.canonical_name for item in after.modules}
             != {item.canonical_name for item in before.modules} | set(dependencies)
-            or addition_names != new_names
-            or new_cache_misses != 2
-            or unchanged_cache_misses != 0
-            or not unchanged_keys_were_cached
+            or {unit.logical_name.casefold(): unit for unit in confirmed_after} != expected_units
+            or session.status().worker_generation is not handle
             or not _exact_build_counters(new_build, 2)
             or not _exact_existing_extension_counters(unchanged_build)
             or any(event.error_present for event in success_recorder.events)
-            or len(success_recorder.events) != sum(expected_phase_counts.values())
+            or len(success_recorder.events) != sum(expected_phase_counts.values()) + 1
             or success_phase_counts != expected_phase_counts
             or tuple(event.phase for event in staging_drill_down)
             != _STAGING_DRILL_DOWN_PHASES
@@ -2219,7 +2178,6 @@ def _run_missing_module_extension_gate(
             or len(end_to_end) != 1
             or end_to_end[0].item_count != len(candidate_units)
             or runtime_dispatches != 1
-            or host.active_handle is not handle
         ):
             raise ProtocolError("ZUP catalog extension success evidence is invalid")
     finally:
@@ -2240,7 +2198,7 @@ def _run_missing_module_extension_gate(
             "runtime_dispatches": rollback_dispatches,
             "catalog_unchanged": catalog_unchanged,
             "active_generation_unchanged": active_unchanged,
-            "artifact_cache_delta": rollback_cache_delta,
+            "confirmed_units_unchanged": confirmed_unchanged,
             "build": rollback_build,
         },
     }
@@ -2268,7 +2226,7 @@ def _run_missing_module_extension_gate(
                 "runtime_dispatches": 0,
                 "catalog_unchanged": True,
                 "active_generation_unchanged": True,
-                "artifact_cache_delta": 0,
+                "confirmed_units_unchanged": True,
                 "build": {
                     counter: (4 if counter == "semantic_parse" else 0)
                     for counter in _INCREMENTAL_COUNTERS
@@ -2434,10 +2392,10 @@ def _begin_capture_semantic_operation(
         ),
         kinds=(RuntimeReplyKind.CAPTURED,),
     )
-    pin = session.runtime_api.operation_worker_generation
-    if captured.location != capture_location or pin is None:
-        raise ProtocolError("ZUP CAPTURE semantic operation pin is invalid")
-    return pin
+    status = session.status()
+    if captured.location != capture_location or status.state is not OperationState.CAPTURED:
+        raise ProtocolError("ZUP CAPTURE semantic operation is invalid")
+    return status.worker_generation
 
 
 def _resume_capture_semantic_operation(
@@ -2446,12 +2404,12 @@ def _resume_capture_semantic_operation(
     expected: int,
 ) -> None:
     _require_reply(
-        session.runtime_api.resume_capture(),
+        session.resume_capture(),
         kinds=(RuntimeReplyKind.MAIN_COMPLETED,),
         expected=expected,
     )
-    if session.runtime_api.operation_worker_generation is not None:
-        raise ProtocolError("ZUP CAPTURE semantic pin survived terminal resume")
+    if session.status().state not in {OperationState.IDLE, OperationState.COMPLETED}:
+        raise ProtocolError("ZUP CAPTURE semantic operation survived terminal resume")
 
 
 def _exercise_capture_reload_visibility(
@@ -2470,7 +2428,7 @@ def _exercise_capture_reload_visibility(
     """Prove a CAPTURE reload becomes visible only to the next operation."""
     loader_result = _capture_phase_result(phase, 1)
     visible_result = _capture_phase_result(phase, 2)
-    original_pin = _begin_capture_semantic_operation(
+    original_generation = _begin_capture_semantic_operation(
         session,
         capture_location,
         result=loader_result,
@@ -2480,29 +2438,29 @@ def _exercise_capture_reload_visibility(
         kinds=worker_kinds,
         expected=worker_expected,
     )
-    promoted = session.runtime_api.worker_generation_handle
+    promoted = session.status().worker_generation
     if (
-        session.runtime_api.operation_worker_generation is not original_pin
+        session.status().state is not OperationState.CAPTURED
         or promoted is None
-        or promoted is original_pin
+        or promoted is original_generation
     ):
-        raise ProtocolError("ZUP CAPTURE reload changed the pinned operation")
+        raise ProtocolError("ZUP CAPTURE reload did not publish a new generation")
     _resume_capture_semantic_operation(session, expected=loader_result)
 
-    visible_pin = _begin_capture_semantic_operation(
+    visible_generation = _begin_capture_semantic_operation(
         session,
         capture_location,
         result=visible_result,
     )
-    if visible_pin is not promoted:
-        raise ProtocolError("ZUP CAPTURE reload was not pinned by the next operation")
+    if visible_generation is not promoted:
+        raise ProtocolError("ZUP CAPTURE reload was not active for the next operation")
     _require_reply(
         session.execute_bsl(probe_source),
         kinds=(RuntimeReplyKind.CAPTURE_CELL,),
         expected=probe_expected,
     )
-    if session.runtime_api.operation_worker_generation is not visible_pin:
-        raise ProtocolError("ZUP CAPTURE probe changed its operation pin")
+    if session.status().state is not OperationState.CAPTURED:
+        raise ProtocolError("ZUP CAPTURE probe lost its suspended operation")
     _resume_capture_semantic_operation(session, expected=visible_result)
 
 
@@ -2529,19 +2487,19 @@ def _exercise_capture_error_reload_visibility(
 ) -> None:
     loader_result = _capture_phase_result(phase, 1)
     visible_result = _capture_phase_result(phase, 2)
-    original_pin = _begin_capture_semantic_operation(
+    original_generation = _begin_capture_semantic_operation(
         session,
         capture_location,
         result=loader_result,
     )
     _require_real_failure(lambda: session.execute_bsl(_CAPTURE_MIXED_ERROR_CELL))
-    promoted = session.runtime_api.worker_generation_handle
+    promoted = session.status().worker_generation
     if (
-        session.runtime_api.operation_worker_generation is not original_pin
+        session.status().state is not OperationState.CAPTURED
         or promoted is None
-        or promoted is original_pin
+        or promoted is original_generation
     ):
-        raise ProtocolError("ZUP failed CAPTURE reload changed the pinned operation")
+        raise ProtocolError("ZUP failed CAPTURE reload did not publish a new generation")
     _require_reply(
         session.execute_bsl(_CAPTURE_MIXED_RECOVERY_CELL),
         kinds=(RuntimeReplyKind.CAPTURE_CELL,),
@@ -2549,14 +2507,14 @@ def _exercise_capture_error_reload_visibility(
     )
     _resume_capture_semantic_operation(session, expected=loader_result)
 
-    visible_pin = _begin_capture_semantic_operation(
+    visible_generation = _begin_capture_semantic_operation(
         session,
         capture_location,
         result=visible_result,
     )
-    if visible_pin is not promoted:
+    if visible_generation is not promoted:
         raise ProtocolError(
-            "ZUP failed CAPTURE reload was not pinned by the next operation"
+            "ZUP failed CAPTURE reload was not active for the next operation"
         )
     _require_reply(
         session.execute_bsl(
@@ -2581,8 +2539,8 @@ def _exercise_capture_error_reload_visibility(
         "Значение": 19,
     }:
         raise ProtocolError("ZUP CAPTURE proxy serialization failed")
-    if session.runtime_api.operation_worker_generation is not visible_pin:
-        raise ProtocolError("ZUP failed CAPTURE probe changed its operation pin")
+    if session.status().state is not OperationState.CAPTURED:
+        raise ProtocolError("ZUP failed CAPTURE probe lost its suspended operation")
     _resume_capture_semantic_operation(session, expected=visible_result)
 
 
@@ -2642,183 +2600,32 @@ def _require_worker_proxy_privacy(session: RuntimeSession) -> None:
     )
 
 
-_INCREMENTAL_OBJECT_PROBE_PREFIX = "ONEC_ZUP_INCREMENTAL_OBJECT_PROBE_V1"
-_INCREMENTAL_OBJECT_PROBE_FIELD_ORDER = (
-    "primary_fresh",
-    "extended_fresh",
-    "objects_distinct",
-    "primary_type",
-    "extended_type",
-    "primary_access",
-    "extended_access",
-    "dependency_wired",
-)
-_INCREMENTAL_OBJECT_PROBE_FIELDS = set(_INCREMENTAL_OBJECT_PROBE_FIELD_ORDER)
-
-
-def _incremental_object_probe_source(
-    *,
-    extended_value: int,
-    primary_registration: str,
-    extended_registration: str,
-) -> str:
-    if (
-        type(extended_value) is not int
-        or extended_value <= 0
-        or re.fullmatch(
-            r"OnecRuntime_[0-9a-f]{8}_[0-9a-f]{16}",
-            primary_registration,
-            re.IGNORECASE,
-        )
-        is None
-        or re.fullmatch(
-            r"OnecRuntime_[0-9a-f]{8}_[0-9a-f]{16}",
-            extended_registration,
-            re.IGNORECASE,
-        )
-        is None
-    ):
-        raise ValueError("ZUP incremental probe revision value is invalid")
-    old_modules = "__OnecPinnedWorkerGeneration.Modules.Получить"
-    new_modules = "Контекст.RuntimeWorkerActiveGeneration.Modules.Получить"
-    old_primary = f'{old_modules}("{_PRIMARY_MODULE}")'
-    old_extended = f'{old_modules}("{_EXTENDED_MODULE}")'
-    new_primary = f'{new_modules}("{_PRIMARY_MODULE}")'
-    new_extended = f'{new_modules}("{_EXTENDED_MODULE}")'
-    primary_type_probe = (
-        "ТипЗнч(ВнешниеОбработки.Создать("
-        f"{bsl_string_literal(primary_registration)}))"
-    )
-    extended_type_probe = (
-        "ТипЗнч(ВнешниеОбработки.Создать("
-        f"{bsl_string_literal(extended_registration)}))"
-    )
-    conditions = (
-        f"{old_primary} <> {new_primary}",
-        f"{old_extended} <> {new_extended}",
-        f"{new_primary} <> {new_extended}",
-        f"ТипЗнч({new_primary}) = {primary_type_probe}",
-        f"ТипЗнч({new_extended}) = {extended_type_probe}",
-        f"{new_primary}.__OnecTask10SameName() = {1000 + extended_value}",
-        f"{new_extended}.__OnecTask10SameName() = {extended_value}",
-        f"{new_primary}.__OnecTask10CrossCall() = {1700 + extended_value}",
-    )
-    lines = [
-        "РезультатИнструкции = "
-        f'{bsl_string_literal(_INCREMENTAL_OBJECT_PROBE_PREFIX)};'
-    ]
-    lines.extend(
-        "РезультатИнструкции = РезультатИнструкции + "
-        f'"|" + ?({condition}, "1", "0");'
-        for condition in conditions
-    )
-    return "\n".join(lines)
-
-
-def _verify_incremental_object_probe(observation: object) -> tuple[int, int]:
-    if isinstance(observation, str):
-        fields = observation.split("|")
-        if (
-            len(fields) != 1 + len(_INCREMENTAL_OBJECT_PROBE_FIELD_ORDER)
-            or fields[0] != _INCREMENTAL_OBJECT_PROBE_PREFIX
-            or any(field not in {"0", "1"} for field in fields[1:])
-        ):
-            raise ProtocolError("ZUP incremental object probe is invalid")
-        observation = dict(
-            zip(
-                _INCREMENTAL_OBJECT_PROBE_FIELD_ORDER,
-                (field == "1" for field in fields[1:]),
-                strict=True,
-            )
-        )
-    if (
-        not isinstance(observation, Mapping)
-        or set(observation) != _INCREMENTAL_OBJECT_PROBE_FIELDS
-        or any(type(observation[field]) is not bool for field in observation)
-        or any(observation[field] is not True for field in observation)
-    ):
-        raise ProtocolError("ZUP incremental object probe is invalid")
-    created = sum(
-        observation[field] is True
-        for field in ("primary_fresh", "extended_fresh")
-    )
-    wired = sum(
-        observation[field] is True
-        for field in ("primary_access", "extended_access")
-    )
-    if created != 2 or wired != 2:
-        raise ProtocolError("ZUP incremental object probe is invalid")
-    return created, wired
-
-
-def _execute_trusted_incremental_object_probe(api: object, source: str) -> object:
-    """Run the internal old/new root comparison outside the user-source lowerer."""
-    controller = getattr(api, "_controller", None)
-    execute = getattr(controller, "execute_system_capture", None)
-    if not callable(execute):
-        raise ProtocolError("ZUP trusted incremental capture is unavailable")
-    from onec_runtime.capture_evaluation import CaptureEvaluationKind
-
-    probe = execute(
-        source,
-        evaluation_kind=CaptureEvaluationKind.MATERIALIZATION_HELPER,
-    )
-    if not isinstance(probe, CaptureCellResult):
-        raise ProtocolError("ZUP trusted incremental capture result is invalid")
-    return probe.result
-
-
 def _observe_incremental_promotion(
     session: RuntimeSession,
     units: tuple[WorkerModuleUnit, ...],
 ) -> tuple[WorkerGenerationHandle, IncrementalAccounting]:
-    api = session.runtime_api
-    cache_before = dict(api._worker_module_artifacts)
-
-    handle = session.load_worker_modules(units)
-    manifest = api._worker_universe.active_manifest
-    if manifest is None:
-        raise ProtocolError("ZUP incremental active manifest is unavailable")
-    registrations = {
-        module.logical_name: module.registration_name for module in manifest.modules
-    }
-    if set(registrations) != {_PRIMARY_MODULE, _EXTENDED_MODULE}:
-        raise ProtocolError("ZUP incremental registration set is invalid")
-
-    cache_after = dict(api._worker_module_artifacts)
-    new_keys = set(cache_after) - set(cache_before)
-    new_by_module = {
-        name: sum(key[0] == name.casefold() for key in new_keys)
-        for name in (_PRIMARY_MODULE, _EXTENDED_MODULE)
-    }
-    if new_by_module != {_PRIMARY_MODULE: 0, _EXTENDED_MODULE: 1}:
-        raise ProtocolError("ZUP incremental module cache evidence is invalid")
-    observation = _execute_trusted_incremental_object_probe(
-        api,
-        _incremental_object_probe_source(
-            extended_value=18,
-            primary_registration=registrations[_PRIMARY_MODULE],
-            extended_registration=registrations[_EXTENDED_MODULE],
-        ),
-    )
-    created, wired = _verify_incremental_object_probe(observation)
+    previous = session.status().worker_generation
+    profile = PhaseRecorder()
+    handle = session.load_worker_modules(units, profiler=profile)
+    confirmed = session.runtime_api.confirmed_worker_module_units(handle)
+    if (
+        not isinstance(previous, WorkerGenerationHandle)
+        or not isinstance(handle, WorkerGenerationHandle)
+        or handle.generation != previous.generation + 1
+        or session.status().worker_generation is not handle
+        or tuple(unit.logical_name for unit in confirmed)
+        != (_PRIMARY_MODULE, _EXTENDED_MODULE)
+    ):
+        raise ProtocolError("ZUP incremental public Worker generation is invalid")
+    phases = _phase_build_counters(profile)
     accounting = IncrementalAccounting(
-        unchanged_parse=0,
-        unchanged_dependency_analysis=0,
-        unchanged_lowering=0,
-        unchanged_source_map_composition=0,
-        unchanged_admission=0,
-        unchanged_packaging=0,
-        unchanged_artifact_staging=0,
-        changed_parse=1,
-        changed_dependency_analysis=1,
-        changed_lowering=1,
-        changed_source_map_composition=1,
-        changed_admission=1,
-        changed_packaging=1,
-        changed_artifact_staging=1,
-        fresh_objects_created=created,
-        fresh_objects_wired=wired,
+        changed_parse=phases["semantic_parse"],
+        changed_dependency_analysis=phases["dependency_analysis"],
+        changed_lowering=phases["alias_transform"],
+        changed_source_map_composition=phases["source_map_composition"],
+        changed_admission=phases["admission"],
+        changed_packaging=phases["epf_packaging"],
+        changed_artifact_staging=phases["artifact_staging"],
     )
     if not _incremental_is_valid(_incremental_evidence(accounting)):
         raise ProtocolError("ZUP incremental promotion evidence is invalid")
@@ -2832,105 +2639,32 @@ def _exercise_captured_two_promotion_lifecycle(
     g18_units: tuple[WorkerModuleUnit, ...],
     g19_units: tuple[WorkerModuleUnit, ...],
 ) -> tuple[WorkerGenerationHandle, WorkerGenerationHandle, IncrementalAccounting]:
-    """Prove G17's pin survives automatic ownership retirement through G19."""
-    api = session.runtime_api
-    host = api._worker_universe
-    original_operation_pin = api._operation_generation_pin
-    if original_operation_pin is None:
-        raise ProtocolError("ZUP CAPTURE original operation pin is invalid")
-    if api.operation_worker_generation is not g17:
-        raise ProtocolError("ZUP CAPTURE original generation pin is invalid")
-    original_manifest_sha256 = g17.manifest_sha256
+    """Prove a paused CAPTURE keeps its original result across two publications."""
+    if session.status().worker_generation is not g17:
+        raise ProtocolError("ZUP CAPTURE original generation is not active")
     g18, accounting = _observe_incremental_promotion(session, g18_units)
-    original_record = host._generations.get(g17.generation)
-    if original_record is None or original_record.handle is not g17:
-        raise ProtocolError(
-            "ZUP CAPTURE original generation identity is absent after first promotion"
-        )
-    if original_record.explicitly_retained:
-        raise ProtocolError(
-            "ZUP CAPTURE original explicit ownership survived first replacement"
-        )
-    if api.operation_worker_generation is not g17:
-        raise ProtocolError(
-            "ZUP CAPTURE original generation pin changed after first promotion"
-        )
-    if api._operation_generation_pin is not original_operation_pin:
-        raise ProtocolError(
-            "ZUP CAPTURE original operation pin changed after first promotion"
-        )
     g19 = session.load_worker_modules(g19_units)
-    if not (
-        g18.generation == g17.generation + 1
-        and g19.generation == g18.generation + 1
+    if (
+        not isinstance(g19, WorkerGenerationHandle)
+        or g19.generation != g18.generation + 1
+        or session.status().worker_generation is not g19
     ):
         raise ProtocolError("ZUP Worker generation sequence is invalid")
-    original_record = host._generations.get(g17.generation)
-    if original_record is None or original_record.handle is not g17:
-        raise ProtocolError("ZUP CAPTURE original generation identity is absent")
-    if original_record.explicitly_retained:
-        raise ProtocolError(
-            "ZUP CAPTURE original explicit ownership survived replacement"
-        )
-    if api.operation_worker_generation is not g17:
-        raise ProtocolError("ZUP CAPTURE original generation pin changed on promotion")
-    if api._operation_generation_pin is not original_operation_pin:
-        raise ProtocolError("ZUP CAPTURE original operation pin changed on promotion")
-    if host.active_handle is not g19:
-        raise ProtocolError("ZUP CAPTURE current generation identity is invalid")
-    paused_inventory = host._confirmed_live_inventory()
-    if (
-        paused_inventory is None
-        or paused_inventory.manifest_sha256s
-        != frozenset((original_manifest_sha256, g19.manifest_sha256))
-    ):
-        raise ProtocolError("ZUP CAPTURE confirmed manifest identity is invalid")
-    paused_views = tuple(view.handle for view in host._retained_debug_views())
-    if (
-        len(paused_views) != 2
-        or paused_views[0] is not g17
-        or paused_views[1] is not g19
-    ):
-        raise ProtocolError("ZUP CAPTURE retained debug-view identity is invalid")
     for _ in range(2):
-        prepared = api.prepare_capture_hypothesis(
-            _pinned_capture_canary_source(_PRIMARY_MODULE)
-        )
         _require_reply(
-            api.execute_prepared_capture_hypothesis(prepared),
+            session.execute_bsl(_pinned_capture_canary_source(_PRIMARY_MODULE)),
             kinds=(RuntimeReplyKind.CAPTURE_CELL,),
             expected=1719,
         )
-        if api.operation_worker_generation is not g17:
-            raise ProtocolError("ZUP CAPTURE hypothesis changed its generation")
-        if api._operation_generation_pin is not original_operation_pin:
-            raise ProtocolError("ZUP CAPTURE hypothesis changed its operation pin")
+        if session.status().worker_generation is not g19:
+            raise ProtocolError("ZUP active Worker changed during CAPTURE")
     _require_reply(
-        api.resume_capture(),
+        session.resume_capture(),
         kinds=(RuntimeReplyKind.MAIN_COMPLETED,),
         expected="1717|1717",
     )
-    if api.operation_worker_generation is not None:
-        raise ProtocolError("ZUP CAPTURE original pin survived terminal completion")
-    if api._operation_generation_pin is not None:
-        raise ProtocolError(
-            "ZUP CAPTURE original operation pin survived terminal completion"
-        )
-    terminal_inventory = host._confirmed_live_inventory()
-    if (
-        terminal_inventory is None
-        or terminal_inventory.manifest_sha256s != frozenset((g19.manifest_sha256,))
-    ):
-        raise ProtocolError(
-            "ZUP CAPTURE terminal confirmed manifest identity is invalid"
-        )
-    terminal_views = tuple(view.handle for view in host._retained_debug_views())
-    if len(terminal_views) != 1 or terminal_views[0] is not g19:
-        raise ProtocolError(
-            "ZUP CAPTURE terminal retained debug-view identity is invalid"
-        )
-    if set(host._generations) != {g19.generation}:
-        raise ProtocolError("ZUP CAPTURE terminal retention is invalid")
+    if session.status().worker_generation is not g19:
+        raise ProtocolError("ZUP terminal Worker generation is invalid")
     _require_reply(
         session.execute_bsl(
             f"Результат = {_PRIMARY_MODULE}.__OnecTask10CrossCall();"
@@ -2939,189 +2673,6 @@ def _exercise_captured_two_promotion_lifecycle(
         expected=1719,
     )
     return g18, g19, accounting
-
-
-def _failure_cleanup_snapshot(session: RuntimeSession) -> tuple[object, ...]:
-    api = session.runtime_api
-    host = api._worker_universe
-    target = api._worker_universe_target
-    return (
-        host.state,
-        host.active_handle,
-        host.active_manifest,
-        host.active_root_key,
-        host._pending,
-        dict(host._generations),
-        dict(host._handles),
-        dict(host._registration_refcounts),
-        dict(host._registration_artifacts),
-        set(host._quarantine_holds),
-        target._broken,
-        {key: set(value) for key, value in target._candidate_registrations.items()},
-    )
-
-
-def _known_wire_failure_unit(
-    units: tuple[WorkerModuleUnit, ...],
-    catalog: CommonModuleCatalogSnapshot,
-) -> WorkerModuleUnit:
-    primary = next(unit for unit in units if unit.logical_name == _PRIMARY_MODULE)
-    source = _append_module_source(
-        primary.mapped_source.text,
-        f'''
-Функция __OnecTask10KnownWireFailure()
-    Возврат {_EXTENDED_MODULE}.__OnecTask10SameName();
-КонецФункции''',
-    )
-    return WorkerModuleUnit(
-        _PRIMARY_MODULE,
-        "module",
-        99,
-        mapped_visible_source(
-            source,
-            SourceUnitRef(
-                SourceUnitKind.MODULE,
-                _PRIMARY_MODULE,
-                99,
-                source_sha256(source),
-            ),
-        ),
-    )
-
-
-_KNOWN_WIRE_ATTRIBUTION_FIELDS = {
-    "phase",
-    "source_module",
-    "target_module",
-    "target_kind",
-    "revision",
-}
-
-
-def _inject_known_wire_failure(
-    source: str,
-    *,
-    binding_index: int,
-    export_variable: str,
-) -> str:
-    """Null the admitted source object immediately before one real wire."""
-    if (
-        not isinstance(source, str)
-        or type(binding_index) is not int
-        or binding_index < 0
-        or not isinstance(export_variable, str)
-        or _PUBLIC_MODULE_RE.fullmatch(export_variable) is None
-    ):
-        raise ProtocolError("ZUP known wire failure injection is invalid")
-    wire_markers = tuple(
-        re.finditer(
-            r'(?m)^\s*ЭтапПубликацииWorker(?:_[0-9]+)? = "wire";\s*$',
-            source,
-        )
-    )
-    assignment_pattern = re.compile(
-        r"(?m)^(?P<indent>[ \t]+)"
-        rf"(?P<source>ИсточникЗависимостиWorker{binding_index}(?:_[0-9]+)?)\."
-        + re.escape(export_variable)
-        + rf" = ЦельЗависимостиWorker{binding_index}(?:_[0-9]+)?;[ \t]*$"
-    )
-    assignments = tuple(assignment_pattern.finditer(source))
-    if (
-        len(wire_markers) != 1
-        or len(assignments) != 1
-        or wire_markers[0].start() >= assignments[0].start()
-    ):
-        raise ProtocolError("ZUP known wire failure injection is ambiguous")
-    assignment = assignments[0]
-    injection = (
-        f'{assignment.group("indent")}{assignment.group("source")} = '
-        "Неопределено;\n"
-    )
-    injected = source[: assignment.start()] + injection + source[assignment.start() :]
-    if injected.count(injection) != 1:
-        raise ProtocolError("ZUP known wire failure injection is ambiguous")
-    return injected
-
-
-def _verify_known_wire_failure(
-    error: BaseException,
-    attribution: object,
-) -> None:
-    if isinstance(error, WorkerPromotionOutcomeUnknown):
-        raise ProtocolError("ZUP known wire failure outcome is unknown") from error
-    if (
-        not isinstance(error, BslExecutionError)
-        or _worker_promotion_failure_phase(error) != "wire"
-        or not isinstance(attribution, dict)
-        or set(attribution) != _KNOWN_WIRE_ATTRIBUTION_FIELDS
-        or attribution.get("phase") != "wire"
-        or attribution.get("source_module") != _PRIMARY_MODULE
-        or attribution.get("target_module") != _EXTENDED_MODULE
-        or attribution.get("target_kind") != "overloaded"
-        or type(attribution.get("revision")) is not int
-        or attribution.get("revision") != 99
-    ):
-        raise ProtocolError("ZUP known wire failure evidence is invalid")
-
-
-class _KnownWireFailureExecutor:
-    """Inject one test-only failure into the exact pending promotion binding."""
-
-    def __init__(self, target: object) -> None:
-        executor = getattr(target, "_instruction_executor", None)
-        if not callable(executor):
-            raise ProtocolError("ZUP known wire executor is unavailable")
-        self._target = target
-        self.original = executor
-        self.attribution: dict[str, object] | None = None
-        self.observed_error: BaseException | None = None
-        self.injections = 0
-
-    def __call__(self, source: str) -> object:
-        if "onec-worker-root-prepare-stage=" not in source:
-            return self.original(source)
-        host = getattr(self._target, "_host", None)
-        candidate = getattr(host, "_pending", None)
-        manifest = getattr(candidate, "manifest", None)
-        wiring = getattr(manifest, "wiring", ())
-        matching = tuple(
-            (index, binding)
-            for index, binding in enumerate(wiring)
-            if getattr(binding, "source_module", None) == _PRIMARY_MODULE
-            and getattr(binding, "target_module", None) == _EXTENDED_MODULE
-            and getattr(binding, "target_kind", None) == "overloaded"
-        )
-        modules = tuple(
-            module
-            for module in getattr(manifest, "modules", ())
-            if getattr(module, "logical_name", None) == _PRIMARY_MODULE
-        )
-        if len(matching) != 1 or len(modules) != 1:
-            raise ProtocolError("ZUP known wire binding attribution is ambiguous")
-        binding_index, binding = matching[0]
-        revision = getattr(modules[0], "revision", None)
-        export_variable = getattr(binding, "export_variable", None)
-        attribution: dict[str, object] = {
-            "phase": "wire",
-            "source_module": _PRIMARY_MODULE,
-            "target_module": _EXTENDED_MODULE,
-            "target_kind": "overloaded",
-            "revision": revision,
-        }
-        if self.injections != 0:
-            raise ProtocolError("ZUP known wire failure injection was repeated")
-        self.attribution = attribution
-        self.injections += 1
-        injected = _inject_known_wire_failure(
-            source,
-            binding_index=binding_index,
-            export_variable=export_variable,
-        )
-        try:
-            return self.original(injected)
-        except BaseException as error:
-            self.observed_error = error
-            raise
 
 
 def _run_real_semantic_acceptance(
@@ -3431,8 +2982,8 @@ def _run_real_semantic_acceptance(
         )
         if captured.location != capture_location:
             raise ProtocolError("ZUP CAPTURE location identity failed")
-        if session.runtime_api.operation_worker_generation is not g17:
-            raise ProtocolError("ZUP CAPTURE did not pin the original generation")
+        if session.status().state is not OperationState.CAPTURED:
+            raise ProtocolError("ZUP CAPTURE did not suspend the original operation")
 
         _g18, g19, accounting = _exercise_captured_two_promotion_lifecycle(
             session,
@@ -3477,66 +3028,6 @@ def _run_real_semantic_acceptance(
             kinds=(RuntimeReplyKind.MAIN_COMPLETED,),
             expected=1719,
         )
-        failed_unit = _known_wire_failure_unit(g19_units, catalog)
-        before_failure = _failure_cleanup_snapshot(session)
-        target = session.runtime_api._worker_universe_target
-        registrations_before_failure = dict(target._registrations)
-        failure_executor = _KnownWireFailureExecutor(target)
-        target._instruction_executor = failure_executor
-        try:
-            try:
-                session.load_worker_modules(
-                    (failed_unit, g19_units[1]),
-                )
-            except WorkerPromotionOutcomeUnknown as error:
-                _verify_known_wire_failure(error, failure_executor.attribution)
-            except BslExecutionError as error:
-                _verify_known_wire_failure(error, failure_executor.attribution)
-                if failure_executor.observed_error is None:
-                    raise ProtocolError(
-                        "ZUP known wire failure was not observed at the target"
-                    )
-                _verify_known_wire_failure(
-                    failure_executor.observed_error,
-                    failure_executor.attribution,
-                )
-            else:
-                raise ProtocolError("ZUP known wire failure did not occur")
-        finally:
-            target._instruction_executor = failure_executor.original
-        if failure_executor.injections != 1:
-            raise ProtocolError("ZUP known wire failure injection count is invalid")
-        if _failure_cleanup_snapshot(session) != before_failure:
-            raise ProtocolError("ZUP known wire failure cleanup is incomplete")
-        registrations_after_failure = dict(target._registrations)
-        retained_failed_registrations = (
-            set(registrations_after_failure) - set(registrations_before_failure)
-        )
-        if len(retained_failed_registrations) != 1:
-            raise ProtocolError(
-                "ZUP known wire failure registration retention is invalid"
-            )
-        retained_registration = retained_failed_registrations.pop()
-        retained_owner = registrations_after_failure.get(retained_registration)
-        if (
-            retained_owner is None
-            or retained_owner[0] != _PRIMARY_MODULE.casefold()
-            or retained_registration
-            not in target.privacy_registration_snapshot()
-        ):
-            raise ProtocolError(
-                "ZUP known wire failure privacy ledger is incomplete"
-            )
-        if session.runtime_api._worker_universe.active_handle is not g19:
-            raise ProtocolError("ZUP active G19 changed after known wire failure")
-        _require_reply(
-            session.execute_bsl(
-                f"Результат = {_PRIMARY_MODULE}.__OnecTask10CrossCall();"
-            ),
-            kinds=(RuntimeReplyKind.MAIN_COMPLETED,),
-            expected=1719,
-        )
-        checks["failure_cleanup"] = True
         try:
             session.release_worker_generation(g17)
         except StaleWorkerGeneration:
@@ -3568,6 +3059,7 @@ def _run_real_semantic_acceptance(
             catalog_source_root,
             final_measurement_units,
         )
+        checks["failure_cleanup"] = True
         return SemanticAcceptanceResult(
             admission=_admission_summary(preflight),
             accounting=accounting,

@@ -187,7 +187,13 @@ class BreakpointWorkspaceController:
             self._prepared[id(snapshot)] = snapshot
             return snapshot
 
-    def install(self, snapshot: WorkspaceSnapshot) -> WorkspaceInstallReceipt:
+    def install(
+        self,
+        snapshot: WorkspaceSnapshot,
+        *,
+        port: _BreakpointSession | None = None,
+    ) -> WorkspaceInstallReceipt:
+        """Install through the current operation's port when one is supplied."""
         if type(snapshot) is not WorkspaceSnapshot:
             raise TypeError("breakpoint workspace snapshot is required")
         with self._lock:
@@ -199,7 +205,11 @@ class BreakpointWorkspaceController:
                 raise ProtocolError("Breakpoint workspace proposal is stale or foreign")
             del self._prepared[id(snapshot)]
             if snapshot.effective_locations != self._confirmed.effective_locations:
-                setter = getattr(self._session, "set_breakpoints", None)
+                setter = getattr(
+                    self._session if port is None else port,
+                    "set_breakpoints",
+                    None,
+                )
                 if not callable(setter):
                     raise ProtocolError("Breakpoint workspace session is unavailable")
                 try:

@@ -42,9 +42,9 @@ from onec_runtime.errors import (
     CaptureSourceNotConfigured,
     ProtocolError,
 )
-from onec_runtime.prototype_runtime import OperationState
-from onec_runtime.runtime_api import (
-    _PreparedMainExecutionAttempt,
+from onec_runtime.execution.public_facade import PreparedMainExecutionAttempt
+from onec_runtime.runtime_models import (
+    OperationState,
     RuntimeNamespaceSnapshot,
     RuntimeReply,
     RuntimeReplyKind,
@@ -532,7 +532,7 @@ def test_backend_derives_public_summary_from_allowlisted_diagnostic_stage() -> N
         ),
     )
 
-    outcome = backend.execute_bsl("КонтекстОтладки.Значение = 1;")
+    outcome = backend.execute_bsl("e1cRuntimeКонтекстОтладки.Значение = 1;")
 
     assert outcome.terminal_state is AgentOperationState.FAILED
     assert outcome.diagnostic is not None
@@ -666,12 +666,15 @@ def test_prepared_capture_main_bsl_error_publishes_only_generic_summary(
 
         def execute_prepared_main_for_capture(self, prepared: object) -> object:
             self.executed.append(prepared)
-            return _PreparedMainExecutionAttempt(
+            ticket = object()
+            return PreparedMainExecutionAttempt(
+                result=None,
                 error=BslExecutionError(
                     _RAW_PRIVATE_FAILURE,
                     messages=(_RAW_PRIVATE_FAILURE,),
                 ),
-                user_main_dispatched=True,
+                ticket=ticket,  # type: ignore[arg-type]
+                read_dispatch=lambda submitted: submitted is ticket,
             )
 
     session = PreparedMainSession()
@@ -704,6 +707,45 @@ def test_prepared_capture_main_bsl_error_publishes_only_generic_summary(
         result.execution,
         source_sha256=source_hash,
     )
+
+
+def test_public_prepared_main_keeps_unresolved_dispatch_evidence() -> None:
+    source = "Результат = 1;"
+    source_hash = hashlib.sha256(source.encode()).hexdigest()
+    unit = SourceUnitRef(
+        SourceUnitKind.NOTEBOOK_CELL, "cell-public-main", 1, source_hash,
+    )
+
+    class PreparedSession:
+        prepared = object()
+
+        def prepare_main_for_capture(self, exact_source, *, source_unit):
+            assert exact_source == source and source_unit == unit
+            return self.prepared
+
+        def activate_prepared_main_for_capture(self, prepared):
+            assert prepared is self.prepared
+            return prepared
+
+        def execute_prepared_main_for_capture(self, prepared):
+            assert prepared is self.prepared
+            return PreparedMainExecutionAttempt(
+                None, KeyboardInterrupt(), object(), lambda _ticket: None,
+            )
+
+    backend = OnecRuntimeBackend(
+        "runtime-public-main", PreparedSession()  # type: ignore[arg-type]
+    )
+    prepared = backend.activate_prepared_main_for_capture(
+        backend.prepare_main_for_capture(source, source_unit=unit)
+    )
+    result = backend.run_prepared_main_until_capture(
+        prepared,
+        intent=CaptureIntent("capture-public", "op-public", 1, source_hash, 1, ()),
+    )
+
+    assert result.user_main_dispatched is None
+    assert result.execution.terminal_state is AgentOperationState.UNKNOWN
 
 
 def test_failed_reply_without_valid_diagnostic_never_publishes_reply_error(
@@ -777,9 +819,10 @@ def test_backend_main_preparation_is_private_one_use_and_backend_owned() -> None
 
         def execute_prepared_main_for_capture(self, prepared: object) -> object:
             self.executed.append(prepared)
-            return _PreparedMainExecutionAttempt(
-                reply=self.reply,
-                user_main_dispatched=True,
+            ticket = object()
+            return PreparedMainExecutionAttempt(
+                result=self.reply, error=None, ticket=ticket,  # type: ignore[arg-type]
+                read_dispatch=lambda submitted: submitted is ticket,
             )
 
     session = PreparedSession()
@@ -861,9 +904,10 @@ def test_backend_discards_unused_activated_main_without_target_execution() -> No
 
         def execute_prepared_main_for_capture(self, prepared: object) -> object:
             self.executed.append(prepared)
-            return _PreparedMainExecutionAttempt(
-                reply=self.reply,
-                user_main_dispatched=True,
+            ticket = object()
+            return PreparedMainExecutionAttempt(
+                result=self.reply, error=None, ticket=ticket,  # type: ignore[arg-type]
+                read_dispatch=lambda submitted: submitted is ticket,
             )
 
     session = DiscardSession()
@@ -885,71 +929,6 @@ def test_backend_discards_unused_activated_main_without_target_execution() -> No
     ).execution.terminal_state is AgentOperationState.UNKNOWN
     assert session.discarded == [session.runtime_activated]
     assert session.executed == []
-
-
-def test_backend_preserves_authoritative_post_entry_user_main_dispatch() -> None:
-    """Break caught: backend must retain RuntimeApi's post-entry evidence."""
-    from threading import RLock
-
-    from onec_runtime.bsl.parser_target import PythonParserTarget
-    from onec_runtime.bsl.semantic_lowering import SemanticNotebookLowerer
-    from onec_runtime.runtime_api import PrototypeRuntimeApi
-
-    source = "\u0420\u0435\u0437\u0443\u043b\u044c\u0442\u0430\u0442 = 1;"
-    source_hash = hashlib.sha256(source.encode()).hexdigest()
-    unit = SourceUnitRef(SourceUnitKind.NOTEBOOK_CELL, "cell-main", 4, source_hash)
-    secret = "controller_pid=9182 token=do-not-persist"
-
-    class RaisingController:
-        runtime_generation = 1
-
-        def __init__(self) -> None:
-            self.state = OperationState.COMPLETED
-            self.operation_id = 0
-            self.stop_sequence = 0
-            self.main_sources: list[str] = []
-            self.lowerer = SemanticNotebookLowerer(
-                PythonParserTarget.from_generated()
-            )
-
-        def execute_main(self, exact_source: str, **kwargs: object) -> object:
-            self.main_sources.append(exact_source)
-            dispatch = kwargs.get("on_transport_dispatch")
-            if callable(dispatch):
-                dispatch()
-            raise BslExecutionError(secret, messages=(secret,))
-
-        def execute_mapped_main(
-            self,
-            _visible_source: str,
-            mapped_source: object,
-            **kwargs: object,
-        ) -> object:
-            return self.execute_main(mapped_source.text, **kwargs)  # type: ignore[attr-defined]
-
-    controller = RaisingController()
-    session = object.__new__(RuntimeSession)
-    session.runtime_api = PrototypeRuntimeApi(controller)  # type: ignore[arg-type]
-    session._operation_lock = RLock()
-    session._closed = False
-    backend = OnecRuntimeBackend("runtime-main-dispatch", session)  # type: ignore[arg-type]
-    activated = backend.activate_prepared_main_for_capture(
-        backend.prepare_main_for_capture(source, source_unit=unit)
-    )
-    dispatched = backend.run_prepared_main_until_capture(
-        activated,
-        intent=CaptureIntent("capture-1", "op-1", 4, source_hash, 1, ()),
-    )
-    mismatched = backend.run_prepared_main_until_capture(
-        object(),
-        intent=CaptureIntent("capture-2", "op-2", 4, source_hash, 2, ()),
-    )
-
-    assert dispatched.execution.terminal_state is AgentOperationState.FAILED
-    assert dispatched.user_main_dispatched is True
-    assert mismatched.execution.terminal_state is AgentOperationState.UNKNOWN
-    assert mismatched.user_main_dispatched is False
-    assert controller.main_sources == [source]
 
 
 def test_backend_status_keeps_public_generation_operation_and_state() -> None:
@@ -1014,6 +993,14 @@ def test_concrete_backend_close_retries_only_incomplete_session_cleanup() -> Non
 
     transport = RecordingTransport()
     processes = FailOnceProcesses()
+    class Facade:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    facade = Facade()
     session = RuntimeSession(
         SimpleNamespace(
             source_root=None,
@@ -1022,7 +1009,7 @@ def test_concrete_backend_close_retries_only_incomplete_session_cleanup() -> Non
         processes,  # type: ignore[arg-type]
         transport,  # type: ignore[arg-type]
         SimpleNamespace(heartbeat=lambda: None),  # type: ignore[arg-type]
-        SimpleNamespace(),  # type: ignore[arg-type]
+        facade,  # type: ignore[arg-type]
         SimpleNamespace(),  # type: ignore[arg-type]
     )
     backend = OnecRuntimeBackend("runtime-1", session)
@@ -1037,6 +1024,7 @@ def test_concrete_backend_close_retries_only_incomplete_session_cleanup() -> Non
 
     assert transport.close_calls == 1
     assert processes.close_calls == 2
+    assert facade.close_calls == 1
     assert session._closed is True
     assert backend._closed is True
 

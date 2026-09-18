@@ -1743,7 +1743,7 @@ class AgentWorkspaceService:
                 operation_id,
                 stage="capture_setup_after_activation",
             )
-        if result.user_main_dispatched is not True:
+        if result.user_main_dispatched is False:
             try:
                 runtime.backend.discard_prepared_main_for_capture(prepared_main)
             except BaseException:
@@ -3002,7 +3002,7 @@ class AgentWorkspaceService:
             return
         snapshot = backend.namespace_snapshot()
         for name in snapshot.names:
-            backend.validate_value_reference(f"Контекст.{name}")
+            backend.validate_value_reference(f"e1cRuntimeКонтекст.{name}")
         provenance = ProxyProvenance(
             "runtime-admission",
             1,
@@ -3030,7 +3030,7 @@ class AgentWorkspaceService:
                     "runtime_generation": snapshot.runtime_generation,
                     "context_generation": snapshot.context_generation,
                     "provenance": provenance,
-                    "resolver_handle": f"Контекст.{name}",
+                    "resolver_handle": f"e1cRuntimeКонтекст.{name}",
                     "capabilities": (
                         "describe",
                         "size",

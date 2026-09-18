@@ -6,7 +6,14 @@ from xml.etree import ElementTree
 import pytest
 
 import onec_runtime.rdbg.session as session_module
-from onec_runtime.errors import CommandTimeout, ProtocolError, TargetLost, UnexpectedStop
+from onec_runtime.errors import (
+    CommandTimeout,
+    EvaluationDispatchUnknown,
+    LocalVariablesResultTimeout,
+    ProtocolError,
+    TargetLost,
+    UnexpectedStop,
+)
 from onec_runtime.performance_profile import PhaseRecorder
 from onec_runtime.rdbg.models import (
     DebugTarget,
@@ -146,7 +153,7 @@ def test_invalidate_fences_breakpoint_request_after_validation_and_build(
     assert session._breakpoint_installed is False
 
 
-def test_invalidate_fences_eval_request_after_dispatch_marker() -> None:
+def test_invalidate_after_eval_admission_allows_only_the_admitted_request() -> None:
     transport = FakeTransport()
     session = ready_session(transport)
     dispatch_entered = Event()
@@ -178,7 +185,7 @@ def test_invalidate_fences_eval_request_after_dispatch_marker() -> None:
     assert not worker.is_alive()
     assert len(errors) == 1
     assert isinstance(errors[0], ProtocolError)
-    assert transport.calls == []
+    assert transport.calls == ["evalExpr"]
     assert session._pending_evaluation_states == {}
 
 
@@ -223,6 +230,69 @@ def test_heartbeat_renews_the_registered_debug_ui_lease() -> None:
     assert transport.calls == ["pingDebugUIParams", "getDbgAllTargetStates"]
 
 
+def test_heartbeat_marks_each_transport_entry_before_request() -> None:
+    events: list[str] = []
+
+    class OrderedTransport(FakeTransport):
+        def test_server(self) -> float:
+            events.append("test_server")
+            return super().test_server()
+
+        def request(self, command: str, payload: bytes = b"", **options: object) -> bytes:
+            events.append(command)
+            return super().request(command, payload, **options)
+
+    transport = OrderedTransport()
+    transport.responses["pingDebugUIParams"].append(b"")
+    transport.responses["getDbgAllTargetStates"].append(target_states_payload())
+    session = ready_session(transport)
+
+    result = session.heartbeat(on_transport_dispatch=lambda: events.append("dispatch"))
+
+    assert result == {"rtt_ms": 1.0, "target_state": "stopped"}
+    assert events == [
+        "dispatch", "test_server", "dispatch", "pingDebugUIParams",
+        "dispatch", "getDbgAllTargetStates",
+    ]
+
+
+def test_heartbeat_callback_rejection_blocks_first_and_later_transport_entries() -> None:
+    class CountingTransport(FakeTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.server_checks = 0
+
+        def test_server(self) -> float:
+            self.server_checks += 1
+            return super().test_server()
+
+    first = CountingTransport()
+    first_session = ready_session(first)
+
+    def reject_first() -> None:
+        raise ValueError("before first entry")
+
+    with pytest.raises(ValueError, match="before first entry"):
+        first_session.heartbeat(on_transport_dispatch=reject_first)
+    assert first.server_checks == 0
+    assert first.calls == []
+
+    later = CountingTransport()
+    later_session = ready_session(later)
+    attempts = 0
+
+    def reject_second() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 2:
+            raise ValueError("before second entry")
+
+    with pytest.raises(ValueError, match="before second entry"):
+        later_session.heartbeat(on_transport_dispatch=reject_second)
+    assert later.server_checks == 1
+    assert later.calls == []
+
+
 def test_heartbeat_reports_lost_selected_target_after_renewing_lease() -> None:
     """Break: treating a missing selected target as a healthy heartbeat."""
     transport = FakeTransport()
@@ -250,6 +320,141 @@ def started_payload(target_id: UUID) -> bytes:
     return f"""<response xmlns="{RDBG_NS}"><result><cmdID>targetStarted</cmdID>
       <targetID xmlns="{BASE_NS}"><id>{target_id}</id><infoBaseAlias>DefAlias</infoBaseAlias>
       <targetType>ManagedClient</targetType></targetID></result></response>""".encode()
+
+
+@pytest.mark.parametrize(
+    ("blocked_entry", "expected_calls"),
+    [
+        (3, ["pingDebugUIParams"]),
+        (4, ["pingDebugUIParams", "clearBreakOnNextStatement"]),
+        (5, ["pingDebugUIParams", "clearBreakOnNextStatement", "attachDetachDbgTargets"]),
+    ],
+)
+def test_heartbeat_fences_each_autoattach_effect_after_ping(
+    blocked_entry: int, expected_calls: list[str],
+) -> None:
+    transport = FakeTransport()
+    transport.responses["pingDebugUIParams"].append(
+        started_payload(UUID("33333333-3333-3333-3333-333333333333"))
+    )
+    transport.responses["getDbgAllTargetStates"].append(target_states_payload())
+    session = ready_session(transport)
+    session._breakpoint_installed = True
+    session._breakpoint_locations = (LOCATION,)
+    entries = 0
+
+    def reject_at_entry() -> None:
+        nonlocal entries
+        entries += 1
+        if entries == blocked_entry:
+            raise ValueError("Stop fenced autoattach")
+
+    with pytest.raises(ValueError, match="Stop fenced autoattach"):
+        session.heartbeat(on_transport_dispatch=reject_at_entry)
+
+    assert entries == blocked_entry
+    assert transport.calls == expected_calls
+
+
+def test_eval_wait_fences_autoattach_discovered_during_poll() -> None:
+    transport = FakeTransport()
+    transport.responses["pingDebugUIParams"].append(
+        started_payload(UUID("33333333-3333-3333-3333-333333333333"))
+    )
+    session = ready_session(transport)
+    pending = session.start_evaluation("1")
+    entries = 0
+
+    def reject_autoattach() -> None:
+        nonlocal entries
+        entries += 1
+        if entries == 2:
+            raise ValueError("Stop fenced eval poll autoattach")
+
+    with pytest.raises(ValueError, match="Stop fenced eval poll autoattach"):
+        session.wait_evaluation_event(
+            pending, timeout_s=1, on_transport_dispatch=reject_autoattach,
+        )
+
+    assert transport.calls == ["evalExpr", "pingDebugUIParams"]
+    assert id(pending) in session._pending_evaluation_states
+
+
+def test_eval_result_survives_fenced_autoattach_in_same_ping() -> None:
+    transport = FakeTransport()
+    session = ready_session(transport)
+    pending = session.start_evaluation("1")
+    discovered_id = UUID("33333333-3333-3333-3333-333333333333")
+    transport.responses["pingDebugUIParams"].append(f'''<response xmlns="{RDBG_NS}">
+      <result><cmdID>targetStarted</cmdID>
+        <targetID xmlns="{BASE_NS}"><id>{discovered_id}</id>
+          <infoBaseAlias>DefAlias</infoBaseAlias><targetType>ManagedClient</targetType>
+        </targetID></result>
+      <result><cmdID>exprEvaluated</cmdID><evalExprResBaseData>
+        <expressionResultID xmlns="{CALC_NS}">{pending.result_id}</expressionResultID>
+        <resultValueInfo xmlns="{CALC_NS}"><typeName>Число</typeName><pres>MQ==</pres></resultValueInfo>
+        <errorOccurred xmlns="{CALC_NS}">false</errorOccurred>
+      </evalExprResBaseData></result></response>'''.encode())
+    entries = 0
+
+    def stop_before_autoattach() -> None:
+        nonlocal entries
+        entries += 1
+        if entries == 2:
+            raise ValueError("Stop fenced autoattach")
+
+    with pytest.raises(ValueError, match="Stop fenced autoattach"):
+        session.wait_evaluation_event(
+            pending, timeout_s=1, on_transport_dispatch=stop_before_autoattach,
+        )
+
+    assert transport.calls == ["evalExpr", "pingDebugUIParams"]
+    assert id(pending) in session._pending_evaluation_states
+    result = session.wait_evaluation_event(pending, timeout_s=0.01)
+    assert (result.result_id, result.presentation) == (pending.result_id, "1")
+    assert transport.calls == ["evalExpr", "pingDebugUIParams"]
+
+
+def test_main_stop_wait_fences_autoattach_discovered_during_poll() -> None:
+    transport = FakeTransport()
+    transport.responses["pingDebugUIParams"].append(
+        started_payload(UUID("33333333-3333-3333-3333-333333333333"))
+    )
+    session = ready_session(transport)
+    session.state = SessionState.EXECUTING
+    entries = 0
+
+    def reject_autoattach() -> None:
+        nonlocal entries
+        entries += 1
+        if entries == 2:
+            raise ValueError("Stop fenced MAIN poll autoattach")
+
+    with pytest.raises(ValueError, match="Stop fenced MAIN poll autoattach"):
+        session.wait_for_any_stop(timeout_s=1, on_transport_dispatch=reject_autoattach)
+
+    assert transport.calls == ["pingDebugUIParams"]
+
+
+def test_local_variables_wait_fences_autoattach_discovered_during_poll() -> None:
+    transport = FakeTransport()
+    transport.responses["evalLocalVariables"].append(b"")
+    transport.responses["pingDebugUIParams"].append(
+        started_payload(UUID("33333333-3333-3333-3333-333333333333"))
+    )
+    session = ready_session(transport)
+    entries = 0
+
+    def reject_autoattach() -> None:
+        nonlocal entries
+        entries += 1
+        if entries == 3:
+            raise ValueError("Stop fenced locals poll autoattach")
+
+    with pytest.raises(ValueError, match="Stop fenced locals poll autoattach"):
+        session.local_variables(timeout_s=1, on_transport_dispatch=reject_autoattach)
+
+    assert transport.calls == ["evalLocalVariables", "pingDebugUIParams"]
 
 
 def test_heartbeat_preserves_stop_evaluation_and_locals_for_real_consumers(
@@ -339,6 +544,26 @@ def test_wait_for_any_stop_returns_unregistered_location_paused() -> None:
     assert event.location == UNREGISTERED
     assert session.state is SessionState.READY
     assert transport.calls.count("step") == 0
+
+
+def test_wait_for_any_stop_interval_expiry_preserves_running_target() -> None:
+    transport = FakeTransport()
+    session = ready_session(transport)
+    original_target = session.target
+    session.state = SessionState.EXECUTING
+
+    with pytest.raises(CommandTimeout, match="waiting for a runtime stop"):
+        session.wait_for_any_stop(timeout_s=0.001)
+
+    assert session.state is SessionState.EXECUTING
+    assert session.target is original_target
+
+    transport.responses["pingDebugUIParams"].append(stopped_payload(CAPTURE_A))
+    stop = session.wait_for_any_stop(timeout_s=1)
+
+    assert stop.location == CAPTURE_A
+    assert session.state is SessionState.READY
+    assert session.target is original_target
 
 
 def test_wait_for_any_stop_aborts_when_owned_client_exits_between_polls() -> None:
@@ -499,6 +724,67 @@ def test_local_variables_bounds_the_http_request_by_its_deadline() -> None:
     assert 0 < transport.request_timeout <= 0.25
 
 
+def test_local_variables_missing_result_is_a_read_timeout() -> None:
+    transport = FakeTransport()
+    session = ready_session(transport)
+
+    with pytest.raises(LocalVariablesResultTimeout):
+        session.local_variables(timeout_s=0.01)
+
+    assert transport.calls[0] == 'evalLocalVariables'
+    assert session.state is SessionState.READY
+
+
+def test_local_variables_callback_rejection_prevents_transport_and_pending_state() -> None:
+    transport = FakeTransport()
+    session = ready_session(transport)
+
+    def reject() -> None:
+        raise ValueError("local owner rejected dispatch")
+
+    with pytest.raises(ValueError, match="local owner rejected dispatch"):
+        session.local_variables(timeout_s=1, on_transport_dispatch=reject)
+
+    assert transport.calls == []
+    assert session._pending_local_variables == {}
+    assert session.state is SessionState.READY
+
+
+def test_local_variables_marks_transport_entry_before_each_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_id = UUID("11111111-9999-9999-9999-999999999999")
+    second_id = UUID("22222222-9999-9999-9999-999999999999")
+    events: list[str] = []
+
+    class OrderedTransport(FakeTransport):
+        def request(self, command: str, payload: bytes = b"", **options: object) -> bytes:
+            events.append("request")
+            return super().request(command, payload, **options)
+
+    transport = OrderedTransport()
+    for result_id in (first_id, second_id):
+        transport.responses["evalLocalVariables"].append(
+            f"""<response xmlns="{RDBG_NS}"><result>
+              <expressionResultID xmlns="{CALC_NS}">{result_id}</expressionResultID>
+              <calculationResult xmlns="{CALC_NS}"/><errorOccurred>false</errorOccurred>
+            </result></response>""".encode()
+        )
+    session = ready_session(transport)
+    result_ids = iter((first_id, second_id))
+    monkeypatch.setattr("onec_runtime.rdbg.session.uuid4", lambda: next(result_ids))
+
+    result = session.local_variables(
+        timeout_s=1,
+        retry_delays_s=(0,),
+        on_transport_dispatch=lambda: events.append("dispatch"),
+    )
+
+    assert result.result_id == second_id
+    assert events == ["dispatch", "request", "dispatch", "request"]
+    assert transport.calls == ["evalLocalVariables", "evalLocalVariables"]
+
+
 def test_evaluate_targets_selected_stack_frame(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -515,7 +801,7 @@ def test_evaluate_targets_selected_stack_frame(
     monkeypatch.setattr("onec_runtime.rdbg.session.uuid4", lambda: result_id)
 
     session.evaluate(
-        "RuntimeKernelServer.НачатьКонтекстОтладки(Неопределено, Контекст)",
+        "RuntimeKernelServer.НачатьКонтекстОтладки(Неопределено, e1cRuntimeКонтекст)",
         stack_level=2,
     )
 
@@ -546,6 +832,94 @@ def test_evaluation_stop_is_returned_before_matching_result(
     assert transport.calls.count("step") == 1
 
 
+def test_pending_evaluation_preserves_foreign_stop_before_matching_result() -> None:
+    transport = FakeTransport()
+    session = ready_session(transport)
+    pending = session.start_evaluation("1", stack_level=0)
+    foreign = DebugTarget(
+        TargetId(UUID("33333333-3333-3333-3333-333333333333"), "DefAlias"),
+        "ManagedClient",
+        "stopped",
+    )
+    session.attached_targets[foreign.target_id.id] = foreign
+    foreign_stop = StopEvent(foreign.target_id, LOCATION, "breakpoint")
+    result = EvaluationResult(pending.result_id, "Число", "1", False)
+    session._event_queue.extend((foreign_stop, result))
+
+    assert session.wait_evaluation_event(pending, timeout_s=1) is result
+    assert session.target.target_id == pending.target_id
+    session.state = SessionState.ATTACHED
+    assert session.wait_for_any_stop(
+        expected_target=foreign.target_id, timeout_s=1,
+    ) is foreign_stop
+    assert session.target is foreign
+    assert transport.calls == ["evalExpr"]
+
+
+def test_continue_evaluation_callback_rejection_keeps_exact_pending_stop() -> None:
+    transport = FakeTransport()
+    session = ready_session(transport)
+    pending = session.start_evaluation("1")
+    stop = StopEvent(pending.target_id, UNREGISTERED, "callStackFormed")
+    session._event_queue.append(stop)
+    assert session.wait_evaluation_event(pending, timeout_s=1) is stop
+
+    def reject() -> None:
+        raise ValueError("Stop fenced Continue")
+
+    with pytest.raises(ValueError, match="Stop fenced Continue"):
+        session.continue_evaluation(pending, stop, on_transport_dispatch=reject)
+
+    assert "step" not in transport.calls
+    assert session._pending_evaluation_states[id(pending)].suspended_stop is stop
+    assert session.state is SessionState.READY
+
+
+def test_continue_evaluation_marks_exact_stop_before_step_request() -> None:
+    events: list[str] = []
+
+    class OrderedTransport(FakeTransport):
+        def request(self, command: str, payload: bytes = b"", **options: object) -> bytes:
+            if command == "step":
+                events.append("step")
+            return super().request(command, payload, **options)
+
+    transport = OrderedTransport()
+    session = ready_session(transport)
+    pending = session.start_evaluation("1")
+    stop = StopEvent(pending.target_id, UNREGISTERED, "callStackFormed")
+    session._event_queue.append(stop)
+    assert session.wait_evaluation_event(pending, timeout_s=1) is stop
+
+    session.continue_evaluation(
+        pending, stop, on_transport_dispatch=lambda: events.append("dispatch"),
+    )
+
+    assert events == ["dispatch", "step"]
+    assert session._pending_evaluation_states[id(pending)].suspended_stop is None
+    assert transport.calls.count("step") == 1
+
+
+def test_continue_evaluation_rejects_foreign_stop_before_callback() -> None:
+    transport = FakeTransport()
+    session = ready_session(transport)
+    pending = session.start_evaluation("1")
+    owned_stop = StopEvent(pending.target_id, UNREGISTERED, "callStackFormed")
+    session._event_queue.append(owned_stop)
+    assert session.wait_evaluation_event(pending, timeout_s=1) is owned_stop
+    foreign_stop = StopEvent(pending.target_id, UNREGISTERED, "callStackFormed")
+    entered: list[str] = []
+
+    with pytest.raises(ProtocolError, match="stale or foreign"):
+        session.continue_evaluation(
+            pending, foreign_stop, on_transport_dispatch=lambda: entered.append("step"),
+        )
+
+    assert entered == []
+    assert "step" not in transport.calls
+    assert session._pending_evaluation_states[id(pending)].suspended_stop is owned_stop
+
+
 def test_start_evaluation_accepts_empty_xml_acknowledgement() -> None:
     transport = FakeTransport()
     transport.responses["evalExpr"].append(
@@ -559,15 +933,109 @@ def test_start_evaluation_accepts_empty_xml_acknowledgement() -> None:
     assert session.state is SessionState.READY
 
 
-def test_start_evaluation_rejects_nonempty_xml_without_result() -> None:
+def test_ambiguous_eval_transport_keeps_one_capability_for_late_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TimedOutEvalTransport(FakeTransport):
+        def request(self, command: str, payload: bytes = b"", **options: object) -> bytes:
+            if command == "evalExpr":
+                self.calls.append(command)
+                raise CommandTimeout("evalExpr HTTP response was lost")
+            return super().request(command, payload, **options)
+
+    transport = TimedOutEvalTransport()
+    session = ready_session(transport)
+    entered: list[str] = []
+
+    with pytest.raises(EvaluationDispatchUnknown) as raised:
+        session.start_evaluation("1", on_transport_dispatch=lambda: entered.append("evalExpr"))
+
+    pending = raised.value.pending
+    assert entered == ["evalExpr"]
+    assert len(session._pending_evaluation_states) == 1
+    with pytest.raises(ProtocolError, match="already pending"):
+        session.start_evaluation("2")
+
+    result = EvaluationResult(pending.result_id, "Число", "1", False)
+    monkeypatch.setattr(session, "_poll", lambda _timeout: ([], [result]))
+    assert session.wait_evaluation_event(pending, timeout_s=1) is result
+    assert transport.calls.count("evalExpr") == 1
+    assert session._pending_evaluation_states == {}
+
+
+def test_pretransport_eval_admission_failure_releases_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = FakeTransport()
+    session = ready_session(transport)
+    original_request = session._request
+    entered: list[str] = []
+
+    def invalidate_before_request(command: str, payload: bytes = b"", **options: object) -> bytes:
+        session.invalidate()
+        return original_request(command, payload, **options)
+
+    monkeypatch.setattr(session, "_request", invalidate_before_request)
+    with pytest.raises(ProtocolError, match="invalidated"):
+        session.start_evaluation("1", on_transport_dispatch=lambda: entered.append("evalExpr"))
+
+    assert entered == []
+    assert transport.calls == []
+    assert session._pending_evaluation_states == {}
+
+
+def test_invalidation_after_eval_dispatch_reports_unknown_outcome() -> None:
+    class InvalidatingTransport(FakeTransport):
+        def request(self, command: str, payload: bytes = b"", **options: object) -> bytes:
+            response = super().request(command, payload, **options)
+            if command == "evalExpr":
+                session.invalidate()
+            return response
+
+    transport = InvalidatingTransport()
+    session = ready_session(transport)
+    entered: list[str] = []
+
+    with pytest.raises(EvaluationDispatchUnknown) as raised:
+        session.start_evaluation("1", on_transport_dispatch=lambda: entered.append("evalExpr"))
+
+    assert entered == ["evalExpr"]
+    assert raised.value.pending.target_id is not None
+    assert transport.calls.count("evalExpr") == 1
+    assert session.state is SessionState.FAILED
+
+
+def test_malformed_eval_ack_retains_capability_until_correlated_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = FakeTransport()
+    transport.responses["evalExpr"].append(b"<broken")
+    session = ready_session(transport)
+
+    with pytest.raises(EvaluationDispatchUnknown) as raised:
+        session.start_evaluation("1")
+
+    pending = raised.value.pending
+    assert isinstance(raised.value.__cause__, ProtocolError)
+    result = EvaluationResult(pending.result_id, "Число", "1", False)
+    monkeypatch.setattr(session, "_poll", lambda _timeout: ([], [result]))
+    assert session.wait_evaluation_event(pending, timeout_s=1) is result
+    assert transport.calls.count("evalExpr") == 1
+
+
+def test_start_evaluation_treats_nonempty_xml_without_result_as_unknown() -> None:
     transport = FakeTransport()
     transport.responses["evalExpr"].append(
         f'<response xmlns="{RDBG_NS}"><unexpected/></response>'.encode()
     )
     session = ready_session(transport)
 
-    with pytest.raises(ProtocolError, match="missing required result"):
+    with pytest.raises(EvaluationDispatchUnknown) as raised:
         session.start_evaluation("1")
+
+    assert isinstance(raised.value.__cause__, ProtocolError)
+    assert "missing required result" in str(raised.value.__cause__)
+    assert len(session._pending_evaluation_states) == 1
 
 
 def test_pending_evaluation_rejects_copied_capability() -> None:
@@ -675,7 +1143,7 @@ def test_evaluate_collection_returns_absolute_row_indices_and_page_request(
     monkeypatch.setattr("onec_runtime.rdbg.session.uuid4", lambda: result_id)
 
     result = session.evaluate_collection(
-        "Контекст.ZupMaterializationTable",
+        "e1cRuntimeКонтекст.ZupMaterializationTable",
         start_index=4800,
         page_size=2400,
         stack_level=2,
@@ -723,7 +1191,7 @@ def test_evaluate_collection_correlates_deferred_ping_result(
     session.profiler = recorder
     monkeypatch.setattr("onec_runtime.rdbg.session.uuid4", lambda: result_id)
 
-    result = session.evaluate_collection("Контекст.Таблица", start_index=0, timeout_s=1)
+    result = session.evaluate_collection("e1cRuntimeКонтекст.Таблица", start_index=0, timeout_s=1)
 
     assert result.collection_size == 1
     assert result.collection_rows[0].cells[0].value_decimal == "1"
@@ -770,7 +1238,7 @@ def test_started_collection_evaluation_retains_one_capability_until_late_result(
     dispatches: list[str] = []
 
     pending = session.start_collection_evaluation(
-        "Контекст.Таблица",
+        "e1cRuntimeКонтекст.Таблица",
         start_index=100,
         page_size=101,
         stack_level=2,
@@ -805,7 +1273,7 @@ def test_collection_uses_one_deadline_for_http_dispatch_and_result_polling(monke
     monkeypatch.setattr("onec_runtime.rdbg.session.monotonic", lambda: now[0])
     session = ready_session(SlowTransport())
     with pytest.raises(CommandTimeout):
-        session.evaluate_collection("Контекст.Данные", start_index=0, timeout_s=1.0)
+        session.evaluate_collection("e1cRuntimeКонтекст.Данные", start_index=0, timeout_s=1.0)
     assert requests[0] == ("evalExpr", pytest.approx(1.0))
     assert requests[1] == ("pingDebugUIParams", pytest.approx(0.02))
     assert len(requests) == 2
@@ -831,7 +1299,7 @@ def test_collection_rejects_direct_result_received_after_deadline(monkeypatch):
     monkeypatch.setattr("onec_runtime.rdbg.session.monotonic", lambda: now[0])
     session = ready_session(LateTransport())
     with pytest.raises(CommandTimeout):
-        session.evaluate_collection("Контекст.Данные", start_index=0, timeout_s=1.0)
+        session.evaluate_collection("e1cRuntimeКонтекст.Данные", start_index=0, timeout_s=1.0)
 
 
 def test_modify_returns_correlated_error_state(
@@ -910,3 +1378,150 @@ def test_pending_evaluation_survives_interval_timeout_and_consumes_one_late_resu
         session.wait_evaluation_event(pending, timeout_s=0.025)
     assert transport.calls.count("evalExpr") == 1
     assert not session._pending_evaluation_states
+
+@pytest.mark.parametrize('command', ['set_breakpoints', 'modify', 'continue_'])
+def test_main_commands_report_transport_entry_after_validation(command):
+    transport = FakeTransport()
+    session = ready_session(transport)
+    entered = []
+    def invoke():
+        if command == 'set_breakpoints':
+            return session.set_breakpoints((LOCATION,), on_transport_dispatch=lambda: entered.append(True))
+        if command == 'modify':
+            return session.modify('x', '1', on_transport_dispatch=lambda: entered.append(True))
+        return session.continue_(on_transport_dispatch=lambda: entered.append(True))
+    session.state = SessionState.DETACHED
+    with pytest.raises(ProtocolError):
+        invoke()
+    assert entered == []
+    assert transport.calls == []
+    session.state = SessionState.READY
+    if command == 'modify':
+        with pytest.raises(ProtocolError):  # Empty response is ambiguous after entry.
+            invoke()
+    else:
+        invoke()
+    assert entered == [True]
+
+
+def test_continue_validates_remote_acknowledgement():
+    transport = FakeTransport()
+    session = ready_session(transport)
+    transport.responses['step'].append(b'<response><result>failure</result></response>')
+    with pytest.raises(ProtocolError):
+        session.continue_()
+    assert session.state is SessionState.EXECUTING
+
+
+def test_wait_expected_target_preserves_foreign_stop_before_admission():
+    transport = FakeTransport()
+    session = ready_session(transport)
+    expected = session.target
+    foreign = DebugTarget(TargetId(UUID('33333333-3333-3333-3333-333333333333'), 'DefAlias'), 'ServerEmulation', 'stopped')
+    session.attached_targets[foreign.target_id.id] = foreign
+    foreign_stop = StopEvent(foreign.target_id, LOCATION, 'breakpoint')
+    expected_stop = StopEvent(expected.target_id, LOCATION, 'breakpoint')
+    session._event_queue.extend((foreign_stop, expected_stop))
+    session.state = SessionState.EXECUTING
+    assert session.wait_for_any_stop(expected_target=expected.target_id, timeout_s=1) is expected_stop
+    assert session.target is expected
+    assert session.state is SessionState.READY
+    # Another owner can later consume the original foreign event.
+    session.state = SessionState.ATTACHED
+    assert session.wait_for_any_stop(expected_target=foreign.target_id, timeout_s=1) is foreign_stop
+    assert session.target is foreign
+    assert transport.calls == []
+
+
+def test_foreign_only_stop_does_not_prevent_later_expected_poll():
+    transport = FakeTransport()
+    session = ready_session(transport)
+    expected = session.target
+    foreign = DebugTarget(TargetId(UUID('33333333-3333-3333-3333-333333333333'), 'DefAlias'), 'ServerEmulation', 'stopped')
+    session.attached_targets[foreign.target_id.id] = foreign
+    foreign_stop = StopEvent(foreign.target_id, LOCATION, 'breakpoint')
+    session._event_queue.append(foreign_stop)
+    session.state = SessionState.EXECUTING
+    with pytest.raises(CommandTimeout):
+        session.wait_for_any_stop(expected_target=expected.target_id, timeout_s=0.001)
+    assert session.target is expected
+    assert session.state is SessionState.EXECUTING
+    expected_stop = StopEvent(expected.target_id, LOCATION, 'breakpoint')
+    session._event_queue.append(expected_stop)
+    assert session.wait_for_any_stop(expected_target=expected.target_id, timeout_s=1) is expected_stop
+    session.state = SessionState.ATTACHED
+    assert session.wait_for_any_stop(expected_target=foreign.target_id, timeout_s=1) is foreign_stop
+
+
+def test_continue_accepts_step_target_state_response_for_selected_target():
+    transport = FakeTransport()
+    session = ready_session(transport)
+    transport.responses["step"].append(
+        f'''<response xmlns="{RDBG_NS}"><item>
+        <targetID xmlns="{BASE_NS}"><id>{TARGET_ID}</id>
+        <infoBaseAlias>DefAlias</infoBaseAlias><targetType>ServerEmulation</targetType>
+        </targetID><stateNum>16</stateNum><state>Worked</state>
+        </item></response>'''.encode()
+    )
+
+    session.continue_()
+
+    assert session.state is SessionState.EXECUTING
+    assert transport.calls == ["step"]
+
+
+def test_continue_accepts_selected_target_among_step_state_items():
+    transport = FakeTransport()
+    session = ready_session(transport)
+    transport.responses["step"].append(
+        f'''<response xmlns="{RDBG_NS}">
+        <item><targetID xmlns="{BASE_NS}"><id>{UUID(int=91)}</id>
+        <infoBaseAlias>DefAlias</infoBaseAlias><targetType>ManagedClient</targetType>
+        </targetID><stateNum>16</stateNum><state>Worked</state></item>
+        <item><targetID xmlns="{BASE_NS}"><id>{TARGET_ID}</id>
+        <infoBaseAlias>DefAlias</infoBaseAlias><targetType>ServerEmulation</targetType>
+        </targetID><stateNum>16</stateNum><state>Worked</state></item>
+        </response>'''.encode()
+    )
+
+    session.continue_()
+
+    assert session.state is SessionState.EXECUTING
+
+
+def test_continue_rejects_step_state_response_for_another_target():
+    transport = FakeTransport()
+    session = ready_session(transport)
+    transport.responses["step"].append(
+        f'''<response xmlns="{RDBG_NS}"><item>
+        <targetID xmlns="{BASE_NS}"><id>{UUID(int=91)}</id>
+        <infoBaseAlias>DefAlias</infoBaseAlias><targetType>ServerEmulation</targetType>
+        </targetID><stateNum>16</stateNum><state>Worked</state>
+        </item></response>'''.encode()
+    )
+
+    with pytest.raises(ProtocolError, match="step acknowledgement"):
+        session.continue_()
+    assert session.state is SessionState.EXECUTING
+
+
+def test_empty_stop_interval_has_distinct_retryable_exception():
+    from onec_runtime.errors import StopWaitIntervalElapsed
+    session = ready_session(FakeTransport())
+    session.state = SessionState.EXECUTING
+    with pytest.raises(StopWaitIntervalElapsed):
+        session.wait_for_any_stop(timeout_s=0)
+    assert session.state is SessionState.EXECUTING
+
+
+def test_stop_transport_timeout_is_not_an_empty_interval():
+    from onec_runtime.errors import RdbgTransportTimeout, StopWaitIntervalElapsed
+    class FailedTransport(FakeTransport):
+        def request(self, *args, **kwargs):
+            raise RdbgTransportTimeout('network timeout')
+    session = ready_session(FailedTransport())
+    session.state = SessionState.EXECUTING
+    with pytest.raises(RdbgTransportTimeout) as raised:
+        session.wait_for_any_stop(timeout_s=1)
+    assert not isinstance(raised.value, StopWaitIntervalElapsed)
+    assert session.state is SessionState.EXECUTING

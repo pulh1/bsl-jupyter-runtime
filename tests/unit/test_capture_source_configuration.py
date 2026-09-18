@@ -15,9 +15,9 @@ from onec_runtime.errors import (
     CaptureSourceNotConfigured,
     ProtocolError,
 )
+from onec_runtime.execution.public_facade import PublicExecutionFacade
 from onec_runtime.kernel import OBJECT_MODULE_PROPERTY_ID
 from onec_runtime.rdbg.models import ModuleLocation, StackFrame, TargetId
-from onec_runtime.runtime_api import PrototypeRuntimeApi
 from onec_runtime.session import RuntimeSession, RuntimeSessionConfig
 from tests.unit.test_extension_session import (
     FakeLifecycle,
@@ -36,17 +36,21 @@ ACTIVE_TICKET_FIXTURE = object()
 class RecordingCaptureApi:
     calls: list[tuple[ModuleLocation, ...]] = field(default_factory=list)
     failure: BaseException | None = None
+    source_resolvers: list[object] = field(default_factory=list)
 
     def configure_capture_points(self, locations: tuple[ModuleLocation, ...]) -> None:
         if self.failure is not None:
             raise self.failure
         self.calls.append(locations)
 
+    def configure_capture_source_resolver(self, resolver: object) -> None:
+        self.source_resolvers.append(resolver)
+
 
 def bare_capture_session(api: RecordingCaptureApi) -> RuntimeSession:
     session = object.__new__(RuntimeSession)
     session._operation_lock = RLock()
-    session.runtime_api = cast(PrototypeRuntimeApi, api)
+    session.runtime_api = cast(PublicExecutionFacade, api)
     session._active_capture_ticket = None
     session._active_capture_points = ()
     session._active_capture_locations = ()
@@ -154,6 +158,26 @@ def test_clear_capture_source_disarms_and_invalidates_bindings(
         session.resolve_capture_points((request(),))
     with pytest.raises(ValueError, match="not resolved by this capture source"):
         session.verify_capture_points(old)
+
+
+def test_public_facade_receives_rebound_frame_source_resolver(tmp_path: Path) -> None:
+    calls: list[tuple[str, object]] = []
+    facade = object.__new__(PublicExecutionFacade)
+    facade.configure_capture_points = (
+        lambda locations: calls.append(("points", locations))
+    )
+    facade.configure_capture_source_resolver = (
+        lambda resolver: calls.append(("resolver", resolver))
+    )
+    session = bare_capture_session(cast(RecordingCaptureApi, facade))
+
+    session.configure_capture_source("ut", FIXTURES / "designer_base")
+    configured = session._capture_stack_source_resolver
+    assert configured is not None
+    assert calls == [("points", ()), ("resolver", configured)]
+
+    session.clear_capture_source()
+    assert calls[-2:] == [("points", ()), ("resolver", None)]
 
 
 def test_disarm_failure_preserves_existing_source_and_bindings(
@@ -274,16 +298,6 @@ def test_bootstrap_source_root_binds_capture_stack_source_resolution(
     lifecycle = FakeLifecycle(decisions=[fast_decision()])
     patch_successful_runtime_attempt(monkeypatch, lifecycle)
 
-    class RuntimeApi:
-        def configure_capture_points(
-            self, _locations: tuple[ModuleLocation, ...]
-        ) -> None:
-            pass
-
-    import onec_runtime.session as session_module
-    monkeypatch.setattr(
-        session_module, "PrototypeRuntimeApi", lambda *_args, **_kwargs: RuntimeApi()
-    )
     source_root = tmp_path / "source"
     shutil.copytree(FIXTURES / "designer_base", source_root)
 
@@ -517,23 +531,62 @@ def test_confirmed_worker_upserts_publish_complete_source_set(
     tmp_path, loader, failure
 ):
     import shutil
+    from onec_runtime.bsl import (
+        SourceUnitKind, SourceUnitRef, WorkerModuleUnit,
+        mapped_visible_source, source_sha256,
+    )
     from onec_runtime.bsl.module_catalog import SessionCommonModuleCatalog
     from onec_runtime.errors import BslExecutionError, WorkerPromotionOutcomeUnknown
+    from onec_runtime.worker_universe import WorkerGenerationHandle
     from tests.unit.test_bsl_module_catalog import add_metadata
     from tests.unit.test_configuration_source_layout import FIXTURES
-    from tests.unit.test_runtime_api import (
-        _common_module_catalog,
-        _semantic_snapshot_runtime,
-        _SemanticSnapshotFailureTarget,
-        _worker_module_unit,
-    )
+
+    class RecordingWorkerFacade(RecordingCaptureApi):
+        def __init__(self) -> None:
+            super().__init__()
+            self.active_units: dict[str, WorkerModuleUnit] = {}
+            self.active_handle: WorkerGenerationHandle | None = None
+            self.failure_mode: str | None = None
+
+        def load_worker_modules(self, units, **_kwargs):
+            if self.failure_mode == "create":
+                raise BslExecutionError("Worker creation failed")
+            if self.failure_mode == "unknown":
+                raise WorkerPromotionOutcomeUnknown(3, "a" * 64)
+            self.active_units.update(
+                (unit.logical_name.casefold(), unit) for unit in units
+            )
+            generation = (
+                1 if self.active_handle is None
+                else self.active_handle.generation + 1
+            )
+            self.active_handle = WorkerGenerationHandle(
+                1, 1, generation, "a" * 64
+            )
+            return self.active_handle
+
+        def confirmed_worker_module_units(self, handle):
+            if handle is not self.active_handle:
+                raise ProtocolError("Worker source generation is not current")
+            return tuple(self.active_units.values())
+
+    def worker_module_unit(name: str, revision: int) -> WorkerModuleUnit:
+        source = (
+            "Функция Версия() Экспорт\n"
+            f'    Возврат "{name}-{revision}";\n'
+            "КонецФункции\n"
+        )
+        reference = SourceUnitRef(
+            SourceUnitKind.MODULE, name, revision, source_sha256(source)
+        )
+        return WorkerModuleUnit(
+            name, "module", revision, mapped_visible_source(source, reference)
+        )
 
     root = tmp_path / "project"
     shutil.copytree(FIXTURES / "designer_base", root)
     names = ("ModuleA", "ModuleB", "ModuleC")
-    metadata_catalog = _common_module_catalog(*names)
-    target = _SemanticSnapshotFailureTarget()
-    api = _semantic_snapshot_runtime(tmp_path, metadata_catalog, target=target)
+    api = RecordingWorkerFacade()
     session = bare_capture_session(api)
     session._common_module_catalog = SessionCommonModuleCatalog(
         root, profile="server-test"
@@ -544,7 +597,7 @@ def test_confirmed_worker_upserts_publish_complete_source_set(
 
     def save(name, revision):
         add_metadata(root, name, server=True, client=False, global_module=False)
-        unit = _worker_module_unit(name, revision, metadata_catalog)
+        unit = worker_module_unit(name, revision)
         path = root / "CommonModules" / name / "Ext/Module.bsl"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(unit.mapped_source.text.encode("utf-8"))
@@ -597,7 +650,7 @@ def test_confirmed_worker_upserts_publish_complete_source_set(
     assert session._capture_source_catalog.generation == before_update + 1
     confirmed = session._capture_worker_sources
     failed_revision, _ = save("ModuleA", 3)
-    target.failure = failure
+    api.failure_mode = failure
     with pytest.raises((BslExecutionError, WorkerPromotionOutcomeUnknown)):
         if loader == "batch":
             session.load_worker_modules((failed_revision,))
@@ -610,12 +663,12 @@ def test_confirmed_worker_upserts_publish_complete_source_set(
     assert session._capture_source_catalog.generation == before_update + 1
 
 
-def test_confirmed_worker_source_inventory_rejects_unconfirmed_handle(tmp_path):
-    from tests.unit.test_runtime_api import (
-        _common_module_catalog,
-        _semantic_snapshot_runtime,
-    )
+def test_confirmed_worker_source_inventory_rejects_unconfirmed_handle() -> None:
+    from tests.unit.test_worker_module_lifecycle_service import _bound
 
-    api = _semantic_snapshot_runtime(tmp_path, _common_module_catalog("ModuleA"))
-    with pytest.raises(ProtocolError, match="generation"):
-        api.confirmed_worker_module_units(None)
+    _, _, arbiter, _, service = _bound()
+    try:
+        with pytest.raises(ProtocolError, match="generation"):
+            service.confirmed_worker_module_units(None)
+    finally:
+        arbiter.close(timeout=3)

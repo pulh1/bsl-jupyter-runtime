@@ -151,23 +151,19 @@ def main():
             from check_jupyter_bsl_lsp import create_edt_fixture
             create_edt_fixture(root, 'NotebookOnlyLeak')
         startup = f'''import sys
-sys.path.extend({[str(Path(p).resolve()) for p in ('tests/unit', 'packages/mcp/src')]!r})
+sys.path.extend({[str(Path(p).resolve()) for p in ('tests/unit', 'packages/mcp/src', 'tools')]!r})
 import onec_runtime, onec_runtime_jupyter
 assert 'site-packages' in onec_runtime.__file__ and 'site-packages' in onec_runtime_jupyter.__file__, 'Not testing the installed wheel'
-from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from types import SimpleNamespace
-from onec_runtime.session import RuntimeSession
 from onec_runtime_jupyter.extension import install_runtime
-from test_extension_session import session_config, _Closeable, _IdleRdbg
-from test_runtime_api import _semantic_snapshot_runtime, _common_module_catalog, _SemanticSnapshotFailureTarget, _worker_module_source_unit
+from lsp_public_fixture import LspFailureTarget, make_lsp_session, worker_module_source_unit
+_worker_module_source_unit = worker_module_source_unit
 _lsp_fixture = TemporaryDirectory(prefix="onec-lsp-runtime-fixture-")
 _lsp_work = Path(_lsp_fixture.name)
-_lsp_config = replace(session_config(_lsp_work), source_root=Path({str(source_root)!r}))
-_lsp_target = _SemanticSnapshotFailureTarget()
-_lsp_api = _semantic_snapshot_runtime(_lsp_work, _common_module_catalog("JupyterBslFixtureCalleeServer"), target=_lsp_target)
-_lsp_runtime = RuntimeSession(_lsp_config, _Closeable(), _Closeable(), _IdleRdbg(), _lsp_api, SimpleNamespace())
+_lsp_source_root = Path({str(source_root.resolve())!r})
+_lsp_target = LspFailureTarget()
+_lsp_runtime = make_lsp_session(_lsp_work, _lsp_source_root, _lsp_target)
 install_runtime(get_ipython(), _lsp_runtime)
 '''
         sources = [startup, "%%bsl\nНачальноеЗначение = 1;", "%%bsl\nРезультат = JupyterBslFixtureCalleeServer."]
@@ -525,9 +521,8 @@ install_runtime(get_ipython(), _lsp_runtime)
                     assert any(kind == 'completion' for kind, _, _ in held), 'No real completion captured'
                     bindings_before = http_statuses.count(201)
                     previous_status = context_replies[-1]
-                    reinstall_code = ('_lsp_target = _SemanticSnapshotFailureTarget()\n'
-                        '_lsp_api = _semantic_snapshot_runtime(_lsp_work, _common_module_catalog("JupyterBslFixtureCalleeServer"), target=_lsp_target)\n'
-                        '_lsp_runtime = RuntimeSession(_lsp_config, _Closeable(), _Closeable(), _IdleRdbg(), _lsp_api, SimpleNamespace())\n'
+                    reinstall_code = ('_lsp_target = LspFailureTarget()\n'
+                        '_lsp_runtime = make_lsp_session(_lsp_work, _lsp_source_root, _lsp_target)\n'
                         'install_runtime(get_ipython(), _lsp_runtime)')
                     page.evaluate('''async code => {
                       const kernel = window.jupyterapp.shell.currentWidget.sessionContext.session.kernel;
@@ -667,7 +662,10 @@ install_runtime(get_ipython(), _lsp_runtime)
                     finally:
                         unavailable_root.rename(source_root)
                     before_none = context_replies[-1]
-                    execute_fixture(reinstall_code.replace('RuntimeSession(_lsp_config,', 'RuntimeSession(replace(_lsp_config, source_root=None),'))
+                    execute_fixture(reinstall_code.replace(
+                        'make_lsp_session(_lsp_work, _lsp_source_root,',
+                        'make_lsp_session(_lsp_work, None,',
+                    ))
                     for _ in range(300):
                         if any(reply['epoch'] > before_none['epoch'] and reply['analysis_state'] == 'ready'
                                and reply['mode'] == 'virtual-only' for reply in context_replies): break

@@ -28,7 +28,7 @@ from onec_runtime.table_materialization import (
 
 
 _HANDLE = re.compile(
-    r"Контекст\.[^\W\d]\w*(?:\.[^\W\d]\w*)*\Z",
+    r"e1cRuntimeКонтекст\.[^\W\d]\w*(?:\.[^\W\d]\w*)*\Z",
     re.UNICODE,
 )
 _CONTEXT_KEY = re.compile(r"__onec_compact_table_[0-9a-f]{32}\Z")
@@ -212,7 +212,7 @@ def _build_compact_transfer_instruction(
             "Если Не Материализация.Доступ Тогда",
             '    Результат = "D|worker_generation_value";',
             "Иначе",
-            f"    Контекст.Вставить({bsl_string_literal(context_key)}, "
+            f"    e1cRuntimeКонтекст.Вставить({bsl_string_literal(context_key)}, "
             "Материализация.Base64);",
             "    Результат = \"R|\" + "
             f"Формат({runtime_generation}, \"ЧГ=0; ЧДЦ=0\") + \"|\" + "
@@ -385,7 +385,7 @@ class CompactRuntimeTableTransfer:
             return metadata
 
         return CaptureTransferPlan(
-            source, key, f"Контекст.Удалить({bsl_string_literal(key)});\nРезультат = Истина;",
+            source, key, f"e1cRuntimeКонтекст.Удалить({bsl_string_literal(key)});\nРезультат = Истина;",
             self._max_text_size, decode, admit,
         )
 

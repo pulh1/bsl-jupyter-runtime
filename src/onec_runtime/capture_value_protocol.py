@@ -1,9 +1,9 @@
-"""Closed protocol-2 envelope for CAPTURE value inspection.
+"""Closed protocol-3 envelope for CAPTURE value inspection.
 
 The public value descriptors carry only ``SafeValuePath`` objects.  This module
-turns an already-checked descriptor request into a small BSL program which asks
-the checked-in extension helper to admit and project values, then validates the
-opaque payload before the controller creates immutable public records.
+turns an already-checked descriptor request into a bounded expression for the
+checked-in extension helper, then validates the opaque payload before the
+controller creates immutable public records.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ from onec_runtime.capture_values import (
     ValueViewKind,
     VariableRole,
 )
-from onec_runtime.errors import CaptureValueCheckError, ProtocolError
+from onec_runtime.errors import CapturePathError, CaptureValueCheckError, ProtocolError
 from onec_runtime.experiment import bsl_string_literal
 
 
@@ -113,6 +113,102 @@ class CaptureValueInspectionEnvelope:
             raise TypeError("capture value inspection envelope callbacks are invalid")
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class InlineCaptureValueInspection:
+    """One bounded debugger expression with an inline, verified result."""
+
+    source: str = field(repr=False)
+    max_text_size: int
+    decode: Callable[[object], object] = field(repr=False, compare=False)
+
+
+def build_capture_value_inline_expression(
+    *,
+    action: str,
+    path: SafeValuePath,
+    request: ValueInspectionRequest | None,
+    limit: int | None,
+    runtime_generation: int,
+    context_generation: int,
+    worker_type_registrations: tuple[str, ...],
+    native_candidates: tuple[str, ...] = (),
+    native_page: NativeCandidatePage | None = None,
+    policy: CaptureValuePolicy | None = None,
+) -> InlineCaptureValueInspection:
+    """Project values at their own frame without a cross-frame temporary key.
+
+    The old two-step envelope remains a decoder/validation compatibility path;
+    its generated source and key are never dispatched by this request. The
+    checked-in helper returns admission metadata and base64 in one expression.
+    """
+
+    selected_policy = policy or CaptureValuePolicy()
+    baseline = build_capture_value_inspection_envelope(
+        action=action,
+        path=path,
+        request=request,
+        limit=limit,
+        runtime_generation=runtime_generation,
+        context_generation=context_generation,
+        worker_type_registrations=worker_type_registrations,
+        native_candidates=native_candidates,
+        native_page=native_page,
+        policy=selected_policy,
+        _enforce_source_budget=False,
+    )
+    if path.root.kind is ValueRootKind.CONTEXT:
+        roots = "e1cRuntimeКонтекст.e1cRuntimeКонтекстОтладки"
+    elif native_candidates:
+        roots = (
+            "Новый Структура("
+            + bsl_string_literal(",".join(native_candidates))
+            + ", " + ", ".join(native_candidates) + ")"
+        )
+    else:
+        roots = "Новый Структура"
+    selected_request = native_page.source_request if native_page else request
+    argument = {
+        "action": action,
+        "path": [
+            {"kind": segment.kind.value, "key": segment.key}
+            for segment in path.segments
+        ],
+        "view": selected_request.view.value if selected_request else "",
+        "start": selected_request.start if selected_request else 0,
+        "stop": selected_request.stop if selected_request else 0,
+        "role": selected_request.role.value if selected_request else "variables",
+        "parameters": list(selected_request.parameter_names) if selected_request else [],
+        "exact": selected_request.exact if selected_request else None,
+        "registrations": list(worker_type_registrations),
+        "column_limit": 101 if limit is None else limit,
+        "max_items": selected_policy.max_items,
+        "max_bytes": selected_policy.max_bytes,
+        "runtime_generation": runtime_generation,
+        "context_generation": context_generation,
+    }
+    encoded_argument = json.dumps(argument, ensure_ascii=False, separators=(",", ":"))
+    source = (
+        "RuntimeValueTransferServer.СериализоватьИнспекциюДляОтладки("
+        + roots + ", " + bsl_string_literal(encoded_argument) + ")"
+    )
+    if len(source.encode("utf-8")) > MAX_CAPTURE_VALUE_INSPECTION_SOURCE_BYTES:
+        raise CaptureValueCheckError("capture value inspection source exceeds its budget")
+
+    max_text_size = 307_200
+
+    def decode(raw: object) -> object:
+        if not isinstance(raw, str) or len(raw) > max_text_size:
+            raise CaptureValueCheckError("CAPTURE value admission result is invalid")
+        fields = raw.split("|", 6)
+        if len(fields) != 7:
+            baseline.parse_metadata(raw)
+            raise CaptureValueCheckError("CAPTURE value admission result is invalid")
+        metadata = baseline.parse_metadata("|".join(fields[:6]))
+        return baseline.decode(metadata, fields[6])
+
+    return InlineCaptureValueInspection(source, max_text_size, decode)
+
+
 def build_capture_value_inspection_envelope(
     *,
     action: str,
@@ -125,6 +221,7 @@ def build_capture_value_inspection_envelope(
     native_candidates: tuple[str, ...] = (),
     native_page: NativeCandidatePage | None = None,
     policy: CaptureValuePolicy | None = None,
+    _enforce_source_budget: bool = True,
 ) -> CaptureValueInspectionEnvelope:
     """Build a target program with no values or target handles in its API."""
     selected_policy = policy or CaptureValuePolicy()
@@ -198,7 +295,10 @@ def build_capture_value_inspection_envelope(
         max_items=selected_policy.max_items,
         max_bytes=selected_policy.max_bytes,
     )
-    if len(source.encode("utf-8")) > MAX_CAPTURE_VALUE_INSPECTION_SOURCE_BYTES:
+    if (
+        _enforce_source_budget
+        and len(source.encode("utf-8")) > MAX_CAPTURE_VALUE_INSPECTION_SOURCE_BYTES
+    ):
         raise CaptureValueCheckError("capture value inspection source exceeds its budget")
 
     def parse_metadata(metadata: object) -> AdmissionEnvelopeV1:
@@ -495,7 +595,7 @@ def _inspection_source(
         f"    {context} = RuntimeContextStoreServer.ПолучитьКонтекст();",
     ]
     if path.root.kind is ValueRootKind.CONTEXT:
-        lines.append(f"    {roots} = {context}.КонтекстОтладки;")
+        lines.append(f"    {roots} = {context}.e1cRuntimeКонтекстОтладки;")
     else:
         lines.append(f"    {roots} = Новый Структура;")
         for name in native_candidates:
@@ -699,15 +799,27 @@ def _decode_columns(document: dict[str, object], limit: int | None) -> tuple[str
 
 
 def _decode_entry(value: object, *, named: bool) -> PrivateProjectedValue:
-    raw = _exact_object(value, frozenset({"name", "denied"})) if isinstance(value, dict) and value.get("denied") is True else _exact_object(
-        value,
-        frozenset({"name", "denied", "type_name", "preview", "size", "shape", "cycle"}),
-    )
+    if isinstance(value, dict) and value.get("unavailable") is True:
+        raw = _exact_object(value, frozenset({"name", "unavailable"}))
+    elif isinstance(value, dict) and value.get("denied") is True:
+        raw = _exact_object(value, frozenset({"name", "denied"}))
+    else:
+        raw = _exact_object(
+            value,
+            frozenset({"name", "denied", "type_name", "preview", "size", "shape", "cycle"}),
+        )
     name = raw["name"]
     if named:
-        name = SafePathSegment(ValuePathSegmentKind.FIELD, name).key
+        try:
+            name = SafePathSegment(ValuePathSegmentKind.FIELD, name).key
+        except CapturePathError:
+            raise CaptureValueCheckError("CAPTURE value payload is invalid") from None
     elif type(name) is not int or name < 0:
         raise CaptureValueCheckError("CAPTURE value payload is invalid")
+    if "unavailable" in raw:
+        return PrivateProjectedValue(
+            name, lambda: _unavailable_metadata(), unavailable=True,
+        )
     denied = raw["denied"]
     if type(denied) is not bool:
         raise CaptureValueCheckError("CAPTURE value payload is invalid")
@@ -751,3 +863,7 @@ def _selector_key(value: str | int) -> str | int:
 
 def _denied_metadata() -> ValueMetadata:
     raise CaptureValueCheckError("denied capture value metadata is unavailable")
+
+
+def _unavailable_metadata() -> ValueMetadata:
+    raise CaptureValueCheckError("capture value metadata is unavailable")

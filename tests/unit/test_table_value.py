@@ -37,7 +37,7 @@ class FakeSession:
 
 
 def test_legacy_snapshot_materializes_rows_and_columns() -> None:
-    table = OnecTableValue(FakeSession(), "Контекст.Таблица")  # type: ignore[arg-type]
+    table = OnecTableValue(FakeSession(), "e1cRuntimeКонтекст.Таблица")  # type: ignore[arg-type]
 
     frame = table.to_df_legacy()
 
@@ -121,7 +121,7 @@ def test_to_df_reads_stopped_frame_in_2400_row_collection_pages() -> None:
     session = FakeCollectionSession()
     table = OnecTableValue(
         session,  # type: ignore[arg-type]
-        "Контекст.ZupMaterializationTable",
+        "e1cRuntimeКонтекст.ZupMaterializationTable",
     )
 
     frame = table.to_df()
@@ -133,11 +133,11 @@ def test_to_df_reads_stopped_frame_in_2400_row_collection_pages() -> None:
         "Сотрудник": "Сотрудник 10000",
     }
     assert session.calls == [
-        ("Контекст.ZupMaterializationTable", 0, 2400),
-        ("Контекст.ZupMaterializationTable", 2400, 2400),
-        ("Контекст.ZupMaterializationTable", 4800, 2400),
-        ("Контекст.ZupMaterializationTable", 7200, 2400),
-        ("Контекст.ZupMaterializationTable", 9600, 2400),
+        ("e1cRuntimeКонтекст.ZupMaterializationTable", 0, 2400),
+        ("e1cRuntimeКонтекст.ZupMaterializationTable", 2400, 2400),
+        ("e1cRuntimeКонтекст.ZupMaterializationTable", 4800, 2400),
+        ("e1cRuntimeКонтекст.ZupMaterializationTable", 7200, 2400),
+        ("e1cRuntimeКонтекст.ZupMaterializationTable", 9600, 2400),
     ]
 
 
@@ -151,7 +151,7 @@ def test_collection_materializer_profiles_page_conversion_and_dataframe_build() 
         session,  # type: ignore[arg-type]
         page_size=2400,
         profiler=recorder,
-    ).to_df("Контекст.ZupMaterializationTable", ReferencePolicy())
+    ).to_df("e1cRuntimeКонтекст.ZupMaterializationTable", ReferencePolicy())
 
     assert frame.shape == (10_000, 2)
     page_events = [

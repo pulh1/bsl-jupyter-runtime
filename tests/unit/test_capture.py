@@ -29,8 +29,8 @@ def test_rejects_unsafe_or_keyword_capture_names(name: str) -> None:
 
 def test_builds_one_extension_call_with_multiline_instruction() -> None:
     instruction = (
-        'КонтекстОтладки.Результат.Добавить("ИзИнструкции");\n'
-        "ПроверкаРазмера = КонтекстОтладки.Результат.Количество();\n"
+        'e1cRuntimeКонтекстОтладки.Результат.Добавить("ИзИнструкции");\n'
+        "ПроверкаРазмера = e1cRuntimeКонтекстОтладки.Результат.Количество();\n"
         "РезультатИнструкции = ПроверкаРазмера;"
     )
 
@@ -39,17 +39,17 @@ def test_builds_one_extension_call_with_multiline_instruction() -> None:
     assert expression == (
         "RuntimeKernelServer.ВыполнитьВКонтекстеОтладки("
         'Новый Структура("Документы,Результат", Документы, Результат), '
-        '"КонтекстОтладки.Результат.Добавить(""ИзИнструкции"");" + Символы.ПС + '
-        '"ПроверкаРазмера = КонтекстОтладки.Результат.Количество();" + Символы.ПС + '
+        '"e1cRuntimeКонтекстОтладки.Результат.Добавить(""ИзИнструкции"");" + Символы.ПС + '
+        '"ПроверкаРазмера = e1cRuntimeКонтекстОтладки.Результат.Количество();" + Символы.ПС + '
         '"РезультатИнструкции = ПроверкаРазмера;")'
     )
 
 
 def test_builds_lowered_extension_call_with_notebook_context() -> None:
     lowered = (
-        'КонтекстОтладки.Результат.Добавить("ИзИнструкции");\n'
-        'Контекст.Вставить("РезультатИнструкции", '
-        "КонтекстОтладки.Результат.Количество());"
+        'e1cRuntimeКонтекстОтладки.Результат.Добавить("ИзИнструкции");\n'
+        'e1cRuntimeКонтекст.Вставить("РезультатИнструкции", '
+        "e1cRuntimeКонтекстОтладки.Результат.Количество());"
     )
 
     assert hasattr(capture, "build_lowered_extension_call")
@@ -58,9 +58,9 @@ def test_builds_lowered_extension_call_with_notebook_context() -> None:
     assert expression == (
         "RuntimeKernelServer.ВыполнитьПониженныйКодВКонтекстеОтладки("
         'Новый Структура("Результат", Результат), '
-        '"КонтекстОтладки.Результат.Добавить(""ИзИнструкции"");" + Символы.ПС + '
-        '"Контекст.Вставить(""РезультатИнструкции"", '
-        'КонтекстОтладки.Результат.Количество());")'
+        '"e1cRuntimeКонтекстОтладки.Результат.Добавить(""ИзИнструкции"");" + Символы.ПС + '
+        '"e1cRuntimeКонтекст.Вставить(""РезультатИнструкции"", '
+        'e1cRuntimeКонтекстОтладки.Результат.Количество());")'
     )
 
 
@@ -92,21 +92,21 @@ def test_builds_live_kernel_frame_capture_transfer_calls() -> None:
     )
     assert capture.build_live_capture_begin_call(address) == (
         "RuntimeKernelServer.НачатьКонтекстОтладкиВКонтексте("
-        'Контекст, "e1cib/tempstorage/capture-1")'
+        'e1cRuntimeКонтекст, "e1cib/tempstorage/capture-1")'
     )
     assert capture.build_live_current_capture_call(
         "РезультатИнструкции = 1;"
     ) == (
         "RuntimeKernelServer.ВыполнитьКодВКонтекстеОтладки("
-        'Контекст, "РезультатИнструкции = 1;")'
+        'e1cRuntimeКонтекст, "РезультатИнструкции = 1;")'
     )
     assert capture.build_live_capture_root_transfer_call("ШаблонЗапроса") == (
         "RuntimeKernelServer.ПоместитьЗначениеКонтекстаОтладки("
-        'Контекст, "ШаблонЗапроса")'
+        'e1cRuntimeКонтекст, "ШаблонЗапроса")'
     )
     assert capture.build_temporary_storage_value_expression(address) == (
         'ПолучитьИзВременногоХранилища("e1cib/tempstorage/capture-1")'
     )
     assert capture.build_live_capture_end_call() == (
-        "RuntimeKernelServer.ЗавершитьКонтекстОтладкиВКонтексте(Контекст)"
+        "RuntimeKernelServer.ЗавершитьКонтекстОтладкиВКонтексте(e1cRuntimeКонтекст)"
     )

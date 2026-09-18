@@ -11,6 +11,9 @@ from uuid import UUID, uuid4
 
 from onec_runtime.errors import (
     CommandTimeout,
+    LocalVariablesResultTimeout,
+    StopWaitIntervalElapsed,
+    EvaluationDispatchUnknown,
     ProtocolError,
     RdbgDebugUiNotRegistered,
     TransportRecoveryError,
@@ -57,6 +60,7 @@ from onec_runtime.rdbg.xml_codec import (
     parse_ping_target_events_from_document,
     parse_targets,
     validate_command_acknowledgement,
+    validate_step_acknowledgement,
 )
 
 
@@ -73,6 +77,17 @@ class _PendingEvaluationState:
     capability: PendingEvaluation
     suspended_stop: StopEvent | None = None
     collection_start_index: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class BoundServerTargetAbsence:
+    """A fresh RDBG registry observation, not proof of process termination."""
+
+    bound_client: TargetId
+    expected_target: TargetId
+    observed_at_monotonic: float
+    observations: int
+    source: str = "getDbgAllTargetStates"
 
 
 class RdbgSession:
@@ -127,6 +142,8 @@ class RdbgSession:
         self,
         command: str,
         payload: bytes = b"",
+        *,
+        on_transport_entry: Callable[[], None] | None = None,
         **options: object,
     ) -> bytes:
         """Admit one normal request atomically against session invalidation.
@@ -138,6 +155,8 @@ class RdbgSession:
         with self._request_admission_lock:
             if self._requests_invalidated:
                 raise ProtocolError("RDBG session was invalidated")
+        if on_transport_entry is not None:
+            on_transport_entry()
         return self.transport.request(command, payload, **options)
 
     def _teardown_request(
@@ -243,14 +262,15 @@ class RdbgSession:
             self._managed_client_id = next(iter(client_ids))
         return candidates
 
-    def list_targets(self) -> list[DebugTarget]:
+    def list_targets(self, *, on_transport_dispatch: Callable[[], None] | None = None) -> list[DebugTarget]:
         payload = self._request(
-            "getDbgAllTargetStates", build_get_targets_request(self.alias, self.ui_id)
+            "getDbgAllTargetStates", build_get_targets_request(self.alias, self.ui_id),
+            on_transport_entry=on_transport_dispatch,
         )
         return parse_targets(payload)
 
     def terminate_bound_server_session(self) -> bool:
-        """Stop our server calls, then client; return whether native client exit was requested."""
+        """Request native termination; the returned bool does not prove disappearance."""
         if self.server_target_type != "Server" or self._bound_client_target is None:
             return False
         payload = self._teardown_request(
@@ -288,6 +308,79 @@ class RdbgSession:
         )
         validate_command_acknowledgement(response, command="terminateDbgTarget")
         return True
+
+    def wait_for_bound_server_targets_absent(
+        self,
+        expected_target: TargetId,
+        *,
+        timeout_s: float = 30.0,
+        poll_interval_s: float = 0.1,
+    ) -> BoundServerTargetAbsence:
+        """Observe the old bound client's debugger targets disappear.
+
+        A termination acknowledgement alone is insufficient. This method
+        queries the target registry until the old client, the expected target,
+        and all visible targets of the bound client session are absent. The
+        evidence concerns debugger registry subjects, not OS process exit or
+        completion of all side effects. An expired verification deadline or
+        failed query leaves the remote termination outcome unknown.
+        """
+        client = self._bound_client_target
+        if self.server_target_type != "Server" or client is None:
+            raise ProtocolError("No bound client session can be verified")
+        if (
+            not isinstance(expected_target, TargetId)
+            or expected_target.infobase_alias.casefold() != client.infobase_alias.casefold()
+            or expected_target.seance_id != client.seance_id
+            or expected_target.id in self._preexisting_target_ids
+        ):
+            raise ProtocolError("Expected target does not belong to the bound client session")
+        if not isfinite(timeout_s) or timeout_s < 0:
+            raise ValueError("timeout_s must be finite and non-negative")
+        if not isfinite(poll_interval_s) or poll_interval_s < 0:
+            raise ValueError("poll_interval_s must be finite and non-negative")
+
+        deadline = monotonic() + timeout_s
+        observations = 0
+        while True:
+            remaining = max(0.0, deadline - monotonic())
+            payload = self._teardown_request(
+                "getDbgAllTargetStates",
+                build_get_targets_request(self.alias, self.ui_id),
+                timeout_s=min(10.0, max(0.001, remaining)),
+            )
+            targets = parse_targets(payload)
+            observations += 1
+            visible_ids = {target.target_id.id for target in targets}
+            bound_session_targets = (
+                target for target in targets
+                if target.target_id.infobase_alias.casefold()
+                == client.infobase_alias.casefold()
+                and target.target_id.seance_id == client.seance_id
+                and (
+                    client.infobase_instance_id is None
+                    or target.target_id.infobase_instance_id is None
+                    or target.target_id.infobase_instance_id
+                    == client.infobase_instance_id
+                )
+            )
+            if (
+                client.id not in visible_ids
+                and expected_target.id not in visible_ids
+                and not any(bound_session_targets)
+            ):
+                return BoundServerTargetAbsence(
+                    bound_client=client,
+                    expected_target=expected_target,
+                    observed_at_monotonic=monotonic(),
+                    observations=observations,
+                )
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise CommandTimeout(
+                    "Bound server target disappearance was not confirmed"
+                )
+            sleep(min(poll_interval_s, remaining))
 
     def discover_server_emulation_target(self, *, timeout_s: float = 30.0) -> DebugTarget:
         self._require(SessionState.ATTACHED)
@@ -337,13 +430,15 @@ class RdbgSession:
             dbgui=str(self.ui_id),
         )
 
-    def set_breakpoints(self, locations: tuple[ModuleLocation, ...]) -> None:
+    def set_breakpoints(self, locations: tuple[ModuleLocation, ...], *,
+                        on_transport_dispatch: Callable[[], None] | None = None) -> None:
         self._require(SessionState.ATTACHED, SessionState.READY)
         if not locations:
             raise ValueError("At least one breakpoint location is required")
         response = self._request(
             "setBreakpoints",
             build_breakpoints_request(self.alias, self.ui_id, locations),
+            on_transport_entry=on_transport_dispatch,
         )
         validate_command_acknowledgement(response, command="setBreakpoints")
         self._breakpoint_installed = True
@@ -355,6 +450,7 @@ class RdbgSession:
         *,
         profile_page_start: int | None = None,
         profile_result_id: str = "",
+        on_transport_dispatch: Callable[[], None] | None = None,
     ) -> tuple[list[StopEvent], list[EvaluationResult]]:
         metadata = {
             "page_start": profile_page_start,
@@ -367,6 +463,7 @@ class RdbgSession:
                 b"",
                 timeout_s=timeout_s,
                 dbgui=str(self.ui_id),
+                on_transport_entry=on_transport_dispatch,
             ),
             output_bytes=len,
             **metadata,
@@ -385,7 +482,6 @@ class RdbgSession:
             item_count=len,
             **metadata,
         )
-        self._attach_discovered_targets(targets)
         stops = self._profile(
             "rdbg.ping.extract_stops",
             lambda: parse_ping_events_from_document(document),
@@ -408,9 +504,19 @@ class RdbgSession:
         )
         for evaluation in evaluations:
             self._pending_evaluations[evaluation.result_id] = evaluation
+        try:
+            self._attach_discovered_targets(targets, on_transport_dispatch=on_transport_dispatch)
+        except BaseException:
+            # The ping has already consumed these events. Preserve them even
+            # when Stop fences an autoattach request from the same response.
+            self._ingest_poll_events(stops, evaluations)
+            raise
         return stops, evaluations
 
-    def _attach_discovered_targets(self, targets: list[DebugTarget]) -> None:
+    def _attach_discovered_targets(
+        self, targets: list[DebugTarget], *,
+        on_transport_dispatch: Callable[[], None] | None = None,
+    ) -> None:
         for target in self._attachable_targets(targets):
             if target.target_id.id in self.attached_targets:
                 continue
@@ -418,12 +524,14 @@ class RdbgSession:
                 self._request(
                     "clearBreakOnNextStatement",
                     build_clear_break_request(self.alias, self.ui_id),
+                    on_transport_entry=on_transport_dispatch,
                 )
             self._request(
                 "attachDetachDbgTargets",
                 build_attach_target_request(
                     self.alias, self.ui_id, target.target_id, attach=True
                 ),
+                on_transport_entry=on_transport_dispatch,
             )
             self.attached_targets[target.target_id.id] = target
             if self._breakpoint_installed:
@@ -432,6 +540,7 @@ class RdbgSession:
                     build_breakpoints_request(
                         self.alias, self.ui_id, self._breakpoint_locations
                     ),
+                    on_transport_entry=on_transport_dispatch,
                 )
 
     def _ingest_poll_events(
@@ -450,10 +559,10 @@ class RdbgSession:
             if result.result_id in pending_result_ids
         )
 
-    def _pop_queued_stop(self) -> StopEvent | None:
+    def _pop_queued_stop(self, expected_target: TargetId | None = None) -> StopEvent | None:
         queued = list(self._event_queue)
         for index, event in enumerate(queued):
-            if isinstance(event, StopEvent):
+            if isinstance(event, StopEvent) and (expected_target is None or event.target_id == expected_target):
                 del queued[index]
                 self._event_queue = deque(queued)
                 return event
@@ -493,22 +602,25 @@ class RdbgSession:
         self,
         *,
         timeout_s: float = 60.0,
+        expected_target: TargetId | None = None,
         on_poll: Callable[[], None] | None = None,
+        on_transport_dispatch: Callable[[], None] | None = None,
     ) -> StopEvent:
+        # Select ownership before _admit_stop changes target and session state.
+        # Foreign stops stay queued in their original relative order.
         self._require(SessionState.ATTACHED, SessionState.EXECUTING)
         deadline = monotonic() + timeout_s
         while monotonic() < deadline:
             if on_poll is not None:
                 on_poll()
-            queued = self._pop_queued_stop()
+            queued = self._pop_queued_stop(expected_target)
             if queued is not None:
                 return self._admit_stop(queued)
             remaining = max(0.1, min(6.0, deadline - monotonic()))
-            polled = self._poll(remaining)
+            polled = self._poll(remaining, on_transport_dispatch=on_transport_dispatch)
             self._ingest_poll_events(*polled)
             sleep(0.05)
-        self.state = SessionState.FAILED
-        raise CommandTimeout("Timed out waiting for a runtime stop")
+        raise StopWaitIntervalElapsed("Timed out waiting for a runtime stop")
 
     def read_current_stack(self, *, timeout_s: float = 5.0) -> StopEvent:
         self._require(SessionState.ATTACHED, SessionState.READY)
@@ -678,26 +790,37 @@ class RdbgSession:
             pending,
             collection_start_index=collection_start_index,
         )
-        try:
+        entered_transport = False
+
+        def mark_transport_entry() -> None:
+            nonlocal entered_transport
             if on_transport_dispatch is not None:
                 on_transport_dispatch()
+            entered_transport = True
+
+        try:
             response = self._request(
                 "evalExpr",
                 request,
+                on_transport_entry=mark_transport_entry,
                 timeout_s=timeout_s,
             )
-        except BaseException:
+        except BaseException as error:
+            if entered_transport:
+                raise EvaluationDispatchUnknown(pending) from error
             self._pending_evaluation_states.pop(id(pending), None)
             raise
+        if self._requests_invalidated:
+            raise EvaluationDispatchUnknown(pending) from ProtocolError(
+                "RDBG session was invalidated during expression dispatch"
+            )
         if response.strip():
             try:
                 result = parse_eval_response(response)
-            except ProtocolError:
-                self._pending_evaluation_states.pop(id(pending), None)
-                raise
-            if result is not None and result.result_id != result_id:
-                self._pending_evaluation_states.pop(id(pending), None)
-                raise ProtocolError("RDBG evaluation result ID mismatch")
+                if result is not None and result.result_id != result_id:
+                    raise ProtocolError("RDBG evaluation result ID mismatch")
+            except ProtocolError as error:
+                raise EvaluationDispatchUnknown(pending) from error
             if result is not None:
                 self._event_queue.append(result)
         return pending
@@ -707,6 +830,7 @@ class RdbgSession:
         pending: PendingEvaluation,
         *,
         timeout_s: float,
+        on_transport_dispatch: Callable[[], None] | None = None,
     ) -> EvaluationResult | StopEvent:
         """Consume one event; interval expiry leaves the capability registered.
 
@@ -746,7 +870,9 @@ class RdbgSession:
             remaining = deadline - monotonic()
             if remaining <= 0:
                 break
-            polled = self._poll(min(6.0, remaining))
+            interval = min(6.0, remaining)
+            polled = (self._poll(interval) if on_transport_dispatch is None else
+                      self._poll(interval, on_transport_dispatch=on_transport_dispatch))
             self._ingest_poll_events(*polled)
         raise CommandTimeout(
             f"Timed out waiting for expression result {pending.result_id}"
@@ -756,13 +882,15 @@ class RdbgSession:
         self,
         pending: PendingEvaluation,
         stop: StopEvent,
+        *,
+        on_transport_dispatch: Callable[[], None] | None = None,
     ) -> None:
         state = self._require_pending_evaluation(pending)
         if state.suspended_stop is not stop:
             raise ProtocolError("Pending evaluation stop is stale or foreign")
         if stop.target_id != pending.target_id or self.target is None:
             raise ProtocolError("Pending evaluation target changed")
-        self.continue_()
+        self.continue_(on_transport_dispatch=on_transport_dispatch)
         state.suspended_stop = None
 
     def _require_pending_evaluation(
@@ -786,14 +914,17 @@ class RdbgSession:
         self,
         pending: PendingEvaluation,
     ) -> EvaluationResult | StopEvent | None:
-        if not self._event_queue:
-            return None
-        event = self._event_queue[0]
-        if isinstance(event, StopEvent):
-            return self._event_queue.popleft()
-        if event.result_id != pending.result_id:
-            raise ProtocolError("Evaluation event correlation mismatch")
-        return self._event_queue.popleft()
+        queued = list(self._event_queue)
+        for index, event in enumerate(queued):
+            if isinstance(event, StopEvent):
+                if event.target_id != pending.target_id:
+                    continue
+            elif event.result_id != pending.result_id:
+                raise ProtocolError("Evaluation event correlation mismatch")
+            del queued[index]
+            self._event_queue = deque(queued)
+            return event
+        return None
 
     def evaluate_collection(
         self,
@@ -900,6 +1031,7 @@ class RdbgSession:
         timeout_s: float = 30.0,
         max_text_size: int = 307_200,
         retry_delays_s: tuple[float, ...] = (0.05, 0.10, 0.15),
+        on_transport_dispatch: Callable[[], None] | None = None,
     ) -> LocalVariablesResult:
         self._require(SessionState.READY)
         if self.target is None:
@@ -912,7 +1044,7 @@ class RdbgSession:
         def request_once() -> LocalVariablesResult:
             remaining = deadline - monotonic()
             if remaining <= 0:
-                raise CommandTimeout("Timed out waiting for local variables")
+                raise LocalVariablesResultTimeout("Timed out waiting for local variables")
             result_id = uuid4()
             response = self._request(
                 "evalLocalVariables",
@@ -924,6 +1056,7 @@ class RdbgSession:
                     result_id,
                     max_text_size=max_text_size,
                 ),
+                on_transport_entry=on_transport_dispatch,
                 timeout_s=remaining,
             )
             if response.strip():
@@ -937,9 +1070,11 @@ class RdbgSession:
                 pending = self._pending_local_variables.pop(result_id, None)
                 if pending is not None:
                     return pending
-                polled = self._poll(max(0.1, min(6.0, deadline - monotonic())))
+                interval = max(0.1, min(6.0, deadline - monotonic()))
+                polled = (self._poll(interval) if on_transport_dispatch is None else
+                          self._poll(interval, on_transport_dispatch=on_transport_dispatch))
                 self._ingest_poll_events(*polled)
-            raise CommandTimeout(
+            raise LocalVariablesResultTimeout(
                 f"Timed out waiting for local variables result {result_id}"
             )
 
@@ -955,7 +1090,8 @@ class RdbgSession:
                 return result
         return result
 
-    def modify(self, variable: str, value_expression: str) -> ModifyResult:
+    def modify(self, variable: str, value_expression: str, *,
+               on_transport_dispatch: Callable[[], None] | None = None) -> ModifyResult:
         self._require(SessionState.READY)
         if self.target is None:
             raise TargetLost("No target has been selected")
@@ -970,6 +1106,7 @@ class RdbgSession:
                 value_expression,
                 result_id,
             ),
+            on_transport_entry=on_transport_dispatch,
         )
         if not response.strip():
             raise ProtocolError("RDBG modifyValue returned an empty response")
@@ -981,30 +1118,39 @@ class RdbgSession:
             )
         return result
 
-    def continue_(self) -> None:
+    def continue_(self, *, on_transport_dispatch: Callable[[], None] | None = None) -> None:
         self._require(SessionState.READY)
         if self.target is None:
             raise TargetLost("No target has been selected")
-        self._request(
-            "step", build_step_request(self.alias, self.ui_id, self.target.target_id)
+        def entered() -> None:
+            if on_transport_dispatch is not None:
+                on_transport_dispatch()
+            # Once entered, polling must remain possible even without an ack.
+            self.state = SessionState.EXECUTING
+        response = self._request(
+            "step", build_step_request(self.alias, self.ui_id, self.target.target_id),
+            on_transport_entry=entered,
         )
-        self.state = SessionState.EXECUTING
+        validate_step_acknowledgement(response, self.target.target_id)
 
-    def heartbeat(self) -> dict[str, object]:
+    def heartbeat(self, *, on_transport_dispatch: Callable[[], None] | None = None) -> dict[str, object]:
         self._require(SessionState.READY)
         if self.target is None:
             raise TargetLost("No target has been selected")
         with self._request_admission_lock:
             if self._requests_invalidated:
                 raise ProtocolError("RDBG session was invalidated")
+        if on_transport_dispatch is not None:
+            on_transport_dispatch()
         rtt_ms = self.transport.test_server()
         # The platform expires the registered Debug UI unless its dedicated
         # long-poll endpoint is called. Server and target probes alone do not
         # renew that lease. Bound idle empty-response waiting while RuntimeSession
         # holds its shared operation lock; returned events are still ingested.
-        self._ingest_poll_events(*self._poll(0.1))
+        self._ingest_poll_events(*self._poll(0.1, on_transport_dispatch=on_transport_dispatch))
         matches = [
-            target for target in self.list_targets() if target.target_id.id == self.target.target_id.id
+            target for target in self.list_targets(on_transport_dispatch=on_transport_dispatch)
+            if target.target_id.id == self.target.target_id.id
         ]
         if len(matches) != 1:
             raise TargetLost("Selected target disappeared during heartbeat")

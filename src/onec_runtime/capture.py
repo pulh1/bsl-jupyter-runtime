@@ -82,7 +82,7 @@ def build_capture_transfer_call(variable_names: Iterable[str]) -> str:
 
 def build_live_capture_begin_call(address: str) -> str:
     return (
-        "RuntimeKernelServer.НачатьКонтекстОтладкиВКонтексте(Контекст, "
+        "RuntimeKernelServer.НачатьКонтекстОтладкиВКонтексте(e1cRuntimeКонтекст, "
         + bsl_string_literal(address)
         + ")"
     )
@@ -90,7 +90,7 @@ def build_live_capture_begin_call(address: str) -> str:
 
 def build_live_current_capture_call(instruction: str) -> str:
     return (
-        "RuntimeKernelServer.ВыполнитьКодВКонтекстеОтладки(Контекст, "
+        "RuntimeKernelServer.ВыполнитьКодВКонтекстеОтладки(e1cRuntimeКонтекст, "
         + bsl_string_literal(instruction)
         + ")"
     )
@@ -99,7 +99,7 @@ def build_live_current_capture_call(instruction: str) -> str:
 def build_live_capture_root_transfer_call(name: str) -> str:
     _validate_capture_variable(name)
     return (
-        "RuntimeKernelServer.ПоместитьЗначениеКонтекстаОтладки(Контекст, "
+        "RuntimeKernelServer.ПоместитьЗначениеКонтекстаОтладки(e1cRuntimeКонтекст, "
         + bsl_string_literal(name)
         + ")"
     )
@@ -110,4 +110,4 @@ def build_temporary_storage_value_expression(address: str) -> str:
 
 
 def build_live_capture_end_call() -> str:
-    return "RuntimeKernelServer.ЗавершитьКонтекстОтладкиВКонтексте(Контекст)"
+    return "RuntimeKernelServer.ЗавершитьКонтекстОтладкиВКонтексте(e1cRuntimeКонтекст)"

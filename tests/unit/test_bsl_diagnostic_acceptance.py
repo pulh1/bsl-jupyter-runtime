@@ -56,8 +56,8 @@ from onec_runtime.bsl.source_maps import (
     source_sha256,
 )
 from onec_runtime_jupyter.extension import NotebookDisplayConfig, _display_reply
-from onec_runtime.prototype_runtime import OperationState, PrototypeRuntimeController
-from onec_runtime.runtime_api import PrototypeRuntimeApi, RuntimeReply, RuntimeReplyKind
+from onec_runtime.execution.message_collector import with_message_collector
+from onec_runtime.runtime_models import OperationState, RuntimeReply, RuntimeReplyKind
 
 
 _MIXED_SOURCE = (
@@ -165,7 +165,7 @@ _SCENARIOS = {
     "persistent_reference": _ScenarioSpec(
         "// вводная\nРезультат = 0;\nРезультат = Сохраненное;",
         2,
-        22,
+        32,
         context_names=("Сохраненное",),
     ),
     "message_argument": _ScenarioSpec(
@@ -174,7 +174,7 @@ _SCENARIOS = {
         "Результат = 2;\n"
         'Сообщить("Ошибка 😀");',
         6,
-        48,
+        58,
     ),
     "worker_export_argument": _ScenarioSpec(
         "Результат = 0;\n"
@@ -183,14 +183,14 @@ _SCENARIOS = {
         "Результат = 3;\n"
         "Результат = Удвоить(Повтор + Повтор);",
         5,
-        71,
+        101,
         context_names=("Повтор",),
         worker_exports=(("Удвоить", "Удвоить"),),
     ),
     "worker_export_callee": _ScenarioSpec(
         "Результат = Удвоить(1);",
         1,
-        36,
+        46,
         worker_exports=(("Удвоить", "Удвоить"),),
     ),
     "main_result_channel": _ScenarioSpec(
@@ -199,8 +199,8 @@ _SCENARIOS = {
         1,
     ),
     "capture_result_channel": _ScenarioSpec(
-        "КонтекстОтладки.Счётчик = 1;\n"
-        "РезультатИнструкции = КонтекстОтладки.Счётчик;",
+        "e1cRuntimeКонтекстОтладки.Счётчик = 1;\n"
+        "РезультатИнструкции = e1cRuntimeКонтекстОтладки.Счётчик;",
         2,
         1,
         branch="capture",
@@ -214,7 +214,7 @@ _SCENARIOS = {
     "mixed_statement": _ScenarioSpec(
         _MIXED_SOURCE,
         2,
-        53,
+        73,
         branch="main",
         worker_exports=(("Удвоить", "Удвоить"),),
     ),
@@ -226,23 +226,23 @@ _SCENARIOS = {
     "lf_nonbmp": _ScenarioSpec(
         'Маркер = "😀";\nРезультат = Маркер;',
         2,
-        22,
+        32,
     ),
     "crlf_nonbmp": _ScenarioSpec(
         'Первая = "😀";\r\nРезультат = Первая;',
         2,
-        22,
+        32,
     ),
     "multiline_repeated": _ScenarioSpec(
         "Результат = (\n    Повтор +\n    Повтор);",
         3,
-        14,
+        24,
         context_names=("Повтор",),
     ),
     "nearest": _ScenarioSpec(
         "Ответ = 1;",
         1,
-        20,
+        30,
     ),
 }
 
@@ -303,15 +303,12 @@ class _AcceptanceScenario:
             mapped = lowered.mapped_source
             lowered_text = mapped.text
             if lowered.messages_intercepted:
-                mapped = PrototypeRuntimeController._with_message_collector_mapped(
+                mapped = with_message_collector(
                     mapped,
                     lowered.messages_intercepted,
                     "__acceptance_messages",
                 )
-        executed = PrototypeRuntimeController._as_executed_source(
-            mapped,
-            mode=mode,
-        )
+        executed = mapped
         parsed = parse_platform_diagnostic(
             "{<Неизвестный модуль>"
             f"({spec.platform_line},{spec.platform_column})"
@@ -403,24 +400,24 @@ def test_same_name_worker_callee_acceptance_uses_literal_visible_coordinates(
             13,
             {"start": 38, "end": 39},
             "b078ef31ebf4e18a5138c6c7368366e023271c6b6a63dcc8998250ce91b640d2",
-            "dd48fff9403ac722d5ed3b539e19a1c18fbd6ef698fc27003a85847e70e44ebb",
-            "a2bb0c1f57ea561a496f686e0140f5c67343bf1f09ba6830c5260d8469b47d59",
+            "3c83eaf7c4bb4c4560931245ad1f2d77abd695cc3bffe0ad7ac675907a6220c2",
+            "c8263749c6da8fe1018731ef404fefc4633e5733697669a89ded774160217b34",
         ),
         (
             "message_argument",
             11,
             {"start": 55, "end": 56},
             "ed69d8e16cbca333191c7107b713a814b1635222a336246cce859025066e1995",
-            "d6d5d1d6d2d777fb83b950e0e207cdfa680581aef8a70abbc2c36f28390af533",
-            "097071d38aeeda9ee8ad84a2a06029c489ca07fce7ce4abf2835c7efaf48a9ea",
+            "e8476a552cae68b62d9d18dc3d54cf42b8c8dca35052262dc7d5f1ca677cd758",
+            "b98cd48e11f49b3cb8b5e6d45d718e04cfd33ab0f22d2c3de084cf4768c7dc30",
         ),
         (
             "worker_export_argument",
             30,
             {"start": 89, "end": 90},
             "81609f2207ad37fe9a2d2546372157ce97ead44e52f36fdeb75e252a45502ea2",
-            "9ab94d040082eafbaa13c65f0dac8b031a5eec07c834fd91b7b0e9a0e0bd731f",
-            "92863dedae9cf30059518831104961f6ffbc56a2f22bb3230a31db829ab8f118",
+            "14393fb80fe564dcb372a8540e6e96a57d3addff0db75a8aa24329999e6b2d78",
+            "87928c2a98215cce38704496ac96dd58199620fab5e87ac91a870c498e14b469",
         ),
         (
             "main_result_channel",
@@ -428,15 +425,15 @@ def test_same_name_worker_callee_acceptance_uses_literal_visible_coordinates(
             {"start": 25, "end": 26},
             "14ebe3499133c3c18b2311ed9f1b0abdc06b1c94355c9eccec7182424393a260",
             "dc3f53f39d08cce70e6d62136f620a1360a99fd36a1f00dd3435dae603d71d5e",
-            "0bacf7aec59c10f20b1b741c41cddf4e78b95016bee926210914ea034bdc8347",
+            "7f8e01a0dd27777e80488d51029691782bf423ae80b600efb8a8487e4b8aa88a",
         ),
         (
             "capture_result_channel",
             1,
-            {"start": 29, "end": 30},
-            "8787ec326b8929898cb41e5c0e997c2958f8350101768bbaf1723af8c0eb4385",
-            "8787ec326b8929898cb41e5c0e997c2958f8350101768bbaf1723af8c0eb4385",
-            "b7e4b029b7d62817f2662a36d40751df29b72e8b882bc439f269ddcca657c304",
+            {"start": 39, "end": 40},
+            "345b49f9bfa0d79f0c7e715bcf0a4137e30aaa2cf70d3e93356cc3b8b7ebd35b",
+            "345b49f9bfa0d79f0c7e715bcf0a4137e30aaa2cf70d3e93356cc3b8b7ebd35b",
+            "de779fe2fbfd4c5bf44db94bdba7ae4cdcc9a0f11f862748a0fbecda246e67bf",
         ),
         (
             "mixed_method",
@@ -444,15 +441,15 @@ def test_same_name_worker_callee_acceptance_uses_literal_visible_coordinates(
             {"start": 40, "end": 41},
             "f7435200eebd0a50404044633019fcd64cbdbbf8e941da01d56567ac9f633337",
             "a099a26ae5cc75c855ebc12db54c7398aa6ea9a187cf63b1f06419156503eff2",
-            "a357d9bb679c2bd8395ec4dfe93067c64bfb844dd31ed940654513305d327c32",
+            "4f545a8f51312cb2420507bf10ef604599605a11ef348a328258faa11dfc67f5",
         ),
         (
             "mixed_statement",
             21,
             {"start": 105, "end": 106},
             "f7435200eebd0a50404044633019fcd64cbdbbf8e941da01d56567ac9f633337",
-            "a1aa02a3cef8f46ee4ff36776c85b2e269931a1dbe89c2e367afafa1effb8a85",
-            "13ed24477b86acf65e4ae5ea9a1bf29d4109a8695d3d5ba74d36db5243467e29",
+            "558af9310d0544d910b1409c3c0887ab322978a908666874bdb633fff9ea241b",
+            "2459de3d33271edd3509f03563790cf3ff49ac3867e210385a25cf1baf8e627f",
         ),
     ),
 )
@@ -495,8 +492,8 @@ def test_exact_acceptance_coordinates_and_hash_fences_are_literal(
             13,
             {"start": 26, "end": 27},
             "ad532c34236f369af9a2951bcc755c85b6be588e401858ae098a627e5ba98a0f",
-            "0b074eabf40b04c2631b491350036eb1ad897f38345357572e631d40ea00f8e6",
-            "2eda4688bc0950db400d57fb5e0814e7da4f9566653a50a571d896f694fcb392",
+            "fb4803ddc5c38e63f037f61bb8e6b50f343955b0ad22be95aa2100e32b7c0514",
+            "2ebac72afd12d3ff638cc4b834486f04260591caab7be2bb22f5259a6d0f9fc9",
         ),
         (
             "crlf_nonbmp",
@@ -505,8 +502,8 @@ def test_exact_acceptance_coordinates_and_hash_fences_are_literal(
             13,
             {"start": 27, "end": 28},
             "fd127c3ef185152ecf6223e24cdf596f232d681dace5dac509c1d31bffdaf925",
-            "d4b6011f8cc78f1109761ff00e6e9c87850f29057ae7d5ce9dfc8fdedb59150b",
-            "c195e82c08c7b56a682eb5fb70a9cdde277e7fb989185e63ccf524511d25b053",
+            "881c9e12f8cbfe305a9fe587daa32d67e40bd4503fd46b63b6d5112bd6689060",
+            "b48cb34b83dc4694d22b7dc62a848aef8f2789a8e49e076aa42437f10fbccf56",
         ),
         (
             "multiline_repeated",
@@ -515,8 +512,8 @@ def test_exact_acceptance_coordinates_and_hash_fences_are_literal(
             5,
             {"start": 31, "end": 32},
             "79f15ad497126d11922d02b152cd39d780871be7c39f5737cbabdf230dbd1b8b",
-            "d7c33e20bacb0d76e0029471591e018e592b5a37675c71b94ac2a1acf529beb3",
-            "34e2396142f321aedab8dc9eb2b818537f9c2cfe56082baff595288565eb46a0",
+            "cd03d5b10fc7bfc72c8fed055c902c41a05d8d907eea094d46dcf1b23539306f",
+            "f8ecac4630e6bc7294faa8e4a8917cf59a2d412f9af8a88f4d1877945b8e0a57",
         ),
     ),
 )
@@ -559,8 +556,8 @@ def test_line_endings_unicode_multiline_and_repeated_fragments_are_code_point_ex
             {"start": 0, "end": 5},
             None,
             "7b05cd84c72886168cfb4e0bd74a6a1f1fc50a481aeaee6aa6faa61840ac7f73",
-            "3badf3d7584edaf541f1095565d3d6f467b78829a2feea70c92a54b8ac615c26",
-            "d6924724895d915d478e11ed90a69138cd868dbda117ff3b6b00bbe26db58473",
+            "7a070f516a059415206ecdbb6c5d14066535097d09be055c71009e3ed3259a8c",
+            "e3bcc66c43f39abfa674a034e3dd63eb3f03680c13ffcd261c013b2114cf7a2d",
         ),
         (
             "synthetic_wrapper",
@@ -568,8 +565,8 @@ def test_line_endings_unicode_multiline_and_repeated_fragments_are_code_point_ex
             {"start": 0, "end": 9},
             "message_collector_try",
             "13ac8b858884aaa085d253571232f942553c7432898073c9db49bada08e0dace",
-            "c83aa4e6f6eee83b2fe56eb6024cd3bf6998d77c93a43866805431399d50244d",
-            "ecba28b82b8b432febb58637c98637e9dc23e680d4a67def5def2dc6b1e7e44c",
+            "6ffd6751d18b4adfd14ee2f6ddc1d0b3fe2299a819cd24584af53a3d139b2e8b",
+            "b6c1466965635b516c163903e8e00fbb94536b40eed144eda6390336e784da43",
         ),
     ),
 )
@@ -620,7 +617,41 @@ def test_unknown_host_coordinates_never_borrow_a_visible_or_related_position(
 
 def test_main_failure_keeps_the_next_safe_run_available_with_exact_visible_line() -> None:
     """Break caught: diagnostic processing strands MAIN in an unusable state."""
-    from test_prototype_runtime import SERVICE, ScriptedSession
+    from onec_runtime.execution.post_bootstrap import compose_fresh_post_bootstrap_execution
+    from onec_runtime.rdbg.models import EvaluationResult
+    from dataclasses import replace
+    from test_execution_controller_routes import CompleteSession
+    from test_execution_route_sequence import KERNEL, MAIN_STOP
+
+    class FailedOnce(CompleteSession):
+        def __init__(self) -> None:
+            super().__init__(capture_count=0)
+            self.stops.append(replace(MAIN_STOP, stop_by_breakpoint=True))
+            self.fail_next_error_read = True
+            self.completed_reads = 0
+
+        def wait_evaluation_event(self, pending, *, timeout_s, on_transport_dispatch):
+            if self.expression == "ЗавершеннаяКоманда":
+                self.completed_reads += 1
+                on_transport_dispatch()
+                self._record("wait_eval")
+                self.pending = None
+                return EvaluationResult(
+                    pending.result_id, "Число", str(self.completed_reads), False,
+                )
+            if self.expression == "Ошибка" and self.fail_next_error_read:
+                self.fail_next_error_read = False
+                on_transport_dispatch()
+                self._record("wait_eval")
+                self.pending = None
+                return EvaluationResult(
+                    pending.result_id, "Строка",
+                    '"{<Неизвестный модуль>(1,15)}: Деление на ноль"', False,
+                )
+            return super().wait_evaluation_event(
+                pending, timeout_s=timeout_s,
+                on_transport_dispatch=on_transport_dispatch,
+            )
 
     source = "// 1\n// 2\n// 3\n// 4\n// 5\nРезультат = 1 / 0;"
     unit = SourceUnitRef(
@@ -629,27 +660,26 @@ def test_main_failure_keeps_the_next_safe_run_available_with_exact_visible_line(
         1,
         source_sha256(source),
     )
-    session = ScriptedSession(
-        (SERVICE, SERVICE),
-        completion_errors=(
-            "{<Неизвестный модуль>(1,15)}: Деление на ноль",
-            "",
-        ),
-    )
-    controller = PrototypeRuntimeController(session, SERVICE)
-    api = PrototypeRuntimeApi(controller)
-
-    failed = api.execute_bsl(source, source_unit=unit)
-    safe_source = "Результат = 1;"
-    recovered = api.execute_bsl(
-        safe_source,
-        source_unit=SourceUnitRef(
-            SourceUnitKind.NOTEBOOK_CELL,
-            "acceptance-main-runtime-next",
-            2,
-            source_sha256(safe_source),
-        ),
-    )
+    session = FailedOnce()
+    api = compose_fresh_post_bootstrap_execution(
+        session, KERNEL, runtime_generation=1,
+        stopped_target=session.target, capture_locations=(),
+        notebook_builder=lambda *_args, **_kwargs: None,
+    ).execution.facade
+    try:
+        failed = api.execute_bsl(source, source_unit=unit)
+        safe_source = "Результат = 1;"
+        recovered = api.execute_bsl(
+            safe_source,
+            source_unit=SourceUnitRef(
+                SourceUnitKind.NOTEBOOK_CELL,
+                "acceptance-main-runtime-next",
+                2,
+                source_sha256(safe_source),
+            ),
+        )
+    finally:
+        api.close()
 
     assert failed.succeeded is False
     assert failed.diagnostic is not None
@@ -663,58 +693,72 @@ def test_main_failure_keeps_the_next_safe_run_available_with_exact_visible_line(
     ) == (6, 15, 39, 40)
     assert recovered.succeeded is True
     assert recovered.operation_id == 2
-    assert controller.state is OperationState.COMPLETED
+    assert recovered.state is OperationState.COMPLETED
 
 
 def test_capture_failure_stays_paused_restores_workspace_and_sends_no_continue() -> None:
     """Break caught: failed CAPTURE evaluation resumes or clears the paused fence."""
-    from test_prototype_runtime import (
-        CAPTURE_A,
-        SERVICE,
-        ScriptedSession,
-        evaluation,
-        workspace_calls,
-    )
+    from onec_runtime.execution.post_bootstrap import compose_fresh_post_bootstrap_execution
+    from onec_runtime.rdbg.models import EvaluationResult
+    from test_execution_controller_routes import CompleteSession
+    from test_execution_route_sequence import BUSINESS, KERNEL
 
-    session = ScriptedSession(
-        (CAPTURE_A,),
-        capture_evaluations=(
-            evaluation(
-                "Ошибка",
-                "boom",
-                error="{<Неизвестный модуль>(2,25)}: Деление на ноль",
-            ),
-        ),
+    class CaptureFailure(CompleteSession):
+        def wait_evaluation_event(self, pending, *, timeout_s, on_transport_dispatch):
+            if self.expression.startswith(
+                "RuntimeKernelServer.ВыполнитьКодВКонтекстеОтладки("
+            ):
+                on_transport_dispatch()
+                self._record("wait_eval")
+                self.pending = None
+                return EvaluationResult(
+                    pending.result_id, "Ошибка", "", True,
+                    "{<Неизвестный модуль>(2,25)}: Деление на ноль",
+                )
+            return super().wait_evaluation_event(
+                pending, timeout_s=timeout_s,
+                on_transport_dispatch=on_transport_dispatch,
+            )
+
+    session = CaptureFailure()
+    composed = compose_fresh_post_bootstrap_execution(
+        session, KERNEL, runtime_generation=1,
+        stopped_target=session.target, capture_locations=(BUSINESS,),
+        notebook_builder=lambda *_args, **_kwargs: None,
     )
-    controller = PrototypeRuntimeController(session, SERVICE)
-    api = PrototypeRuntimeApi(controller, capture_points=(CAPTURE_A,))
-    captured = api.execute_bsl("Результат = Capture();")
+    api = composed.execution.facade
+    api.configure_capture_points((BUSINESS,))
+    api.prepare_capture_ticket()
+    captured = api.execute_bsl("Результат = 1;")
     assert captured.kind is RuntimeReplyKind.CAPTURED
-    continue_calls_before = session.continue_count
+    continue_calls_before = sum(name == "continue" for name, _ in session.calls)
     source = (
-        "КонтекстОтладки.Счётчик = 1;\n"
+        "e1cRuntimeКонтекстОтладки.Счётчик = 1;\n"
         "РезультатИнструкции = 1 / 0;"
     )
 
-    failed = api.execute_bsl(
-        source,
-        source_unit=SourceUnitRef(
-            SourceUnitKind.NOTEBOOK_CELL,
-            "acceptance-capture-runtime",
-            1,
-            source_sha256(source),
-        ),
-    )
+    try:
+        failed = api.execute_bsl(
+            source,
+            source_unit=SourceUnitRef(
+                SourceUnitKind.NOTEBOOK_CELL,
+                "acceptance-capture-runtime",
+                1,
+                source_sha256(source),
+            ),
+        )
 
-    assert failed.succeeded is False
-    assert failed.state is OperationState.CAPTURED
-    assert controller.state is OperationState.CAPTURED
-    assert failed.diagnostic is not None
-    assert failed.diagnostic.mapping_confidence.value == "exact"
-    assert failed.diagnostic.visible_location is not None
-    assert failed.diagnostic.visible_location.line == 2
-    assert session.continue_count == continue_calls_before
-    assert workspace_calls(session)[-2:] == [(SERVICE,), (SERVICE, CAPTURE_A)]
+        assert failed.succeeded is False
+        assert failed.state is OperationState.CAPTURED
+        assert api.status().state is OperationState.CAPTURED
+        assert failed.diagnostic is not None
+        assert failed.diagnostic.mapping_confidence.value == "exact"
+        assert failed.diagnostic.visible_location is not None
+        assert failed.diagnostic.visible_location.line == 2
+        assert sum(name == "continue" for name, _ in session.calls) == continue_calls_before
+        assert composed.breakpoint_workspace.confirmed_snapshot.captures == (BUSINESS,)
+    finally:
+        api.close()
 
 
 def test_jupyter_and_agent_share_public_visible_semantics_without_source_leakage(
@@ -788,7 +832,7 @@ def test_jupyter_and_agent_share_public_visible_semantics_without_source_leakage
 
     expected_public_diagnostic = {
         "diagnostic_id": (
-            "75c115bedde730515556624dc19457216b528516c8287407cfbf9553b0d4d50a"
+            "facd24a96edec646ca3035f2014e29aa5ecd3888c8e0a5e2b13798226ee7d85c"
         ),
         "stage": "execution",
         "mapping_confidence": "exact",
@@ -973,7 +1017,7 @@ def test_operation_restart_rehydrates_hash_only_reference_and_keeps_compact_view
         "dc3f53f39d08cce70e6d62136f620a1360a99fd36a1f00dd3435dae603d71d5e"
     )
     assert expert["source_map_sha256"] == (
-        "0bacf7aec59c10f20b1b741c41cddf4e78b95016bee926210914ea034bdc8347"
+        "7f8e01a0dd27777e80488d51029691782bf423ae80b600efb8a8487e4b8aa88a"
     )
     assert "private_diagnostic_ref" not in expert
     assert reference["content_integrity_sha256"] not in json.dumps(expert)

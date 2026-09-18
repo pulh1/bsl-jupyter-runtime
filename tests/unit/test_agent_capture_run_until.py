@@ -40,11 +40,11 @@ from onec_runtime.session import RuntimeSession
 from onec_runtime_mcp.agent.runtime_session import AgentRuntimeSession
 from onec_runtime.errors import BslExecutionError, ProtocolError
 from onec_runtime.bsl import SourceUnitKind, SourceUnitRef, mapped_visible_source
-from onec_runtime.prototype_runtime import OperationState
+from onec_runtime.execution.public_facade import PreparedMainExecutionAttempt
 from onec_runtime.rdbg.models import ModuleLocation
-from onec_runtime.runtime_api import (
-    _PreparedMainExecutionAttempt,
+from onec_runtime.runtime_models import (
     CaptureCorrelationTicket,
+    OperationState,
     RuntimeNamespaceSnapshot,
     RuntimeReply,
     RuntimeReplyKind,
@@ -339,6 +339,35 @@ def test_capture_service_disarms_every_terminal_no_stop_outcome_without_continui
     assert backend.calls == ["resolve", "arm", "run_prepared_main", "disarm"]
 
 
+def test_capture_service_keeps_armed_intent_while_main_dispatch_is_unresolved(
+    tmp_path: Path,
+) -> None:
+    class PendingBackend(_CaptureBackend):
+        def run_prepared_main_until_capture(
+            self, prepared: object, *, intent: CaptureIntent
+        ) -> CaptureRunOutcome:
+            assert prepared is self.prepared
+            self.calls.append("run_prepared_main")
+            return CaptureRunOutcome(
+                BackendExecution(AgentOperationState.UNKNOWN, (), False, "unknown"),
+                user_main_dispatched=None,
+            )
+
+    backend = PendingBackend()
+    result = CaptureService(tmp_path).run_until(
+        backend,
+        operation_id="op-pending",
+        prepared_main=backend.prepared,
+        source_revision=2,
+        source_sha256="a" * 64,
+        points=(_point(),),
+    )
+
+    assert result.user_main_dispatched is None
+    assert result.execution.terminal_state is AgentOperationState.UNKNOWN
+    assert backend.calls == ["resolve", "arm", "run_prepared_main"]
+
+
 def test_capture_service_reports_an_unexpected_debug_stop_with_recovery(tmp_path: Path) -> None:
     backend = _CaptureBackend(terminal=True)
     backend.terminal_state = AgentOperationState.UNKNOWN
@@ -494,9 +523,9 @@ def test_real_zup_adapter_disarms_failed_capture_before_the_next_main(tmp_path: 
 
         def execute_prepared_main_for_capture(self, prepared: object) -> object:
             assert isinstance(prepared, str)
-            return _PreparedMainExecutionAttempt(
-                reply=self.execute_bsl(prepared),
-                user_main_dispatched=True,
+            return PreparedMainExecutionAttempt(
+                result=self.execute_bsl(prepared), error=None,
+                ticket=object(), read_dispatch=lambda _ticket: True,
             )
 
         def activate_prepared_main_for_capture(self, prepared: object) -> object:
@@ -577,9 +606,9 @@ def test_real_zup_adapter_rejects_mutated_runtime_capture_evidence(
 
         def execute_prepared_main_for_capture(self, prepared: object) -> object:
             assert isinstance(prepared, str)
-            return _PreparedMainExecutionAttempt(
-                reply=self.execute_bsl(prepared),
-                user_main_dispatched=True,
+            return PreparedMainExecutionAttempt(
+                result=self.execute_bsl(prepared), error=None,
+                ticket=object(), read_dispatch=lambda _ticket: True,
             )
 
         def activate_prepared_main_for_capture(self, prepared: object) -> object:
@@ -694,6 +723,9 @@ def _runtime_session_for_capture(
 
         def configure_capture_points(self, locations: tuple[object, ...]) -> None:
             self.configured = locations
+
+        def configure_capture_source_resolver(self, _resolver: object) -> None:
+            pass
 
         def prepare_capture_ticket(self) -> CaptureCorrelationTicket:
             self.prepared += 1
@@ -872,6 +904,58 @@ class _CaptureFactory:
     def start(self, *, mode: CapabilityMode) -> _ServiceCaptureBackend:
         assert mode is CapabilityMode.EXPERIMENT
         return self.backend
+
+
+def test_agent_service_retains_runtime_for_unresolved_main_dispatch(
+    tmp_path: Path,
+) -> None:
+    source = "Результат = 1;"
+    source_sha256 = sha256(source.encode()).hexdigest()
+    cell = nbformat.v4.new_code_cell(source=source, id="cell-pending")
+    cell.metadata["onec_runtime"] = {
+        "revision": 1,
+        "language": "bsl",
+        "mode": "main",
+        "source_sha256": source_sha256,
+    }
+    nbformat.write(nbformat.v4.new_notebook(cells=[cell]), tmp_path / "demo.ipynb")
+
+    class PendingBackend(_ServiceCaptureBackend):
+        def run_prepared_main_until_capture(
+            self, prepared: object, *, intent: CaptureIntent
+        ) -> CaptureRunOutcome:
+            assert prepared is self.prepared
+            self.calls.append("run_prepared_main")
+            return CaptureRunOutcome(
+                BackendExecution(AgentOperationState.UNKNOWN, (), False, "unknown"),
+                user_main_dispatched=None,
+            )
+
+    backend = PendingBackend()
+    service = AgentWorkspaceService(
+        tmp_path, _CaptureFactory(backend), maximum_mode=CapabilityMode.EXPERIMENT,
+    )
+    try:
+        _ready(service)
+        assert service.call("code.list", {"container": "demo.ipynb"}).ok
+        response = service.call("capture.run_until", {
+            "cell_id": "cell-pending",
+            "revision": 1,
+            "source_sha256": source_sha256,
+            "request_id": "capture-pending",
+            "points": [{
+                "name": "before", "project": "zup", "module": "Payroll",
+                "procedure": "Run", "line": 17,
+            }],
+            "wait_s": 2.0,
+        })
+        assert response.ok
+        assert response.value.state is AgentOperationState.UNKNOWN
+        assert "discard_main" not in backend.calls
+        assert "disarm" not in backend.calls
+        assert service.call("workspace.status", {}).ok
+    finally:
+        service.close()
 
 
 def test_service_run_until_returns_the_correlated_durable_operation_view(tmp_path: Path) -> None:
@@ -1852,297 +1936,6 @@ def test_run_until_arming_journal_failure_after_activation_quarantines_generatio
         service.close()
 
 
-def test_stale_phase_two_validation_before_controller_call_quarantines_generation(
-    tmp_path: Path,
-) -> None:
-    """Break caught: RuntimeApi pre-dispatch drift must quarantine the changed Worker."""
-    from collections import deque
-
-    from onec_runtime.bsl.parser_target import PythonParserTarget
-    from onec_runtime.bsl.semantic_lowering import SemanticNotebookLowerer
-    from onec_runtime.config import RuntimeConfig
-    from onec_runtime.prototype_runtime import (
-        CaptureCellResult,
-        MainCompletion,
-        OperationHandle,
-    )
-    from onec_runtime.runtime_api import PrototypeRuntimeApi
-    from onec_runtime.server_worker import NotebookWorkerArtifactBuilder
-
-    platform = tmp_path / "platform"
-    platform.mkdir()
-    for executable in ("1cv8.exe", "1cv8c.exe", "dbgs.exe"):
-        (platform / executable).write_bytes(b"stub")
-
-        def worker_universe_result(source: str) -> object | None:
-            from onec_runtime.worker_stage_protocol import (
-                WORKER_STAGE_SCHEMA,
-                WORKER_STAGE_SCHEMA_VERSION,
-            )
-
-            if f'"{WORKER_STAGE_SCHEMA}"' in source:
-                header = re.search(
-                    r'"onec-worker-stage-batch-receipt", 2, '
-                    r'"([0-9a-f-]{36})", (\d+), (\d+), "([0-9a-f]{64})", '
-                    r'СтатусWorker',
-                    source,
-                )
-                entries = re.findall(
-                    r'Новый Структура\('
-                    r'"registration_name,artifact_sha256,temp_storage_url", '
-                    r'"([A-Za-z_][A-Za-z0-9_]*)", "([0-9a-f]{64})", '
-                    r'АдресАртефактаWorker(\d+)\);',
-                    source,
-                )
-                assert header is not None
-                transaction_id, batch_index, batch_count, batch_digest = header.groups()
-                return json.dumps(
-                    {
-                        "schema": WORKER_STAGE_SCHEMA,
-                        "schema_version": WORKER_STAGE_SCHEMA_VERSION,
-                        "transaction_id": transaction_id,
-                        "batch_index": int(batch_index),
-                        "batch_count": int(batch_count),
-                        "batch_digest": batch_digest,
-                        "status": "succeeded",
-                        "connected": [
-                            {
-                                "registration_name": registration,
-                                "artifact_sha256": artifact_sha256,
-                                "temp_storage_url": (
-                                    f"e1cib/tempstorage/{transaction_id}-{item_index}"
-                                    "?seanceId=agent-capture-test"
-                                ),
-                            }
-                            for registration, artifact_sha256, item_index in entries
-                        ],
-                        "failure": False,
-                    },
-                    separators=(",", ":"),
-                )
-            if "onec-worker-root-prepare-stage=" in source:
-                transaction = re.search(
-                    r"onec-worker-prepared-root-receipt-v1\|([0-9a-f-]{36})\|",
-                    source,
-                )
-                generation = re.search(r'Вставить\("Generation", (\d+)\);', source)
-                manifest = re.search(
-                    r'Вставить\("ManifestSha256", "([0-9a-f]{64})"\);',
-                    source,
-                )
-                root = re.search(
-                    r'Вставить\("CandidateRootKey", "([^"|]+)"\);',
-                    source,
-                )
-                previous = re.search(
-                    r'Вставить\("PreviousRootKey", "([^"|]*)"\);',
-                    source,
-                )
-                assert transaction and generation and manifest and root and previous
-                return (
-                    "onec-worker-prepared-root-receipt-v1|"
-                    f"{transaction.group(1)}|{generation.group(1)}|{manifest.group(1)}|"
-                    f"{root.group(1)}|{previous.group(1) or '-'}|13"
-                )
-            if "onec-worker-root-swap-stage=guard" in source:
-                transaction = re.search(
-                    r"onec-worker-root-swap-receipt-v1\|([0-9a-f-]{36})\|",
-                    source,
-                )
-                generation = re.search(
-                    r'Формат\((\d+), "ЧГ=0; ЧДЦ=0; ЧН=0"\)', source
-                )
-                identity = re.search(
-                    r'"([0-9a-f]{64})\|(generation-\d+)\|([^|" ]+)\|1\|"',
-                    source,
-                )
-                assert transaction and generation and identity
-                return (
-                    "onec-worker-root-swap-receipt-v1|"
-                    f"{transaction.group(1)}|{generation.group(1)}|{identity.group(1)}|"
-                    f"{identity.group(2)}|{identity.group(3)}|1|13|2"
-                )
-            return None
-
-    class Controller:
-        runtime_generation = 1
-
-        def __init__(self) -> None:
-            self.state = OperationState.COMPLETED
-            self.operation_id = 0
-            self.stop_sequence = 0
-            self.lowerer = SemanticNotebookLowerer(
-                PythonParserTarget.from_generated()
-            )
-            self.worker_results = deque((True,))
-            self.system_main_calls = 0
-            self.user_main_calls = 0
-
-        def execute_system_main(self, source: str) -> MainCompletion:
-            self.system_main_calls += 1
-            self.operation_id += 1
-            operation = OperationHandle(self.operation_id, source, source)
-            universe_result = worker_universe_result(source)
-            return MainCompletion(
-                operation,
-                (
-                    universe_result
-                    if universe_result is not None
-                    else self.worker_results.popleft()
-                ),
-                "",
-                True,
-            )
-
-        def execute_system_capture(
-            self,
-            source: str,
-            *,
-            evaluation_kind: object,
-        ) -> CaptureCellResult:
-            del evaluation_kind
-            return CaptureCellResult(
-                self.operation_id,
-                source,
-                source,
-                self.worker_results.popleft(),
-            )
-
-        def execute_main(self, source: str, **kwargs: object) -> MainCompletion:
-            del source, kwargs
-            self.user_main_calls += 1
-            raise AssertionError("stale phase two entered controller user MAIN")
-
-        def execute_mapped_main(
-            self,
-            _visible_source: str,
-            mapped_source: object,
-            **kwargs: object,
-        ) -> MainCompletion:
-            return self.execute_main(mapped_source.text, **kwargs)  # type: ignore[attr-defined]
-
-    controller = Controller()
-    api = PrototypeRuntimeApi(
-        controller,  # type: ignore[arg-type]
-        notebook_worker_builder=NotebookWorkerArtifactBuilder(
-            RuntimeConfig(tmp_path, platform)
-        ),
-    )
-
-    class StalePhaseTwoSession(RuntimeSession):
-        def __init__(self) -> None:
-            self.runtime_api = api
-            self._operation_lock = RLock()
-            self._closed = False
-            self.disarm_calls: list[str] = []
-            self.runtime_activated: object | None = None
-
-        def execute_prepared_main_for_capture(self, prepared: object) -> object:
-            self.runtime_activated = prepared
-            return super().execute_prepared_main_for_capture(prepared)
-
-        def resolve_capture_points(
-            self, points: tuple[CapturePointRequest, ...]
-        ) -> tuple[ResolvedCapturePoint, ...]:
-            return _CaptureBackend().resolve_capture_points(points)
-
-        def arm_capture_intent(self, intent: CaptureIntent) -> CaptureArming:
-            del intent
-            api.configure_capture_points(
-                (ModuleLocation("ConfigModule", "", uuid4(), uuid4(), 17),)
-            )
-            ticket = api.prepare_capture_ticket()
-            controller.operation_id += 1
-            return CaptureArming(
-                ticket.ticket_id,
-                ticket.expected_operation_id,
-                ticket.expected_stop_sequence,
-            )
-
-        def disarm_capture_intent(self, *, policy: str) -> None:
-            self.disarm_calls.append(policy)
-
-        def owned_process_snapshot(self) -> tuple[dict[str, object], ...]:
-            return ()
-
-        def close(self) -> None:
-            self._closed = True
-
-    digest = sha256(_MIXED_CAPTURE_SETUP_SOURCE.encode()).hexdigest()
-    cell = nbformat.v4.new_code_cell(
-        source=_MIXED_CAPTURE_SETUP_SOURCE,
-        id="cell-stale-phase-two",
-    )
-    cell.metadata["onec_runtime"] = {
-        "revision": 1,
-        "language": "bsl",
-        "mode": "main",
-        "source_sha256": digest,
-    }
-    nbformat.write(nbformat.v4.new_notebook(cells=[cell]), tmp_path / "demo.ipynb")
-    session = StalePhaseTwoSession()
-    backend = OnecRuntimeBackend(
-        "runtime-stale-phase-two",
-        session,
-        mode=CapabilityMode.EXPERIMENT,
-    )
-    service = AgentWorkspaceService(
-        tmp_path,
-        _ZupFactory(backend),
-        maximum_mode=CapabilityMode.EXPERIMENT,
-    )
-    try:
-        _ready(service)
-        assert service.call("code.list", {"container": "demo.ipynb"}).ok
-
-        response = service.call(
-            "capture.run_until",
-            {
-                "cell_id": "cell-stale-phase-two",
-                "revision": 1,
-                "source_sha256": digest,
-                "request_id": "stale-phase-two-validation",
-                "points": [
-                    {
-                        "name": "before",
-                        "project": "zup",
-                        "module": "Payroll",
-                        "procedure": "Run",
-                        "line": 17,
-                    }
-                ],
-                "wait_s": 2.0,
-            },
-        )
-
-        assert response.ok
-        view = response.value
-        assert view.state is AgentOperationState.UNKNOWN
-        assert view.failure == {
-            "stage": "capture_setup_after_activation",
-            "partial_results": {},
-            "state_changed": "unknown",
-        }
-        assert tuple(action.method for action in view.recovery) == (
-            "workspace.status",
-            "runtime.close",
-            "runtime.ensure",
-        )
-        assert service._runtime is not None and service._runtime.closing is True
-        assert api.worker_generation_handle is not None
-        assert controller.system_main_calls == 3
-        assert controller.user_main_calls == 0
-        assert session.disarm_calls == ["terminal_no_stop"]
-        assert session.runtime_activated is not None
-        with pytest.raises(ProtocolError, match="already consumed"):
-            api.execute_prepared_main_for_capture(session.runtime_activated)
-        assert "user_main_dispatched" not in json.dumps(
-            to_wire(view), ensure_ascii=False
-        )
-    finally:
-        service.close()
-
-
 def test_run_until_request_journal_failure_terminates_submission_and_releases_lane(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2356,7 +2149,7 @@ def _ready(service: AgentWorkspaceService) -> None:
 
 @pytest.mark.parametrize(
     ("source", "stage"),
-    [("Результат = ;", "parsing"), ("КонтекстОтладки.Значение = 1;", "lowering")],
+    [("Результат = ;", "parsing"), ("e1cRuntimeКонтекстОтладки.Значение = 1;", "lowering")],
 )
 def test_invalid_inline_bsl_is_admitted_before_preparation_without_target_execution(
     tmp_path: Path, source: str, stage: str

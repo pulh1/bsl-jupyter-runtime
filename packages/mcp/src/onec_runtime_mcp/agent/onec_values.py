@@ -23,7 +23,7 @@ from onec_runtime_mcp.agent.proxies import (
 )
 from onec_runtime_mcp.agent.observation import ValueSelection
 from onec_runtime.errors import ProtocolError
-from onec_runtime.runtime_api import RuntimeNamespaceSnapshot
+from onec_runtime.runtime_models import RuntimeNamespaceSnapshot
 
 
 _BSL_IDENTIFIER = re.compile(r"[^\W\d]\w*", re.UNICODE)
@@ -105,7 +105,7 @@ def publish_onec_bindings(
     ):
         raise ProtocolError("published binding is absent from runtime namespace")
     for name in selected_names:
-        backend.validate_value_reference(f"Контекст.{name}")
+        backend.validate_value_reference(f"e1cRuntimeКонтекст.{name}")
     return registry.register_context_batch(
         tuple(
             {
@@ -115,7 +115,7 @@ def publish_onec_bindings(
                 "runtime_generation": snapshot.runtime_generation,
                 "context_generation": snapshot.context_generation,
                 "provenance": provenance,
-                "resolver_handle": f"Контекст.{name}",
+                "resolver_handle": f"e1cRuntimeКонтекст.{name}",
                 "capabilities": _CONTEXT_CAPABILITIES,
             }
             for name in selected_names
@@ -370,7 +370,7 @@ class OnecValueResolver:
         if root.casefold() not in {name.casefold() for name in snapshot.names}:
             raise StaleProxy("1C context binding no longer exists")
         handle = self._registry.resolver_handle(descriptor.proxy_id)
-        if not isinstance(handle, str) or not handle.startswith("Контекст."):
+        if not isinstance(handle, str) or not handle.startswith("e1cRuntimeКонтекст."):
             raise ProtocolError("1C proxy has no symbolic context handle")
         self._backend.validate_value_reference(handle)
         return descriptor, handle

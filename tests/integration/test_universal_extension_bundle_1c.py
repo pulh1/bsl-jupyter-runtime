@@ -24,7 +24,7 @@ from onec_runtime.extension_bundle import (
 from onec_runtime.extension_state import ExtensionStateStore, VerifiedExtensionState
 from onec_runtime.performance_profile import PhaseRecorder
 from onec_runtime.processes import FileModeProcesses, OwnedProcess
-from onec_runtime.runtime_api import RuntimeReplyKind
+from onec_runtime.runtime_models import RuntimeReplyKind
 from onec_runtime.session import ExtensionMode, RuntimeSession, RuntimeSessionConfig
 from onec_runtime.toolchain import (
     apply_product_extension,
@@ -376,12 +376,13 @@ def _build_table_bound_instrumented_bundle(
         encoding="utf-8",
         newline="\n",
     )
+    packaged = packaged_extension_bundle(root / "packaged").manifest
     return build_runtime_extension_bundle(
         source_root=source,
         output_root=root / "bundle",
         platform_bin=platform,
-        artifact_version="0.1.5",
-        protocol_version="2",
+        artifact_version=packaged.artifact_version,
+        protocol_version=packaged.protocol_version,
     )
 
 
@@ -393,7 +394,7 @@ def _install_cfe(config: RuntimeConfig, cfe: Path, root: Path) -> None:
 @pytest.mark.live_1c
 @pytest.mark.parametrize(
     ("move_serializer_guard_after_read", "expected"),
-    ((False, "bounded|bounded"), (True, "serializer_probe|bounded")),
+    ((False, "bounded|exact|bounded"), (True, "serializer_probe|exact|bounded")),
     ids=("bounded", "guard_after_read_is_detected"),
 )
 def test_compact_table_bound_is_executed_before_value_table_and_query_sentinel_cells(
@@ -448,19 +449,52 @@ def test_compact_table_bound_is_executed_before_value_table_and_query_sentinel_c
 |    \"\"safe\"\" КАК Значение
 |ОБЪЕДИНИТЬ ВСЕ
 |ВЫБРАТЬ
+|    \"\"safe\"\" КАК Значение";
+ПроверкаТочногоЛимита = "";
+Попытка
+    ТочныйРезультат = RuntimeTableTransferServer.СериализоватьКомпактнуюТаблицу(
+        Запрос.Выполнить(), "presentation", Новый Соответствие, Новый Массив, 3, 1000000);
+    ПроверкаТочногоЛимита = ?(ТочныйРезультат.Доступ, "exact", "denied");
+Исключение
+    ПроверкаТочногоЛимита = "failed";
+КонецПопытки;
+
+Запрос.Текст = "ВЫБРАТЬ
+|    1 КАК НомерСтроки,
 |    \"\"safe\"\" КАК Значение
 |ОБЪЕДИНИТЬ ВСЕ
 |ВЫБРАТЬ
-|    \"\"__table_bound_sentinel__\"\" КАК Значение";
+|    2 КАК НомерСтроки,
+|    \"\"safe\"\" КАК Значение
+|ОБЪЕДИНИТЬ ВСЕ
+|ВЫБРАТЬ
+|    3 КАК НомерСтроки,
+|    \"\"safe\"\" КАК Значение
+|ОБЪЕДИНИТЬ ВСЕ
+|ВЫБРАТЬ
+|    4 КАК НомерСтроки,
+|    \"\"__table_bound_sentinel__\"\" КАК Значение
+|УПОРЯДОЧИТЬ ПО НомерСтроки";
 ПроверкаЗапроса = "";
 Попытка
     МатериализацияЗапроса = RuntimeTableTransferServer.СериализоватьКомпактнуюТаблицу(
         Запрос.Выполнить(), "presentation", Новый Соответствие, Новый Массив, 3, 1000000);
-    ПроверкаЗапроса = ?(МатериализацияЗапроса.Доступ, "bounded", "denied");
+    ПроверкаЗапроса = ?(МатериализацияЗапроса.Доступ, "unexpected_success", "denied");
 Исключение
-    ПроверкаЗапроса = "failed";
+    ОписаниеОшибки = ИнформацияОбОшибке().Описание;
+    Если ОписаниеОшибки = "Превышен лимит строк компактной таблицы" Тогда
+        ПроверкаЗапроса = "bounded";
+    ИначеЕсли ОписаниеОшибки = "out_of_page_query_cell_read" Тогда
+        ПроверкаЗапроса = "query_probe";
+    ИначеЕсли ОписаниеОшибки = "out_of_page_classifier_cell_read" Тогда
+        ПроверкаЗапроса = "classifier_probe";
+    ИначеЕсли ОписаниеОшибки = "out_of_page_serializer_cell_read" Тогда
+        ПроверкаЗапроса = "serializer_probe";
+    Иначе
+        ПроверкаЗапроса = "failed";
+    КонецЕсли;
 КонецПопытки;
-Результат = ПроверкаТаблицыЗначений + "|" + ПроверкаЗапроса;''')
+Результат = ПроверкаТаблицыЗначений + "|" + ПроверкаТочногоЛимита + "|" + ПроверкаЗапроса;''')
     finally:
         session.close()
 
@@ -476,12 +510,13 @@ def test_unbounded_to_df_keeps_all_rows_after_schema_probe(
 ) -> None:
     """A two-row ValueTable must not inherit the schema probe's one-row limit."""
     platform = _platform_bin()
+    packaged = packaged_extension_bundle(tmp_path / "packaged").manifest
     bundle = build_runtime_extension_bundle(
         source_root=_REPOSITORY / "onec" / "OnecInteractiveRuntime",
         output_root=tmp_path / "bundle",
         platform_bin=platform,
-        artifact_version="0.1.5",
-        protocol_version="2",
+        artifact_version=packaged.artifact_version,
+        protocol_version=packaged.protocol_version,
     )
     config = _config(tmp_path / "target", platform)
     create_empty_infobase(config)
@@ -497,7 +532,7 @@ def test_unbounded_to_df_keeps_all_rows_after_schema_probe(
 ТаблицаДляPython.Добавить().Значение = "second";
 ''')
         assert reply.succeeded
-        frame = session.to_df("Контекст.ТаблицаДляPython")
+        frame = session.to_df("e1cRuntimeКонтекст.ТаблицаДляPython")
         assert frame["Значение"].tolist() == ["first", "second"]
     finally:
         session.close()
@@ -512,12 +547,13 @@ def test_bounded_to_df_initializes_value_transfer_module(
 ) -> None:
     """A bounded table page must compile and run the real value-transfer module."""
     platform = _platform_bin()
+    packaged = packaged_extension_bundle(tmp_path / "packaged").manifest
     bundle = build_runtime_extension_bundle(
         source_root=_REPOSITORY / "onec" / "OnecInteractiveRuntime",
         output_root=tmp_path / "bundle",
         platform_bin=platform,
-        artifact_version="0.1.5",
-        protocol_version="2",
+        artifact_version=packaged.artifact_version,
+        protocol_version=packaged.protocol_version,
     )
     config = _config(tmp_path / "target", platform)
     create_empty_infobase(config)
@@ -535,7 +571,7 @@ def test_bounded_to_df_initializes_value_transfer_module(
 ''')
         assert reply.succeeded
         frame = session.project_to_df(
-            "Контекст.ТаблицаДляСреза",
+            "e1cRuntimeКонтекст.ТаблицаДляСреза",
             {"offset": 5, "limit": 5},
             timeout_s=20,
         )
@@ -588,7 +624,7 @@ def test_capture_cell_table_to_df_before_resume(
 ''')
         assert cell.kind is RuntimeReplyKind.CAPTURE_CELL
         assert cell.succeeded, cell.error
-        frame = session.to_df("Контекст.СнимокПосле")
+        frame = session.to_df("e1cRuntimeКонтекст.СнимокПосле")
         assert frame["Значение"].tolist() == ["first", "second"]
         resumed = session.resume_capture()
         assert resumed.kind is RuntimeReplyKind.MAIN_COMPLETED
@@ -638,7 +674,7 @@ def test_capture_table_materialization_after_failed_then_fixed_cell(
         assert cell.kind is RuntimeReplyKind.CAPTURE_CELL
         assert cell.succeeded, cell.error
         page = session.project_to_df(
-            "Контекст.СнимокПоказателей", {"offset": 0, "limit": 1},
+            "e1cRuntimeКонтекст.СнимокПоказателей", {"offset": 0, "limit": 1},
         )
         assert page["Значение"].tolist() == ["after failure"]
         failed = session.execute_bsl('''
@@ -659,7 +695,7 @@ def test_capture_table_materialization_after_failed_then_fixed_cell(
 ''')
         assert fixed.kind is RuntimeReplyKind.CAPTURE_CELL
         assert fixed.succeeded, fixed.error
-        frame = session.to_df("Контекст.СнимокПоказателей")
+        frame = session.to_df("e1cRuntimeКонтекст.СнимокПоказателей")
         assert frame["Значение"].tolist() == ["after failure"]
         resumed = session.resume_capture()
         assert resumed.kind is RuntimeReplyKind.MAIN_COMPLETED

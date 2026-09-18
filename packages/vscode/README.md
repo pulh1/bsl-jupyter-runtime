@@ -69,7 +69,7 @@ read or verify that runtime value.
 - Only local `file:` notebooks and readable, unlinked local directories are
   supported. Symlinks, junctions, virtual filesystems, live infobase metadata,
   and automatic source transfer are outside this version's scope.
-- Static completion yields `Контекст.*` requests to the existing kernel matcher.
+- Static completion yields `e1cRuntimeКонтекст.*` requests to the existing kernel matcher.
   Actual combined Jupyter/Pylance/kernel behavior still needs manual acceptance.
   Ordinary `.bsl` and `.os` editors remain with the BSL extension.
 - The bridge resolves at most eight leading completion items per request; later

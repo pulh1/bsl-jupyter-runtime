@@ -71,22 +71,21 @@ sys.path[:0] = [
     str(workspace / "packages" / "jupyter" / "src"),
 ]
 
-import onec_runtime.runtime_api
+import onec_runtime.execution.public_facade
 import onec_runtime.session
 from onec_runtime.bsl.module_catalog import (
     CommonModuleCatalogSnapshot,
     CommonModuleDescriptor,
     CommonModuleScope,
 )
-from onec_runtime.bsl.module_universe import WorkerModuleUnit
+from onec_runtime.bsl.module_universe import WorkerModuleUnit, lower_resolved_worker_module
 from onec_runtime.bsl.source_maps import (
     SourceUnitKind,
     SourceUnitRef,
     mapped_visible_source,
     source_sha256,
 )
-from onec_runtime.runtime_api import PrototypeRuntimeApi
-from onec_runtime.worker_universe import WorkerGenerationHandle, WorkerModuleArtifact, WorkerModuleBinaryKey
+from onec_runtime.execution.worker_catalog_resolver import resolve_worker_module_catalog
 
 source = "Процедура P()\n    Локальная = 1;\nКонецПроцедуры"
 catalog = CommonModuleCatalogSnapshot.create(
@@ -110,32 +109,9 @@ unit = WorkerModuleUnit(
     mapped_visible_source(source, unit_ref),
 )
 
-class Controller:
-    runtime_generation = 1
-
-class Builder:
-    def build(self, lowered, **_kwargs):
-        key = WorkerModuleBinaryKey.create(
-            lowered,
-            packer_version="import-fence",
-            target_profile="runtime-import-fence",
-        )
-        return WorkerModuleArtifact(
-            logical_name=lowered.analysis.unit.logical_name,
-            revision=lowered.analysis.unit.revision,
-            source_sha256=lowered.mapped_source.artifact.source_sha256,
-            binary_key=key,
-            artifact_sha256="0" * 64,
-            dependency_bindings=lowered.analysis.dependencies,
-            exports=(),
-            source_map_sha256=lowered.mapped_source.source_map_sha256,
-            worker_artifact=None,
-        )
-
-api = PrototypeRuntimeApi(Controller(), worker_module_builder=Builder())
-api._publish_worker_artifacts_locked = lambda artifacts, **_kwargs: WorkerGenerationHandle(1, 1, 1, "0" * 64)
-api._prune_worker_caches_locked = lambda: None
-api.load_worker_modules((unit,), common_modules=catalog)
+resolution = resolve_worker_module_catalog(catalog, (unit,))
+lowered = lower_resolved_worker_module(unit, resolution.plans[0])
+assert lowered.analysis.unit is unit
 
 forbidden = {"parsergen", "win32com", "pythoncom", "comtypes"}
 loaded = sorted(

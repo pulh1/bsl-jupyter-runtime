@@ -28,7 +28,7 @@ def write_dump_fixture(
     *,
     extension_name: str = "OnecInteractiveRuntime",
     artifact_version: str = "0.1.3",
-    protocol_version: str = "2",
+    protocol_version: str = "5",
 ) -> Path:
     dump = root / "dump"
     managed = dump / "Ext" / "ManagedApplicationModule.bsl"
@@ -131,7 +131,7 @@ def write_manifest_fixture(
     cfe_sha256: str,
     cfe_size: int = 0,
     artifact_version: str = "0.1.3",
-    protocol_version: str = "2",
+    protocol_version: str = "5",
 ) -> Path:
     identity = {
         "product_id": "onec-interactive-runtime",

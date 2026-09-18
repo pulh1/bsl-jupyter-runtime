@@ -783,7 +783,8 @@ def _prepare_worker_module_source_delta(
     prior_wrapper_index = _OriginSegmentIndex(prior_wrapper_map)
     parent_cursor = _GeneratedSegmentCursor(source.source_map)
 
-    for fragment in source.retained_fragments:
+    fragments = source.retained_fragments
+    for fragment_index, fragment in enumerate(fragments):
         local_cursor = 0
         index = fragment.text.find("\r")
         while index >= 0:
@@ -796,7 +797,18 @@ def _prepare_worker_module_source_delta(
                     previous_module,
                     prior_wrapper_index,
                 )
-            end = index + 2 if fragment.text.startswith("\r\n", index) else index + 1
+            next_is_lf = fragment.text.startswith("\r\n", index) or (
+                index + 1 == len(fragment.text)
+                and fragment_index + 1 < len(fragments)
+                and fragments[fragment_index + 1].text.startswith("\n")
+            )
+            if next_is_lf:
+                # The full normalizer drops CR and copies LF with its own
+                # origin, even when the pair crosses retained fragments.
+                local_cursor = index + 1
+                index = fragment.text.find("\r", local_cursor)
+                continue
+            end = index + 1
             current_span = SourceSpan(
                 fragment.generated.start + index,
                 fragment.generated.start + end,

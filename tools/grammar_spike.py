@@ -54,8 +54,8 @@ def main() -> None:
         context_names=("Расчет",),
     ).lower(VISIBLE_CELL, mode=LoweringMode.MAIN).source
     expected = (
-        'Контекст.Вставить("НДФЛ", Контекст.Расчет.Ндфл.Посчитать()); '
-        "Контекст.Расчет.Ндфл.ИзменитьРезультат(Контекст.НДФЛ);"
+        'e1cRuntimeКонтекст.Вставить("НДФЛ", e1cRuntimeКонтекст.Расчет.Ндфл.Посчитать()); '
+        "e1cRuntimeКонтекст.Расчет.Ндфл.ИзменитьРезультат(e1cRuntimeКонтекст.НДФЛ);"
     )
     if lowered != expected:
         raise RuntimeError(f"Unexpected lowering: {lowered}")

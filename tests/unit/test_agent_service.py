@@ -24,7 +24,7 @@ from onec_runtime_mcp.agent.capture_contracts import CaptureFence
 from onec_runtime_mcp.agent.proxies import ProxyProvenance, ProxyRealm
 from onec_runtime_mcp.agent.service import AgentWorkspaceService
 from onec_runtime.errors import ProtocolError
-from onec_runtime.runtime_api import RuntimeNamespaceSnapshot
+from onec_runtime.runtime_models import RuntimeNamespaceSnapshot
 from onec_runtime.bsl import (
     DiagnosticStage,
     MappingConfidence,
@@ -348,7 +348,7 @@ def test_initial_mcp_namespace_seed_validates_all_handles_before_publication(
 ) -> None:
     service, backend, _ = seeded_service(tmp_path)
     backend.names = ("БезопасноеИмя", "АлиасМодуля")
-    backend.forbidden_handles.add("Контекст.АлиасМодуля")
+    backend.forbidden_handles.add("e1cRuntimeКонтекст.АлиасМодуля")
     try:
         with pytest.raises(
             ProtocolError,
@@ -357,8 +357,8 @@ def test_initial_mcp_namespace_seed_validates_all_handles_before_publication(
             service._install_onec_resolver(backend)
 
         assert backend.guard_calls == [
-            "Контекст.БезопасноеИмя",
-            "Контекст.АлиасМодуля",
+            "e1cRuntimeКонтекст.БезопасноеИмя",
+            "e1cRuntimeКонтекст.АлиасМодуля",
         ]
         assert service._proxy_registry.current(ProxyRealm.ONEC) == ()
         assert ProxyRealm.ONEC not in service._value_resolvers
@@ -1277,7 +1277,7 @@ def test_agent_value_release_is_idempotent_without_deleting_bsl_binding(
         runtime_generation=1,
         context_generation=1,
         provenance=ProxyProvenance("cell-main", 1, "a" * 64, "op-1"),
-        resolver_handle="Контекст.Порог",
+        resolver_handle="e1cRuntimeКонтекст.Порог",
     )
 
     assert service.call("value.describe", {"proxy_id": proxy.proxy_id}).ok

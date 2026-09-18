@@ -7,7 +7,7 @@ from uuid import UUID
 
 from onec_runtime.privacy import public_artifact_value
 from onec_runtime.worker_breakpoints import WorkerBreakpointCoordinator
-from test_worker_breakpoints import _debug_view
+from worker_debug_fixtures import worker_debug_view
 
 
 def _public_json(value: object) -> str:
@@ -22,7 +22,7 @@ def _public_json(value: object) -> str:
 def test_debug_views_and_workspace_plan_hide_physical_worker_locator(
     tmp_path: Path,
 ) -> None:
-    view = _debug_view(tmp_path)
+    view = worker_debug_view(tmp_path)
     module = view.modules[0]
     private_url = module.registration.exact_temp_storage_url
     registration_name = module.registration.registration_name
@@ -44,7 +44,7 @@ def test_debug_views_and_workspace_plan_hide_physical_worker_locator(
 
 
 def test_breakpoint_plan_repr_never_contains_private_locator(tmp_path: Path) -> None:
-    view = _debug_view(tmp_path)
+    view = worker_debug_view(tmp_path)
     module = view.modules[0]
     coordinator = WorkerBreakpointCoordinator(session_id=UUID(int=92))
     coordinator.set_views((view,))
@@ -66,6 +66,7 @@ def test_capture_value_snapshots_expose_only_normalized_public_fields() -> None:
     from onec_runtime.capture_values import (
         SafePathSegment,
         SafeValuePath,
+        UnavailableValueNode,
         ValueNode,
         ValuePage,
         ValuePathSegmentKind,
@@ -98,6 +99,9 @@ def test_capture_value_snapshots_expose_only_normalized_public_fields() -> None:
     }
     assert "object at" not in serialized
     assert "_owner" not in serialized and "_lineage" not in serialized
+    assert public_artifact_value(UnavailableValueNode("Недоступное")) == {
+        "name": "Недоступное", "access": "unavailable", "expandable": False,
+    }
 
 
 def test_attached_frame_and_live_descriptors_never_publish_inspection_capabilities() -> None:
@@ -154,50 +158,34 @@ def test_attached_frame_and_live_descriptors_never_publish_inspection_capabiliti
 def test_current_capture_artifact_retains_no_live_control_plane(monkeypatch) -> None:
     from dataclasses import fields
 
-    from test_capture_control_plane import _capture_runtime
-    from test_capture_evaluation_lifecycle import close_owner
+    from onec_runtime.capture_inspection import CaptureView
 
-    api, controller, transport = _capture_runtime()
-    try:
-        capture = api.current_capture()
-        owner = api._capture_control_owner()
-        fence = owner._fence
-        callbacks = tuple(
-            getattr(capture, item.name)
-            for item in fields(capture)
-            if callable(getattr(capture, item.name))
-        )
-        calls = []
+    calls = []
+    private_fence = object()
 
-        def forbidden(*args, **kwargs):
-            calls.append("live capture access")
-            raise AssertionError("artifact conversion must not read a live capture")
+    def forbidden(*args, **kwargs):
+        _ = private_fence
+        calls.append("live capture access")
+        raise AssertionError("artifact conversion must not read a live capture")
 
-        with monkeypatch.context() as patch:
-            patch.setattr(api, "_capture_control_owner", forbidden)
-            patch.setattr(owner, "status", forbidden)
-            patch.setattr(owner, "wait", forbidden)
-            patch.setattr(type(capture), "__repr__", forbidden)
-            converted = public_artifact_value(capture)
-            assert converted == {"type": "CaptureView"}
-            serialized = json.dumps(converted, ensure_ascii=False, sort_keys=True)
-            assert len(serialized.encode("utf-8")) <= 64
-            assert public_artifact_value({"capture": capture}) == {"capture": converted}
-            controller.stop_sequence += 1
-            assert json.dumps(
-                public_artifact_value(capture), ensure_ascii=False, sort_keys=True,
-            ) == serialized
-            assert calls == []
+    capture = CaptureView(7, 3, 2, forbidden, forbidden, forbidden)
+    callbacks = tuple(
+        getattr(capture, item.name)
+        for item in fields(capture)
+        if callable(getattr(capture, item.name))
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr(type(capture), "__repr__", forbidden)
+        converted = public_artifact_value(capture)
+        assert converted == {"type": "CaptureView"}
+        serialized = json.dumps(converted, ensure_ascii=False, sort_keys=True)
+        assert len(serialized.encode("utf-8")) <= 64
+        assert public_artifact_value({"capture": capture}) == {"capture": converted}
+        assert calls == []
 
-        assert all(
-            value is not private
-            for value in converted.values()
-            for private in (api, owner, fence, *callbacks)
-        )
-        for private in (repr(api), repr(owner), repr(fence), *(repr(cb) for cb in callbacks)):
-            assert private not in serialized
-        assert "function" not in serialized and "0x" not in serialized
-        assert "operation_id" not in serialized and "capture_generation" not in serialized
-        assert "stop_sequence" not in serialized
-    finally:
-        close_owner(controller, transport)
+    assert all(value is not private_fence for value in converted.values())
+    for callback in callbacks:
+        assert repr(callback) not in serialized
+    assert "function" not in serialized and "0x" not in serialized
+    assert "operation_id" not in serialized and "capture_generation" not in serialized
+    assert "stop_sequence" not in serialized

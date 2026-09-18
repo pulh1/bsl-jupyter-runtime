@@ -44,7 +44,13 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True, slots=True, repr=False)
 class CaptureView:
-    """Immutable access to one captured stop's local control plane."""
+    """A handle fenced to one CAPTURE debugger stop.
+
+    Obtain it with ``runtime.current_capture()``. ``operation_id``,
+    ``capture_generation`` and ``stop_sequence`` identify the local stop.
+    The handle may outlive that stop, but its status then reports ``stale``;
+    waiting or reading its frame-backed data is no longer valid.
+    """
 
     operation_id: int
     capture_generation: int
@@ -90,6 +96,11 @@ class CaptureView:
         )
 
     def status(self) -> CaptureStatus:
+        """Return this stop's phase and available inspection/wait actions.
+
+        An old view returns a ``CaptureStatus`` with phase ``stale`` without
+        consulting a later debugger frame.
+        """
         if not self.__is_current():
             return CaptureStatus(
                 self.operation_id,
@@ -104,19 +115,36 @@ class CaptureView:
         timeout_s: float | None = None,
         evaluation_id: str | None = None,
     ) -> CaptureEvaluationOutcome:
+        """Observe a CAPTURE evaluation already owned by this stop.
+
+        ``evaluation_id`` selects an exact evaluation; when omitted, the
+        current or last retained evaluation is selected. ``timeout_s`` is a
+        local wait limit. Expiry returns an outcome with state ``pending``;
+        it does not cancel or redispatch the remote expression. Raises
+        ``StaleCaptureError`` if this view no longer names the current stop.
+        """
         if not self.__is_current():
             raise StaleCaptureError()
         return self.__wait_for_outcome(timeout_s, evaluation_id)
 
     @property
     def stack(self) -> StackDescriptor:
+        """Return a descriptor for bounded stack pages at this stop.
+
+        Each indexed read validates the stop fence. ``stack.native`` includes
+        physical frames that the default visible stack may hide.
+        """
         if self.__stack is None:
             raise CaptureSourceUnavailableError("capture stack inspection is not attached")
         return self.__stack
 
     @property
     def context(self) -> CaptureContextView:
-        """Live, fenced values from the staged CAPTURE context namespace."""
+        """Return live, fenced variables of the staged CAPTURE context.
+
+        Use ``context.variables[name]`` or a bounded slice. Each value read
+        checks this stop's identity; a later stop cannot revive this view.
+        """
         if self.__context is None:
             raise CaptureSourceUnavailableError(
                 "capture context value inspection is not attached"
@@ -198,6 +226,13 @@ class PhysicalFrameIdentity:
 
 @dataclass(frozen=True, slots=True, repr=False)
 class DebugFrame:
+    """One saved frame with optional source and live value descriptors.
+
+    ``source_status`` and ``method_status`` indicate whether source mapping
+    and method enrichment succeeded. ``variables``, ``parameters`` and
+    ``locals`` return descriptors whose indexed reads check the stop fence.
+    """
+
     native_level: int
     source: str
     line: int | None
@@ -266,7 +301,12 @@ class RuntimeFrameMarker:
 
 @dataclass(frozen=True, slots=True, repr=False)
 class StackPage:
-    """Saved request result; an empty request has no continuation cursor."""
+    """A bounded stack result with ``frames``, ``total`` and ``next_cursor``.
+
+    ``with_methods()`` adds source-derived method names where available.
+    The returned frames are saved metadata; their value descriptors still
+    require the original stop to be current.
+    """
 
     frames: tuple[DebugFrame | RuntimeFrameMarker, ...]
     total: int
@@ -294,11 +334,19 @@ class StackPage:
 
 @dataclass(frozen=True, slots=True, repr=False)
 class StackDescriptor:
+    """Read a CAPTURE stack by index or bounded slice.
+
+    ``stack[index]`` returns one visible frame; ``stack[start:stop]`` returns
+    a :class:`StackPage` of at most 100 frames. Use ``stack.native`` to read
+    physical frames, including runtime frames.
+    """
+
     _owner: LocalStackAdapter
     _native: bool = False
 
     @property
     def native(self) -> StackDescriptor:
+        """Return a descriptor that indexes physical debugger frames."""
         return replace(self, _native=True)
 
     @overload
@@ -308,6 +356,7 @@ class StackDescriptor:
     def __getitem__(self, key: slice) -> StackPage: ...
 
     def __getitem__(self, key: int | slice) -> StackPage | DebugFrame:
+        """Fetch a frame or finite unit-step page under the current stop fence."""
         if type(key) is int:
             start, stop = key, key + 1
         elif type(key) is slice and (

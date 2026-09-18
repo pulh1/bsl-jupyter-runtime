@@ -62,15 +62,18 @@ def prepare_worker_module_source(source: MappedSource) -> MappedSource:
         if cursor < index:
             builder.copy(SourceSpan(cursor, index))
         end = index + 2 if source.text.startswith("\r\n", index) else index + 1
+        if end == index + 2:
+            # Retain the LF with its own parent mapping. Two adjacent CRLFs
+            # may straddle synthetic and exact source-map segments; replacing
+            # them as one derived fragment would erase that distinction.
+            cursor = index + 1
+            index = cursor
+            continue
         parent = next(
             segment
             for segment in source.source_map.segments
             if segment.generated.start <= index < segment.generated.end
         )
-        if end == index + 2 and parent.generated.end == index + 1:
-            cursor = index + 1
-            index = cursor
-            continue
         region = (
             parent.synthetic_region
             if parent.relation is MappingRelation.DERIVED

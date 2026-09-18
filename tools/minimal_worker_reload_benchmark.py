@@ -622,30 +622,21 @@ def validate_cold_transport_contract(transport: Mapping[str, object]) -> None:
 
 
 def assert_fresh_worker_state(session: object) -> dict[str, int | bool]:
-    """Fail closed unless all session, API, host and target Worker caches are empty."""
+    """Require a fresh catalog and no published Worker generation."""
     try:
         catalog = session._require_common_module_catalog()
-        api = session.runtime_api
         index = catalog._path_index
+        worker_generation = session.status().worker_generation
         state = {
             "catalog_initialized": bool(catalog.initialized),
             "catalog_index_entries": 0 if index is None else len(index),
             "catalog_resolved_entries": len(catalog._resolved),
-            "active_models": len(api._worker_active_modules),
-            "descriptor_artifacts": len(api._worker_module_artifacts),
-            "binary_artifacts": len(api._worker_module_builder._cache._capsules),
-            "host_generations": len(api._worker_universe._generations),
-            "target_registrations": len(api._worker_universe_target._registrations),
-            "active_generation": (
-                api._worker_generation_handle is not None
-                or api._worker_universe._active_generation is not None
-            ),
+            "active_generation": worker_generation is not None,
         }
     except (AttributeError, TypeError):
         raise BenchmarkContractError("Worker state is not inspectable") from None
     if (
         index is not None
-        or api._worker_catalog_snapshot is not None
         or any(
         value is not False if isinstance(value, bool) else value != 0
         for value in state.values()
@@ -1464,7 +1455,7 @@ def _prepare_mode(session: object, mode: str) -> None:
         _require_reply,
         _synthetic_capture_location,
     )
-    from onec_runtime.runtime_api import RuntimeReplyKind
+    from onec_runtime.runtime_models import OperationState, RuntimeReplyKind
 
     location = _synthetic_capture_location(session.config.runtime.runtime_dir)
     session.configure_capture_points((location,))
@@ -1473,19 +1464,19 @@ def _prepare_mode(session: object, mode: str) -> None:
         "Результат = 41;"
     )
     _require_reply(reply, kinds=(RuntimeReplyKind.CAPTURED,))
-    if session.runtime_api.operation_worker_generation is not None:
-        raise BenchmarkContractError("CAPTURE sample unexpectedly pinned a generation")
+    if session.status().state is not OperationState.CAPTURED:
+        raise BenchmarkContractError("CAPTURE sample is not suspended")
 
 
 def _verify_semantic_canary(session: object, mode: str) -> None:
     from integration.zup_worker_universe_acceptance import _require_reply
-    from onec_runtime.runtime_api import RuntimeReplyKind
+    from onec_runtime.runtime_models import OperationState, RuntimeReplyKind
 
     if mode == "CAPTURE":
-        if session.runtime_api.operation_worker_generation is not None:
-            raise BenchmarkContractError("CAPTURE reload changed the current pin")
+        if session.status().state is not OperationState.CAPTURED:
+            raise BenchmarkContractError("CAPTURE sample is not suspended")
         _require_reply(
-            session.runtime_api.resume_capture(),
+            session.resume_capture(),
             kinds=(RuntimeReplyKind.MAIN_COMPLETED,),
             expected=41,
         )
@@ -1590,9 +1581,7 @@ def _run_cold_child(request: ColdSampleRequest) -> dict[str, object]:
                 phases,
                 end_to_end_ms=end_to_end_ms,
             )
-            catalog = session.runtime_api._worker_catalog_snapshot
-            if catalog is None:
-                raise BenchmarkContractError("cold catalog publication is absent")
+            catalog = session._require_common_module_catalog().ensure_initialized()
             sample = {
                 "sequence": request.sequence,
                 "mode": request.mode,

@@ -23,6 +23,7 @@ from onec_runtime.capture_evaluation import (
 )
 from onec_runtime.errors import (
     CaptureBusyError,
+    CaptureEvaluationDeliveryError,
     CaptureEvaluationPendingError,
     CaptureOutcomeUnknownError,
     CaptureRecoveryRequiredError,
@@ -30,6 +31,7 @@ from onec_runtime.errors import (
     CaptureValueCheckError,
     NoActiveCaptureError,
     NoCaptureEvaluationError,
+    ProtocolError,
     StaleCaptureError,
 )
 
@@ -51,6 +53,39 @@ def test_admission_envelope_v1_round_trips_the_only_ready_shape() -> None:
         max_payload_bytes=33,
         max_base64_chars=44,
     ) == envelope
+
+
+def test_public_capture_models_keep_supported_import_identity_and_redaction() -> None:
+    from onec_runtime.capture_evaluation_models import (
+        CaptureEvaluationOutcome as OutcomeModel,
+        CaptureStatus as StatusModel,
+    )
+    from onec_runtime.capture_transfer_models import (
+        AdmissionEnvelopeV1 as EnvelopeModel,
+        CaptureFence,
+        CaptureTransferPlan,
+    )
+
+    assert OutcomeModel is CaptureEvaluationOutcome
+    assert StatusModel is CaptureStatus
+    assert EnvelopeModel is AdmissionEnvelopeV1
+    fence = CaptureFence(1, 2, 3, identity="private target")
+    plan = CaptureTransferPlan(
+        "private instruction", "private key", "private cleanup", 128,
+        lambda metadata, payload: b"ok",
+    )
+    assert "private target" not in repr(fence)
+    assert "private instruction" not in repr(plan)
+    assert "private key" not in repr(plan)
+
+
+def test_delivery_error_bounds_and_sanitizes_its_diagnostic() -> None:
+    error = CaptureEvaluationDeliveryError("delivery\n" + "x" * 3000)
+    assert isinstance(error, ProtocolError)
+    assert len(str(error)) <= 1024
+    assert "\n" not in str(error)
+    assert error.diagnostic.code == "result_delivery_failed"
+    assert len(error.diagnostic.message) <= 1024
 
 
 @pytest.mark.parametrize(
@@ -157,7 +192,7 @@ def test_public_evaluation_receipt_grammar_is_exported_and_disjoint_from_private
         "__onec_materialization_" + "a" * 32,
         "__onec_projection_" + "a" * 32,
         "__onec_compact_table_" + "a" * 32,
-        "Контекст.Секрет",
+        "e1cRuntimeКонтекст.Секрет",
         "worker://private-handle",
     ):
         assert not is_public_capture_evaluation_id(private_identifier)

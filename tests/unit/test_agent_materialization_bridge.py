@@ -17,7 +17,7 @@ from onec_runtime_mcp.agent.python_protocol import PythonWorkspaceLimits
 from onec_runtime_mcp.agent.python_workspace import PythonWorkspace
 from onec_runtime_mcp.agent.value_service import OnecMaterializationBridge
 from onec_runtime.errors import ProtocolError
-from onec_runtime.runtime_api import RuntimeNamespaceSnapshot
+from onec_runtime.runtime_models import RuntimeNamespaceSnapshot
 
 
 def table_payload(*, rows: int = 10_000) -> bytes:
@@ -62,15 +62,15 @@ class FakePayloadBackend:
         self, handle: str, *, timeout_s: float | None = None
     ) -> str:
         del timeout_s
-        return self.payloads[handle.removeprefix("Контекст.")][0]
+        return self.payloads[handle.removeprefix("e1cRuntimeКонтекст.")][0]
 
     def materialize_value_payload(self, handle: str, **options: object) -> bytes:
         self.value_calls.append(handle)
-        return self.payloads[handle.removeprefix("Контекст.")][1]
+        return self.payloads[handle.removeprefix("e1cRuntimeКонтекст.")][1]
 
     def materialize_table_payload(self, handle: str, **options: object) -> bytes:
         self.table_calls.append((handle, options))
-        return self.payloads[handle.removeprefix("Контекст.")][1]
+        return self.payloads[handle.removeprefix("e1cRuntimeКонтекст.")][1]
 
     def project_value_payload(
         self, handle: str, selection: ValueSelection, **options: object
@@ -162,7 +162,7 @@ def test_to_df_returns_python_proxy_and_preserves_onec_provenance(
         assert python.inspect(frame_proxy.proxy_id).shape == (10_000, 15)
         assert len(backend.table_calls) == 1
         handle, options = backend.table_calls[0]
-        assert handle == "Контекст.Таблица"
+        assert handle == "e1cRuntimeКонтекст.Таблица"
         timeout_s = options.pop("timeout_s")
         assert isinstance(timeout_s, float) and 0 < timeout_s <= 10
         assert options == {
@@ -306,7 +306,7 @@ def test_bounded_projection_is_built_in_1c_before_python_ingest(tmp_path: Path) 
         assert python.inspect(count.proxy_id).preview == 1
         assert len(backend.project_calls) == 1
         handle, actual_selection, options = backend.project_calls[0]
-        assert handle == "Контекст.Значение"
+        assert handle == "e1cRuntimeКонтекст.Значение"
         assert actual_selection == selection
         timeout_s = options.pop("timeout_s")
         assert isinstance(timeout_s, float)

@@ -26,18 +26,18 @@ test('empty BSL body accepts completion at its first cursor without mapping the 
 
 test('kernel context receiver detection preserves indexed and partial fields without matching strings or unrelated receivers', () => {
   const {isKernelContextReceiver} = mapping();
-  for (const text of ['Контекст.', 'Контекст.Таблица[0].', 'Х = Контекст . Таблица [ 12 ] . По', 'Сообщить(контекст.Структура.По', 'Контекст.\nПоле.']) {
+  for (const text of ['e1cRuntimeКонтекст.', 'e1cRuntimeКонтекст.Таблица[0].', 'Х = e1cRuntimeКонтекст . Таблица [ 12 ] . По', 'Сообщить(E1CRUNTIMEконтекст.Структура.По', 'e1cRuntimeКонтекст.\nПоле.']) {
     assert.equal(isKernelContextReceiver(text), true, text);
   }
-  for (const text of ['ОбщийМодуль.Метод(', 'Контекст.Метод().', 'НеКонтекст.', 'Объект.Контекст.', '// Контекст.', '"Контекст.', 'Новый Контекст.', 'Контекст[Х].']) {
+  for (const text of ['ОбщийМодуль.Метод(', 'e1cRuntimeКонтекст.Метод().', 'Контекст.', 'Неe1cRuntimeКонтекст.', 'Объект.e1cRuntimeКонтекст.', '// e1cRuntimeКонтекст.', '"e1cRuntimeКонтекст.', 'Новый e1cRuntimeКонтекст.', 'e1cRuntimeКонтекст[Х].']) {
     assert.equal(isKernelContextReceiver(text), false, text);
   }
 });
 
 test('kernel handoff recognizes a receiver on a new statement line after a procedure header', () => {
   const {isKernelContextReceiver} = mapping();
-  assert.equal(isKernelContextReceiver('Процедура П()\nКонтекст.Таблица.'), true);
-  assert.equal(isKernelContextReceiver('Вызов().Контекст.Таблица.'), false);
+  assert.equal(isKernelContextReceiver('Процедура П()\ne1cRuntimeКонтекст.Таблица.'), true);
+  assert.equal(isKernelContextReceiver('Вызов().e1cRuntimeКонтекст.Таблица.'), false);
 });
 
 test('kernel handoff accepts RU and EN expression keywords but not constructors or receiver suffixes', () => {
@@ -48,13 +48,13 @@ test('kernel handoff accepts RU and EN expression keywords but not constructors 
     'If ', 'ElsIf ', 'Return ', 'While ', 'For Each Row In ',
     'If Value And ', 'If Value Or ', 'If Not ',
   ]) {
-    assert.equal(isKernelContextReceiver(`${prefix}Контекст.Таблица.`), true, prefix);
-    assert.equal(isKernelContextReceiver(`${prefix}Контекст.Структура.По`), true, prefix);
+    assert.equal(isKernelContextReceiver(`${prefix}e1cRuntimeКонтекст.Таблица.`), true, prefix);
+    assert.equal(isKernelContextReceiver(`${prefix}e1cRuntimeКонтекст.Структура.По`), true, prefix);
   }
   for (const text of [
-    'Новый Контекст.', 'New Контекст.', 'Вызов().Контекст.',
-    'Объект.Контекст.', 'Объект.Если Контекст.', 'Value Контекст.',
-    'Если "Контекст.', 'Return // Контекст.',
+    'Новый e1cRuntimeКонтекст.', 'New e1cRuntimeКонтекст.', 'Вызов().e1cRuntimeКонтекст.',
+    'Объект.e1cRuntimeКонтекст.', 'Объект.Если e1cRuntimeКонтекст.', 'Value e1cRuntimeКонтекст.',
+    'Если "e1cRuntimeКонтекст.', 'Return // e1cRuntimeКонтекст.',
   ]) assert.equal(isKernelContextReceiver(text), false, text);
 });
 
