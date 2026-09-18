@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from uuid import uuid4
+from threading import RLock
+from uuid import UUID, uuid4
 
 from onec_runtime.breakpoint_workspace import (
     BreakpointWorkspaceController,
@@ -16,7 +17,8 @@ from onec_runtime.worker_breakpoints import (
     WorkerBreakpointConflict,
     WorkerBreakpointCoordinator,
     WorkerBreakpointPlan,
-    WorkerBreakpointReloadPolicy,
+    WorkerBreakpointReloadOutcome, WorkerBreakpointReloadPolicy,
+    WorkerBreakpointReloadReport,
 )
 from onec_runtime.worker_universe import (
     OperationGenerationPin,
@@ -52,6 +54,15 @@ class WorkerBreakpointWorkspace:
         self._breakpoints = breakpoints
         self._workspace = workspace
         self._reload_policy = reload_policy
+        self._report_lock = RLock()
+        self._last_reload_report: WorkerBreakpointReloadReport | None = None
+
+    @property
+    def last_reload_report(self) -> WorkerBreakpointReloadReport | None:
+        """Return the latest confirmed, aborted, or quarantined promotion."""
+
+        with self._report_lock:
+            return self._last_reload_report
 
     def promote(
         self,
@@ -60,18 +71,33 @@ class WorkerBreakpointWorkspace:
         candidate: WorkerUniverseCandidate,
         *,
         port: SessionPort,
+        reload_policy: WorkerBreakpointReloadPolicy | None = None,
+        record_report: bool = True,
     ) -> WorkerGenerationHandle:
         self._require_port(port)
+        policy = self._reload_policy if reload_policy is None else reload_policy
+        if type(policy) is not WorkerBreakpointReloadPolicy:
+            raise TypeError("Worker breakpoint reload policy is invalid")
+        if type(record_report) is not bool:
+            raise TypeError("Worker breakpoint report selection is invalid")
         self._workspace.require_confirmed()
         previous = self._workspace.confirmed_snapshot
+        transaction_id = uuid4()
         prepared = None
         plan: WorkerBreakpointPlan | None = None
         installed = False
         swapped = False
+
+        def record(outcome: WorkerBreakpointReloadOutcome) -> None:
+            if record_report:
+                self._record_reload(
+                    transaction_id, candidate.handle, policy, outcome, plan,
+                )
+
         try:
-            prepared = target.prepare_root(candidate, transaction_id=uuid4())
+            prepared = target.prepare_root(candidate, transaction_id=transaction_id)
             plan = self._breakpoints.prepare_generation(
-                host._candidate_debug_view(candidate), self._reload_policy,
+                host._candidate_debug_view(candidate), policy,
             )
             desired = self._prepare_workspace(plan.desired_slots)
             self._workspace.install(desired, port=port)
@@ -79,19 +105,32 @@ class WorkerBreakpointWorkspace:
             handle = target.swap_root(prepared)
             swapped = True
             self._breakpoints.commit(plan, workspace_confirmed=True)
+            record(WorkerBreakpointReloadOutcome.COMMITTED)
             return handle
         except WorkerBreakpointConflict:
             if prepared is not None:
-                target.discard_root(prepared)
+                try:
+                    target.discard_root(prepared)
+                except BaseException as error:
+                    self._quarantine(plan)
+                    record(WorkerBreakpointReloadOutcome.QUARANTINED)
+                    if isinstance(error, WorkerPromotionOutcomeUnknown):
+                        raise
+                    raise OutcomeUnknown(
+                        "Worker breakpoint conflict discard outcome is unknown"
+                    ) from error
+            record(WorkerBreakpointReloadOutcome.ABORTED)
             raise
         except (BreakpointWorkspaceOutcomeUnknown, WorkerPromotionOutcomeUnknown, OutcomeUnknown):
             self._quarantine(plan)
+            record(WorkerBreakpointReloadOutcome.QUARANTINED)
             if prepared is not None and not swapped:
                 target.quarantine_root(prepared)
             raise
         except BaseException as error:
             if swapped:
                 self._quarantine(plan)
+                record(WorkerBreakpointReloadOutcome.QUARANTINED)
                 raise OutcomeUnknown(
                     "Worker breakpoint catalog could not confirm the active root"
                 ) from error
@@ -102,9 +141,11 @@ class WorkerBreakpointWorkspace:
                     target.discard_root(prepared)
             except BaseException as restoration_error:
                 self._quarantine(plan)
+                record(WorkerBreakpointReloadOutcome.QUARANTINED)
                 raise OutcomeUnknown(
                     "Worker breakpoint workspace could not be restored"
                 ) from restoration_error
+            record(WorkerBreakpointReloadOutcome.ABORTED)
             raise
 
     def release(
@@ -176,3 +217,29 @@ class WorkerBreakpointWorkspace:
             except ProtocolError:
                 pass
         self._workspace.quarantine()
+
+    def _record_reload(
+        self,
+        transaction_id: UUID,
+        handle: WorkerGenerationHandle,
+        policy: WorkerBreakpointReloadPolicy,
+        outcome: WorkerBreakpointReloadOutcome,
+        plan: WorkerBreakpointPlan | None,
+    ) -> None:
+        version = (
+            plan.next_snapshot.catalog_version
+            if plan is not None and outcome is WorkerBreakpointReloadOutcome.COMMITTED
+            else self._breakpoints.snapshot().catalog_version
+        )
+        report = WorkerBreakpointReloadReport(
+            transaction_id, handle, policy, outcome,
+            () if plan is None else plan.removal_details,
+            (
+                plan.removed_ids
+                if plan is not None
+                and outcome is WorkerBreakpointReloadOutcome.COMMITTED else ()
+            ),
+            version,
+        )
+        with self._report_lock:
+            self._last_reload_report = report

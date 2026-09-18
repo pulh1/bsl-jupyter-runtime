@@ -2,9 +2,9 @@
 
 Pure module analysis and packaging are supplied by a composition-owned
 preparer. Promotion and release enter the existing Worker universe through an
-admitted ``SessionPort``. This port currently supports a confirmed catalog
-snapshot and a workspace with no logical Worker breakpoints. Reload with
-breakpoints needs a per-call policy and report from WorkerBreakpointWorkspace.
+admitted ``SessionPort``. This port accepts a confirmed catalog snapshot and
+delegates breakpoint-bearing promotion to the same shared
+``WorkerBreakpointWorkspace`` used by notebook Worker activation.
 """
 
 from __future__ import annotations
@@ -31,7 +31,8 @@ from onec_runtime.execution.worker_mutation import (
 from onec_runtime.execution.worker import WorkerActivationUnknown
 from onec_runtime.performance_profile import PhaseRecorder
 from onec_runtime.worker_breakpoints import (
-    WorkerBreakpointReloadPolicy, WorkerBreakpointReloadReport,
+    WorkerBreakpointReloadOutcome, WorkerBreakpointReloadPolicy,
+    WorkerBreakpointReloadReport,
 )
 from onec_runtime.worker_universe import (
     WorkerGenerationHandle, WorkerModuleArtifact, WorkerModuleArtifactBuilder,
@@ -90,11 +91,16 @@ class WorkerModulePublisher(Protocol):
 
     def publish_modules(
         self, artifacts: tuple[WorkerModuleArtifact, ...], *, port: SessionPort,
+        reload_policy: WorkerBreakpointReloadPolicy,
     ) -> WorkerGenerationHandle: ...
 
     def release_generation(
         self, handle: WorkerGenerationHandle, *, port: SessionPort,
     ) -> None: ...
+
+    def last_worker_breakpoint_reload_report(
+        self,
+    ) -> WorkerBreakpointReloadReport | None: ...
 
 
 class WorkerModuleLifecycleService:
@@ -130,7 +136,9 @@ class WorkerModuleLifecycleService:
             raise TypeError("Worker lifecycle collaborators must be callable")
         if not callable(getattr(publisher, "publish_modules", None)) or not callable(
             getattr(publisher, "release_generation", None)
-        ) or not callable(getattr(publisher, "snapshot", None)):
+        ) or not callable(getattr(publisher, "snapshot", None)) or not callable(
+            getattr(publisher, "last_worker_breakpoint_reload_report", None)
+        ):
             raise TypeError("Worker module publisher is required")
         self._arbiter = arbiter
         self._publisher = publisher
@@ -201,7 +209,10 @@ class WorkerModuleLifecycleService:
             with self._lock:
                 if self._revision != revision:
                     raise ProtocolError("Worker module source inventory changed")
-            publish = lambda: self._publisher.publish_modules(artifacts, port=port)
+            breakpoint_report_required = self._worker_breakpoints_present()
+            publish = lambda: self._publisher.publish_modules(
+                artifacts, port=port, reload_policy=breakpoint_policy,
+            )
             try:
                 handle = (
                     publish() if profiler is None
@@ -212,6 +223,17 @@ class WorkerModuleLifecycleService:
                 raise
             if not isinstance(handle, WorkerGenerationHandle):
                 raise OutcomeUnknown("Worker module publication returned no generation")
+            if breakpoint_report_required:
+                report = self._publisher.last_worker_breakpoint_reload_report()
+                if (
+                    not isinstance(report, WorkerBreakpointReloadReport)
+                    or report.candidate_handle is not handle
+                    or report.policy is not breakpoint_policy
+                    or report.outcome is not WorkerBreakpointReloadOutcome.COMMITTED
+                ):
+                    raise OutcomeUnknown(
+                        "Worker breakpoint publication report is unconfirmed"
+                    )
             with self._lock:
                 self._units = desired
                 self._catalog = common_modules
@@ -268,13 +290,18 @@ class WorkerModuleLifecycleService:
     def last_worker_breakpoint_reload_report(
         self,
     ) -> WorkerBreakpointReloadReport | None:
-        """No report exists while breakpoint-bearing reload is unavailable."""
+        """Read the shared workspace owner's latest local reload evidence."""
 
-        return None
+        report = self._publisher.last_worker_breakpoint_reload_report()
+        if report is not None and not isinstance(report, WorkerBreakpointReloadReport):
+            raise ProtocolError("Worker breakpoint reload report is invalid")
+        return report
 
     def _admit_route(self) -> WorkerMutationRoute:
         self._require_mutation_boundary()
-        if self._worker_breakpoints_present():
+        if self._worker_breakpoints_present() and not getattr(
+            self._publisher, "supports_breakpoint_reload", False
+        ):
             raise ProtocolError("Worker breakpoint reload requires a policy/report port")
         if self._arbiter.has_pending_operations:
             raise ProtocolError("RDBG activity prevents Worker module lifecycle")
@@ -285,7 +312,9 @@ class WorkerModuleLifecycleService:
 
     def _require_current_route(self, expected: WorkerMutationRoute, token: object) -> None:
         self._require_mutation_boundary()
-        if self._worker_breakpoints_present():
+        if self._worker_breakpoints_present() and not getattr(
+            self._publisher, "supports_breakpoint_reload", False
+        ):
             raise ProtocolError("Worker breakpoint reload requires a policy/report port")
         current = self._route_provider()
         if self._arbiter.current_route != token or not _same_route(expected, current):

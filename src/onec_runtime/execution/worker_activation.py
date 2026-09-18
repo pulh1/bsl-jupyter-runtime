@@ -23,6 +23,9 @@ from onec_runtime.execution.arbiter import OutcomeUnknown, SessionPort
 from onec_runtime.execution.preparation import WorkerCandidateIntent
 from onec_runtime.execution.worker import WorkerActivationUnknown
 from onec_runtime.execution.worker_breakpoint_workspace import WorkerBreakpointWorkspace
+from onec_runtime.worker_breakpoints import (
+    WorkerBreakpointReloadPolicy, WorkerBreakpointReloadReport,
+)
 from onec_runtime.server_worker import (
     NotebookWorkerArtifactBuilder, WorkerArtifact, WorkerSourceProvenance,
     validate_production_worker_artifact,
@@ -269,14 +272,24 @@ class WorkerUniverseActivationAdapter:
     def worker_exports(self) -> tuple[WorkerExport, ...]:
         return self.snapshot().worker_exports
 
+    @property
+    def supports_breakpoint_reload(self) -> bool:
+        return self._breakpoint_workspace is not None
+
+    def last_worker_breakpoint_reload_report(
+        self,
+    ) -> WorkerBreakpointReloadReport | None:
+        workspace = self._breakpoint_workspace
+        return None if workspace is None else workspace.last_reload_report
+
     def publish_modules(
         self, artifacts: tuple[WorkerModuleArtifact, ...], *, port: SessionPort,
+        reload_policy: WorkerBreakpointReloadPolicy = WorkerBreakpointReloadPolicy.STRICT,
     ) -> WorkerGenerationHandle:
         """Promote a complete module graph through this adapter's bound port.
 
-        This narrow port supports only a workspace without logical Worker
-        breakpoints. A breakpoint-bearing reload needs per-call policy and
-        report publication from the shared breakpoint workspace owner.
+        A breakpoint-bearing reload uses the same workspace owner and report
+        as notebook Worker activation.
         """
 
         if port is None:
@@ -290,7 +303,11 @@ class WorkerUniverseActivationAdapter:
         names = tuple(artifact.logical_name.casefold() for artifact in artifacts)
         if len(names) != len(set(names)) or "worker" in names:
             raise ProtocolError("Worker module artifact names are invalid")
-        if self._breakpoints_present():
+        if type(reload_policy) is not WorkerBreakpointReloadPolicy:
+            raise TypeError("Worker breakpoint reload policy is invalid")
+        workspace = self._breakpoint_workspace
+        breakpoints_present = self._breakpoints_present()
+        if breakpoints_present and workspace is None:
             raise ProtocolError("Worker breakpoint reload requires a policy/report port")
         if getattr(self._bound, "port", None) is not None:
             raise ProtocolError("Worker activation is already bound to an RDBG port")
@@ -303,7 +320,14 @@ class WorkerUniverseActivationAdapter:
         )
         self._bound.port = port
         try:
-            handle = self._target.promote(candidate)
+            handle = (
+                self._target.promote(candidate)
+                if workspace is None else workspace.promote(
+                    self._host, self._target, candidate,
+                    port=port, reload_policy=reload_policy,
+                    record_report=breakpoints_present,
+                )
+            )
         except (
             OutcomeUnknown, WorkerPromotionOutcomeUnknown,
             BreakpointWorkspaceOutcomeUnknown,
@@ -321,7 +345,10 @@ class WorkerUniverseActivationAdapter:
         previous = published.active_handle
         if previous is not None:
             try:
-                self._target.release(previous)
+                if workspace is None:
+                    self._target.release(previous)
+                else:
+                    workspace.release(self._target, previous, port=port)
             except BaseException as error:
                 raise WorkerActivationUnknown(
                     _GenerationLease(
@@ -348,9 +375,13 @@ class WorkerUniverseActivationAdapter:
             raise TypeError("An admitted arbiter port is required to release Worker")
         if not isinstance(handle, WorkerGenerationHandle):
             raise TypeError("Worker generation handle is required")
-        if self._breakpoints_present():
+        workspace = self._breakpoint_workspace
+        if self._breakpoints_present() and workspace is None:
             raise ProtocolError("Worker breakpoint release requires a policy/report port")
-        self._target.release(handle)
+        if workspace is None:
+            self._target.release(handle)
+        else:
+            workspace.release(self._target, handle, port=port)
 
     def pin_active(self, *, port: SessionPort) -> _GenerationLease | None:
         """Pin the confirmed active root for an ordinary MAIN/CAPTURE cell."""
@@ -463,6 +494,7 @@ class WorkerUniverseActivationAdapter:
                 if self._breakpoint_workspace is None
                 else self._breakpoint_workspace.promote(
                     self._host, self._target, candidate, port=port,
+                    record_report=self._breakpoints_present(),
                 )
             )
         except (
