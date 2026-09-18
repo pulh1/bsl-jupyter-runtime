@@ -365,6 +365,7 @@ class CaptureStatus:
     last_user_evaluation_id: str | None = None
     evaluation_timing: CaptureEvaluationTiming | None = None
     failure: CaptureFailureDiagnostic | None = None
+    inspection_available: bool = True
 
     def __post_init__(self) -> None:
         for name in ("operation_id", "capture_generation", "stop_sequence"):
@@ -372,6 +373,8 @@ class CaptureStatus:
             if type(value) is not int or value < 0:
                 raise ValueError(f"{name} must be a non-negative integer")
         object.__setattr__(self, "phase", _enum(self.phase, CapturePhase, name="phase"))
+        if type(self.inspection_available) is not bool:
+            raise ValueError("inspection_available must be a boolean")
         for name in (
             "pending_evaluation_id",
             "last_evaluation_id",
@@ -431,7 +434,7 @@ class CaptureStatus:
 
     @property
     def can_inspect(self) -> bool:
-        return self.phase is CapturePhase.PAUSED
+        return self.phase is CapturePhase.PAUSED and self.inspection_available
 
     @property
     def can_resume_capture(self) -> bool:

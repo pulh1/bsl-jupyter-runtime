@@ -259,6 +259,9 @@ class CaptureEvaluationLedger:
                 self._identity.runtime_generation,
                 self._identity.local_stop_sequence,
                 CapturePhase.RESUMING if self._resuming else CapturePhase.PAUSED,
+                inspection_available=(
+                    self._scope.inspection_target_id == self._identity.target_id
+                ),
                 last_evaluation_id=self._last_id,
                 last_user_evaluation_id=self._last_user_id,
                 evaluation_timing=None if last is None else self._timing_locked(last),
