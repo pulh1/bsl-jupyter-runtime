@@ -352,7 +352,10 @@ class MainIdleMaterializationService:
     ) -> Settlement:
         self._require_current_fence(fence)
         self._require_same_worker_catalog(catalog)
-        first = self._evaluate(port, plan.instruction, fence.target, plan.max_text_size)
+        first = self._evaluate(
+            port, _main_instruction_call(plan.instruction),
+            fence.target, plan.max_text_size,
+        )
         policy_error: BaseException | None = None
         payload: bytes | None = None
         if first.error_occurred:
@@ -395,7 +398,8 @@ class MainIdleMaterializationService:
         try:
             self._require_current_fence(fence)
             deletion = self._evaluate(
-                port, plan.cleanup_instruction, fence.target, plan.max_text_size,
+                port, _main_instruction_call(plan.cleanup_instruction),
+                fence.target, plan.max_text_size,
             )
             if deletion.error_occurred:
                 raise CaptureValueCheckError("MAIN materialization cleanup failed")
@@ -459,3 +463,13 @@ class MainIdleMaterializationService:
 
 def _no_direct_rdbg(*_args: object) -> object:
     raise ProtocolError("MAIN materialization requires its arbiter ticket")
+
+
+def _main_instruction_call(instruction: str) -> str:
+    """Execute BSL statements in the stopped MAIN frame via one evalExpr call."""
+
+    return (
+        "RuntimeKernelServer.ВыполнитьКодВКонтекстеMain(Контекст, "
+        + bsl_string_literal(instruction + "\nРезультатИнструкции = Результат;")
+        + ")"
+    )

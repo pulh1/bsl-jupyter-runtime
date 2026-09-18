@@ -376,12 +376,13 @@ def _build_table_bound_instrumented_bundle(
         encoding="utf-8",
         newline="\n",
     )
+    packaged = packaged_extension_bundle(root / "packaged").manifest
     return build_runtime_extension_bundle(
         source_root=source,
         output_root=root / "bundle",
         platform_bin=platform,
-        artifact_version="0.1.8",
-        protocol_version="4",
+        artifact_version=packaged.artifact_version,
+        protocol_version=packaged.protocol_version,
     )
 
 
@@ -509,12 +510,13 @@ def test_unbounded_to_df_keeps_all_rows_after_schema_probe(
 ) -> None:
     """A two-row ValueTable must not inherit the schema probe's one-row limit."""
     platform = _platform_bin()
+    packaged = packaged_extension_bundle(tmp_path / "packaged").manifest
     bundle = build_runtime_extension_bundle(
         source_root=_REPOSITORY / "onec" / "OnecInteractiveRuntime",
         output_root=tmp_path / "bundle",
         platform_bin=platform,
-        artifact_version="0.1.8",
-        protocol_version="4",
+        artifact_version=packaged.artifact_version,
+        protocol_version=packaged.protocol_version,
     )
     config = _config(tmp_path / "target", platform)
     create_empty_infobase(config)
@@ -545,12 +547,13 @@ def test_bounded_to_df_initializes_value_transfer_module(
 ) -> None:
     """A bounded table page must compile and run the real value-transfer module."""
     platform = _platform_bin()
+    packaged = packaged_extension_bundle(tmp_path / "packaged").manifest
     bundle = build_runtime_extension_bundle(
         source_root=_REPOSITORY / "onec" / "OnecInteractiveRuntime",
         output_root=tmp_path / "bundle",
         platform_bin=platform,
-        artifact_version="0.1.8",
-        protocol_version="4",
+        artifact_version=packaged.artifact_version,
+        protocol_version=packaged.protocol_version,
     )
     config = _config(tmp_path / "target", platform)
     create_empty_infobase(config)

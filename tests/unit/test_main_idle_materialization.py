@@ -49,6 +49,8 @@ class Session:
         on_transport_dispatch()
         self.calls.append(("wait", pending, get_ident()))
         response = self._responses.pop(0)
+        if response == "eval-error":
+            return EvaluationResult(pending.result_id, "Ошибка", "", True)
         if response == "cleanup-error":
             self.cleanup_error_seen.set()
             return EvaluationResult(pending.result_id, "Ошибка", "", True)
@@ -56,6 +58,22 @@ class Session:
             self.cleanup_error_seen.set()
             raise RdbgTransportTimeout("cleanup outcome is unknown")
         return EvaluationResult(pending.result_id, "Строка", response, False)
+
+
+class ExpressionOnlySession(Session):
+    """Model evalExpr rejecting statement blocks before they can run."""
+
+    def wait_evaluation_event(self, pending, *, timeout_s, on_transport_dispatch):
+        expression = self.calls[-1][1]
+        if not expression.startswith("RuntimeKernelServer."):
+            on_transport_dispatch()
+            self.calls.append(("wait", pending, get_ident()))
+            self.cleanup_error_seen.set()
+            return EvaluationResult(pending.result_id, "Ошибка", "", True)
+        return super().wait_evaluation_event(
+            pending, timeout_s=timeout_s,
+            on_transport_dispatch=on_transport_dispatch,
+        )
 
 
 def test_main_idle_transfer_rejects_private_worker_root_before_dispatch() -> None:
@@ -191,7 +209,16 @@ def test_direct_table_materialization_uses_the_same_ticket_transfer_protocol() -
 
         assert frame["Name"].tolist() == ["Alice", "Bob"]
         assert "СериализоватьКомпактнуюТаблицу" in session.calls[0][1]
-        assert len([call for call in session.calls if call[0] == "start"]) == 3
+        expressions = [call[1] for call in session.calls if call[0] == "start"]
+        assert len(expressions) == 3
+        assert expressions[0].startswith(
+            "RuntimeKernelServer.ВыполнитьКодВКонтекстеMain(Контекст, "
+        )
+        assert " + Символы.ПС + " in expressions[0]
+        assert expressions[2].startswith(
+            "RuntimeKernelServer.ВыполнитьКодВКонтекстеMain(Контекст, "
+        )
+        assert "Контекст.Удалить" in expressions[2]
     finally:
         arbiter.close(timeout=3)
 
@@ -329,6 +356,35 @@ def test_confirmed_private_key_deletion_failure_is_retryable_arbiter_debt() -> N
 
         assert service.retryable_cleanup_keys == ()
         assert blocked.wait_initiator(1) == "must wait"
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_main_admission_bsl_error_cleans_key_and_allows_next_transfer() -> None:
+    payload = b'{"version":1,"root":{"t":"number","v":"2"}}'
+    encoded = b64encode(payload).decode("ascii")
+    session = ExpressionOnlySession([
+        "eval-error",
+        "Истина",
+        f"R|7|3|{len(payload)}|{sha256(payload).hexdigest()}|{len(encoded)}",
+        encoded,
+        "Истина",
+    ])
+    arbiter = RdbgArbiter(session, ROUTE)
+    service = MainIdleMaterializationService(
+        arbiter,
+        main_idle_fence=lambda: MainIdleTargetFence(ROUTE, TARGET),
+        runtime_generation=7,
+        context_generation=3,
+    )
+    try:
+        with pytest.raises(CaptureValueCheckError, match="MAIN value admission failed"):
+            service.materialize_value("Контекст.Сумма")
+
+        assert service.materialize(
+            "Контекст.Сумма", timeout_s=0.5,
+        ) == Decimal("2")
+        assert service.retryable_cleanup_keys == ()
     finally:
         arbiter.close(timeout=3)
 

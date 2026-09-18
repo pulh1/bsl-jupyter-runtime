@@ -1,7 +1,7 @@
 &После("ПриНачалеРаботыСистемы")
 Процедура OnecInteractiveRuntime_ПриНачалеРаботыСистемы()
 	ИдентификаторПродуктаRuntime = "onec-interactive-runtime";
-	ВерсияАртефактаRuntime = "0.1.8";
+	ВерсияАртефактаRuntime = "0.1.9";
 	ВерсияПротоколаRuntime = "4";
 	ПродолжатьЦикл = Ложь;
 	С = 1; // @runtime-extension-service-breakpoint

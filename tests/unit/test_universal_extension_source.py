@@ -31,13 +31,13 @@ def test_product_extension_metadata_is_universal() -> None:
 def test_product_extension_exposes_exact_handshake_values() -> None:
     expected = {
         'ИдентификаторПродуктаRuntime = "onec-interactive-runtime";',
-        'ВерсияАртефактаRuntime = "0.1.8";',
+        'ВерсияАртефактаRuntime = "0.1.9";',
         'ВерсияПротоколаRuntime = "4";',
     }
     configuration = ElementTree.parse(SOURCE / "Configuration.xml").getroot()
     properties = configuration.find(f"{{{MD}}}Configuration/{{{MD}}}Properties")
     assert properties is not None
-    assert properties.findtext(f"{{{MD}}}Version") == "0.1.8"
+    assert properties.findtext(f"{{{MD}}}Version") == "0.1.9"
     for relative in (
         Path("Ext/ManagedApplicationModule.bsl"),
         Path("CommonModules/RuntimeKernelServer/Ext/Module.bsl"),
@@ -86,7 +86,7 @@ def test_checked_in_bundle_matches_canonical_source_and_manifest(
     )
 
     assert bundle.manifest.extension_name == "OnecInteractiveRuntime"
-    assert bundle.manifest.artifact_version == "0.1.8"
+    assert bundle.manifest.artifact_version == "0.1.9"
     assert bundle.manifest.protocol_version == "4"
     assert bundle.manifest.fingerprints.artifact.language_bound_by_name is False
     assert bundle.manifest.fingerprints == fingerprint_extension_dump(SOURCE)

@@ -2,11 +2,11 @@
   "schema_version": 1,
   "product_id": "onec-interactive-runtime",
   "extension_name": "OnecInteractiveRuntime",
-  "artifact_version": "0.1.8",
+  "artifact_version": "0.1.9",
   "protocol_version": "4",
   "cfe_filename": "OnecInteractiveRuntime.cfe",
-  "cfe_size": 27057,
-  "cfe_sha256": "4067088c4d1b5630c5b1b80c688fae60eff43ece62d586feac245ca54fbd4837",
+  "cfe_size": 27210,
+  "cfe_sha256": "4be180ea26304dab59bc390e1639a319222947015f68c8ca55f843d0dcd9c451",
   "fingerprints": {
     "identity": {
       "product_id": "onec-interactive-runtime",
@@ -23,7 +23,7 @@
       "vendor": "onec-interactive-runtime"
     },
     "artifact": {
-      "artifact_version": "0.1.8",
+      "artifact_version": "0.1.9",
       "protocol_version": "4",
       "language_bound_by_name": false,
       "metadata": [
@@ -69,14 +69,14 @@
         }
       ],
       "source_sha256": {
-        "CommonModules/RuntimeKernelServer/Ext/Module.bsl": "54ccc7668ea08b258656250197f7a97e11faee0ebc04affe617be51a041edeb5",
+        "CommonModules/RuntimeKernelServer/Ext/Module.bsl": "a58abc04e176a95bcfeed3d560bfe3804004a0409b610e31f964d652aa69b46d",
         "CommonModules/RuntimeTableTransferServer/Ext/Module.bsl": "9df10fbcf05fe67383e3265dd05efb1e033e44306e3e9ef467d5a9587ba1e229",
         "CommonModules/RuntimeValueTransferServer/Ext/Module.bsl": "290ee511278514f0a6537ef932b0bac3364b74c7b366737df40483e93da644e0",
-        "Ext/ManagedApplicationModule.bsl": "6a60fc4bb5eb876bf2906cbe2bdf746aff754f407920e12266c0e8ebbf45a589"
+        "Ext/ManagedApplicationModule.bsl": "95a69552192f6297572cbd3bbf14ccdabfb809d7115474a559faf9341681815d"
       }
     },
     "identity_sha256": "726065a5d3c6f5472e24a83fc0c474fd5f13c42eace441b90c7eba1b404df496",
-    "artifact_sha256": "0cf478b9e237b56da75fecca17c2b4cd2c72658a4cbb9a5d3cbf335e5264b3a2"
+    "artifact_sha256": "0a7dd17c561900c2cc8eacffd484cac6466d852e52eac15012b486eaccfcb382"
   },
   "breakpoints": {
     "managed": {
