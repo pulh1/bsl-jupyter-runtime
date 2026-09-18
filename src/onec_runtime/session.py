@@ -81,6 +81,8 @@ from onec_runtime.extension_lifecycle import (
     LifecycleMode,
 )
 from onec_runtime.extension_state import ExtensionStateStore
+from onec_runtime.execution.arbiter import ArbiterBusy
+from onec_runtime.execution.public_facade import PublicExecutionFacade
 from onec_runtime.performance_profile import PhaseRecorder
 from onec_runtime.processes import FileModeProcesses
 from onec_runtime.prototype_runtime import (
@@ -2455,6 +2457,18 @@ class RuntimeSession:
         self._heartbeat_stop.set()
         if current_thread() is not self._heartbeat_thread:
             self._heartbeat_thread.join(timeout=2.0)
+        if (
+            shutdown
+            and isinstance(self.runtime_api, PublicExecutionFacade)
+            and state.runtime_api_data_plane_finalized is not _ShutdownAxis.COMPLETE
+        ):
+            # The server teardown path issues direct RDBG termination only
+            # after the execution arbiter has retired every pending ticket.
+            self.runtime_api.close()
+            state = self._mark_shutdown_axes(
+                capture_publication_finalized=True,
+                runtime_api_data_plane_finalized=True,
+            )
         errors: list[BaseException] = []
         if (
             shutdown
@@ -2491,6 +2505,11 @@ class RuntimeSession:
             else:
                 try:
                     close_runtime_api()
+                except ArbiterBusy:
+                    # The arbiter still owns an in-flight target operation.
+                    # Closing the transport or process here would orphan its
+                    # debugger event stream and invalidate its pending ticket.
+                    raise
                 except BaseException as error:
                     errors.append(error)
                 else:

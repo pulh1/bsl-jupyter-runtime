@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 
 _BSL_FAILURE = "BSL execution failed"
 _CAPTURE_DECODE_FAILURE = "CAPTURE result decode failed"
+_MAIN_DECODE_FAILURE = "MAIN completion decode failed"
 
 
 def _execution_diagnostic(
@@ -71,17 +72,54 @@ class MainPublicationRecord:
     message_collector_key: str = field(default="", repr=False)
 
 
+@dataclass(frozen=True, slots=True)
+class MainConfirmedDecodeFailure:
+    """MAIN ID matched, but a later completion scalar could not be decoded.
+
+    Construct this only after ``MainOperation.remote_completed``. A decode
+    failure before command-ID correlation has no such proof and must remain a
+    protocol failure, not a terminal reply for this MAIN command.
+    """
+
+    operation: MainOperation = field(repr=False)
+    remote_error: str = field(default="", repr=False)
+    messages: tuple[str, ...] = ()
+
+
 class MainReplyPolicy:
     """Map one confirmed MAIN yield to the existing public reply contract."""
 
-    def publish(self, outcome: MainYield, record: MainPublicationRecord) -> RuntimeReply:
+    def publish(
+        self, outcome: MainYield | MainConfirmedDecodeFailure,
+        record: MainPublicationRecord,
+    ) -> RuntimeReply:
         # RuntimeApi can import this policy before declaring its public reply
         # dataclasses; resolve the public contract only when publishing.
         from onec_runtime.runtime_api import OperationState, RuntimeReply, RuntimeReplyKind
 
-        if not isinstance(outcome, MainYield) or outcome.operation is not record.operation:
+        if (
+            not isinstance(outcome, (MainYield, MainConfirmedDecodeFailure))
+            or outcome.operation is not record.operation
+        ):
             raise ValueError("MAIN yield belongs to another publication record")
         operation = record.operation
+        if isinstance(outcome, MainConfirmedDecodeFailure):
+            if operation.phase is not MainPhase.COMPLETED:
+                raise ValueError("MAIN command completion is not confirmed")
+            return RuntimeReply(
+                RuntimeReplyKind.MAIN_COMPLETED,
+                operation.command_id,
+                OperationState.FAILED,
+                error=_BSL_FAILURE if outcome.remote_error else _MAIN_DECODE_FAILURE,
+                succeeded=False,
+                messages=outcome.messages,
+                changed_roots=record.changed_roots,
+                diagnostic=_execution_diagnostic(
+                    outcome.remote_error,
+                    record.executed_source,
+                    record.visible_source_context,
+                ),
+            )
         if outcome.kind is MainYieldKind.COMPLETED:
             completion = outcome.completion
             if not isinstance(completion, MainRemoteCompletion) or operation.phase is not MainPhase.COMPLETED:

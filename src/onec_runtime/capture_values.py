@@ -882,7 +882,7 @@ class LocalCaptureValueAdapter:
     @staticmethod
     def _preview(metadata: ValueMetadata) -> str:
         preview = metadata.preview
-        if metadata.shape is not ValueShape.SCALAR and metadata.size is not None:
+        if metadata.shape not in {ValueShape.SCALAR, ValueShape.UNDOCUMENTED} and metadata.size is not None:
             preview = f"{metadata.size} elements"
         if len(preview) > MAX_PREVIEW_CHARS:
             preview = preview[: MAX_PREVIEW_CHARS - 1] + "…"

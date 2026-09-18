@@ -1,6 +1,7 @@
 """The cell pipeline is independent of the runtime's concrete routes."""
 
 import pytest
+from contextlib import contextmanager
 
 from onec_runtime.bsl.source_maps import SourceUnitKind, SourceUnitRef, source_sha256
 from onec_runtime.execution.contracts import (
@@ -561,3 +562,137 @@ def test_submission_receipt_cannot_replace_an_adopted_ticket() -> None:
         receipt.adopt(object())
 
     assert receipt.ticket is first_ticket
+
+
+def test_wait_handoff_wraps_route_and_ticket_wait_but_not_preparation_or_admission() -> None:
+    waiting = False
+    entered: list[str] = []
+
+    @contextmanager
+    def handoff():
+        nonlocal waiting
+        assert not waiting
+        waiting = True
+        try:
+            yield
+        finally:
+            waiting = False
+
+    class Parser:
+        def prepare(self, source, source_unit):
+            assert not waiting
+            return CommonCell(source_unit, source, {}, "hash")
+
+    class Policy:
+        def prepare(self, common, snapshots, context):
+            assert not waiting
+            return PreparedCell(context.route_token, context.preparation_nonce, common.parsed_units)
+
+    class Snapshots:
+        def read_for(self, capabilities):
+            assert not waiting
+            return PreparationSnapshots({}, {}, "guard")
+
+    class Ticket:
+        def wait_initiator(self):
+            assert waiting
+            entered.append("wait")
+            return "settled"
+
+    class Controller:
+        def await_preparation_context(self):
+            assert waiting
+            entered.append("route")
+            return PreparationContext("route", "nonce", Policy(), ())
+
+        def submit_cell(self, context, prepared, guards, receipt):
+            assert not waiting
+            entered.append("admit")
+            ticket = Ticket()
+            receipt.adopt(ticket)
+            return Accepted(ticket)
+
+    class Replies:
+        pass
+
+    pipeline = CellExecutionPipeline(Parser(), Controller(), Snapshots(), Replies())
+    assert pipeline.execute("source", unit("source"), wait_handoff=handoff) == "settled"
+    assert entered == ["route", "admit", "wait"]
+    assert not waiting
+
+
+def test_admitted_callback_sees_only_accepted_prepared_cell() -> None:
+    admitted: list[PreparedCell] = []
+
+    class Parser:
+        def prepare(self, source, source_unit):
+            return CommonCell(source_unit, source, {}, "hash")
+
+    class Policy:
+        def prepare(self, common, snapshots, context):
+            return PreparedCell(context.route_token, context.preparation_nonce, common.parsed_units)
+
+    class Snapshots:
+        def read_for(self, capabilities):
+            return PreparationSnapshots({}, {}, "guard")
+
+    class Ticket:
+        def wait_initiator(self):
+            assert len(admitted) == 1
+            return "settled"
+
+    class Controller:
+        def __init__(self):
+            self.calls = 0
+
+        def await_preparation_context(self):
+            self.calls += 1
+            return PreparationContext("route", f"nonce-{self.calls}", Policy(), ())
+
+        def submit_cell(self, context, prepared, guards, receipt):
+            if self.calls == 1:
+                return Rejected(StalePreparation("changed"))
+            ticket = Ticket()
+            receipt.adopt(ticket)
+            return Accepted(ticket)
+
+    pipeline = CellExecutionPipeline(Parser(), Controller(), Snapshots(), object())
+    assert pipeline.execute("source", unit("source"), on_admitted=admitted.append) == "settled"
+    assert [prepared.preparation_nonce for prepared in admitted] == ["nonce-2"]
+
+
+def test_prepared_callback_rejects_unsupported_artifact_before_admission() -> None:
+    calls: list[str] = []
+
+    class Parser:
+        def prepare(self, source, source_unit):
+            return CommonCell(source_unit, source, {}, "hash")
+
+    class Policy:
+        def prepare(self, common, snapshots, context):
+            return PreparedCell(context.route_token, context.preparation_nonce, "worker-only")
+
+    class Snapshots:
+        def read_for(self, capabilities):
+            return PreparationSnapshots({}, {}, "guard")
+
+    class Controller:
+        def await_preparation_context(self):
+            return PreparationContext("route", "nonce", Policy(), ())
+
+        def submit_cell(self, context, prepared, guards, receipt):
+            calls.append("admission")
+            raise AssertionError("unsupported source must fail before admission")
+
+    def reject_artifact(prepared):
+        calls.append("prepared")
+        raise ValueError("Worker artifact not built")
+
+    pipeline = CellExecutionPipeline(Parser(), Controller(), Snapshots(), object())
+    with pytest.raises(ValueError, match="Worker artifact"):
+        pipeline.execute(
+            "source", unit("source"),
+            on_prepared=reject_artifact,
+            on_admitted=lambda prepared: calls.append("admitted"),
+        )
+    assert calls == ["prepared"]

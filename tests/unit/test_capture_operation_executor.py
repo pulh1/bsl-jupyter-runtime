@@ -5,10 +5,12 @@ from uuid import UUID
 
 import pytest
 
-from onec_runtime.errors import BslExecutionError, RdbgTransportTimeout
+from onec_runtime.errors import BslExecutionError, ProtocolError, RdbgTransportTimeout
 from onec_runtime.execution.arbiter import OutcomeUnknown, RdbgArbiter, RouteToken, Settlement
 from onec_runtime.execution.capture.cell_evaluator import CaptureCellEvaluator
+from onec_runtime.execution.capture.messages import CaptureMessageCollector
 from onec_runtime.execution.capture import operation_executor as operation_module
+from onec_runtime.execution.reply_publication import CaptureRemoteOutcome
 from onec_runtime.execution.capture.resources import TemporaryCleanupState
 from onec_runtime.execution.capture.scope import (
     CaptureContextState,
@@ -579,3 +581,159 @@ def test_unready_capture_scope_rejects_before_workspace_side_effect() -> None:
         ticket.wait(3)
     assert session.calls == []
     arbiter.close(timeout=3)
+
+
+def test_messages_are_collected_on_the_same_worker_before_pure_policy() -> None:
+    primary = EvaluationResult(UUID(int=4), "Неопределено", "", True, "user BSL error")
+    messages = EvaluationResult(UUID(int=5), "Строка", "", False, value_string='["sealed"]')
+    session = Session([primary, messages])
+    route = RouteToken("runtime", 1, 0, "capture")
+    arbiter = RdbgArbiter(session, route)
+    scope = ready_scope()
+    operation = operation_module.CaptureCellOperation(scope.identity)
+    executor = operation_module.CaptureCellOperationExecutor(
+        CaptureCellEvaluator(wait_interval_s=0.01),
+        message_collector=CaptureMessageCollector(wait_interval_s=0.01),
+    )
+
+    def policy(outcome):
+        assert isinstance(outcome, CaptureRemoteOutcome)
+        assert outcome.evaluation is primary
+        assert outcome.messages == ("sealed",)
+        session.calls.append(("policy", outcome, get_ident()))
+        return outcome
+
+    try:
+        ticket = arbiter.submit(
+            route,
+            lambda port: executor.execute(
+                scope, "ВызватьИсключение;", operation=operation,
+                message_collector_key="__cell_messages",
+                port=port,
+                shield_workspace=lambda worker: worker.set_breakpoints(SHIELDED),
+                restore_workspace=lambda worker: worker.set_breakpoints(FULL),
+                cleanup=lambda worker: session.calls.append(("cleanup", None, get_ident())),
+                result_policy=policy,
+            ),
+        )
+        arbiter.dispatch(ticket)
+        outcome = ticket.wait(3)
+
+        assert isinstance(outcome, CaptureRemoteOutcome)
+        assert [kind for kind, _, _ in session.calls] == [
+            "breakpoints", "start", "wait", "breakpoints",
+            "start", "wait", "policy", "cleanup",
+        ]
+        assert session.calls[4][1] == (
+            'RuntimeKernelServer.ЗабратьСообщенияЯчейкиИзКонтекста(Контекст, '
+            '"__cell_messages")', 2,
+        )
+        assert operation.confirmed_result is primary
+        assert len({thread for _, _, thread in session.calls}) == 1
+        assert scope.frame_identity is CaptureFrameIdentity.CONFIRMED
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_pending_message_collection_reconciles_without_reexecuting_primary_or_collector() -> None:
+    primary = EvaluationResult(UUID(int=4), "Число", "17", False)
+    messages = EvaluationResult(UUID(int=5), "Строка", "", False, value_string='["late"]')
+    session = Session([primary, RdbgTransportTimeout("message wait unknown"), messages])
+    route = RouteToken("runtime", 1, 0, "capture")
+    arbiter = RdbgArbiter(session, route)
+    scope = ready_scope()
+    operation = operation_module.CaptureCellOperation(scope.identity)
+    executor = operation_module.CaptureCellOperationExecutor(
+        CaptureCellEvaluator(wait_interval_s=0.01),
+        message_collector=CaptureMessageCollector(wait_interval_s=0.01),
+    )
+    policy_calls = []
+
+    def policy(outcome):
+        policy_calls.append(outcome)
+        return outcome.messages
+
+    try:
+        ticket = arbiter.submit(
+            route,
+            lambda port: executor.execute(
+                scope, "Результат = 17;", operation=operation,
+                message_collector_key="__cell_messages",
+                port=port,
+                shield_workspace=lambda worker: worker.set_breakpoints(SHIELDED),
+                restore_workspace=lambda worker: worker.set_breakpoints(FULL),
+                cleanup=lambda worker: None,
+                result_policy=policy,
+            ),
+        )
+        arbiter.dispatch(ticket)
+        assert ticket.wait_unknown(3)
+        pending = ticket.status().pending_capability
+        assert pending is session.pending
+        assert operation.confirmed_result is primary
+        assert operation.workspace_restored
+        assert policy_calls == []
+        assert [kind for kind, _, _ in session.calls].count("start") == 2
+        later = arbiter.submit(route, lambda port: Settlement("next"))
+        arbiter.dispatch(later)
+        with pytest.raises(TimeoutError):
+            later.wait(0)
+
+        arbiter.reconcile(
+            ticket,
+            lambda port: executor.reconcile_pending_messages(
+                operation, scope, pending,
+                port=port,
+                restore_workspace=lambda worker: worker.set_breakpoints(FULL),
+                cleanup=lambda worker: None,
+                result_policy=policy,
+            ),
+        )
+        assert ticket.wait_settled(3) == ("late",)
+        assert later.wait(3) == "next"
+        assert [kind for kind, _, _ in session.calls].count("start") == 2
+        assert len(policy_calls) == 1
+        assert policy_calls[0].evaluation is primary
+        assert scope.frame_identity is CaptureFrameIdentity.CONFIRMED
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_confirmed_message_decode_error_settles_cell_and_preserves_frame() -> None:
+    primary = EvaluationResult(UUID(int=4), "Число", "17", False)
+    malformed = EvaluationResult(UUID(int=5), "Строка", "", False, value_string="not JSON")
+    session = Session([primary, malformed])
+    route = RouteToken("runtime", 1, 0, "capture")
+    arbiter = RdbgArbiter(session, route)
+    scope = ready_scope()
+    operation = operation_module.CaptureCellOperation(scope.identity)
+    executor = operation_module.CaptureCellOperationExecutor(
+        CaptureCellEvaluator(wait_interval_s=0.01),
+        message_collector=CaptureMessageCollector(wait_interval_s=0.01),
+    )
+    cleanup_calls = []
+    try:
+        ticket = arbiter.submit(
+            route,
+            lambda port: executor.execute(
+                scope, "Результат = 17;", operation=operation,
+                message_collector_key="__cell_messages", port=port,
+                shield_workspace=lambda worker: worker.set_breakpoints(SHIELDED),
+                restore_workspace=lambda worker: worker.set_breakpoints(FULL),
+                cleanup=lambda worker: cleanup_calls.append("done"),
+                result_policy=lambda outcome: pytest.fail("policy cannot decode malformed messages"),
+            ),
+        )
+        arbiter.dispatch(ticket)
+        with pytest.raises(ProtocolError, match="invalid JSON"):
+            ticket.wait(3)
+        assert cleanup_calls == ["done"]
+        assert operation.confirmed_result is primary
+        assert scope.frame_identity is CaptureFrameIdentity.CONFIRMED
+        assert ticket.status().settled
+        assert arbiter.active_ticket is None
+        next_ticket = arbiter.submit(route, lambda port: Settlement("next"))
+        arbiter.dispatch(next_ticket)
+        assert next_ticket.wait(3) == "next"
+    finally:
+        arbiter.close(timeout=3)

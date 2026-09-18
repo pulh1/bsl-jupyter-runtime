@@ -79,6 +79,31 @@ class CompleteSession(RouteSession):
         )
 
 
+def test_capture_variable_page_uses_owned_ticket_and_safe_names() -> None:
+    from onec_runtime.execution.controller.controller import ExecutionController
+
+    session = CompleteSession()
+    arbiter = RdbgArbiter(session, RouteToken("runtime-1", 1, 0, "main"))
+    controller = ExecutionController(
+        arbiter,
+        MainExecutor(poll_interval_s=0.1),
+        CaptureExecutor(None, KERNEL, decode_command_id=evaluation_to_python),
+        CaptureCellEvaluator(),
+        BreakpointRegistry(KERNEL, (BUSINESS,)),
+        runtime_generation=1,
+    )
+    try:
+        controller.submit_main("Результат = 1;").wait_settled(3)
+        page = controller.submit_capture_variable_page(
+            stack_level=0, start=0, stop=10,
+        ).wait_settled(3)
+        assert page.names == ("Amount",)
+        assert page.total == 1
+        assert {thread for _, thread in session.calls} == {arbiter._worker}
+    finally:
+        arbiter.close(timeout=3)
+
+
 def test_controller_runs_main_capture_cell_resume_and_completion_with_one_owner() -> None:
     from onec_runtime.execution.controller.controller import (
         ExecutionController,
@@ -120,6 +145,63 @@ def test_controller_runs_main_capture_cell_resume_and_completion_with_one_owner(
         assert controller.capture_scope is None
         assert scope.frame_identity.value == "released"
         assert len({thread for _, thread in session.calls}) == 1
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_failed_capture_cell_preserves_stack_for_repair_cell() -> None:
+    from onec_runtime.execution.capture.public_inspection import CaptureInspectionBridge
+    from onec_runtime.execution.controller.controller import ExecutionController
+
+    class BslRejectedOnce(CompleteSession):
+        def __init__(self) -> None:
+            super().__init__()
+            self.rejected = False
+
+        def wait_evaluation_event(self, pending, *, timeout_s, on_transport_dispatch):
+            if (
+                self.expression.startswith(
+                    "RuntimeKernelServer.ВыполнитьКодВКонтекстеОтладки("
+                )
+                and not self.rejected
+            ):
+                self.rejected = True
+                on_transport_dispatch()
+                self._record("wait_eval")
+                self.pending = None
+                return EvaluationResult(
+                    pending.result_id, "Ошибка", "", True, "planned BSL error"
+                )
+            return super().wait_evaluation_event(
+                pending, timeout_s=timeout_s,
+                on_transport_dispatch=on_transport_dispatch,
+            )
+
+    session = BslRejectedOnce()
+    arbiter = RdbgArbiter(session, RouteToken("runtime-1", 1, 0, "main"))
+    controller = ExecutionController(
+        arbiter,
+        MainExecutor(poll_interval_s=0.1),
+        CaptureExecutor(None, KERNEL, decode_command_id=evaluation_to_python),
+        CaptureCellEvaluator(),
+        BreakpointRegistry(KERNEL, (BUSINESS,)),
+        runtime_generation=1,
+    )
+    try:
+        controller.submit_main("Результат = 1;").wait_settled(3)
+        scope = controller.capture_scope
+        assert scope is not None
+        failed = controller.submit_capture_cell("ОшибочнаяКоманда();").wait_settled(3)
+        assert failed.error_occurred is True
+        assert controller.capture_scope is scope
+
+        inspection = CaptureInspectionBridge(controller).current()
+        assert inspection.stack[:1].total >= 1
+        assert inspection.frame(0).variables[:1].total >= 1
+
+        repaired = controller.submit_capture_cell("Результат = 2;").wait_settled(3)
+        assert repaired.error_occurred is False
+        assert controller.capture_scope is scope
     finally:
         arbiter.close(timeout=3)
 
@@ -250,6 +332,113 @@ def test_capture_resume_writes_dirty_root_before_continuing_main() -> None:
         call_names = [name for name, _ in session.calls]
         assert call_names.index("modify", 2) < call_names.index("continue", 10)
         assert len({thread for _, thread in session.calls}) == 1
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_explicit_resume_dirty_root_is_admitted_before_writeback() -> None:
+    from onec_runtime.execution.controller.controller import (
+        ExecutionController, MainYieldKind,
+    )
+
+    session = CompleteSession()
+    arbiter = RdbgArbiter(session, RouteToken("runtime-1", 1, 0, "main"))
+    controller = ExecutionController(
+        arbiter, MainExecutor(poll_interval_s=0.1),
+        CaptureExecutor(None, KERNEL, decode_command_id=evaluation_to_python),
+        CaptureCellEvaluator(), BreakpointRegistry(KERNEL, (BUSINESS,)),
+        runtime_generation=1,
+    )
+    try:
+        captured = controller.submit_main("Результат = 1;").wait_settled(3)
+        scope = captured.scope
+        resumed = controller.submit_resume(
+            dirty_roots=("Результат",),
+        ).wait_settled(3)
+        assert resumed.kind is MainYieldKind.COMPLETED
+        assert scope.dirty_roots == ("Результат",)
+        assert scope.writeback_ledger.record("Результат").phase.value == "succeeded"
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_capture_transfer_revalidates_worker_catalog_before_remote_effect() -> None:
+    from onec_runtime.errors import ProtocolError
+    from onec_runtime.execution.controller.controller import ExecutionController
+
+    session = CompleteSession()
+    arbiter = RdbgArbiter(session, RouteToken("runtime-1", 1, 0, "main"))
+    controller = ExecutionController(
+        arbiter, MainExecutor(poll_interval_s=0.1),
+        CaptureExecutor(None, KERNEL, decode_command_id=evaluation_to_python),
+        CaptureCellEvaluator(), BreakpointRegistry(KERNEL, (BUSINESS,)),
+        runtime_generation=1,
+    )
+    try:
+        scope = controller.submit_main("Результат = 1;").wait_settled(3).scope
+        before = len(session.calls)
+
+        def reject_stale_catalog():
+            raise ProtocolError("Worker catalog changed")
+
+        with pytest.raises(ProtocolError, match="catalog changed"):
+            controller.submit_capture_materialization(
+                object(), _before_first_effect=reject_stale_catalog,
+            ).wait_settled(3)
+        assert session.calls[before:] == []
+        assert controller.capture_scope is scope
+        assert scope.frame_identity.value == "confirmed"
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_resume_retry_keeps_frozen_explicit_root_ledger() -> None:
+    from onec_runtime.execution.capture.writeback import CaptureExportFailed
+    from onec_runtime.execution.controller.controller import ExecutionController
+
+    class ExportRejectedOnce(CompleteSession):
+        def __init__(self) -> None:
+            super().__init__()
+            self.rejected = False
+
+        def wait_evaluation_event(self, pending, *, timeout_s, on_transport_dispatch):
+            if (
+                self.expression.startswith(
+                    "RuntimeKernelServer.ПоместитьЗначениеКонтекстаОтладки("
+                )
+                and not self.rejected
+            ):
+                self.rejected = True
+                on_transport_dispatch()
+                self._record("wait_eval")
+                self.pending = None
+                return EvaluationResult(
+                    pending.result_id, "Ошибка", "", True, "planned rejection"
+                )
+            return super().wait_evaluation_event(
+                pending, timeout_s=timeout_s,
+                on_transport_dispatch=on_transport_dispatch,
+            )
+
+    session = ExportRejectedOnce()
+    arbiter = RdbgArbiter(session, RouteToken("runtime-1", 1, 0, "main"))
+    controller = ExecutionController(
+        arbiter, MainExecutor(poll_interval_s=0.1),
+        CaptureExecutor(None, KERNEL, decode_command_id=evaluation_to_python),
+        CaptureCellEvaluator(), BreakpointRegistry(KERNEL, (BUSINESS,)),
+        runtime_generation=1,
+    )
+    try:
+        scope = controller.submit_main("Результат = 1;").wait_settled(3).scope
+        with pytest.raises(CaptureExportFailed):
+            controller.submit_resume(
+                dirty_roots=("Результат",),
+            ).wait_settled(3)
+        assert scope.writeback_ledger.roots == ("Результат",)
+        scope.writeback_ledger.retry_confirmed_export("Результат")
+        assert controller.submit_resume(
+            dirty_roots=("Результат",),
+        ).wait_settled(3).kind.value == "completed"
     finally:
         arbiter.close(timeout=3)
 

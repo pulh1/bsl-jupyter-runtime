@@ -5563,6 +5563,7 @@ def test_worker_activation_adapter_promotes_over_supplied_port_and_retains_metho
     target = _UniverseTargetExecutor()
     port = object()
     observed_ports: list[object] = []
+    worker_breakpoints = [False]
 
     def execute(supplied_port: object, source: str) -> object:
         observed_ports.append(supplied_port)
@@ -5577,7 +5578,7 @@ def test_worker_activation_adapter_promotes_over_supplied_port_and_retains_metho
         notebook_builder=_notebook_builder(tmp_path),
         instruction_runner=execute,
         target_profile="server-test",
-        worker_breakpoints_present=lambda: False,
+        worker_breakpoints_present=lambda: worker_breakpoints[0],
     )
 
     def intent(source: str, revision: int):
@@ -5597,9 +5598,51 @@ def test_worker_activation_adapter_promotes_over_supplied_port_and_retains_metho
         "Функция Первый() Экспорт\nВозврат 1;\nКонецФункции\nИтог = Первый();", 1,
     ), port=port)
     old_pin = first.pin
-    second = adapter.activate(intent(
+    first_snapshot = adapter.snapshot()
+    assert first_snapshot.revision == 1
+    assert first_snapshot.active_handle is first.handle
+    assert first_snapshot.active_methods is adapter.active_methods
+    assert first_snapshot.worker_exports is adapter.worker_exports
+
+    second_intent = intent(
         "Функция Второй() Экспорт\nВозврат 2;\nКонецФункции", 2,
-    ), port=port)
+    )
+    old_release = adapter._target.release
+    release_entered = Event()
+    allow_release = Event()
+
+    def delayed_release(handle):
+        release_entered.set()
+        assert allow_release.wait(3)
+        old_release(handle)
+
+    adapter._target.release = delayed_release
+    promoted: list[object] = []
+    failures: list[BaseException] = []
+
+    def promote_second():
+        try:
+            promoted.append(adapter.activate(second_intent, port=port))
+        except BaseException as error:
+            failures.append(error)
+
+    worker = Thread(target=promote_second)
+    worker.start()
+    try:
+        assert release_entered.wait(3)
+        assert adapter.snapshot() is first_snapshot
+    finally:
+        allow_release.set()
+        worker.join(3)
+    assert not failures
+    assert not worker.is_alive()
+    second = promoted[0]
+    second_snapshot = adapter.snapshot()
+    assert second_snapshot.revision == 2
+    assert second_snapshot.active_handle is second.handle
+    assert second_snapshot.active_methods is adapter.active_methods
+    assert second_snapshot.worker_exports is adapter.worker_exports
+    assert second_snapshot is not first_snapshot
 
     assert observed_ports and set(observed_ports) == {port}
     assert {export.method for export in adapter.active_methods.exports} == {
@@ -5607,8 +5650,15 @@ def test_worker_activation_adapter_promotes_over_supplied_port_and_retains_metho
     }
     assert host.active_handle is second.handle
     assert old_pin.handle is first.handle
-    ordinary = adapter.pin_active()
+    ordinary = adapter.pin_active(port=port)
     assert ordinary is not None and ordinary.pin.handle is second.handle
+    worker_breakpoints[0] = True
+    with pytest.raises(ProtocolError, match="workspace transaction"):
+        adapter.pin_active(port=port)
+    with pytest.raises(ProtocolError, match="workspace transaction"):
+        ordinary.release(port=port)
+    assert host.active_handle is second.handle
+    worker_breakpoints[0] = False
     ordinary.release(port=port)
     first.release(port=port)
     second.release(port=port)

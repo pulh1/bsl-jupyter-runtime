@@ -30,6 +30,10 @@ class WorkerActivationUnknown(OutcomeUnknown):
 class WorkerActivationPort(Protocol):
     """Build, publish, and pin a prepared Worker on the arbiter worker only."""
 
+    def pin_active(self, *, port: SessionPort) -> WorkerActivationLease | None:
+        """Pin the current generation for one admitted ordinary operation."""
+        ...
+
     def activate(
         self, intent: WorkerCandidateIntent, *, port: SessionPort
     ) -> WorkerActivationLease: ...

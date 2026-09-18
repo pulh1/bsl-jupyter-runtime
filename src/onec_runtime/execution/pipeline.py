@@ -1,5 +1,8 @@
 """Generic cell preparation and admission; route decisions remain in its ports."""
 
+from contextlib import AbstractContextManager, nullcontext
+from typing import Callable
+
 from onec_runtime.bsl.source_maps import SourceUnitRef
 from onec_runtime.execution.contracts import (
     Accepted,
@@ -10,6 +13,7 @@ from onec_runtime.execution.contracts import (
     PreparationContext,
     PreparationSnapshotReader,
     PreparationSnapshots,
+    PreparedCell,
     Rejected,
     ReplyPresenter,
     SourceDiagnostic,
@@ -33,12 +37,29 @@ class CellExecutionPipeline:
         self._snapshots = snapshots
         self._replies = replies
 
-    def execute(self, source: str, source_unit: SourceUnitRef) -> object:
+    def execute(
+        self,
+        source: str,
+        source_unit: SourceUnitRef,
+        *,
+        wait_handoff: Callable[[], AbstractContextManager[None]] | None = None,
+        on_prepared: Callable[[PreparedCell], None] | None = None,
+        on_admitted: Callable[[PreparedCell], None] | None = None,
+    ) -> object:
+        """Execute a cell, releasing a caller lock only at blocking waits.
+
+        ``on_admitted`` runs after the controller accepts the ticket. The
+        controller may have dispatched it by then; this is a publication
+        callback, not a before-transport hook.
+        """
+
+        release_wait = wait_handoff or nullcontext
         common: CommonCell = self._parser.prepare(source, source_unit)
         if isinstance(common, SourceDiagnostic):
             return self._replies.diagnostic_reply(common)
         while True:
-            context: PreparationContext = self._controller.await_preparation_context()
+            with release_wait():
+                context: PreparationContext = self._controller.await_preparation_context()
             if isinstance(context, Unavailable):
                 return self._replies.unavailable_reply(context)
             snapshots: PreparationSnapshots = self._snapshots.read_for(context.capabilities)
@@ -52,6 +73,8 @@ class CellExecutionPipeline:
                 if isinstance(validity, Unavailable):
                     return self._replies.unavailable_reply(validity)
                 raise TypeError("Invalid preparation validation result")
+            if on_prepared is not None:
+                on_prepared(prepared)
             receipt = SubmissionReceipt()
             try:
                 try:
@@ -74,7 +97,10 @@ class CellExecutionPipeline:
                     raise TypeError("Invalid admission result")
                 if admission.ticket is not receipt.ticket:
                     raise RuntimeError("Accepted ticket was not adopted by submission receipt")
-                return admission.ticket.wait_initiator()
+                if on_admitted is not None:
+                    on_admitted(prepared)
+                with release_wait():
+                    return admission.ticket.wait_initiator()
             except KeyboardInterrupt:
                 if receipt.ticket is not None:
                     self._controller.request_stop(receipt.ticket)

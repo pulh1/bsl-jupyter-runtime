@@ -42,13 +42,16 @@ def _common(source: str, parser: PythonParserTarget):
     return result
 
 
-def _runtime(snapshot_provider, *, session=None, settlement_services=None, worker_activation=None):
+def _runtime(snapshot_provider, *, session=None, settlement_services=None, worker_activation=None,
+             capture_snapshot_provider=None):
     from onec_runtime.execution.controller.controller import ExecutionController
 
     session = session or CompleteSession()
     arbiter = RdbgArbiter(session, RouteToken("runtime-1", 1, 0, "main"))
     parser = PythonParserTarget.from_generated()
     kwargs = {} if worker_activation is None else {"worker_activation": worker_activation}
+    if capture_snapshot_provider is not None:
+        kwargs["capture_snapshot_provider"] = capture_snapshot_provider
     controller = ExecutionController(
         arbiter,
         MainExecutor(poll_interval_s=0.1),
@@ -62,6 +65,109 @@ def _runtime(snapshot_provider, *, session=None, settlement_services=None, worke
         **kwargs,
     )
     return controller, arbiter, session, parser
+
+
+def test_capture_preparation_uses_suspended_main_speculative_namespace() -> None:
+    owner = object()
+    captured_operations = []
+
+    def capture_snapshot(operation):
+        captured_operations.append(operation)
+        return RoutePreparationSnapshot(owner, 2, ("ИзMain",), ())
+
+    controller, arbiter, _session, _parser = _runtime(
+        lambda: RoutePreparationSnapshot(owner, 1, (), ()),
+        capture_snapshot_provider=capture_snapshot,
+    )
+    try:
+        controller.submit_main("Результат = 1;").wait_settled(3)
+        context = controller.await_preparation_context()
+        assert context.capabilities.namespace_names == ("ИзMain",)
+        assert captured_operations == [controller.main_operation]
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_capture_preparation_rejects_changed_speculative_namespace() -> None:
+    owner = object()
+    pending = [("ИзMain",)]
+    controller, arbiter, _session, parser = _runtime(
+        lambda: RoutePreparationSnapshot(owner, 1, (), ()),
+        capture_snapshot_provider=lambda _operation: RoutePreparationSnapshot(
+            owner, 2 if pending[0] == ("ИзMain",) else 3, pending[0], (),
+        ),
+    )
+    try:
+        controller.submit_main("Результат = 1;").wait_settled(3)
+        context, _prepared_cell = _prepared(controller, parser, "Результат = 2;")
+        pending[0] = ("ДругоеИмя",)
+
+        result = controller.validate_preparation(
+            context, context.capabilities.for_pipeline().guards,
+        )
+
+        assert isinstance(result, StalePreparation)
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_capture_points_can_be_configured_before_first_main_dispatch() -> None:
+    owner = object()
+    controller, arbiter, _session, _parser = _runtime(
+        lambda: RoutePreparationSnapshot(owner, 1, (), ()),
+    )
+    try:
+        controller.configure_capture_points((BUSINESS,))
+        assert controller._registry.captures == (BUSINESS,)
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_controller_status_facts_keep_confirmed_capture_after_cell_failure() -> None:
+    from onec_runtime.execution.status_projection import ExecutionActivity
+    from onec_runtime.execution.capture.scope import CaptureFrameIdentity
+
+    class BslErrorSession(CompleteSession):
+        def wait_evaluation_event(self, pending, *, timeout_s, on_transport_dispatch):
+            if self.expression.startswith(
+                "RuntimeKernelServer.ВыполнитьКодВКонтекстеОтладки("
+            ):
+                on_transport_dispatch()
+                self._record("wait_eval")
+                self.pending = None
+                return EvaluationResult(
+                    pending.result_id, "Ошибка", "", True, "planned BSL error"
+                )
+            return super().wait_evaluation_event(
+                pending, timeout_s=timeout_s,
+                on_transport_dispatch=on_transport_dispatch,
+            )
+
+    owner = object()
+    controller, arbiter, _session, _parser = _runtime(
+        lambda: RoutePreparationSnapshot(owner, 1, (), ()),
+        session=BslErrorSession(),
+    )
+    try:
+        initial = controller.status_facts()
+        assert initial.command_id == 0
+        assert initial.main_phase is None
+
+        controller.submit_main("Результат = 1;").wait_settled(3)
+        stopped = controller.status_facts()
+        assert stopped.command_id == 1
+        assert stopped.main_phase is MainPhase.SUSPENDED_CAPTURE
+        assert stopped.capture_frame_identity is CaptureFrameIdentity.CONFIRMED
+        assert stopped.activity is ExecutionActivity.NONE
+
+        result = controller.submit_capture_cell("РезультатИнструкции = 2;").wait_settled(3)
+        assert result.error_occurred
+        after_error = controller.status_facts()
+        assert after_error.main_phase is MainPhase.SUSPENDED_CAPTURE
+        assert after_error.capture_frame_identity is CaptureFrameIdentity.CONFIRMED
+        assert after_error.activity is ExecutionActivity.NONE
+    finally:
+        arbiter.close(timeout=3)
 
 
 def _prepared(controller, parser, source: str):
@@ -1048,6 +1154,9 @@ def test_worker_intent_activates_after_ticket_admission_and_releases_on_its_rout
             events.append(("retain", port))
 
     class Activation:
+        def pin_active(self, *, port):
+            return None
+
         def activate(self, intent, *, port):
             events.append(("activate", intent, port))
             return Lease()
@@ -1165,6 +1274,9 @@ def test_confirmed_worker_release_failure_preserves_capture_cell_result() -> Non
             raise AssertionError("The release failure was confirmed")
 
     class Activation:
+        def pin_active(self, *, port):
+            return None
+
         def activate(self, intent, *, port):
             return Lease()
 
@@ -1445,5 +1557,177 @@ def test_worker_main_keeps_its_policy_and_message_key_across_capture_resume() ->
         assert finished[1].kind.value == "completed"
         assert finished[1].operation is operation
         assert finished[2] is prepared.payload
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_existing_worker_generation_is_pinned_for_main_and_each_capture_cell() -> None:
+    """Ordinary statements retain the active generation across one MAIN stop."""
+
+    events: list[tuple[str, int, object]] = []
+
+    class Lease:
+        def __init__(self, number: int) -> None:
+            self.number = number
+
+        def release(self, *, port) -> None:
+            events.append(("release", self.number, port))
+
+        def retain_outcome_unknown(self, *, port) -> None:
+            events.append(("retain", self.number, port))
+
+    class ActiveWorker:
+        def pin_active(self, *, port):
+            number = len([event for event in events if event[0] == "pin"]) + 1
+            events.append(("pin", number, port))
+            return Lease(number)
+
+        def activate(self, intent, *, port):
+            raise AssertionError("No new Worker generation is being published")
+
+    owner = object()
+    controller, arbiter, _session, _parser = _runtime(
+        lambda: RoutePreparationSnapshot(owner, 1, (), ()),
+        worker_activation=ActiveWorker(),
+    )
+    try:
+        main = controller.submit_main("Результат = 1;")
+        assert main.wait_settled(3).kind.value == "capture"
+        assert [(kind, number) for kind, number, _ in events] == [("pin", 1)]
+
+        capture = controller.submit_capture_cell("Результат = 2;")
+        assert capture.wait_settled(3).error_occurred is False
+        assert capture.post_settlement_cleanup is not None
+        assert capture.post_settlement_cleanup.wait_settled(3) is None
+        assert [(kind, number) for kind, number, _ in events] == [
+            ("pin", 1), ("pin", 2), ("release", 2),
+        ]
+
+        resumed = controller.submit_resume()
+        assert resumed.wait_settled(3).kind.value == "completed"
+        assert resumed.post_settlement_cleanup is not None
+        assert resumed.post_settlement_cleanup.wait_settled(3) is None
+        assert [(kind, number) for kind, number, _ in events] == [
+            ("pin", 1), ("pin", 2), ("release", 2), ("release", 1),
+        ]
+        assert all(port is not None for _kind, _number, port in events)
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_existing_worker_capture_pin_survives_unknown_eval_until_reconciliation() -> None:
+    class AmbiguousCaptureSession(CompleteSession):
+        def __init__(self) -> None:
+            super().__init__()
+            self.ambiguous_once = True
+
+        def start_evaluation(self, expression, **kwargs):
+            pending = super().start_evaluation(expression, **kwargs)
+            if (
+                self.ambiguous_once
+                and expression.startswith("RuntimeKernelServer.ВыполнитьКодВКонтекстеОтладки(")
+            ):
+                self.ambiguous_once = False
+                raise EvaluationDispatchUnknown(pending)
+            return pending
+
+    events: list[tuple[str, int]] = []
+
+    class Lease:
+        def __init__(self, number: int) -> None:
+            self.number = number
+
+        def release(self, *, port) -> None:
+            events.append(("release", self.number))
+
+        def retain_outcome_unknown(self, *, port) -> None:
+            events.append(("retain", self.number))
+
+    class ActiveWorker:
+        def pin_active(self, *, port):
+            number = len([event for event in events if event[0] == "pin"]) + 1
+            events.append(("pin", number))
+            return Lease(number)
+
+        def activate(self, intent, *, port):
+            raise AssertionError("No Worker publication is expected")
+
+    owner = object()
+    controller, arbiter, _session, _parser = _runtime(
+        lambda: RoutePreparationSnapshot(owner, 1, (), ()),
+        session=AmbiguousCaptureSession(), worker_activation=ActiveWorker(),
+    )
+    try:
+        controller.submit_main("Результат = 1;").wait_settled(3)
+        ticket = controller.submit_capture_cell("Результат = 2;")
+        assert ticket.wait_unknown(3)
+        assert events == [("pin", 1), ("pin", 2)]
+        assert ticket.post_settlement_cleanup is None
+
+        controller.reconcile_capture_pending_eval(ticket)
+        assert ticket.wait_settled(3).error_occurred is False
+        assert ticket.post_settlement_cleanup is not None
+        assert ticket.post_settlement_cleanup.wait_settled(3) is None
+        assert events == [("pin", 1), ("pin", 2), ("release", 2)]
+    finally:
+        if 'ticket' in locals() and ticket.status().phase == 'unknown':
+            from onec_runtime.execution.termination import FileTerminationConfirmed
+
+            arbiter.retire_terminated_target(
+                ticket, arbiter.current_route,
+                FileTerminationConfirmed(TARGET, 1234, -15),
+            )
+        arbiter.close(timeout=3)
+
+
+def test_existing_worker_main_pin_releases_after_matching_completion_decode_error() -> None:
+    """A confirmed command ID ends MAIN even when its result cannot be decoded."""
+    from onec_runtime.execution.main.completion import MainScalarDecodeError
+
+    class BadResultSession(CompleteSession):
+        def __init__(self) -> None:
+            super().__init__(capture_count=0)
+
+        def wait_evaluation_event(self, pending, *, timeout_s, on_transport_dispatch):
+            if self.expression == "Результат":
+                on_transport_dispatch()
+                self._record("wait_eval")
+                self.pending = None
+                return EvaluationResult(pending.result_id, "Число", "NaN", False)
+            return super().wait_evaluation_event(
+                pending, timeout_s=timeout_s,
+                on_transport_dispatch=on_transport_dispatch,
+            )
+
+    events: list[str] = []
+
+    class Lease:
+        def release(self, *, port) -> None:
+            events.append("release")
+
+        def retain_outcome_unknown(self, *, port) -> None:
+            events.append("retain")
+
+    class ActiveWorker:
+        def pin_active(self, *, port):
+            events.append("pin")
+            return Lease()
+
+        def activate(self, intent, *, port):
+            raise AssertionError("No Worker publication is expected")
+
+    owner = object()
+    controller, arbiter, _session, _parser = _runtime(
+        lambda: RoutePreparationSnapshot(owner, 1, (), ()),
+        session=BadResultSession(), worker_activation=ActiveWorker(),
+    )
+    try:
+        ticket = controller.submit_main("Результат = 1;")
+        with pytest.raises(MainScalarDecodeError):
+            ticket.wait_settled(3)
+        assert controller.main_operation.phase is MainPhase.COMPLETED
+        assert ticket.post_settlement_cleanup is not None
+        assert ticket.post_settlement_cleanup.wait_settled(3) is None
+        assert events == ["pin", "release"]
     finally:
         arbiter.close(timeout=3)

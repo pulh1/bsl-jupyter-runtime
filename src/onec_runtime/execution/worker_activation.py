@@ -7,10 +7,11 @@ second debugger reader or calls the legacy runtime controller.
 
 from __future__ import annotations
 
-from dataclasses import replace
-from threading import local
+from dataclasses import dataclass, field, replace
+from threading import RLock, local
 from typing import Callable
 
+from onec_runtime.breakpoint_workspace import BreakpointWorkspaceOutcomeUnknown
 from onec_runtime.bsl.notebook_method_globals import bind_notebook_method_globals
 from onec_runtime.bsl.notebook_methods import (
     NotebookMethodSet,
@@ -21,6 +22,7 @@ from onec_runtime.errors import BslExecutionError, ProtocolError, WorkerPromotio
 from onec_runtime.execution.arbiter import OutcomeUnknown, SessionPort
 from onec_runtime.execution.preparation import WorkerCandidateIntent
 from onec_runtime.execution.worker import WorkerActivationUnknown
+from onec_runtime.execution.worker_breakpoint_workspace import WorkerBreakpointWorkspace
 from onec_runtime.server_worker import (
     NotebookWorkerArtifactBuilder,
     validate_production_worker_artifact,
@@ -38,6 +40,24 @@ from onec_runtime.worker_universe import (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class WorkerActivationSnapshot:
+    """One atomic published Worker generation for route preparation."""
+
+    revision: int
+    worker_exports: tuple[WorkerExport, ...] = field(repr=False)
+    active_methods: NotebookMethodSet | None = field(repr=False)
+    active_handle: WorkerGenerationHandle | None = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerMaterializationSnapshot:
+    """One published Worker revision and its exact privacy registrations."""
+
+    revision: int
+    registrations: tuple[str, ...] = field(repr=False)
+
+
 class _GenerationLease:
     """Retain an exact Worker pin, including an incomplete activation."""
 
@@ -49,23 +69,31 @@ class _GenerationLease:
         handle: WorkerGenerationHandle | None = None,
         pin: OperationGenerationPin | None = None,
         candidate: WorkerUniverseCandidate | None = None,
+        worker_breakpoints_present: Callable[[], bool],
+        breakpoint_workspace: WorkerBreakpointWorkspace | None = None,
     ) -> None:
         self._host = host
         self._target = target
         self.handle = handle
         self.pin = pin
         self._candidate = candidate
+        self._breakpoints_present = worker_breakpoints_present
+        self._breakpoint_workspace = breakpoint_workspace
         self._released = False
         self._retained_unknown = False
 
     def release(self, *, port: SessionPort) -> None:
-        del port  # No target request is needed without Worker breakpoints.
         if self._retained_unknown:
             raise ProtocolError("Outcome-unknown Worker lease cannot be released")
         if self._released:
             return
+        if self._breakpoints_present() and self._breakpoint_workspace is None:
+            raise ProtocolError("Worker breakpoint release requires a workspace transaction")
         if self.pin is not None:
-            self._target.release_pin(self.pin)
+            if self._breakpoint_workspace is None:
+                self._target.release_pin(self.pin)
+            else:
+                self._breakpoint_workspace.release(self._target, self.pin, port=port)
         self._released = True
 
     def retain_outcome_unknown(self, *, port: SessionPort) -> None:
@@ -88,8 +116,8 @@ class WorkerUniverseActivationAdapter:
 
     The adapter owns one persistent host/target registry pair for a session.
     ``instruction_runner`` is route specific and must use the supplied port.
-    Worker breakpoint reload is deliberately not accepted by this adapter;
-    its workspace transaction needs a separate publication collaborator.
+    ``breakpoint_workspace`` is the publication collaborator for logical Worker
+    breakpoints and full-replacement RDBG workspace writes.
     The next route snapshot must use the exact ``active_methods`` object,
     because activation binds global names into a new immutable method set.
 
@@ -106,6 +134,7 @@ class WorkerUniverseActivationAdapter:
         notebook_builder: NotebookWorkerArtifactBuilder,
         instruction_runner: Callable[[SessionPort, str], object],
         worker_breakpoints_present: Callable[[], bool],
+        breakpoint_workspace: WorkerBreakpointWorkspace | None = None,
         target_profile: str = "notebook-worker",
         base_artifacts: tuple[WorkerModuleArtifact, ...] = (),
     ) -> None:
@@ -123,48 +152,77 @@ class WorkerUniverseActivationAdapter:
         self._target_profile = target_profile
         self._base_artifacts = base_artifacts
         self._breakpoints_present = worker_breakpoints_present
+        self._breakpoint_workspace = breakpoint_workspace
         self._bound = local()
         self._target = ServerWorkerUniverseRegistry(
             host,
             self._execute_bound_instruction,
             mutation_executor=self._execute_mutation,
         )
-        self._active_methods: NotebookMethodSet | None = None
-        self._active_descriptor: WorkerModuleArtifact | None = None
-        self._active_handle: WorkerGenerationHandle | None = None
-        self._worker_exports: tuple[WorkerExport, ...] = ()
-        self._revision = 0
+        self._snapshot_lock = RLock()
+        self._published = WorkerActivationSnapshot(0, (), None, None)
+
+    def snapshot(self) -> WorkerActivationSnapshot:
+        """Return one immutable version; never combine separate live getters."""
+        with self._snapshot_lock:
+            return self._published
+
+    def materialization_snapshot(self) -> WorkerMaterializationSnapshot:
+        """Read the active Worker revision and privacy registrations together."""
+
+        with self._snapshot_lock:
+            published = self._published
+            registrations = (
+                () if published.active_handle is None
+                else self._target.privacy_registration_snapshot()
+            )
+            return WorkerMaterializationSnapshot(published.revision, registrations)
 
     @property
     def active_methods(self) -> NotebookMethodSet | None:
-        return self._active_methods
+        return self.snapshot().active_methods
 
     @property
     def active_handle(self) -> WorkerGenerationHandle | None:
-        return self._active_handle
+        return self.snapshot().active_handle
 
     @property
     def worker_exports(self) -> tuple[WorkerExport, ...]:
-        return self._worker_exports
+        return self.snapshot().worker_exports
 
-    def pin_active(self) -> _GenerationLease | None:
+    def pin_active(self, *, port: SessionPort) -> _GenerationLease | None:
         """Pin the confirmed active root for an ordinary MAIN/CAPTURE cell."""
-        if self._active_handle is None:
+        if port is None:
+            raise TypeError("An admitted arbiter port is required to pin Worker")
+        published = self.snapshot()
+        if published.active_handle is None:
             return None
+        if self._breakpoints_present() and self._breakpoint_workspace is None:
+            raise ProtocolError("Worker breakpoint pin requires a workspace transaction")
         pin = self._host.pin_active()
-        if pin.handle is not self._active_handle:
+        if pin.handle is not published.active_handle:
             self._target.release_pin(pin)
             raise ProtocolError("Active Worker generation changed while pinning")
-        return _GenerationLease(self._host, self._target, handle=pin.handle, pin=pin)
+        return _GenerationLease(
+            self._host, self._target, handle=pin.handle, pin=pin,
+            worker_breakpoints_present=self._breakpoints_present,
+            breakpoint_workspace=self._breakpoint_workspace,
+        )
 
     def activate(
         self, intent: WorkerCandidateIntent, *, port: SessionPort,
     ) -> _GenerationLease:
         if not isinstance(intent, WorkerCandidateIntent):
             raise TypeError("Worker candidate intent is required")
-        if intent.previous_methods is not self._active_methods:
+        if port is None or (
+            self._breakpoint_workspace is not None
+            and not callable(getattr(port, "set_breakpoints", None))
+        ):
+            raise TypeError("An admitted arbiter port is required to activate Worker")
+        published = self.snapshot()
+        if intent.previous_methods is not published.active_methods:
             raise ProtocolError("Prepared Worker methods are stale")
-        if self._breakpoints_present():
+        if self._breakpoints_present() and self._breakpoint_workspace is None:
             raise ProtocolError("Worker breakpoint publication requires a workspace transaction")
         if getattr(self._bound, "port", None) is not None:
             raise ProtocolError("Worker activation is already bound to an RDBG port")
@@ -184,7 +242,7 @@ class WorkerUniverseActivationAdapter:
         if validate_production_worker_artifact(artifact) != method_set.exports:
             raise ProtocolError("Prepared Worker artifact catalog changed")
         descriptor = worker_module_artifact_from_notebook(
-            artifact, revision=self._revision + 1,
+            artifact, revision=published.revision + 1,
             target_profile=self._target_profile,
         )
         exports = tuple(
@@ -198,21 +256,29 @@ class WorkerUniverseActivationAdapter:
         )
         self._bound.port = port
         try:
-            handle = self._target.promote(candidate)
-        except (OutcomeUnknown, WorkerPromotionOutcomeUnknown) as error:
+            handle = (
+                self._target.promote(candidate)
+                if self._breakpoint_workspace is None
+                else self._breakpoint_workspace.promote(
+                    self._host, self._target, candidate, port=port,
+                )
+            )
+        except (
+            OutcomeUnknown, WorkerPromotionOutcomeUnknown,
+            BreakpointWorkspaceOutcomeUnknown,
+        ) as error:
             raise WorkerActivationUnknown(
-                _GenerationLease(self._host, self._target, candidate=candidate),
+                _GenerationLease(
+                    self._host, self._target, candidate=candidate,
+                    worker_breakpoints_present=self._breakpoints_present,
+                    breakpoint_workspace=self._breakpoint_workspace,
+                ),
                 "Worker activation outcome is unknown",
             ) from error
         finally:
             self._bound.port = None
 
-        self._active_methods = method_set
-        self._active_descriptor = descriptor
-        previous = self._active_handle
-        self._active_handle = handle
-        self._worker_exports = intent.candidate_catalog
-        self._revision += 1
+        previous = published.active_handle
         pin: OperationGenerationPin | None = None
         try:
             pin = self._host.pin_active()
@@ -221,14 +287,30 @@ class WorkerUniverseActivationAdapter:
                 pin = None
                 raise ProtocolError("Promoted Worker generation changed before pinning")
             if previous is not None:
-                self._target.release(previous)
+                if self._breakpoint_workspace is None:
+                    self._target.release(previous)
+                else:
+                    self._breakpoint_workspace.release(
+                        self._target, previous, port=port,
+                    )
         except BaseException as error:
             raise WorkerActivationUnknown(
-                _GenerationLease(self._host, self._target, handle=handle,
-                                 pin=pin),
+                _GenerationLease(
+                    self._host, self._target, handle=handle, pin=pin,
+                    worker_breakpoints_present=self._breakpoints_present,
+                    breakpoint_workspace=self._breakpoint_workspace,
+                ),
                 "Worker activation ownership could not be finalized",
             ) from error
-        return _GenerationLease(self._host, self._target, handle=handle, pin=pin)
+        with self._snapshot_lock:
+            self._published = WorkerActivationSnapshot(
+                published.revision + 1, intent.candidate_catalog, method_set, handle,
+            )
+        return _GenerationLease(
+            self._host, self._target, handle=handle, pin=pin,
+            worker_breakpoints_present=self._breakpoints_present,
+            breakpoint_workspace=self._breakpoint_workspace,
+        )
 
     def _execute_bound_instruction(self, instruction: str) -> object:
         port = getattr(self._bound, "port", None)
