@@ -18,7 +18,7 @@ import pandas as pd
 from onec_runtime.bsl.source_maps import SourceUnitRef, source_sha256
 from onec_runtime.capture_evaluation import CapturePhase
 from onec_runtime.capture_inspection import CaptureView
-from onec_runtime.errors import ProtocolError
+from onec_runtime.errors import NoActiveCaptureError, ProtocolError
 from onec_runtime.execution.arbiter import ExecutionTicket, RdbgArbiter
 from onec_runtime.execution.contracts import PreparedCell
 from onec_runtime.execution.capture.public_inspection import (
@@ -298,6 +298,8 @@ class PublicExecutionFacade:
     def current_capture(self) -> CaptureView:
         """Return the established CaptureView contract over controller evidence."""
 
+        if self._controller.capture_scope is None:
+            raise NoActiveCaptureError()
         inspection = self._capture_inspection.current()
         ledger = self._controller.capture_evaluation_ledger()
         identity = ledger.identity

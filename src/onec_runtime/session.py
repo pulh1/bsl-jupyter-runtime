@@ -2367,6 +2367,9 @@ class RuntimeSession:
         returned view only for this stop; its status becomes stale after
         continuation or a different stop.
         """
+        read_current = getattr(self.runtime_api, "current_capture", None)
+        if callable(read_current):
+            return read_current()
         return self.runtime_api._current_capture(
             resolve_sources=getattr(self, "_capture_stack_source_resolver", None),
             bind_frame=getattr(self, "_capture_stack_frame_binder", None),
