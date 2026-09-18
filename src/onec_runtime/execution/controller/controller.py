@@ -281,6 +281,10 @@ class ExecutionController:
         )
 
         with self._lock:
+            if self._continuation_admission is not None:
+                raise ProtocolError(
+                    "Worker mutation is blocked by a continuation admission"
+                )
             operation = self.main_operation
             scope = self.capture_scope
             if (

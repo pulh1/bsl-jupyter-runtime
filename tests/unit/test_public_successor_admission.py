@@ -167,6 +167,8 @@ def test_successor_commit_waits_for_confirmed_next_stop() -> None:
     )
     with pytest.raises(ProtocolError, match="idle CAPTURE"):
         api.configure_continuation_capture_points(())
+    with pytest.raises(ProtocolError, match="continuation admission"):
+        api._controller.worker_mutation_route()
     results: list[object] = []
     errors: list[BaseException] = []
 
