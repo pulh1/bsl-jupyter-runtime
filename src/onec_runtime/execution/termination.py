@@ -1,4 +1,4 @@
-"""Synchronous server-target teardown for the arbiter's single RDBG worker.
+"""Exact target termination and proof on the arbiter's single worker.
 
 The caller must have fenced ordinary dispatch before invoking this helper.
 It does not read debugger events or create another RDBG writer.
@@ -6,7 +6,7 @@ It does not read debugger events or create another RDBG writer.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import isfinite
 from typing import Literal, Protocol
 
@@ -33,6 +33,25 @@ class FileTerminationPort(Protocol):
     process: _PollableProcess
 
     def close(self, timeout_s: float) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class FileTargetProcessLease:
+    """Bind one verified file target to its owned 1C debuggee, never dbgs."""
+
+    expected_target: TargetId
+    process: FileTerminationPort = field(repr=False)
+    pid: int = field(init=False)
+
+    def __post_init__(self) -> None:
+        if type(self.expected_target) is not TargetId:
+            raise TypeError("file target identity is required")
+        if self.process is None:
+            raise TypeError("owned file debuggee process is required")
+        pid = self.process.pid
+        if type(pid) is not int or pid <= 0:
+            raise ValueError("owned debuggee PID must be positive")
+        object.__setattr__(self, "pid", pid)
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,8 +91,9 @@ def terminate_file_target(
     expected_target: TargetId,
     *,
     grace_s: float = 30.0,
+    request_termination: bool = True,
 ) -> FileTerminationConfirmed | FileTerminationUnknown:
-    """Terminate the captured file-mode debuggee and verify its process exit."""
+    """Terminate the owned debuggee or only probe after an uncertain request."""
 
     if (
         isinstance(grace_s, bool)
@@ -82,14 +102,17 @@ def terminate_file_target(
         or grace_s < 0
     ):
         raise ValueError("grace_s must be finite and non-negative")
+    if type(request_termination) is not bool:
+        raise TypeError("request_termination must be a boolean")
     pid = process.pid
     close_error_type: str | None = None
-    try:
-        process.close(timeout_s=float(grace_s))
-    except Exception as error:
-        # Closing owned streams may fail after the debuggee has exited. The
-        # process exit, rather than the close return, is the target evidence.
-        close_error_type = type(error).__name__
+    if request_termination:
+        try:
+            process.close(timeout_s=float(grace_s))
+        except Exception as error:
+            # Closing owned streams may fail after the debuggee has exited.
+            # Only process exit proves the Stop outcome.
+            close_error_type = type(error).__name__
     try:
         returncode = process.process.poll()
     except Exception as error:

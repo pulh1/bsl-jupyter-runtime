@@ -17,7 +17,8 @@ from uuid import uuid4
 
 from onec_runtime.errors import CommandTimeout, EvaluationDispatchUnknown, StopWaitIntervalElapsed
 from onec_runtime.execution.termination import (
-    FileTerminationConfirmed, ServerTerminationConfirmed, TerminationUnknown,
+    FileTargetProcessLease, FileTerminationConfirmed, FileTerminationUnknown,
+    ServerTerminationConfirmed, TerminationUnknown, terminate_file_target,
     terminate_server_target,
 )
 from onec_runtime.rdbg.models import DebugTarget, EvaluationResult, LocalVariablesResult, ModuleLocation, ModifyResult, PendingEvaluation, StopEvent, TargetId
@@ -174,7 +175,8 @@ class ExecutionTicket:
         self._stop_requested = False
         self._stop_blocked_after_effect = False
         self._server_termination_attempted = False
-        self._stop_teardown: ServerTeardownAttempt | None = None
+        self._file_termination_attempted = False
+        self._stop_teardown: ServerTeardownAttempt | FileTeardownAttempt | None = None
         self._stop_target: TargetId | None = None
         self._effect_target: TargetId | None = None
         self._value: Any = None
@@ -191,8 +193,8 @@ class ExecutionTicket:
             return self._post_settlement_cleanup
 
     @property
-    def stop_teardown(self) -> ServerTeardownAttempt | None:
-        """Worker-owned Stop proof, if exact server-target evidence allowed it."""
+    def stop_teardown(self) -> ServerTeardownAttempt | FileTeardownAttempt | None:
+        """Worker-owned Stop proof when exact target evidence allowed it."""
 
         with self._owner._mailbox:
             return self._stop_teardown
@@ -515,6 +517,31 @@ class ServerTeardownAttempt:
             return self._result
 
 
+class FileTeardownAttempt:
+    """One worker-owned file debuggee exit proof for a fenced Stop."""
+
+    def __init__(
+        self, owner: RdbgArbiter, ticket: ExecutionTicket,
+        lease: FileTargetProcessLease, grace_s: float,
+        request_termination: bool,
+    ) -> None:
+        self._owner = owner
+        self.ticket = ticket
+        self.lease = lease
+        self.expected_target = lease.expected_target
+        self.grace_s = grace_s
+        self.request_termination = request_termination
+        self._result: FileTerminationConfirmed | FileTerminationUnknown | None = None
+        self._done = False
+
+    def wait(self, timeout: float | None = None) -> FileTerminationConfirmed | FileTerminationUnknown:
+        with self._owner._mailbox:
+            if not self._owner._mailbox.wait_for(lambda: self._done, timeout):
+                raise TimeoutError('Local file teardown wait elapsed; target remains owned')
+            assert self._result is not None
+            return self._result
+
+
 class RdbgArbiter:
     """Own one session after bootstrap, with one mailbox and one worker.
 
@@ -526,14 +553,30 @@ class RdbgArbiter:
     keeps the old owner fenced.
     """
 
-    def __init__(self, session: EvaluationSession, route: RouteToken):
+    def __init__(
+        self, session: EvaluationSession, route: RouteToken, *,
+        file_target_lease: FileTargetProcessLease | None = None,
+    ):
+        if file_target_lease is not None:
+            if not isinstance(file_target_lease, FileTargetProcessLease):
+                raise TypeError('file target process lease is invalid')
+            selected = session.target
+            if (
+                selected is None
+                or selected.target_type != 'ServerEmulation'
+                or selected.target_id != file_target_lease.expected_target
+                or file_target_lease.process.pid != file_target_lease.pid
+            ):
+                raise ValueError('File Stop requires the exact selected file target')
         self._session = session
         self._route = route
+        self._file_target_lease = file_target_lease
         self._mailbox = Condition()
         self._queue: deque[ExecutionTicket] = deque()
         self._active: ExecutionTicket | None = None
         self._reconciliation: Plan | None = None
         self._server_teardown: ServerTeardownAttempt | None = None
+        self._file_teardown: FileTeardownAttempt | None = None
         self._cleanup_debt: ExecutionTicket | None = None
         self._closed = False
         self._worker = Thread(target=self._run, name='rdbg-arbiter', daemon=True)
@@ -633,8 +676,12 @@ class RdbgArbiter:
                 while self._queue:
                     self._settle(self._queue.popleft(), error=CancelledBeforeEffect())
                 self._mailbox.notify_all()
-            self._schedule_auto_server_stop_locked(ticket)
+            self._schedule_auto_stop_locked(ticket)
             return StopRequestOutcome.REQUESTED
+
+    def _schedule_auto_stop_locked(self, ticket: ExecutionTicket) -> None:
+        self._schedule_auto_server_stop_locked(ticket)
+        self._schedule_auto_file_stop_locked(ticket)
 
     def _schedule_auto_server_stop_locked(self, ticket: ExecutionTicket) -> None:
         """Run Stop only after the active plan relinquishes the one RDBG worker."""
@@ -645,6 +692,7 @@ class RdbgArbiter:
             or self._active is not ticket
             or self._reconciliation is not None
             or self._server_teardown is not None
+            or self._file_teardown is not None
         ):
             return
         expected = self._exact_server_stop_target_locked(ticket)
@@ -660,6 +708,46 @@ class RdbgArbiter:
         ticket._stop_teardown = attempt
         self._server_teardown = attempt
         self._mailbox.notify_all()
+
+    def _schedule_auto_file_stop_locked(self, ticket: ExecutionTicket) -> None:
+        """Stop only the bound file debuggee after the active plan yields."""
+
+        lease = self._file_target_lease
+        if (
+            lease is None
+            or not ticket._stop_requested
+            or ticket._phase != 'unknown'
+            or self._active is not ticket
+            or self._reconciliation is not None
+            or self._server_teardown is not None
+            or self._file_teardown is not None
+            or not self._exact_file_stop_target_locked(ticket, lease)
+        ):
+            return
+        attempt = FileTeardownAttempt(
+            self, ticket, lease, 30.0,
+            request_termination=not ticket._file_termination_attempted,
+        )
+        ticket._file_termination_attempted = True
+        ticket._stop_teardown = attempt
+        self._file_teardown = attempt
+        self._mailbox.notify_all()
+
+    def _exact_file_stop_target_locked(
+        self, ticket: ExecutionTicket, lease: FileTargetProcessLease,
+    ) -> bool:
+        expected = (
+            ticket._pending.target_id if ticket._pending is not None else
+            ticket._stop_target or ticket._effect_target
+        )
+        selected = self._session.target
+        return (
+            expected == lease.expected_target
+            and selected is not None
+            and selected.target_id == expected
+            and selected.target_type == 'ServerEmulation'
+            and lease.process.pid == lease.pid
+        )
 
     def _exact_server_stop_target_locked(
         self, ticket: ExecutionTicket,
@@ -684,7 +772,8 @@ class RdbgArbiter:
         with self._mailbox:
             self._check_ticket(ticket)
             if (self._active is not ticket or ticket._phase != 'unknown'
-                    or self._reconciliation is not None or self._server_teardown is not None):
+                    or self._reconciliation is not None or self._server_teardown is not None
+                    or self._file_teardown is not None):
                 raise ArbiterBusy('Reconciliation requires the unknown owner')
             self._reconciliation = plan
             # Do not let wait_unknown() observe the previous unknown phase as
@@ -725,6 +814,35 @@ class RdbgArbiter:
             self._mailbox.notify_all()
             return attempt
 
+    def teardown_fenced_file_target(
+        self, ticket: ExecutionTicket, route: RouteToken, *, grace_s: float = 30.0,
+    ) -> FileTeardownAttempt:
+        """Probe exit after an uncertain file Stop without repeating close."""
+
+        if (isinstance(grace_s, bool) or not isinstance(grace_s, (int, float))
+                or not isfinite(float(grace_s)) or grace_s < 0):
+            raise ValueError('grace_s must be finite and non-negative')
+        with self._mailbox:
+            self._check_ticket(ticket)
+            if route != self._route:
+                raise StaleRoute('File teardown belongs to another route')
+            if (self._active is not ticket or ticket._phase != 'unknown'
+                    or not ticket._stop_requested or self._reconciliation is not None
+                    or self._server_teardown is not None or self._file_teardown is not None):
+                raise ArbiterBusy('File teardown requires the fenced unknown owner')
+            lease = self._file_target_lease
+            if lease is None or not self._exact_file_stop_target_locked(ticket, lease):
+                raise ValueError('File teardown requires the exact selected file target')
+            attempt = FileTeardownAttempt(
+                self, ticket, lease, float(grace_s),
+                request_termination=not ticket._file_termination_attempted,
+            )
+            ticket._file_termination_attempted = True
+            ticket._stop_teardown = attempt
+            self._file_teardown = attempt
+            self._mailbox.notify_all()
+            return attempt
+
     def retire_terminated_target(
         self,
         ticket: ExecutionTicket,
@@ -739,7 +857,8 @@ class RdbgArbiter:
         with self._mailbox:
             self._check_ticket(ticket)
             if (self._active is not ticket or ticket._phase != 'unknown'
-                    or self._reconciliation is not None or self._server_teardown is not None):
+                    or self._reconciliation is not None or self._server_teardown is not None
+                    or self._file_teardown is not None):
                 raise ArbiterBusy('Target retirement requires the unknown owner')
             if route != self._route:
                 raise StaleRoute('Termination evidence belongs to another route')
@@ -761,6 +880,13 @@ class RdbgArbiter:
                         and absence.bound_client.infobase_instance_id != expected.infobase_instance_id)
                 ):
                     raise ValueError('server absence evidence belongs to another target')
+            if isinstance(evidence, FileTerminationConfirmed):
+                lease = self._file_target_lease
+                if (
+                    lease is not None
+                    and (lease.expected_target != expected or evidence.pid != lease.pid)
+                ):
+                    raise ValueError('file exit evidence belongs to another process')
 
             self._closed = True
             while self._queue:
@@ -803,6 +929,7 @@ class RdbgArbiter:
         while True:
             with self._mailbox:
                 self._mailbox.wait_for(lambda: self._closed or self._server_teardown is not None or
+                    self._file_teardown is not None or
                     self._reconciliation is not None or (
                     self._active is None and bool(self._queue) and self._queue[0]._ready
                     and (self._cleanup_debt is None
@@ -811,7 +938,8 @@ class RdbgArbiter:
                 if self._closed:
                     return
                 teardown = self._server_teardown
-                if teardown is None:
+                file_teardown = self._file_teardown
+                if teardown is None and file_teardown is None:
                     reconciling = self._reconciliation is not None
                     if reconciling:
                         ticket = self._active
@@ -828,6 +956,9 @@ class RdbgArbiter:
                     ticket._phase = 'running'
             if teardown is not None:
                 self._run_server_teardown(teardown)
+                continue
+            if file_teardown is not None:
+                self._run_file_teardown(file_teardown)
                 continue
             port = SessionPort(self, ticket)
             try:
@@ -873,7 +1004,7 @@ class RdbgArbiter:
                             or isinstance(error, OutcomeUnknown)):
                         ticket._phase = 'unknown'
                         ticket._error = error
-                        self._schedule_auto_server_stop_locked(ticket)
+                        self._schedule_auto_stop_locked(ticket)
                         self._mailbox.notify_all()
                     else:
                         cleanup_plan = ticket._post_settlement_cleanup_plan
@@ -932,6 +1063,40 @@ class RdbgArbiter:
                 except ValueError:
                     result = TerminationUnknown(
                         attempt.expected_target, 'confirmation', 'EvidenceMismatch', None,
+                    )
+            attempt._result = result
+            attempt._done = True
+            self._mailbox.notify_all()
+
+    def _run_file_teardown(self, attempt: FileTeardownAttempt) -> None:
+        assert get_ident() == self._worker.ident
+        lease = attempt.lease
+        try:
+            if lease.process.pid != lease.pid:
+                result: FileTerminationConfirmed | FileTerminationUnknown = (
+                    FileTerminationUnknown(
+                        attempt.expected_target, lease.pid, 'ProcessIdentityChanged',
+                    )
+                )
+            else:
+                result = terminate_file_target(
+                    lease.process, attempt.expected_target,
+                    grace_s=attempt.grace_s,
+                    request_termination=attempt.request_termination,
+                )
+        except BaseException as error:
+            result = FileTerminationUnknown(
+                attempt.expected_target, lease.pid, type(error).__name__,
+            )
+        with self._mailbox:
+            assert self._file_teardown is attempt
+            self._file_teardown = None
+            if isinstance(result, FileTerminationConfirmed):
+                try:
+                    self.retire_terminated_target(attempt.ticket, self._route, result)
+                except ValueError:
+                    result = FileTerminationUnknown(
+                        attempt.expected_target, lease.pid, 'EvidenceMismatch',
                     )
             attempt._result = result
             attempt._done = True

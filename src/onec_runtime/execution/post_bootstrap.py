@@ -24,6 +24,7 @@ from onec_runtime.execution.reply_presenter import RuntimeReplyPresenter
 from onec_runtime.execution.settlement import RouteSettlementService
 from onec_runtime.execution.source_identity import NotebookSourceIdentityFactory
 from onec_runtime.execution.status_projection import ExecutionStatusProjection
+from onec_runtime.execution.termination import FileTargetProcessLease
 from onec_runtime.execution.value_materialization_router import ValueMaterializationRouter
 from onec_runtime.execution.worker import WorkerActivationPort
 from onec_runtime.execution.worker_activation import (
@@ -89,6 +90,7 @@ def compose_post_bootstrap_execution(
     worker_activation: WorkerActivationPort | None = None,
     breakpoint_routes: RouteBreakpointWorkspace | None = None,
     resolve_capture_sources: CaptureSourceResolver | None = None,
+    file_target_lease: FileTargetProcessLease | None = None,
 ) -> PostBootstrapExecution:
     """Compose the new owner path from already-verified bootstrap resources.
 
@@ -124,6 +126,7 @@ def compose_post_bootstrap_execution(
         worker_activation=worker_activation,
         breakpoint_routes=breakpoint_routes,
         initial_target_id=initial_target_id,
+        file_target_lease=file_target_lease,
     )
     try:
         status = ExecutionStatusProjection(
@@ -173,6 +176,7 @@ def compose_fresh_post_bootstrap_execution(
     target_profile: str = "notebook-worker",
     worker_module_builder: WorkerModuleArtifactBuilder | None = None,
     resolve_capture_sources: CaptureSourceResolver | None = None,
+    file_target_lease: FileTargetProcessLease | None = None,
 ) -> FreshPostBootstrapExecution:
     """Create all new execution owners after bootstrap stopped one exact target.
 
@@ -184,6 +188,16 @@ def compose_fresh_post_bootstrap_execution(
     """
 
     target = _fresh_stopped_target(session, stopped_target)
+    if target.target_type == "ServerEmulation":
+        if file_target_lease is None:
+            raise ProtocolError("fresh file runtime requires its owned file debuggee lease")
+        if (
+            not isinstance(file_target_lease, FileTargetProcessLease)
+            or file_target_lease.expected_target != target.target_id
+        ):
+            raise ProtocolError("file debuggee lease must bind the exact stopped file target")
+    elif file_target_lease is not None:
+        raise ProtocolError("file debuggee lease belongs only to ServerEmulation")
     if type(runtime_generation) is not int or runtime_generation <= 0:
         raise ValueError("runtime generation must be positive")
     if not callable(notebook_builder):
@@ -246,6 +260,7 @@ def compose_fresh_post_bootstrap_execution(
         retained_source_units=settlement.retained_source_units,
         breakpoint_routes=routes,
         resolve_capture_sources=resolve_capture_sources,
+        file_target_lease=file_target_lease,
     )
     status["projection"] = composed.status
     try:
@@ -308,6 +323,7 @@ def _fresh_stopped_target(
         not isinstance(stopped_target, DebugTarget)
         or not isinstance(target, DebugTarget)
         or target.target_id != stopped_target.target_id
+        or target.target_type != stopped_target.target_type
         or target.state.casefold() != "stopped"
         or stopped_target.state.casefold() != "stopped"
     ):

@@ -5,6 +5,7 @@ from uuid import UUID
 import pytest
 
 from onec_runtime.execution.termination import (
+    FileTargetProcessLease,
     FileTerminationConfirmed,
     FileTerminationUnknown,
     terminate_file_target,
@@ -90,6 +91,35 @@ def test_file_stop_can_confirm_exit_even_when_close_raises() -> None:
     assert isinstance(result, FileTerminationConfirmed)
     assert result.pid == process.pid
     assert result.returncode == -15
+    assert process.calls == [2.0]
+
+
+def test_file_stop_lease_captures_exact_debuggee_pid() -> None:
+    process = FakeOwnedProcess()
+
+    lease = FileTargetProcessLease(TARGET, process)
+
+    assert lease.expected_target == TARGET
+    assert lease.process is process
+    assert lease.pid == 1234
+
+
+def test_file_stop_lease_rejects_missing_owned_debuggee() -> None:
+    with pytest.raises(TypeError, match="owned file debuggee"):
+        FileTargetProcessLease(TARGET, None)
+
+
+def test_unknown_file_stop_retry_only_checks_process_exit() -> None:
+    process = FakeOwnedProcess(exit_on_close=False)
+    first = terminate_file_target(process, TARGET, grace_s=2)
+    assert isinstance(first, FileTerminationUnknown)
+
+    process.process.returncode = -15
+    second = terminate_file_target(
+        process, TARGET, grace_s=2, request_termination=False,
+    )
+
+    assert isinstance(second, FileTerminationConfirmed)
     assert process.calls == [2.0]
 
 

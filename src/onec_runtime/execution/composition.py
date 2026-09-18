@@ -20,6 +20,7 @@ from onec_runtime.execution.main import MainExecutor
 from onec_runtime.execution.main import MainOperation
 from onec_runtime.execution.pipeline import CellExecutionPipeline
 from onec_runtime.execution.snapshot_binding import RoutePreparationSnapshot
+from onec_runtime.execution.termination import FileTargetProcessLease
 from onec_runtime.execution.worker import WorkerActivationPort
 from onec_runtime.execution.worker_activation import WorkerUniverseActivationAdapter
 from onec_runtime.execution.worker_breakpoint_workspace import WorkerBreakpointWorkspace
@@ -69,13 +70,15 @@ def build_execution_core(
     breakpoint_routes: RouteBreakpointWorkspace | None = None,
     initial_target_id: TargetId | None = None,
     parser_target: PythonParserTarget | None = None,
+    file_target_lease: FileTargetProcessLease | None = None,
 ) -> ExecutionCore:
     """Bind MAIN and CAPTURE to one RDBG worker after bootstrap has stopped."""
 
     parser = parser_target or PythonParserTarget.from_generated()
     registry = BreakpointRegistry(service_location, capture_locations)
     arbiter = RdbgArbiter(
-        session, RouteToken(f"runtime-{runtime_generation}-{uuid4().hex}", 1, 0, "main")
+        session, RouteToken(f"runtime-{runtime_generation}-{uuid4().hex}", 1, 0, "main"),
+        file_target_lease=file_target_lease,
     )
     try:
         controller = ExecutionController(

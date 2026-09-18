@@ -13,6 +13,7 @@ from onec_runtime.execution.post_bootstrap import (
     compose_fresh_post_bootstrap_execution, compose_post_bootstrap_execution,
 )
 from onec_runtime.execution.settlement import RouteSettlementService
+from onec_runtime.execution.termination import FileTargetProcessLease
 from onec_runtime.execution.worker_activation import WorkerActivationSnapshot
 from onec_runtime.execution.worker_activation import WorkerMaterializationSnapshot
 from onec_runtime.execution.value_materialization_router import ValueMaterializationRouter
@@ -337,6 +338,78 @@ def test_fresh_post_bootstrap_rejects_a_different_stopped_target() -> None:
             session, KERNEL,
             runtime_generation=7,
             stopped_target=foreign,
+            capture_locations=(),
+            notebook_builder=lambda *_args, **_kwargs: None,
+        )
+
+
+def test_fresh_file_composition_requires_and_forwards_exact_debuggee_lease() -> None:
+    session = CompleteSession()
+    session.target = DebugTarget(TARGET, "ServerEmulation", "stopped", 1)
+
+    class Process:
+        pid = 1234
+
+    class OwnedDebuggee:
+        pid = 1234
+        process = Process()
+
+        def close(self, timeout_s):
+            raise AssertionError("composition must not stop the debuggee")
+
+    lease = FileTargetProcessLease(TARGET, OwnedDebuggee())
+    with pytest.raises(ProtocolError, match="file debuggee lease"):
+        compose_fresh_post_bootstrap_execution(
+            session, KERNEL,
+            runtime_generation=7,
+            stopped_target=session.target,
+            capture_locations=(),
+            notebook_builder=lambda *_args, **_kwargs: None,
+        )
+
+    composed = compose_fresh_post_bootstrap_execution(
+        session, KERNEL,
+        runtime_generation=7,
+        stopped_target=session.target,
+        capture_locations=(),
+        notebook_builder=lambda *_args, **_kwargs: None,
+        file_target_lease=lease,
+    )
+    try:
+        assert composed.execution.core.arbiter._file_target_lease is lease
+    finally:
+        composed.execution.facade.close()
+
+
+def test_fresh_file_composition_rejects_foreign_debuggee_lease() -> None:
+    session = CompleteSession()
+    session.target = DebugTarget(TARGET, "ServerEmulation", "stopped", 1)
+    foreign = type(TARGET)(TARGET.id, "another-target")
+
+    class OwnedDebuggee:
+        pid = 1234
+
+    with pytest.raises(ProtocolError, match="exact stopped file target"):
+        compose_fresh_post_bootstrap_execution(
+            session, KERNEL,
+            runtime_generation=7,
+            stopped_target=session.target,
+            capture_locations=(),
+            notebook_builder=lambda *_args, **_kwargs: None,
+            file_target_lease=FileTargetProcessLease(foreign, OwnedDebuggee()),
+        )
+
+
+def test_fresh_file_composition_rejects_mismatched_selected_target_type() -> None:
+    session = CompleteSession()
+    session.target = DebugTarget(TARGET, "Server", "stopped", 1)
+    file_target = DebugTarget(TARGET, "ServerEmulation", "stopped", 1)
+
+    with pytest.raises(ProtocolError, match="exact stopped target"):
+        compose_fresh_post_bootstrap_execution(
+            session, KERNEL,
+            runtime_generation=7,
+            stopped_target=file_target,
             capture_locations=(),
             notebook_builder=lambda *_args, **_kwargs: None,
         )
