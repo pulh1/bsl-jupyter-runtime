@@ -215,6 +215,7 @@ class CaptureManagerMetadataService:
             existing = self._by_path.get(path)
         if existing is not None:
             self._remaining(deadline)
+            self._require_same_scope(scope)
             return self._manager_result(existing)
         confirmed = self._wait(
             self._controller.submit_capture_manager_metadata(plan), deadline,

@@ -1983,7 +1983,7 @@ class ExecutionController:
             assert route is not None and ledger is not None
             receipt_id = f"manager-metadata-{uuid4().hex}"
 
-            def worker_plan(port: SessionPort) -> ReadyForPolicy:
+            def worker_plan(port: SessionPort) -> ReadyForPolicy | ConfirmedFailure:
                 with self._lock:
                     if (
                         self._capture_evaluation_ledger is not ledger
@@ -2004,7 +2004,15 @@ class ExecutionController:
                     self._restore_capture_workspace(port)
                 except BaseException as error:
                     raise CaptureOperationRepairRequired("workspace_restore") from error
-                return ReadyForPolicy(metadata_plan.decode(result))
+                try:
+                    decoded = metadata_plan.decode(result)
+                except Exception as error:
+                    # Decode is local and runs after the helper and workspace
+                    # restore are confirmed. Retire the ledger before the
+                    # ticket publishes this failure to its initiating waiter.
+                    ledger.fail(receipt_id, "CAPTURE manager metadata helper failed")
+                    return ConfirmedFailure(error)
+                return ReadyForPolicy(decoded)
 
             def publish(value: object) -> object:
                 ledger.complete(receipt_id)

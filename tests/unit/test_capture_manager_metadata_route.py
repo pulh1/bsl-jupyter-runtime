@@ -1,6 +1,6 @@
 """Manager origin and temporary-table schema stay on one CAPTURE arbiter."""
 
-from threading import current_thread
+from threading import Event, current_thread
 from types import SimpleNamespace
 from uuid import UUID
 
@@ -236,6 +236,36 @@ def test_malformed_private_probe_and_ambiguous_schema_fail_closed() -> None:
         arbiter.close(timeout=3)
 
 
+def test_confirmed_bad_probe_releases_ledger_before_observer_runs(monkeypatch) -> None:
+    import onec_runtime.execution.controller.controller as controller_module
+
+    session, arbiter, _controller, service = _bound()
+    observer_entered = Event()
+    release_observer = Event()
+    original_observer = controller_module._observe_capture_ticket
+
+    def delayed_observer(ticket, ledger, receipt_id):
+        observer_entered.set()
+        release_observer.wait(3)
+        original_observer(ticket, ledger, receipt_id)
+
+    monkeypatch.setattr(controller_module, "_observe_capture_ticket", delayed_observer)
+    try:
+        session.manager_proof = "malformed"
+        with pytest.raises(ProtocolError):
+            service.resolve_manager_origin(
+                ManagerOrigin("frame", "Query", ("Manager",)),
+            )
+        assert observer_entered.wait(3)
+        session.manager_proof = True
+        assert service.resolve_manager_origin(
+            ManagerOrigin("frame", "Query", ("Manager",)),
+        )["handle"].startswith("capture_manager_")
+    finally:
+        release_observer.set()
+        arbiter.close(timeout=3)
+
+
 def test_manager_and_metadata_handles_fail_after_scope_invalidation() -> None:
     session, arbiter, controller, service = _bound()
     try:
@@ -250,6 +280,26 @@ def test_manager_and_metadata_handles_fail_after_scope_invalidation() -> None:
         with pytest.raises((ProtocolError, StaleCaptureError)):
             service.validate_value_reference(table)
         assert session.metadata_calls[-1][0] == "schema"
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_cached_manager_alias_rechecks_stop_before_return() -> None:
+    session, arbiter, controller, service = _bound()
+    try:
+        first = service.resolve_manager_origin(ManagerOrigin("frame", "Query", ("Manager",)))
+        ticks = [0]
+
+        def clock() -> float:
+            ticks[0] += 1
+            if ticks[0] == 2:
+                controller.invalidate_capture_inspection()
+            return float(ticks[0])
+
+        service._clock = clock
+        with pytest.raises(StaleCaptureError):
+            service.resolve_manager_origin(ManagerOrigin("frame", "query", ("manager",)))
+        assert first["handle"].startswith("capture_manager_")
     finally:
         arbiter.close(timeout=3)
 
