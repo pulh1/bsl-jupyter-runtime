@@ -739,9 +739,21 @@ class RuntimeSession:
             return
         lost_debug_ui = False
         lost_owned_process = False
+        heartbeat_ticket: object | None = None
         try:
             if not self._closed:
-                if not self.runtime_api.owns_debug_ui_stream():
+                schedule_heartbeat = getattr(
+                    self.runtime_api, "try_heartbeat_ticket", None
+                )
+                if callable(schedule_heartbeat):
+                    try:
+                        heartbeat_ticket = schedule_heartbeat()
+                    except RdbgDebugUiNotRegistered:
+                        lost_debug_ui = True
+                    except Exception:
+                        # The owning arbiter surfaces operational failures.
+                        pass
+                elif not self.runtime_api.owns_debug_ui_stream():
                     try:
                         self._rdbg.heartbeat()
                     except RdbgDebugUiNotRegistered:
@@ -762,6 +774,14 @@ class RuntimeSession:
                         pass
         finally:
             self._operation_lock.release()
+        if heartbeat_ticket is not None:
+            try:
+                heartbeat_ticket.wait_settled()
+            except RdbgDebugUiNotRegistered:
+                lost_debug_ui = True
+            except Exception:
+                # A transient keepalive failure cannot terminate the runtime.
+                pass
         if lost_debug_ui or lost_owned_process:
             try:
                 self.close()
@@ -1344,9 +1364,15 @@ class RuntimeSession:
                 )
             bind = getattr(
                 self.runtime_api,
-                "capture_session_caller_handoff",
+                "execution_caller_handoff",
                 None,
             )
+            if not callable(bind):
+                bind = getattr(
+                    self.runtime_api,
+                    "capture_session_caller_handoff",
+                    None,
+                )
             if not callable(bind):
                 return self.runtime_api.execute_bsl(source, **arguments)  # type: ignore[arg-type]
             with bind(self._release_operation_lock_for_capture_wait):
