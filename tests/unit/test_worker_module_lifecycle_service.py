@@ -143,6 +143,16 @@ def _bound(*, breakpoints=False, changed=None):
     return unit, session, arbiter, publisher, service
 
 
+def test_lifecycle_exposes_exact_arbiter_owner_read_only() -> None:
+    _, _, arbiter, _, service = _bound()
+    try:
+        assert service.arbiter is arbiter
+        with pytest.raises(AttributeError):
+            service.arbiter = object()
+    finally:
+        arbiter.close(timeout=3)
+
+
 def test_load_confirms_units_on_one_arbiter_worker_and_release_is_serialized() -> None:
     unit, session, arbiter, publisher, service = _bound()
     try:

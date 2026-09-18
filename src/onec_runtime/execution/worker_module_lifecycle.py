@@ -153,6 +153,11 @@ class WorkerModuleLifecycleService:
         self._revision = 0
         self._api_owned_handle: WorkerGenerationHandle | None = None
 
+    @property
+    def arbiter(self) -> RdbgArbiter:
+        """The sole RDBG owner used for this service's route tickets."""
+        return self._arbiter
+
     def load_worker_modules(
         self,
         units: tuple[WorkerModuleUnit, ...],
