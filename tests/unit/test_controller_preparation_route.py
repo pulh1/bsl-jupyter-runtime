@@ -5,11 +5,12 @@ from threading import Event, Thread, get_ident
 from uuid import UUID
 
 import pytest
+from arbiter_test_cleanup import confirm_test_server_terminated
 
 from onec_runtime.bsl.parser_target import PythonParserTarget
 from onec_runtime.bsl.source_maps import SourceUnitKind, SourceUnitRef, source_sha256
 from onec_runtime.execution.arbiter import (
-    CancelledBeforeEffect, OutcomeUnknown, RdbgArbiter, ReadyForPolicy,
+    ArbiterBusy, CancelledBeforeEffect, OutcomeUnknown, RdbgArbiter, ReadyForPolicy,
     RouteToken, Settlement, WaiterDetached,
 )
 from onec_runtime.errors import EvaluationDispatchUnknown
@@ -448,13 +449,9 @@ def test_capture_policy_reconciles_pending_eval_then_restores_workspace_once() -
         assert scope.published
     finally:
         if 'ticket' in locals() and ticket.status().phase == 'unknown':
-            from onec_runtime.execution.termination import FileTerminationConfirmed
-            arbiter.retire_terminated_target(
-                ticket, arbiter.current_route,
-                FileTerminationConfirmed(
-                    (ticket.status().pending_capability or session.target).target_id,
-                    1234, -15,
-                ),
+            confirm_test_server_terminated(
+                arbiter, ticket, arbiter.current_route, session,
+                (ticket.status().pending_capability or session.target).target_id,
             )
         arbiter.close(timeout=3)
 
@@ -585,7 +582,7 @@ def test_main_policy_and_message_key_survive_capture_until_resumed_completion(
         assert all(record is services.record for record, _payload in services.publications)
         assert all(payload is prepared.payload for _record, payload in services.publications)
         assert session.message_reads == [
-            'RuntimeKernelServer.ЗабратьСообщенияЯчейкиИзКонтекста(Контекст, "__main_messages_1")'
+            'RuntimeKernelServer.ЗабратьСообщенияЯчейкиИзКонтекста(e1cRuntimeКонтекст, "__main_messages_1")'
         ]
     finally:
         arbiter.close(timeout=3)
@@ -635,7 +632,7 @@ def test_main_completion_reads_prepared_message_key_without_capture() -> None:
         completed = accepted.ticket.wait_settled(3)
         assert completed.completion.messages == ("initial completion",)
         assert session.message_reads == [
-            'RuntimeKernelServer.ЗабратьСообщенияЯчейкиИзКонтекста(Контекст, "__initial_messages")'
+            'RuntimeKernelServer.ЗабратьСообщенияЯчейкиИзКонтекста(e1cRuntimeКонтекст, "__initial_messages")'
         ]
     finally:
         arbiter.close(timeout=3)
@@ -1055,6 +1052,48 @@ def test_preparation_waits_for_queued_main_before_choosing_capture_route() -> No
         arbiter.close(timeout=3)
 
 
+def test_preparation_waits_for_dependent_value_cleanup_after_reply() -> None:
+    cleanup_entered = Event()
+    release_cleanup = Event()
+    finished = Event()
+    observed = []
+    owner = object()
+    controller, arbiter, _session, _parser = _runtime(
+        lambda: RoutePreparationSnapshot(owner, 1, (), ())
+    )
+
+    def cleanup_plan(_port):
+        cleanup_entered.set()
+        assert release_cleanup.wait(3)
+        return Settlement(None)
+
+    def parent_plan(port):
+        port.register_post_settlement_cleanup(cleanup_plan)
+        return Settlement(None)
+
+    def await_route():
+        try:
+            observed.append(controller.await_preparation_context())
+        finally:
+            finished.set()
+
+    parent = arbiter.submit(arbiter.current_route, parent_plan)
+    arbiter.dispatch(parent)
+    waiter = Thread(target=await_route)
+    try:
+        parent.wait_settled(3)
+        assert cleanup_entered.wait(3)
+        waiter.start()
+        assert not finished.wait(0.1)
+        release_cleanup.set()
+        assert finished.wait(3)
+        assert isinstance(observed[0].policy, MainCellPolicy)
+    finally:
+        release_cleanup.set()
+        waiter.join(3) if waiter.ident is not None else None
+        arbiter.close(timeout=3)
+
+
 def test_preparation_waits_for_resumed_main_completion() -> None:
     entered = Event()
     release = Event()
@@ -1212,6 +1251,77 @@ def test_worker_intent_activates_after_ticket_admission_and_releases_on_its_rout
         arbiter.close(timeout=3)
 
 
+def test_main_worker_definition_prebuilds_exact_provenance_before_admission() -> None:
+    from onec_runtime.execution.provenance import PreparedExecutionProvenanceReader
+    from onec_runtime.execution.worker_activation import PrebuiltWorkerIntent
+    from onec_runtime.server_worker import WorkerArtifact, WorkerSourceProvenance
+
+    source = (
+        "Функция УвеличитьНаПроцент(Значение)\n"
+        "    Возврат Значение * (1 + ПроцентПовышения / 100);\n"
+        "КонецФункции"
+    )
+    compiled_hash = source_sha256("compiled worker")
+    map_hash = source_sha256("worker source map")
+    build_calls: list[object] = []
+    activations: list[object] = []
+    prebuild_owner = object()
+
+    class Lease:
+        def release(self, *, port) -> None:
+            pass
+
+        def retain_outcome_unknown(self, *, port) -> None:
+            raise AssertionError("Worker activation unexpectedly became unknown")
+
+    class Activation:
+        def pin_active(self, *, port):
+            return None
+
+        def prebuild(self, intent):
+            build_calls.append(intent)
+            artifact = WorkerArtifact(
+                "Worker", compiled_hash, source_sha256("worker binary"),
+                intent.exports,
+                WorkerSourceProvenance(compiled_hash, map_hash),
+            )
+            return PrebuiltWorkerIntent(
+                prebuild_owner, intent, intent.method_set_candidate, artifact, 0,
+            )
+
+        def activate(self, intent, *, port):
+            activations.append(intent)
+            return Lease()
+
+    owner = object()
+    controller, arbiter, _session, parser = _runtime(
+        lambda: RoutePreparationSnapshot(owner, 1, ("ПроцентПовышения",), ()),
+        worker_activation=Activation(),
+    )
+    try:
+        context = controller.await_preparation_context()
+        snapshots = context.capabilities.for_pipeline()
+        prepared = context.policy.prepare(_common(source, parser), snapshots, context)
+        assert isinstance(prepared, PreparedCell)
+        provenance = PreparedExecutionProvenanceReader()(prepared)
+        assert provenance.visible_source_sha256 == source_sha256(source)
+        assert provenance.executed_source_sha256 == compiled_hash
+        assert provenance.source_map_sha256 == map_hash
+        assert provenance.mode == "main"
+        assert len(build_calls) == 1
+        assert arbiter.active_ticket is None
+
+        accepted = controller.submit_cell(
+            context, prepared, snapshots.guards, SubmissionReceipt(),
+        )
+        assert isinstance(accepted, Accepted)
+        assert accepted.ticket.wait_settled(3) is None
+        assert activations == [prepared.payload.worker_intent]
+        assert len(build_calls) == 1
+    finally:
+        arbiter.close(timeout=3)
+
+
 def test_worker_activation_unknown_stays_on_accepted_ticket_without_user_bsl() -> None:
     """An ambiguous activation is an owned ticket outcome, never a rejection."""
 
@@ -1320,11 +1430,14 @@ def test_confirmed_main_completion_survives_worker_pin_release_failure() -> None
     """The completed MAIN command is publishable before Worker cleanup debt."""
 
     released = Event()
+    release_attempts = [0]
 
     class Lease:
         def release(self, *, port) -> None:
+            release_attempts[0] += 1
             released.set()
-            raise ValueError("Worker pin release was rejected")
+            if release_attempts[0] == 1:
+                raise ValueError("Worker pin release was rejected")
 
         def retain_outcome_unknown(self, *, port) -> None:
             raise AssertionError("The release failure was confirmed")
@@ -1358,6 +1471,15 @@ def test_confirmed_main_completion_survives_worker_pin_release_failure() -> None
         assert cleanup is not None
         with pytest.raises(ValueError, match="Worker pin release was rejected"):
             cleanup.wait_settled(3)
+        assert controller.main_operation.phase is MainPhase.COMPLETED
+        with pytest.raises(ArbiterBusy, match="Confirmed cleanup debt requires retry"):
+            arbiter.close(timeout=3)
+        assert accepted.ticket.wait_settled(0) is completed
+
+        retry = arbiter.retry_post_settlement_cleanup(accepted.ticket)
+        assert retry.wait_settled(3) is None
+        assert release_attempts == [2]
+        assert accepted.ticket.wait_settled(0) is completed
         assert controller.main_operation.phase is MainPhase.COMPLETED
     finally:
         arbiter.close(timeout=3)
@@ -1417,7 +1539,7 @@ def test_worker_main_dispatch_unknown_retains_moved_operation_lease() -> None:
                                  on_transport_dispatch=on_transport_dispatch)
 
     owner = object()
-    controller, arbiter, _session, parser = _runtime(
+    controller, arbiter, session, parser = _runtime(
         lambda: RoutePreparationSnapshot(owner, 1, (), ()),
         session=UnknownInstructionSession(), worker_activation=Activation(),
     )
@@ -1436,10 +1558,8 @@ def test_worker_main_dispatch_unknown_retains_moved_operation_lease() -> None:
         assert controller.main_operation.phase is MainPhase.UNKNOWN
         assert [event[0] for event in events] == ["activate", "retain"]
 
-        from onec_runtime.execution.termination import FileTerminationConfirmed
-        arbiter.retire_terminated_target(
-            accepted.ticket, arbiter.current_route,
-            FileTerminationConfirmed(TARGET, 1, -15),
+        confirm_test_server_terminated(
+            arbiter, accepted.ticket, arbiter.current_route, session, TARGET,
         )
     finally:
         arbiter.close(timeout=3)
@@ -1653,7 +1773,7 @@ def test_existing_worker_capture_pin_survives_unknown_eval_until_reconciliation(
             raise AssertionError("No Worker publication is expected")
 
     owner = object()
-    controller, arbiter, _session, _parser = _runtime(
+    controller, arbiter, session, _parser = _runtime(
         lambda: RoutePreparationSnapshot(owner, 1, (), ()),
         session=AmbiguousCaptureSession(), worker_activation=ActiveWorker(),
     )
@@ -1671,11 +1791,8 @@ def test_existing_worker_capture_pin_survives_unknown_eval_until_reconciliation(
         assert events == [("pin", 1), ("pin", 2), ("release", 2)]
     finally:
         if 'ticket' in locals() and ticket.status().phase == 'unknown':
-            from onec_runtime.execution.termination import FileTerminationConfirmed
-
-            arbiter.retire_terminated_target(
-                ticket, arbiter.current_route,
-                FileTerminationConfirmed(TARGET, 1234, -15),
+            confirm_test_server_terminated(
+                arbiter, ticket, arbiter.current_route, session, TARGET,
             )
         arbiter.close(timeout=3)
 

@@ -289,7 +289,7 @@ class ScriptedSession:
             return LocalVariablesResult(
                 uuid4(),
                 (
-                    FrameVariable("Контекст", "Структура", "Структура"),
+                    FrameVariable("e1cRuntimeКонтекст", "Структура", "Структура"),
                     FrameVariable("ТекущаяИнструкция", "Строка", '""'),
                     FrameVariable("ИдентификаторКоманды", "Число", "1"),
                 ),
@@ -353,7 +353,7 @@ class ScriptedSession:
         if expression.endswith(".__onec_cell_messages_result_key"):
             suffix = "1" if self.messages_in_result_slot else "0"
             return evaluation("Строка", f'"__onec_cell_messages_1_1_{suffix}"')
-        if expression.startswith("Контекст.Свойство("):
+        if expression.startswith("e1cRuntimeКонтекст.Свойство("):
             is_result_slot = "Результат" in expression
             exists = bool(self.message_values) and is_result_slot == self.messages_in_result_slot
             return evaluation("Булево", "Истина" if exists else "Ложь")
@@ -363,7 +363,7 @@ class ScriptedSession:
             index = int(expression.rsplit("[", 1)[1][:-1])
             value = self.message_values[index].replace('"', '""')
             return evaluation("Строка", f'"{value}"')
-        if expression.startswith("Контекст.Удалить("):
+        if expression.startswith("e1cRuntimeКонтекст.Удалить("):
             self.message_values.clear()
             return evaluation("Неопределено", "Неопределено")
         if expression == "ЗавершеннаяКоманда":
@@ -558,7 +558,7 @@ def test_message_wrapper_maps_user_body_and_marks_scaffolding_synthetic() -> Non
     assert mapped_finalize.synthetic_region == "message_collector_finalize"
     assert mapped_finalize.anchor_unit is not None
     for marker, region in (
-        ('Контекст.Вставить("__messages"', "message_collector_initialize"),
+        ('e1cRuntimeКонтекст.Вставить("__messages"', "message_collector_initialize"),
         ("Попытка", "message_collector_try"),
         ("Исключение", "message_collector_exception"),
         ("ВызватьИсключение", "message_collector_rethrow"),
@@ -581,7 +581,7 @@ def test_worker_message_wrapper_restores_previous_sink_on_success_and_failure() 
 
     attach = (
         '__OnecPinnedWorkerGenerationMessageObject.__OnecWorkerMessageSink = '
-        'Контекст.__messages;'
+        'e1cRuntimeКонтекст.__messages;'
     )
     restore = (
         '__OnecPinnedWorkerGenerationMessageObject.__OnecWorkerMessageSink = '
@@ -779,7 +779,7 @@ def test_normalizer_failure_keeps_capture_failure_private_and_paused(
 
     failed = api.execute_bsl(
         'Сообщить("before capture failure");\n'
-        "КонтекстОтладки.Скаляр = 778;\n"
+        "e1cRuntimeКонтекстОтладки.Скаляр = 778;\n"
         "РезультатИнструкции = 1 / 0;"
     )
 
@@ -812,7 +812,7 @@ def test_failed_capture_retains_dirty_root_for_reply_and_resume_writeback() -> N
 
     failed = api.execute_bsl(
         "НовоеИмя = 1;\n"
-        "КонтекстОтладки.Скаляр = 778;\n"
+        "e1cRuntimeКонтекстОтладки.Скаляр = 778;\n"
         "РезультатИнструкции = 1 / 0;"
     )
 
@@ -922,7 +922,7 @@ def test_ready_completion_inspection_does_not_start_or_mutate_main_lifecycle() -
     api._namespace_names = ("Данные",)
     before = _completion_lifecycle_snapshot(controller, session)
 
-    assert api.completion_fields("Контекст.Данные") == ("Номер", "Название")
+    assert api.completion_fields("e1cRuntimeКонтекст.Данные") == ("Номер", "Название")
 
     assert _completion_lifecycle_snapshot(controller, session) == before
     inspections = [
@@ -968,7 +968,7 @@ def test_ready_completion_stop_resumes_and_drains_the_real_rdbg_capability(
         controller.breakpoint_workspace_owner.confirmed_snapshot.effective_locations,
     )
 
-    assert api.completion_fields("Контекст.Данные") == ("Номер", "Название")
+    assert api.completion_fields("e1cRuntimeКонтекст.Данные") == ("Номер", "Название")
 
     assert (
         controller.operation_id,
@@ -1008,7 +1008,7 @@ def test_ready_completion_timeout_retains_a_real_rdbg_owner_until_late_result(
     api._namespace_names = ("Данные",)
 
     with pytest.raises(CaptureEvaluationPendingError) as pending:
-        api.completion_fields("Контекст.Данные", timeout_s=0.025)
+        api.completion_fields("e1cRuntimeКонтекст.Данные", timeout_s=0.025)
 
     assert pending.value.evaluation_kind is CaptureEvaluationKind.INSPECTION
     assert pending.value.evaluation_id != str(first_id)
@@ -1020,7 +1020,7 @@ def test_ready_completion_timeout_retains_a_real_rdbg_owner_until_late_result(
     assert owner is not None and owner._active is not None
     assert owner._active.initiator_attached is False
     with pytest.raises(ProtocolError):
-        api.completion_fields("Контекст.Данные", timeout_s=0.025)
+        api.completion_fields("e1cRuntimeКонтекст.Данные", timeout_s=0.025)
     with pytest.raises(ProtocolError):
         controller.execute_system_main("Результат = 1;")
     assert transport.calls.count("evalExpr") == 1
@@ -1033,7 +1033,7 @@ def test_ready_completion_timeout_retains_a_real_rdbg_owner_until_late_result(
     assert controller.state is state.COMPLETED
     assert not session._pending_evaluation_states
     transport.enqueue("evalExpr", _completion_result_payload(second_id, completion_wire))
-    assert api.completion_fields("Контекст.Данные") == ("Номер", "Название")
+    assert api.completion_fields("e1cRuntimeКонтекст.Данные") == ("Номер", "Название")
     assert transport.calls.count("evalExpr") == 2
 
 
@@ -1098,7 +1098,7 @@ def test_ready_inspection_pending_owner_is_closed_through_runtime_api(
     api._namespace_names = ("Данные",)
 
     with pytest.raises(CaptureEvaluationPendingError):
-        api.completion_fields("Контекст.Данные", timeout_s=0.025)
+        api.completion_fields("e1cRuntimeКонтекст.Данные", timeout_s=0.025)
 
     assert api._close_capture_control_plane() is True
     assert session.target is None
@@ -1126,7 +1126,7 @@ def test_ready_completion_bsl_failure_does_not_mutate_main_lifecycle() -> None:
     before = _completion_lifecycle_snapshot(controller, session)
 
     with pytest.raises(BslExecutionError):
-        api.completion_fields("Контекст.Данные")
+        api.completion_fields("e1cRuntimeКонтекст.Данные")
 
     assert _completion_lifecycle_snapshot(controller, session) == before
 
@@ -1281,7 +1281,7 @@ def test_business_frame_forging_kernel_locals_is_not_selected_before_real_kernel
                 return LocalVariablesResult(
                     uuid4(),
                     (
-                        FrameVariable("Контекст", "Структура", "Структура"),
+                        FrameVariable("e1cRuntimeКонтекст", "Структура", "Структура"),
                         FrameVariable("ТекущаяИнструкция", "Строка", '\"\"'),
                         FrameVariable("ИдентификаторКоманды", "Число", "2"),
                     ),
@@ -1433,7 +1433,7 @@ def test_raw_ping_stack_preserves_physical_kernel_level_across_unaddressable_fra
                 return LocalVariablesResult(
                     uuid4(),
                     (
-                        FrameVariable("Контекст", "Структура", "Структура"),
+                        FrameVariable("e1cRuntimeКонтекст", "Структура", "Структура"),
                         FrameVariable("ТекущаяИнструкция", "Строка", '\"\"'),
                         FrameVariable("ИдентификаторКоманды", "Число", "1"),
                     ),
@@ -1473,7 +1473,7 @@ def test_system_main_sends_verbatim_bsl_without_notebook_lowering() -> None:
         for name, value in session.calls
         if name == "modify" and value[0] == "ТекущаяИнструкция"
     )
-    assert "Контекст.Вставить" not in instruction
+    assert "e1cRuntimeКонтекст.Вставить" not in instruction
     assert "ВнешниеОбработки.Подключить" in instruction
     assert completed.result == "Worker"
     assert completed.operation.visible_source == source
@@ -1498,7 +1498,7 @@ def test_runtime_api_main_executes_worker_result_channel_once_lowered() -> None:
     assert controller.active_operation is not None
     assert controller.active_operation.visible_source == "Результат = Расчет.Ндфл.Посчитать();"
     assert controller.active_operation.lowered_source == (
-        "Результат = Контекст.RuntimeWorker.Посчитать();"
+        "Результат = e1cRuntimeКонтекст.RuntimeWorker.Посчитать();"
     )
 
 
@@ -1513,7 +1513,7 @@ def test_runtime_api_capture_executes_worker_result_channel_once_lowered() -> No
     api = PrototypeRuntimeApi(controller)
 
     reply = api.execute_bsl(
-        "КонтекстОтладки.Скаляр = 778; "
+        "e1cRuntimeКонтекстОтладки.Скаляр = 778; "
         "РезультатИнструкции = Расчет.Ндфл.Посчитать();"
     )
     resumed = api.resume_capture()
@@ -1527,10 +1527,10 @@ def test_runtime_api_capture_executes_worker_result_channel_once_lowered() -> No
         for name, value in session.calls
         if name == "evaluate" and "ВыполнитьКодВКонтекстеОтладки" in str(value)
     )
-    assert "РезультатИнструкции = Контекст.RuntimeWorker.Посчитать();" in str(
+    assert "РезультатИнструкции = e1cRuntimeКонтекст.RuntimeWorker.Посчитать();" in str(
         capture_call
     )
-    assert "Контекст.RuntimeWorker.Посчитать()" in str(capture_call)
+    assert "e1cRuntimeКонтекст.RuntimeWorker.Посчитать()" in str(capture_call)
 
 
 def test_runtime_api_prepared_capture_uses_active_worker_catalog_once_without_relowering() -> None:
@@ -1572,7 +1572,7 @@ def test_runtime_api_prepared_capture_uses_active_worker_catalog_once_without_re
         if name == "evaluate" and "ВыполнитьКодВКонтекстеОтладки" in str(value)
     ]
     assert len(capture_calls) == 1
-    assert "Контекст.RuntimeWorker.Посчитать()" in str(capture_calls[0])
+    assert "e1cRuntimeКонтекст.RuntimeWorker.Посчитать()" in str(capture_calls[0])
     with pytest.raises(ProtocolError, match="consumed"):
         api.execute_prepared_capture_hypothesis(prepared)
     assert controller.cell_sequence == 1
@@ -1622,7 +1622,7 @@ def test_failed_prepared_capture_retains_dirty_root_for_resume_writeback() -> No
     api = PrototypeRuntimeApi(controller)
     prepared = api.prepare_capture_hypothesis(
         "НовоеИмя = 1;\n"
-        "КонтекстОтладки.Скаляр = 778;\n"
+        "e1cRuntimeКонтекстОтладки.Скаляр = 778;\n"
         "РезультатИнструкции = 1 / 0;"
     )
 
@@ -1842,7 +1842,7 @@ def test_production_manager_origin_proves_full_frame_chain_and_casefolds_aliases
     assert stack_level == 0
     assert 0 < timeout_s <= 1.5
     assert controller._capture_manager_paths[first["handle"]] == (
-        "Контекст.КонтекстОтладки.Результат.Запрос.Вложенный."
+        "e1cRuntimeКонтекст.e1cRuntimeКонтекстОтладки.Результат.Запрос.Вложенный."
         "МенеджерВременныхТаблиц"
     )
 
@@ -1984,7 +1984,7 @@ def test_capture_hypothesis_preflight_and_replay_use_the_active_runtime_worker_c
         "runtime-worker", AgentRuntimeSession(session), mode=CapabilityMode.EXPERIMENT
     )
     source = (
-        "КонтекстОтладки.Сумма = 3; "
+        "e1cRuntimeКонтекстОтладки.Сумма = 3; "
         "РезультатИнструкции = Расчет.Ндфл.Посчитать();"
     )
     digest = sha256(source.encode()).hexdigest()
@@ -2062,7 +2062,7 @@ def test_capture_hypothesis_preflight_and_replay_use_the_active_runtime_worker_c
         ]
         assert len(capture_calls) == 1
         assert str(capture_calls[0]).count(
-            "Контекст.RuntimeWorker.Посчитать()"
+            "e1cRuntimeКонтекст.RuntimeWorker.Посчитать()"
         ) == 1
     finally:
         if replacement is not None:
@@ -2316,16 +2316,16 @@ def test_notebook_message_cell_uses_isolated_collector_and_returns_messages() ->
     completed = controller.execute_main('Сообщить("первое"); Сообщить("второе");')
 
     instruction = completed.operation.lowered_source
-    assert 'Контекст.Вставить("__onec_cell_messages_1_1_0", Новый Массив);' in instruction
-    assert "Контекст.__onec_cell_messages_1_1_0.Добавить(Строка(" in instruction
+    assert 'e1cRuntimeКонтекст.Вставить("__onec_cell_messages_1_1_0", Новый Массив);' in instruction
+    assert "e1cRuntimeКонтекст.__onec_cell_messages_1_1_0.Добавить(Строка(" in instruction
     assert "Исключение" in instruction
     assert instruction.count(
-        'Контекст.Вставить("__onec_cell_messages_result_key"'
+        'e1cRuntimeКонтекст.Вставить("__onec_cell_messages_result_key"'
     ) == 2
     assert completed.result == 42
     assert completed.messages == expected_messages
     assert not any(
-        name == "evaluate" and str(value).startswith("Контекст.Удалить(")
+        name == "evaluate" and str(value).startswith("e1cRuntimeКонтекст.Удалить(")
         for name, value in session.calls
     )
 
@@ -2403,7 +2403,7 @@ def test_system_capture_sends_verbatim_bsl_without_notebook_lowering() -> None:
     )
     controller = captured_controller(session)
     context_names_before = controller.lowerer.context_names
-    source = "Результат = Контекст.RuntimeWorker.Версия();"
+    source = "Результат = e1cRuntimeКонтекст.RuntimeWorker.Версия();"
 
     cell = controller.execute_system_capture(
         source,
@@ -2417,7 +2417,7 @@ def test_system_capture_sends_verbatim_bsl_without_notebook_lowering() -> None:
         and "ВыполнитьКодВКонтекстеОтладки" in str(value)
     )
     assert source in str(capture_call)
-    assert "Контекст.Вставить" not in capture_call
+    assert "e1cRuntimeКонтекст.Вставить" not in capture_call
     assert cell.result == "v2"
     assert cell.visible_source == source
     assert cell.lowered_source == source
@@ -2454,7 +2454,7 @@ def test_rejected_notebook_main_does_not_mutate_later_capture_lowering() -> None
         if name == "evaluate"
         and "ВыполнитьКодВКонтекстеОтладки" in str(value)
     )
-    assert "Контекст.ОтклоненнаяПеременная" not in str(capture_call)
+    assert "e1cRuntimeКонтекст.ОтклоненнаяПеременная" not in str(capture_call)
     assert "ОтклоненнаяПеременная" in str(capture_call)
 
 
@@ -3858,8 +3858,8 @@ class _OfflineHeartbeatThread:
     def __init__(self) -> None:
         self.join_calls = 0
 
-    def join(self, *, timeout: float) -> None:
-        assert timeout == 2.0
+    def join(self, timeout: float | None = None) -> None:
+        assert timeout is None
         self.join_calls += 1
 
 
@@ -3942,7 +3942,7 @@ def _offline_mcp_stack(
 
 def _offline_capture_notebook(project: Path) -> tuple[str, str]:
     main_source = "Результат = 1;"
-    capture_source = "КонтекстОтладки.Скаляр = 41;"
+    capture_source = "e1cRuntimeКонтекстОтладки.Скаляр = 41;"
     cells = []
     for cell_id, mode, source in (
         ("main-cell", "main", main_source),

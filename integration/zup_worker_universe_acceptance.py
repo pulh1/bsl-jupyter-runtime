@@ -2680,7 +2680,7 @@ def _incremental_object_probe_source(
     ):
         raise ValueError("ZUP incremental probe revision value is invalid")
     old_modules = "__OnecPinnedWorkerGeneration.Modules.Получить"
-    new_modules = "Контекст.RuntimeWorkerActiveGeneration.Modules.Получить"
+    new_modules = "e1cRuntimeКонтекст.RuntimeWorkerActiveGeneration.Modules.Получить"
     old_primary = f'{old_modules}("{_PRIMARY_MODULE}")'
     old_extended = f'{old_modules}("{_EXTENDED_MODULE}")'
     new_primary = f'{new_modules}("{_PRIMARY_MODULE}")'

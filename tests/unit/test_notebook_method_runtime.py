@@ -354,7 +354,7 @@ def test_notebook_method_reads_current_persistent_variable_across_cells(tmp_path
     assert sum('ПолучитьА()' in value[1] for value in sent) == 2
     for value in sent[-2:]:
         assert '__OnecNotebookBoundGlobals.Вставить(' in value[1]
-        assert 'Контекст.А);' in value[1]
+        assert 'e1cRuntimeКонтекст.А);' in value[1]
         assert value[1].count(
             '__OnecNotebookGlobals = __OnecNotebookPreviousGlobals;'
         ) == 2
@@ -420,7 +420,7 @@ def test_compile_invalid_worker_registration_is_not_recreated_by_value_guard(tmp
     assert set(registrations) == before
     assert len(api._worker_universe_target._registrations) > len(registrations)
     before_validation = list(target.sources)
-    assert api.validate_value_reference("Контекст.Число") == "Контекст.Число"
+    assert api.validate_value_reference("e1cRuntimeКонтекст.Число") == "e1cRuntimeКонтекст.Число"
     assert target.sources == before_validation
 
 
@@ -538,7 +538,7 @@ def test_capture_evaluation_uses_new_generation_while_original_main_pin_survives
                 if 'ВыполнитьКодТекущегоКонтекстаОтладки' in text
                 or 'ВыполнитьКодВКонтекстеОтладки' in text]
     assert g2.manifest_sha256 in executed[-1]
-    assert '__OnecPinnedWorkerGeneration = Контекст.RuntimeWorkerActiveGeneration;' in executed[-1]
+    assert '__OnecPinnedWorkerGeneration = e1cRuntimeКонтекст.RuntimeWorkerActiveGeneration;' in executed[-1]
     assert api._operation_generation_pin is original
     resumed = api.resume_capture()
     assert resumed.operation_id == stopped.operation_id and resumed.stop_sequence == 2
@@ -650,7 +650,7 @@ def test_owned_late_bsl_failure_records_dirty_roots_before_paused(tmp_path, monk
     api.execute_bsl('Результат = Б();')
     context_before = controller.lowerer.persistent_names
     prepared = api.prepare_capture_hypothesis(
-        'НовоеЗначение = 12; КонтекстОтладки.Скаляр = 778; ВызватьИсключение "synthetic failure";'
+        'НовоеЗначение = 12; e1cRuntimeКонтекстОтладки.Скаляр = 778; ВызватьИсключение "synthetic failure";'
     )
     coordinator = CaptureEvaluationCoordinator(FENCE, poll_interval_s=0.01)
     driver = Driver()
@@ -726,7 +726,7 @@ def test_owned_submit_interruption_keeps_accepted_record_owner(tmp_path, monkeyp
     api.execute_bsl(UPDATE)
     api.execute_bsl('Результат = Б();')
     context_before = controller.lowerer.persistent_names
-    prepared = api.prepare_capture_hypothesis('НовоеЗначение = 12; КонтекстОтладки.Скаляр = 778;')
+    prepared = api.prepare_capture_hypothesis('НовоеЗначение = 12; e1cRuntimeКонтекстОтладки.Скаляр = 778;')
     coordinator = CaptureEvaluationCoordinator(FENCE, poll_interval_s=.01)
     driver = Driver()
     initiating = current_thread()
@@ -882,7 +882,7 @@ def test_main_stale_or_failed_preparation_does_not_commit_an_extra_name(tmp_path
         with pytest.raises(ProtocolError, match='consumed'):
             api.activate_prepared_main_for_capture(candidate)
     else:
-        reply = api.execute_bsl(THIRD + '\nКонтекстОтладки.Значение = 1;')
+        reply = api.execute_bsl(THIRD + '\ne1cRuntimeКонтекстОтладки.Значение = 1;')
         assert not reply.succeeded
         api.execute_bsl(UPDATE)
     assert paths(api) == {'а', 'б'}
@@ -911,7 +911,7 @@ def test_owned_capture_submission_rejection_restores_prepared_namespace(tmp_path
     api.execute_bsl(UPDATE)
     api.execute_bsl('Результат = Б();')
     context_before = controller.lowerer.persistent_names
-    prepared = api.prepare_capture_hypothesis('НовоеЗначение = 12; КонтекстОтладки.Скаляр = 778;')
+    prepared = api.prepare_capture_hypothesis('НовоеЗначение = 12; e1cRuntimeКонтекстОтладки.Скаляр = 778;')
     def reject(**kwargs):
         raise error_type('rejected before record ownership')
     monkeypatch.setattr(api, '_execute_prepared_capture_handoff', lambda handoff: handoff.execute_owned(reject))

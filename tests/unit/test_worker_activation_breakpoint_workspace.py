@@ -93,6 +93,13 @@ def test_worker_activation_installs_full_workspace_before_root_swap(tmp_path) ->
     lease = adapter.activate(intent, port=port)
 
     assert lease.handle is host.active_handle
+    assert adapter.worker_exports
+    assert all(
+        export.receiver_module == "Worker" for export in adapter.worker_exports
+    )
+    RoutePreparationSnapshot(
+        owner, 2, (), adapter.worker_exports, adapter.active_methods,
+    )
     assert len(port.breakpoint_calls) == 1
     assert port.breakpoint_calls[0][:3] == (SERVICE, CAPTURE, USER)
     assert len(port.breakpoint_calls[0]) == 4
@@ -144,7 +151,7 @@ def test_prebuilt_capture_worker_reuses_exact_artifact_only_after_admission(tmp_
         target_profile="server-test",
     )
 
-    prebuilt = adapter.prebuild_for_capture(intent)
+    prebuilt = adapter.prebuild(intent)
     provenance = prebuilt.source_provenance
     assert provenance.source_sha256
     assert provenance.source_map_sha256

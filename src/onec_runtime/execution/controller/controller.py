@@ -20,6 +20,7 @@ from onec_runtime.capture import (
 from onec_runtime.capture_evaluation import (
     CaptureEvaluationKind, CaptureFailureDiagnostic, CapturePhase,
 )
+from onec_runtime.capture_values import VariableRole
 from onec_runtime.bsl.parser_target import PythonParserTarget
 from onec_runtime.errors import BslExecutionError, ProtocolError, StaleCaptureError
 from onec_runtime.execution.arbiter import (
@@ -87,7 +88,9 @@ from onec_runtime.execution.termination import (
 )
 from onec_runtime.execution.worker import (
     WorkerActivationLease, WorkerActivationPort, WorkerActivationUnknown,
+    WorkerArtifactPrebuildPort,
 )
+from onec_runtime.execution.worker_activation import PrebuiltWorkerIntent
 from onec_runtime.rdbg.models import EvaluationResult, ModuleLocation, StopEvent, TargetId
 from onec_runtime.stop_routing import BreakpointRegistry, StopReason, classify_stop
 
@@ -314,13 +317,20 @@ class ExecutionController:
             ):
                 return CapturePausedWorkerRoute(operation, scope)
             if scope is None and (operation is None or operation.terminal):
+                if self._planned_capture_ticket is not None:
+                    raise ProtocolError(
+                        "Worker MAIN helper cannot overtake an armed CAPTURE ticket"
+                    )
+                route = self._arbiter.current_route
+                if route.context_id != "main":
+                    raise ProtocolError("Worker MAIN helper requires the MAIN route")
                 target_id = (
                     operation.target
                     if operation is not None and operation.target is not None
                     else self._initial_target_id
                 )
                 if target_id is not None:
-                    return MainPausedWorkerRoute(target_id, operation)
+                    return MainPausedWorkerRoute(target_id, operation, route)
             raise ProtocolError("Worker mutation has no confirmed stopped route")
 
     def capture_evaluation_ledger(self) -> CaptureEvaluationLedger:
@@ -716,6 +726,12 @@ class ExecutionController:
                     pass
                 continue
 
+            # A value reply may settle before its private-key cleanup ticket.
+            # That ticket still owns RDBG, but it is part of the completed
+            # operation, so the next statement waits for it outside our lock.
+            if self._arbiter.wait_for_dependent_cleanup():
+                continue
+
             with self._lock:
                 operation_before = self.main_operation
                 scope_before = self.capture_scope
@@ -752,6 +768,12 @@ class ExecutionController:
                     continue
                 if self._resume_in_flight() or self._arbiter.has_pending_operations:
                     return Unavailable("RDBG operation is still active")
+                activation = self._worker_activation
+                prebuild_worker = (
+                    activation.prebuild
+                    if isinstance(activation, WorkerArtifactPrebuildPort)
+                    else None
+                )
                 if (
                     scope is not None
                     and scope.context_state is CaptureContextState.READY
@@ -764,14 +786,14 @@ class ExecutionController:
                     owner: MainOperation | CaptureScope | None = scope
                     policy = CaptureCellPolicy(SnapshotRouteBinding(
                         parser_target, owner=snapshot.owner, version=snapshot.version
-                    ))
+                    ), prebuild_worker=prebuild_worker)
                 elif scope is None and (operation is None or operation.terminal):
                     if capture_before:
                         continue
                     owner = operation
                     policy = MainCellPolicy(SnapshotRouteBinding(
                         parser_target, owner=snapshot.owner, version=snapshot.version
-                    ))
+                    ), prebuild_worker=prebuild_worker)
                 else:
                     return Unavailable("No stable MAIN or CAPTURE route is available")
                 route = self._arbiter.current_route
@@ -846,12 +868,14 @@ class ExecutionController:
             or guards.namespace_names != snapshot.namespace_names
             or guards.worker_exports != snapshot.worker_exports
             or guards.previous_methods != snapshot.previous_methods
+            or guards.active_worker_handle is not snapshot.active_worker_handle
             or not isinstance(live, RoutePreparationSnapshot)
             or live.owner is not snapshot.owner
             or live.version != snapshot.version
             or live.namespace_names != snapshot.namespace_names
             or live.worker_exports != snapshot.worker_exports
             or live.previous_methods != snapshot.previous_methods
+            or live.active_worker_handle is not snapshot.active_worker_handle
         ):
             return StalePreparation("namespace or Worker snapshot changed")
         return Current()
@@ -899,6 +923,13 @@ class ExecutionController:
             if worker_intent is not None:
                 if statement is not None:
                     return Rejected(StalePreparation("Worker payload has an eager statement"))
+                if (
+                    isinstance(context.policy, MainCellPolicy)
+                    and self._planned_capture_ticket is not None
+                ):
+                    return Rejected(Unavailable(
+                        "Worker MAIN activation cannot overtake an armed CAPTURE ticket"
+                    ))
                 activation = self._worker_activation
                 if activation is None:
                     return Rejected(Unavailable("Worker activation is not configured"))
@@ -971,7 +1002,7 @@ class ExecutionController:
         self,
         context: PreparationContext,
         payload: MainPreparedPayload | CapturePreparedPayload,
-        intent: WorkerCandidateIntent,
+        intent: WorkerCandidateIntent | PrebuiltWorkerIntent,
         source: str | None,
         *,
         receipt: SubmissionReceipt,
@@ -2020,6 +2051,8 @@ class ExecutionController:
 
     def submit_capture_variable_page(
         self, *, stack_level: int, start: int, stop: int,
+        role: VariableRole = VariableRole.VARIABLES,
+        parameter_names: tuple[str, ...] = (),
     ) -> ExecutionTicket:
         """Read a bounded page of safe variable names from the stopped frame."""
 
@@ -2044,6 +2077,8 @@ class ExecutionController:
                     stack_level=stack_level,
                     start=start,
                     stop=stop,
+                    role=role,
+                    parameter_names=parameter_names,
                     port=port,
                 )
                 return Settlement(page)
@@ -2055,6 +2090,8 @@ class ExecutionController:
 
     def submit_capture_typed_variable_page(
         self, *, stack_level: int, start: int, stop: int,
+        role: VariableRole = VariableRole.VARIABLES,
+        parameter_names: tuple[str, ...] = (),
     ) -> ExecutionTicket:
         """Read bounded typed metadata from a user frame in this CAPTURE stop."""
 
@@ -2080,6 +2117,8 @@ class ExecutionController:
                     start=start,
                     stop=stop,
                     port=port,
+                    role=role,
+                    parameter_names=parameter_names,
                 )
                 return Settlement(page)
 

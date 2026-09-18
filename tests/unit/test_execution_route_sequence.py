@@ -29,7 +29,7 @@ from onec_runtime.rdbg.models import (
 from onec_runtime.table_value import evaluation_to_python
 
 
-TARGET = TargetId(UUID(int=1), "route-test")
+TARGET = TargetId(UUID(int=1), "route-test", UUID(int=2))
 BUSINESS = ModuleLocation("ExtensionModule", "", UUID(int=20), UUID(int=30), 50, "Business")
 KERNEL = ModuleLocation("ExtensionModule", "", UUID(int=2), UUID(int=3), 60, "Runtime")
 CAPTURE_STOP = StopEvent(
@@ -84,7 +84,7 @@ class RouteSession:
         elif stack_level == 1:
             names = ()
         else:
-            names = ("Контекст", "ТекущаяИнструкция", "ИдентификаторКоманды")
+            names = ("e1cRuntimeКонтекст", "ТекущаяИнструкция", "ИдентификаторКоманды")
         return LocalVariablesResult(
             UUID(int=5), tuple(FrameVariable(name, "Строка", "") for name in names)
         )

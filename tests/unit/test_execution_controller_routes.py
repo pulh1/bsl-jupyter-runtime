@@ -8,6 +8,7 @@ from uuid import UUID
 import pytest
 
 from onec_runtime.errors import ProtocolError
+from onec_runtime.capture_values import VariableRole
 from onec_runtime.execution.arbiter import RdbgArbiter, RouteToken, Settlement
 from onec_runtime.capture_evaluation import CapturePhase
 from onec_runtime.execution.capture.cell_evaluator import CaptureCellEvaluator
@@ -85,6 +86,7 @@ class CompleteSession(RouteSession):
 
 def test_capture_variable_page_uses_owned_ticket_and_safe_names() -> None:
     from onec_runtime.execution.controller.controller import ExecutionController
+    from onec_runtime.capture_values import VariableRole
 
     session = CompleteSession()
     arbiter = RdbgArbiter(session, RouteToken("runtime-1", 1, 0, "main"))
@@ -103,6 +105,16 @@ def test_capture_variable_page_uses_owned_ticket_and_safe_names() -> None:
         ).wait_settled(3)
         assert page.names == ("Amount",)
         assert page.total == 1
+        parameter_page = controller.submit_capture_variable_page(
+            stack_level=0, start=0, stop=1,
+            role=VariableRole.PARAMETERS, parameter_names=("Amount",),
+        ).wait_settled(3)
+        assert parameter_page.names == ("Amount",)
+        local_page = controller.submit_capture_variable_page(
+            stack_level=0, start=0, stop=1,
+            role=VariableRole.LOCALS, parameter_names=("Amount",),
+        ).wait_settled(3)
+        assert local_page.names == () and local_page.total == 0
         assert {thread for _, thread in session.calls} == {arbiter._worker}
     finally:
         arbiter.close(timeout=3)
@@ -139,6 +151,7 @@ def test_capture_typed_variable_page_uses_current_capture_route_for_nonroot_fram
         controller.submit_main("Результат = 1;").wait_settled(3)
         page = controller.submit_capture_typed_variable_page(
             stack_level=1, start=0, stop=1,
+            role=VariableRole.PARAMETERS, parameter_names=("NestedAmount",),
         ).wait_settled(3)
         assert len(page.variables) == 1
         assert (
@@ -821,7 +834,7 @@ def test_capture_materialization_uses_current_scope_and_one_rdbg_owner() -> None
                 self.pending = None
                 if "ЗабратьКомпактнуюМатериализацию" in expression:
                     return EvaluationResult(pending.result_id, "Строка", '"YQ=="', False)
-                if "Контекст.Удалить" in expression:
+                if "e1cRuntimeКонтекст.Удалить" in expression:
                     return EvaluationResult(pending.result_id, "Булево", "Истина", False)
                 return EvaluationResult(pending.result_id, "Строка", envelope.encode(), False)
             return super().wait_evaluation_event(

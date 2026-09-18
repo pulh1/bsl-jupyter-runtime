@@ -80,7 +80,7 @@ def test_proxy_table_materialization_detaches_one_composite_capture_helper() -> 
         primary_source = started_sources[0]
         assert "СериализоватьКомпактнуюТаблицу" in primary_source
         assert primary_source.index("Если Не Материализация.Доступ Тогда") < primary_source.index(
-            "Контекст.Вставить("
+            "e1cRuntimeКонтекст.Вставить("
         )
 
         with pytest.raises(CaptureBusyError) as busy:
@@ -107,7 +107,7 @@ def test_proxy_table_materialization_detaches_one_composite_capture_helper() -> 
             for call in session.calls
             if call[0] == "start_evaluation"
         ][-1]
-        assert "Контекст.Удалить(\"\"__onec_compact_table_" in cleanup_source
+        assert "e1cRuntimeКонтекст.Удалить(\"\"__onec_compact_table_" in cleanup_source
         assert controller.state is OperationState.CAPTURED
         api.resume_capture()
         assert controller.state is OperationState.COMPLETED
@@ -209,7 +209,7 @@ def test_recursive_materialization_detaches_busy_waiter_and_late_payload() -> No
     def materialize() -> None:
         try:
             api.materialize_value(
-                "Контекст.Данные", max_depth=2, max_items=3, max_bytes=1024
+                "e1cRuntimeКонтекст.Данные", max_depth=2, max_items=3, max_bytes=1024
             )
         except BaseException as error:
             errors.append(error)
@@ -226,7 +226,7 @@ def test_recursive_materialization_detaches_busy_waiter_and_late_payload() -> No
         assert pending.evaluation_kind is CaptureEvaluationKind.MATERIALIZATION_HELPER
         with pytest.raises(CaptureBusyError) as busy:
             api.materialize_value(
-                "Контекст.Данные", max_depth=2, max_items=3, max_bytes=1024
+                "e1cRuntimeКонтекст.Данные", max_depth=2, max_items=3, max_bytes=1024
             )
         assert busy.value.evaluation_id == pending.pending_evaluation_id
         assert session.capture_start_count == 1
@@ -290,7 +290,7 @@ def test_table_admission_rejects_before_private_payload_transfer(
         sources = [call[1][0] for call in session.calls if call[0] == "start_evaluation"]
         assert len(sources) == 2
         assert all("ЗабратьКомпактнуюМатериализациюИзКонтекста" not in source for source in sources)
-        assert "Контекст.Удалить(\"\"__onec_compact_table_" in sources[-1]
+        assert "e1cRuntimeКонтекст.Удалить(\"\"__onec_compact_table_" in sources[-1]
     finally:
         if session.capture_pending is not None:
             session.complete()
@@ -421,7 +421,7 @@ def test_materialization_kind_uses_an_explicit_inspection_record() -> None:
 
     def inspect_kind() -> None:
         try:
-            api.materialization_kind("Контекст.Таблица")
+            api.materialization_kind("e1cRuntimeКонтекст.Таблица")
         except BaseException as error:
             errors.append(error)
 
@@ -450,13 +450,13 @@ def test_materialization_kind_uses_an_explicit_inspection_record() -> None:
     (
         (
             lambda api: api.materialize_value(
-                "Контекст.Данные", max_depth=2, max_items=3, max_bytes=1024
+                "e1cRuntimeКонтекст.Данные", max_depth=2, max_items=3, max_bytes=1024
             ),
             CaptureEvaluationKind.MATERIALIZATION_HELPER,
         ),
         (
             lambda api: api.project_value(
-                "Контекст.Данные", {"offset": 0, "limit": 1},
+                "e1cRuntimeКонтекст.Данные", {"offset": 0, "limit": 1},
                 max_depth=2, max_items=3, max_bytes=1024,
             ),
             CaptureEvaluationKind.INSPECTION,
@@ -491,7 +491,7 @@ def test_dynamic_routes_admit_before_route_or_payload_access(
         assert len(sources) == 1
         source = sources[0]
         assert source.index("ДопуститьЗначение(") < source.index("ПолучитьВидМатериализации(")
-        assert source.index("ПолучитьВидМатериализации(") < source.index("Контекст.Вставить(")
+        assert source.index("ПолучитьВидМатериализации(") < source.index("e1cRuntimeКонтекст.Вставить(")
         assert "СериализоватьКомпактнуюТаблицу(" in source
         assert "СериализоватьЗначение(" in source
     finally:

@@ -27,7 +27,6 @@ def _responses(payload: bytes) -> list[str]:
     return [
         f"R|7|4|{len(payload)}|{sha256(payload).hexdigest()}|{len(encoded)}",
         encoded,
-        "Истина",
     ]
 
 
@@ -57,7 +56,7 @@ def _main_router(session: Session, catalog: list[WorkerMaterializationSnapshot])
 
 
 def test_main_projection_payload_runs_all_remote_steps_on_one_arbiter_thread() -> None:
-    """Break: plan execution bypasses MAIN's arbiter or loses its cleanup."""
+    """Break: plan execution bypasses MAIN's arbiter for the payload read."""
 
     payload = b'{"version":1,"root":{"t":"number","v":"12"}}'
     session = Session(_responses(payload))
@@ -69,16 +68,16 @@ def test_main_projection_payload_runs_all_remote_steps_on_one_arbiter_thread() -
     )
     try:
         kind, serialized = service.project_value_payload(
-            "Контекст.Массив", kind="slice", offset=3, limit=1,
+            "e1cRuntimeКонтекст.Массив", kind="slice", offset=3, limit=1,
             columns=(), names=(), max_depth=2, max_items=1,
             max_rows=1, max_bytes=1024,
         )
         assert kind == "value"
         assert serialized == payload
-        assert len([call for call in session.calls if call[0] == "start"]) == 3
+        assert len([call for call in session.calls if call[0] == "start"]) == 2
         assert {call[2] for call in session.calls} == {arbiter._worker.ident}
         assert arbiter._worker.ident != get_ident()
-        assert "Контекст.Удалить" in session.calls[4][1]
+        assert "ЗабратьКомпактнуюМатериализациюИзКонтекста" in session.calls[2][1]
     finally:
         arbiter.close(timeout=3)
 
@@ -95,9 +94,9 @@ def test_kind_inspection_serializes_only_a_bounded_kind_string() -> None:
         worker_catalog_snapshot=lambda: WorkerTransferCatalog(0, ()),
     )
     try:
-        assert service.materialization_kind("Контекст.Таблица") == "table"
+        assert service.materialization_kind("e1cRuntimeКонтекст.Таблица") == "table"
         instruction = session.calls[0][1]
-        assert "ПолучитьВидМатериализации(Контекст.Таблица)" in instruction
+        assert "ПолучитьВидМатериализации(e1cRuntimeКонтекст.Таблица)" in instruction
         assert "СериализоватьЗначение(ВидМатериализации" in instruction
         assert "СериализоватьКомпактнуюТаблицу" not in instruction
         assert {call[2] for call in session.calls} == {arbiter._worker.ident}
@@ -114,7 +113,7 @@ def test_main_catalog_change_rejects_before_any_remote_effect() -> None:
     try:
         with pytest.raises(ProtocolError, match="Worker catalog changed"):
             router.inspect_kind(
-                "Контекст.Значение", catalog=WorkerTransferCatalog(2, ()),
+                "e1cRuntimeКонтекст.Значение", catalog=WorkerTransferCatalog(2, ()),
                 timeout_s=None,
             )
         assert session.calls == []
@@ -156,7 +155,7 @@ def test_capture_projection_rechecks_catalog_inside_same_scope_ticket() -> None:
     try:
         with pytest.raises(ProtocolError, match="Worker catalog changed"):
             router.inspect_kind(
-                "Контекст.Значение", catalog=WorkerTransferCatalog(1, ()),
+                "e1cRuntimeКонтекст.Значение", catalog=WorkerTransferCatalog(1, ()),
                 timeout_s=None,
             )
         assert controller.capture_scope is scope
@@ -195,7 +194,7 @@ def test_capture_kind_inspection_uses_a_valid_private_projection_plan() -> None:
     )
     try:
         assert router.inspect_kind(
-            "Контекст.Таблица", catalog=WorkerTransferCatalog(1, ()), timeout_s=None,
+            "e1cRuntimeКонтекст.Таблица", catalog=WorkerTransferCatalog(1, ()), timeout_s=None,
         ) == "table"
     finally:
         arbiter.close(timeout=3)

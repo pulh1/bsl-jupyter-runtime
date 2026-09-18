@@ -1653,10 +1653,10 @@ def test_worker_proxy_privacy_uses_bare_names_and_exact_context_handles() -> Non
     verifier(session)
 
     assert session.handles == [
-        "Контекст.RuntimeWorkerActiveGeneration",
-        "Контекст.RuntimeWorkerActiveGeneration.Modules.КадровыйУчет",
+        "e1cRuntimeКонтекст.RuntimeWorkerActiveGeneration",
+        "e1cRuntimeКонтекст.RuntimeWorkerActiveGeneration.Modules.КадровыйУчет",
     ]
-    assert all("Контекст.Контекст" not in handle for handle in session.handles)
+    assert all("e1cRuntimeКонтекст.e1cRuntimeКонтекст" not in handle for handle in session.handles)
 
 
 def test_unknown_compile_failure_has_no_phase_but_injected_wire_failure_is_known() -> None:
@@ -1786,7 +1786,7 @@ def test_incremental_object_probe_is_read_only_and_proves_two_fresh_wired_module
     )
 
     assert "__OnecPinnedWorkerGeneration.Modules.Получить" in source
-    assert "Контекст.RuntimeWorkerActiveGeneration.Modules.Получить" in source
+    assert "e1cRuntimeКонтекст.RuntimeWorkerActiveGeneration.Modules.Получить" in source
     assert "Тип(\"ВнешняяОбработкаОбъект\")" not in source
     assert source.count("ВнешниеОбработки.Создать(") == 2
     assert primary_registration in source
@@ -1794,8 +1794,8 @@ def test_incremental_object_probe_is_read_only_and_proves_two_fresh_wired_module
     assert "__OnecTask10CrossCall() = 1718" in source
     assert '"ONEC_ZUP_INCREMENTAL_OBJECT_PROBE_V1"' in source
     assert "Новый Структура" not in source
-    assert "Контекст.Вставить" not in source
-    assert "Контекст.Удалить" not in source
+    assert "e1cRuntimeКонтекст.Вставить" not in source
+    assert "e1cRuntimeКонтекст.Удалить" not in source
     PythonParserTarget.from_generated().parse(source, "БлокНоутбука")
 
     observation = {

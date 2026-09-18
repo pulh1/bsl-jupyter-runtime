@@ -94,7 +94,7 @@ def test_successful_main_publishes_symbolic_context_proxies_without_reading_valu
 
 def test_mcp_does_not_register_runtime_rejected_worker_alias() -> None:
     backend = FakeValueBackend(names=("АлиасМодуля",))
-    backend.forbidden_handles.add("Контекст.АлиасМодуля")
+    backend.forbidden_handles.add("e1cRuntimeКонтекст.АлиасМодуля")
     registry = ProxyRegistry()
 
     with pytest.raises(
@@ -103,7 +103,7 @@ def test_mcp_does_not_register_runtime_rejected_worker_alias() -> None:
     ):
         publish_onec_bindings(backend, registry, operation())
 
-    assert backend.guard_calls == ["Контекст.АлиасМодуля"]
+    assert backend.guard_calls == ["e1cRuntimeКонтекст.АлиасМодуля"]
 
 
 def test_original_bsl_spelling_is_kept_while_binding_identity_is_case_insensitive() -> None:
@@ -182,7 +182,7 @@ def test_scalar_preview_is_bounded_and_size_does_not_hide_a_scan() -> None:
     assert preview.scalar == 42
     assert backend.evaluate_calls == [
         (
-            "Контекст.Порог",
+            "e1cRuntimeКонтекст.Порог",
             {
                 "refs": "presentation",
                 "max_depth": 2,
@@ -207,7 +207,7 @@ def test_child_projection_remains_symbolic_and_uses_parent_provenance() -> None:
     assert backend.evaluate_calls == []
     assert backend.table_calls == [
         (
-            "Контекст.ДокументОбъект.Товары",
+            "e1cRuntimeКонтекст.ДокументОбъект.Товары",
             {"refs": "both", "chunk_size": 2400},
         )
     ]

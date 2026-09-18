@@ -258,7 +258,7 @@ def test_kernel_exports_atomic_compact_payload_take() -> None:
     assert "ЗабратьКомпактнуюМатериализациюИзКонтекста" in set(
         binding.exported_method_names
     )
-    assert "Контекст.Удалить(Ключ)" in kernel
+    assert "e1cRuntimeКонтекст.Удалить(Ключ)" in kernel
 
 
 def test_compact_serializer_classifies_columns_once_before_full_row_loop() -> None:

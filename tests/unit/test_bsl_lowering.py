@@ -29,8 +29,8 @@ PARSERGEN_SRC = Path(os.environ.get(
     "ONEC_PARSERGEN_SRC", str(WORKSPACE / "tests" / "fixtures" / "parsergen" / "src")
 ))
 VISIBLE_CAPTURE_CELL = (
-    'КонтекстОтладки.Результат.Добавить("ИзИнструкции");\n'
-    "КоличествоПосле = КонтекстОтладки.Результат.Количество();\n"
+    'e1cRuntimeКонтекстОтладки.Результат.Добавить("ИзИнструкции");\n'
+    "КоличествоПосле = e1cRuntimeКонтекстОтладки.Результат.Количество();\n"
     "РезультатИнструкции = КоличествоПосле;"
 )
 
@@ -289,7 +289,7 @@ def test_loads_strict_grammar_and_parses_capture_cell_and_procedure_module() -> 
     target.parse(VISIBLE_CAPTURE_CELL, "БлокНоутбука")
     target.parse(
         "Процедура ПроверитьКонтекст() Экспорт\n"
-        "Результат = КонтекстОтладки.Результат.Количество();\n"
+        "Результат = e1cRuntimeКонтекстОтладки.Результат.Количество();\n"
         "КонецПроцедуры",
         "Модуль",
     )

@@ -147,7 +147,7 @@ class SessionCaptureInspectionAdapter:
             "items": tuple({
                 **item,
                 "role": "local",
-                "handle": "Контекст.КонтекстОтладки." + str(item["name"]),
+                "handle": "e1cRuntimeКонтекст.e1cRuntimeКонтекстОтладки." + str(item["name"]),
             } for item in page),
             "total": len(items),
             "next_cursor": next_cursor if next_cursor < len(items) else None,

@@ -16,7 +16,7 @@ from onec_runtime.bsl.module_syntax import ModuleSyntaxRegistry
 from onec_runtime.capture_inspection import (
     DebugFrame, LocalStackAdapter, ResolvedFrameSource, StackDescriptor,
 )
-from onec_runtime.errors import ProtocolError, StaleCaptureError
+from onec_runtime.errors import CaptureSourceUnavailableError, ProtocolError, StaleCaptureError
 from onec_runtime.execution.capture.scope import (
     CaptureContextState, CaptureFrameIdentity, CaptureScope,
 )
@@ -78,6 +78,7 @@ class CaptureTicketDataPlane:
         module_registry: ModuleSyntaxRegistry | None = None,
         source_timeout_s: float = 30.0,
         before_materialization: Callable[[], None] | None = None,
+        bind_frame: Callable[[DebugFrame], DebugFrame] | None = None,
     ) -> None:
         if not isinstance(scope, CaptureScope):
             raise TypeError("CAPTURE scope is required")
@@ -87,6 +88,8 @@ class CaptureTicketDataPlane:
             raise TypeError("CAPTURE source resolver is invalid")
         if before_materialization is not None and not callable(before_materialization):
             raise TypeError("CAPTURE materialization preflight is invalid")
+        if bind_frame is not None and not callable(bind_frame):
+            raise TypeError("CAPTURE frame binder is invalid")
         if (
             isinstance(source_timeout_s, bool)
             or not isinstance(source_timeout_s, (int, float))
@@ -101,8 +104,10 @@ class CaptureTicketDataPlane:
         self._resolve_sources = resolve_sources
         self._module_registry = module_registry or ModuleSyntaxRegistry()
         self._before_materialization = before_materialization
+        self._bind_frame = bind_frame
         self._source_timeout_s = float(source_timeout_s)
         self._stack: StackDescriptor | None = None
+        self._stack_adapter: LocalStackAdapter | None = None
         self._require_current()
 
     @property
@@ -121,12 +126,31 @@ class CaptureTicketDataPlane:
                 is_runtime_frame=backend.is_runtime_frame,
                 registry=self._module_registry,
                 command_timeout_s=self._source_timeout_s,
+                bind_frame=self._bind_frame,
             )
+            self._stack_adapter = adapter
             self._stack = adapter.stack
         return self._stack
 
+    def frame_parameters(self, native_level: int) -> tuple[str, ...]:
+        """Resolve parameter names from this stop's saved physical frame source."""
+
+        self._require_current()
+        frame = self.stack.native[native_level]
+        if frame.runtime_kernel:
+            raise CaptureSourceUnavailableError("runtime frame has no public parameters")
+        adapter = self._stack_adapter
+        assert adapter is not None
+        enriched = adapter.native_frame_with_method(native_level)
+        self._require_current()
+        if enriched.method is None:
+            raise CaptureSourceUnavailableError(
+                "method source unavailable; use variables for unclassified values"
+            )
+        return enriched.method.parameters
+
     def frame(self, native_level: int) -> DebugFrame:
-        """Return one physical frame's safe metadata; values stay unattached."""
+        """Return one physical frame, with values only when a binder was supplied."""
 
         frame = self.stack.native[native_level]
         if not isinstance(frame, DebugFrame):

@@ -2101,7 +2101,7 @@ class PrototypeRuntimeController:
                     "type_name": variable.type_name,
                     "role": "local",
                     # Registry-private path into the captured Context structure.
-                    "handle": "Контекст.КонтекстОтладки." + variable.name,
+                    "handle": "e1cRuntimeКонтекст.e1cRuntimeКонтекстОтладки." + variable.name,
                 }
                 for variable in page
             ),
@@ -2967,7 +2967,7 @@ class PrototypeRuntimeController:
         if canonical_root is None:
             raise ProtocolError("capture manager root is unavailable")
         physical_path = ".".join((canonical_root, *checked_fields))
-        native_path = "Контекст.КонтекстОтладки." + physical_path
+        native_path = "e1cRuntimeКонтекст.e1cRuntimeКонтекстОтладки." + physical_path
         existing = next(
             (
                 key
@@ -3194,14 +3194,14 @@ class PrototypeRuntimeController:
         previous = "__OnecNotebookPreviousGlobals"
         globals_name = "__OnecNotebookBoundGlobals"
         initialization = (
-            f'{worker} = Контекст.RuntimeWorkerActiveGeneration.Modules.Получить("Worker");\n'
+            f'{worker} = e1cRuntimeКонтекст.RuntimeWorkerActiveGeneration.Modules.Получить("Worker");\n'
             f"{previous} = {worker}.__OnecNotebookGlobals;\n"
             f"{globals_name} = Новый Структура;\n"
         )
         for name in names:
             initialization += (
                 f"{globals_name}.Вставить({bsl_string_literal(name)}, "
-                f"Контекст.{name});\n"
+                f"e1cRuntimeКонтекст.{name});\n"
             )
         initialization += f"{worker}.__OnecNotebookGlobals = {globals_name};\n"
         restore = f"{worker}.__OnecNotebookGlobals = {previous};\n"
@@ -3242,28 +3242,28 @@ class PrototypeRuntimeController:
                 f"{previous_sink};\n"
                 if worker_messages else ""
             )
-            + 'Контекст.Вставить("__onec_cell_messages_result_key", '
+            + 'e1cRuntimeКонтекст.Вставить("__onec_cell_messages_result_key", '
             + bsl_string_literal(message_collector_key)
             + ");\n"
-            + 'Контекст.Вставить("__onec_cell_messages_result", Контекст.'
+            + 'e1cRuntimeКонтекст.Вставить("__onec_cell_messages_result", e1cRuntimeКонтекст.'
             + message_collector_key
             + ");\n"
-            + "Контекст.Удалить("
+            + "e1cRuntimeКонтекст.Удалить("
             + bsl_string_literal(message_collector_key)
             + ");"
         )
         start = SourceSpan(0, 0)
         end = SourceSpan(len(source.text), len(source.text))
         builder = SourceTransformBuilder(source)
-        initialize = f'Контекст.Вставить("{message_collector_key}", Новый Массив);\n'
+        initialize = f'e1cRuntimeКонтекст.Вставить("{message_collector_key}", Новый Массив);\n'
         if worker_messages:
             initialize += (
                 f"{worker_object} = "
-                'Контекст.RuntimeWorkerActiveGeneration.Modules.Получить("Worker");\n'
+                'e1cRuntimeКонтекст.RuntimeWorkerActiveGeneration.Modules.Получить("Worker");\n'
                 f"{previous_sink} = "
                 f"{worker_object}.__OnecWorkerMessageSink;\n"
                 f"{worker_object}.__OnecWorkerMessageSink = "
-                f"Контекст.{message_collector_key};\n"
+                f"e1cRuntimeКонтекст.{message_collector_key};\n"
             )
         builder.synthetic(
             initialize,
@@ -3410,7 +3410,7 @@ class PrototypeRuntimeController:
         ) -> str:
             expression = (
                 "RuntimeKernelServer."
-                "ЗабратьКомпактнуюМатериализациюИзКонтекста(Контекст, "
+                "ЗабратьКомпактнуюМатериализациюИзКонтекста(e1cRuntimeКонтекст, "
                 + bsl_string_literal(key)
                 + ")"
             )
@@ -3456,7 +3456,7 @@ class PrototypeRuntimeController:
             return None
 
         self._evaluate_capture_helper(
-            "RuntimeKernelServer.УстановитьПинПоколенияWorker(Контекст, "
+            "RuntimeKernelServer.УстановитьПинПоколенияWorker(e1cRuntimeКонтекст, "
             f"{bsl_string_literal(manifest_sha256)})",
             evaluation_kind=CaptureEvaluationKind.MATERIALIZATION_HELPER,
             stack_level=self._required_capture_kernel_stack_level(),
@@ -3473,7 +3473,7 @@ class PrototypeRuntimeController:
             return None
 
         self._evaluate_capture_helper(
-            "RuntimeKernelServer.ОчиститьПинПоколенияWorker(Контекст)",
+            "RuntimeKernelServer.ОчиститьПинПоколенияWorker(e1cRuntimeКонтекст)",
             evaluation_kind=CaptureEvaluationKind.MATERIALIZATION_HELPER,
             stack_level=self._required_capture_kernel_stack_level(),
             result_policy=accept_cleanup,
@@ -3487,7 +3487,7 @@ class PrototypeRuntimeController:
         if not isinstance(step_context, CaptureStepContext):
             raise TypeError("CAPTURE resume requires its coordinator step context")
         result = step_context.execute_inline(self._capture_remote_step(
-            "RuntimeKernelServer.ОчиститьПинПоколенияWorker(Контекст)",
+            "RuntimeKernelServer.ОчиститьПинПоколенияWorker(e1cRuntimeКонтекст)",
             stack_level=self._required_capture_kernel_stack_level(),
         ))
         if result.error_occurred or evaluation_to_python(result) is not True:
@@ -3588,7 +3588,7 @@ class PrototypeRuntimeController:
                 owned.primary_execution()
             if messages_intercepted:
                 message_step = self._capture_remote_step(
-                    "RuntimeKernelServer.ЗабратьСообщенияЯчейкиИзКонтекста(Контекст, "
+                    "RuntimeKernelServer.ЗабратьСообщенияЯчейкиИзКонтекста(e1cRuntimeКонтекст, "
                     + bsl_string_literal(message_collector_key)
                     + ")",
                     stack_level=stack_level,
@@ -4248,7 +4248,7 @@ class PrototypeRuntimeController:
         if not message_collector_key:
             return ()
         result = self.session.evaluate(
-            "RuntimeKernelServer.ЗабратьСообщенияЯчейкиИзКонтекста(Контекст, "
+            "RuntimeKernelServer.ЗабратьСообщенияЯчейкиИзКонтекста(e1cRuntimeКонтекст, "
             + bsl_string_literal(message_collector_key)
             + ")",
             stack_level=stack_level,
@@ -4281,7 +4281,7 @@ class PrototypeRuntimeController:
             raise ProtocolError("compact table maximum text size is invalid")
         expression = (
             "RuntimeKernelServer."
-            "ЗабратьКомпактнуюМатериализациюИзКонтекста(Контекст, "
+            "ЗабратьКомпактнуюМатериализациюИзКонтекста(e1cRuntimeКонтекст, "
             + bsl_string_literal(key)
             + ")"
         )
@@ -4318,7 +4318,7 @@ class PrototypeRuntimeController:
             raise ProtocolError("materialization context key is invalid")
         expression = (
             "RuntimeKernelServer."
-            "УдалитьМатериализациюИзКонтекста(Контекст, "
+            "УдалитьМатериализациюИзКонтекста(e1cRuntimeКонтекст, "
             + bsl_string_literal(key)
             + ")"
         )

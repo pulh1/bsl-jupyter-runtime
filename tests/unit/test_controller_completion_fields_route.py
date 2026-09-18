@@ -92,7 +92,7 @@ def _service(controller, *, namespace=None):
 def test_main_idle_completion_uses_one_arbiter_worker_and_private_policy() -> None:
     session, arbiter, controller = _bound(schema("Номер", "Название"))
     try:
-        assert _service(controller).completion_fields("Контекст.Данные") == (
+        assert _service(controller).completion_fields("e1cRuntimeКонтекст.Данные") == (
             "Номер", "Название",
         )
         assert len(session.helper_expressions) == 1
@@ -112,7 +112,7 @@ def test_capture_ready_completion_uses_kernel_frame_and_retains_stop() -> None:
         scope = controller.capture_scope
         assert scope is not None
 
-        assert _service(controller).completion_fields("Контекст.Данные") == ("Номер",)
+        assert _service(controller).completion_fields("e1cRuntimeКонтекст.Данные") == ("Номер",)
         assert len(session.helper_expressions) == 1
         expression, level = session.helper_expressions[0]
         assert "ВыполнитьКодВКонтекстеОтладки" in expression
@@ -133,7 +133,7 @@ def test_completion_rechecks_namespace_on_worker_before_any_rdbg_effect() -> Non
 
     try:
         with pytest.raises(ProtocolError, match="namespace or Worker catalog changed"):
-            _service(controller, namespace=namespace).completion_fields("Контекст.Данные")
+            _service(controller, namespace=namespace).completion_fields("e1cRuntimeКонтекст.Данные")
         assert session.helper_expressions == []
         assert session.calls == []
     finally:
@@ -150,7 +150,7 @@ def test_completion_rejects_stale_capture_scope_before_dispatch() -> None:
         prior_calls = tuple(session.calls)
 
         with pytest.raises(ProtocolError):
-            _service(controller).completion_fields("Контекст.Данные")
+            _service(controller).completion_fields("e1cRuntimeКонтекст.Данные")
         assert tuple(session.calls) == prior_calls
     finally:
         arbiter.close(timeout=3)
@@ -160,7 +160,7 @@ def test_completion_rejects_private_schema_without_returning_raw_result() -> Non
     session, arbiter, controller = _bound("private target payload")
     try:
         with pytest.raises(ProtocolError) as failure:
-            _service(controller).completion_fields("Контекст.Данные")
+            _service(controller).completion_fields("e1cRuntimeКонтекст.Данные")
         assert "private" not in str(failure.value)
         assert len(session.helper_expressions) == 1
         assert {thread for _, thread in session.calls} == {arbiter._worker}
@@ -175,7 +175,7 @@ def test_completion_rejects_changed_main_target_inside_ticket_before_rdbg() -> N
         controller._initial_target_id = TargetId(UUID(int=2), "different-target")
 
     plan = CompletionFieldsPlan(
-        "Контекст.Данные", "Результат = Контекст.Данные;", change_target,
+        "e1cRuntimeКонтекст.Данные", "Результат = e1cRuntimeКонтекст.Данные;", change_target,
     )
     try:
         with pytest.raises(ProtocolError, match="fence changed"):
@@ -193,7 +193,7 @@ def test_completion_rejects_active_successor_admission_before_rdbg() -> None:
         controller._continuation_admission = object()
 
         with pytest.raises(ProtocolError, match="continuation prevents completion"):
-            _service(controller).completion_fields("Контекст.Данные")
+            _service(controller).completion_fields("e1cRuntimeКонтекст.Данные")
         assert tuple(session.calls) == prior_calls
     finally:
         arbiter.close(timeout=3)

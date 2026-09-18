@@ -138,7 +138,6 @@ def bind_worker_universe_activation(
         raise ProtocolError("Worker activation requires a shared breakpoint workspace")
     controller = core.controller
     runner = WorkerMutationInstructionRunner(
-        controller._main_executor,
         controller._capture_cell_executor,
         registry_provider=lambda: controller._registry,
         breakpoint_routes=routes,

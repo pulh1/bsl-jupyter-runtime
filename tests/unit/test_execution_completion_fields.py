@@ -70,7 +70,7 @@ def test_completion_service_submits_one_trusted_bounded_schema_plan() -> None:
     controller = Controller(schema("Номер", "Название"))
 
     fields = service(controller).completion_fields(
-        "Контекст.Данные.Вложенные", table_row=True, timeout_s=0.25,
+        "e1cRuntimeКонтекст.Данные.Вложенные", table_row=True, timeout_s=0.25,
     )
 
     assert fields == ("Номер", "Название")
@@ -79,7 +79,7 @@ def test_completion_service_submits_one_trusted_bounded_schema_plan() -> None:
     assert plan.expression.startswith(
         "RuntimeValueTransferServer."
         "СериализоватьДопущенныеИменаСвойствДляПодсказки("
-        "Контекст.Данные.Вложенные, Истина, "
+        "e1cRuntimeКонтекст.Данные.Вложенные, Истина, "
     )
     assert '"worker-address"' in plan.expression
     assert plan.instruction == "Результат = " + plan.expression + ";"
@@ -88,9 +88,9 @@ def test_completion_service_submits_one_trusted_bounded_schema_plan() -> None:
 
 
 @pytest.mark.parametrize("handle", [
-    "Контекст.Данные[0]", "Контекст.Данные.Удалить()",
-    "Контекст.Данные;Удалить()", "Контекст.Несуществующая",
-    "Контекст.RuntimeWorkerActiveGeneration", "Контекст.Данные." + "А" * 510,
+    "e1cRuntimeКонтекст.Данные[0]", "e1cRuntimeКонтекст.Данные.Удалить()",
+    "e1cRuntimeКонтекст.Данные;Удалить()", "e1cRuntimeКонтекст.Несуществующая",
+    "e1cRuntimeКонтекст.RuntimeWorkerActiveGeneration", "e1cRuntimeКонтекст.Данные." + "А" * 510,
 ])
 def test_completion_service_rejects_unsafe_or_unpublished_paths_before_submission(
     handle: str,
@@ -104,7 +104,7 @@ def test_completion_service_rejects_unsafe_or_unpublished_paths_before_submissio
 def test_completion_service_rejects_invalid_row_option_before_submission() -> None:
     controller = Controller(schema("Номер"))
     with pytest.raises(ProtocolError):
-        service(controller).completion_fields("Контекст.Данные", table_row=1)  # type: ignore[arg-type]
+        service(controller).completion_fields("e1cRuntimeКонтекст.Данные", table_row=1)  # type: ignore[arg-type]
     assert controller.plans == []
 
 
@@ -112,13 +112,13 @@ def test_completion_preserves_128_names_and_rejects_truncated_marker_page() -> N
     names = tuple(f"Поле{index}" for index in range(128))
     controller = Controller(schema(*names))
     client = service(controller)
-    assert client.completion_fields("Контекст.Данные") == names
+    assert client.completion_fields("e1cRuntimeКонтекст.Данные") == names
 
     controller.wire = "C\t129\n" + "\n".join(
         ("R\t",) + tuple(f"R\t{name}" for name in names[:127])
     )
     with pytest.raises(ProtocolError, match="Invalid completion field schema"):
-        client.completion_fields("Контекст.Данные")
+        client.completion_fields("e1cRuntimeКонтекст.Данные")
 
 
 @pytest.mark.parametrize("wire, expected", [
@@ -134,14 +134,14 @@ def test_completion_schema_failures_do_not_expose_private_wire(
 ) -> None:
     controller = Controller(wire)
     with pytest.raises(expected) as failure:
-        service(controller).completion_fields("Контекст.Данные")
+        service(controller).completion_fields("e1cRuntimeКонтекст.Данные")
     assert "private" not in str(failure.value)
     assert len(controller.plans) == 1
 
 
 def test_completion_result_policy_rejects_debugger_error_without_raw_text() -> None:
     controller = Controller(schema("Номер"))
-    service(controller).completion_fields("Контекст.Данные")
+    service(controller).completion_fields("e1cRuntimeКонтекст.Данные")
     plan = controller.plans[0]
     result = EvaluationResult(
         UUID(int=2), "Строка", "private presentation", True,
@@ -159,7 +159,7 @@ def test_completion_plan_rechecks_namespace_and_worker_before_remote_effect() ->
     client = service(
         controller, namespace=lambda: current[0], worker=lambda: worker[0],
     )
-    assert client.completion_fields("Контекст.Данные") == ("Номер",)
+    assert client.completion_fields("e1cRuntimeКонтекст.Данные") == ("Номер",)
     plan = controller.plans[-1]
 
     current[0] = RuntimeNamespaceSnapshot(1, 3, ("Данные",))
@@ -188,7 +188,7 @@ def test_completion_timeout_detaches_only_initiating_waiter() -> None:
         worker_catalog_snapshot=lambda: WorkerMaterializationSnapshot(0, ()),
     )
     with pytest.raises(TimeoutError):
-        client.completion_fields("Контекст.Данные", timeout_s=0.1)
+        client.completion_fields("e1cRuntimeКонтекст.Данные", timeout_s=0.1)
     assert controller.ticket.timeout == 0.1
     assert controller.ticket.detached
     assert not controller.ticket.settled
@@ -197,7 +197,7 @@ def test_completion_timeout_detaches_only_initiating_waiter() -> None:
 def test_completion_invalid_local_timeout_rejects_before_submission() -> None:
     controller = Controller(schema("Номер"))
     with pytest.raises(ProtocolError, match="finite positive"):
-        service(controller).completion_fields("Контекст.Данные", timeout_s=0)
+        service(controller).completion_fields("e1cRuntimeКонтекст.Данные", timeout_s=0)
     assert controller.plans == []
 
 
@@ -213,7 +213,7 @@ def test_completion_refuses_snapshot_change_while_ticket_waits() -> None:
     controller = ChangingController(schema("Номер"))
     client = service(controller, namespace=lambda: current[0])
     with pytest.raises(ProtocolError, match="changed"):
-        client.completion_fields("Контекст.Данные")
+        client.completion_fields("e1cRuntimeКонтекст.Данные")
 
 
 def test_completion_rejects_raw_ticket_result_without_leaking_it() -> None:
@@ -229,5 +229,5 @@ def test_completion_rejects_raw_ticket_result_without_leaking_it() -> None:
         worker_catalog_snapshot=lambda: WorkerMaterializationSnapshot(0, ()),
     )
     with pytest.raises(ProtocolError) as failure:
-        client.completion_fields("Контекст.Данные")
+        client.completion_fields("e1cRuntimeКонтекст.Данные")
     assert "private" not in str(failure.value)

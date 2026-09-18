@@ -723,7 +723,7 @@ def test_mixed_cell_prepares_invalid_statements_before_worker_activation(
     source = (
         "Процедура Обновить() Экспорт\n"
         "КонецПроцедуры;\n"
-        "КонтекстОтладки.Значение = 1;"
+        "e1cRuntimeКонтекстОтладки.Значение = 1;"
     )
     controller = FakeController()
     controller.lowerer = SemanticNotebookLowerer(PythonParserTarget.from_generated())
@@ -772,9 +772,9 @@ def test_mixed_capture_cell_reloads_worker_once_then_executes_statement(
         "КонецПроцедуры;\n"
         "СостояниеMixedCapture = Новый Структура(\"Результат\", 0);\n"
         "ОбновитьMixedCapture(СостояниеMixedCapture, "
-        "КонтекстОтладки.Значение);\n"
-        "КонтекстОтладки.Значение = СостояниеMixedCapture.Результат;\n"
-        "РезультатИнструкции = КонтекстОтладки.Значение;"
+        "e1cRuntimeКонтекстОтладки.Значение);\n"
+        "e1cRuntimeКонтекстОтладки.Значение = СостояниеMixedCapture.Результат;\n"
+        "РезультатИнструкции = e1cRuntimeКонтекстОтладки.Значение;"
     )
     captured = api.execute_bsl("Результат = Capture();")
     assert captured.kind is RuntimeReplyKind.CAPTURED
@@ -887,7 +887,7 @@ def test_mixed_capture_lowering_failure_keeps_visible_statement_coordinates(
     )
 
     reply = api.execute_bsl(
-        _mixed_capture_source("РезультатИнструкции = КонтекстОтладки;")
+        _mixed_capture_source("РезультатИнструкции = e1cRuntimeКонтекстОтладки;")
     )
 
     assert reply.kind is RuntimeReplyKind.SOURCE_FAILED
@@ -1072,7 +1072,7 @@ def test_mixed_capture_statement_failure_keeps_committed_worker_and_recovers(
     controller.execute_capture = fail_statement  # type: ignore[method-assign]
     failed = api.execute_bsl(
         _mixed_capture_source(
-            "КонтекстОтладки.Значение = 84;\n"
+            "e1cRuntimeКонтекстОтладки.Значение = 84;\n"
             "РезультатИнструкции = ОбновитьMixedCapture;"
         )
     )
@@ -1092,7 +1092,7 @@ def test_mixed_capture_statement_failure_keeps_committed_worker_and_recovers(
         FakeController,
     )
     recovered = api.execute_bsl(
-        "РезультатИнструкции = КонтекстОтладки.Значение;"
+        "РезультатИнструкции = e1cRuntimeКонтекстОтладки.Значение;"
     )
     completed = api.resume_capture()
 
@@ -1122,7 +1122,7 @@ def test_mixed_capture_execution_diagnostic_maps_to_exact_visible_statement(
     controller.stop_sequence = 8
     controller.worker_results = deque((True,))
     source = _mixed_capture_source(
-        "КонтекстОтладки.Значение = 901;\nОшибкаMixed = 1 / 0;"
+        "e1cRuntimeКонтекстОтладки.Значение = 901;\nОшибкаMixed = 1 / 0;"
     )
     unit = SourceUnitRef(
         SourceUnitKind.NOTEBOOK_CELL,
@@ -1361,7 +1361,7 @@ def test_prepared_main_drift_consumes_capability_before_worker_activation() -> N
     (
         ("$", DiagnosticStage.PARSING, "unexpected_character"),
         (
-            "Результат = КонтекстОтладки.Скаляр;",
+            "Результат = e1cRuntimeКонтекстОтладки.Скаляр;",
             DiagnosticStage.LOWERING,
             "capture_namespace_mode",
         ),
@@ -1518,7 +1518,7 @@ def test_api_rejects_unmapped_capture_controller_without_test_compatibility() ->
     api = PrototypeRuntimeApi(controller)
 
     with pytest.raises(ProtocolError, match="mapped CAPTURE"):
-        api.execute_bsl("КонтекстОтладки.Скаляр = 2;")
+        api.execute_bsl("e1cRuntimeКонтекстОтладки.Скаляр = 2;")
 
     assert lowered_calls == []
 
@@ -1547,12 +1547,12 @@ def test_prepared_capture_rejects_unmapped_controller_without_test_compatibility
 
     controller.execute_lowered_capture = execute_lowered_capture  # type: ignore[attr-defined]
     api = PrototypeRuntimeApi(controller)
-    prepared = api.prepare_capture_hypothesis("КонтекстОтладки.Скаляр = 2;")
+    prepared = api.prepare_capture_hypothesis("e1cRuntimeКонтекстОтладки.Скаляр = 2;")
     provenance = api.prepared_capture_hypothesis_provenance(prepared)
 
     assert provenance.mode == "capture"
     assert provenance.visible_source_sha256 == source_sha256(
-        "КонтекстОтладки.Скаляр = 2;"
+        "e1cRuntimeКонтекстОтладки.Скаляр = 2;"
     )
 
     with pytest.raises(ProtocolError, match="mapped CAPTURE"):
@@ -1563,7 +1563,7 @@ def test_prepared_capture_rejects_unmapped_controller_without_test_compatibility
 
 def test_projection_instruction_is_bounded_and_stages_only_projected_rows() -> None:
     source = PrototypeRuntimeApi._projection_instruction(
-        "Контекст.Таблица",
+        "e1cRuntimeКонтекст.Таблица",
         context_key="__onec_projection_" + "a" * 32,
         kind="table_rows",
         offset=20,
@@ -1572,13 +1572,13 @@ def test_projection_instruction_is_bounded_and_stages_only_projected_rows() -> N
         names=(),
     )
 
-    assert "Для ИндексПроекции = 20 По Мин(Контекст.Таблица.Количество() - 1, 29)" in source
+    assert "Для ИндексПроекции = 20 По Мин(e1cRuntimeКонтекст.Таблица.Количество() - 1, 29)" in source
     assert 'Скопировать(СтрокиПроекции, "Сотрудник,Сумма")' in source
     assert source.index("RuntimeValueTransferServer.ДопуститьЗначение(") < source.index(
         "Для ИндексПроекции"
     )
     assert source.index("RuntimeTableTransferServer.СериализоватьКомпактнуюТаблицу(") < source.index(
-        "Контекст.Вставить"
+        "e1cRuntimeКонтекст.Вставить"
     )
 
 
@@ -3968,7 +3968,7 @@ def test_api_materializes_table_without_active_worker() -> None:
     )
 
     profiler = PhaseRecorder()
-    frame = api.materialize_table("Контекст.Таблица", profiler=profiler)
+    frame = api.materialize_table("e1cRuntimeКонтекст.Таблица", profiler=profiler)
 
     assert frame.to_dict(orient="records") == [{"Имя": "А"}]
     assert len(controller.main_sources) == 1
@@ -3995,7 +3995,7 @@ def _capture_table_descriptor(
     offset: int = 0,
     limit: int = 10,
 ) -> str:
-    manager = ".".join(("Контекст", "КонтекстОтладки", root, *fields))
+    manager = ".".join(("e1cRuntimeКонтекст", "e1cRuntimeКонтекстОтладки", root, *fields))
     selected = (
         "New Array"
         if not columns
@@ -4120,7 +4120,7 @@ def test_api_enforces_table_payload_row_budget_before_transport() -> None:
     )
 
     payload = api.materialize_table_payload(
-        "Контекст.Таблица", max_rows=3, max_bytes=4096
+        "e1cRuntimeКонтекст.Таблица", max_rows=3, max_bytes=4096
     )
 
     assert payload == content
@@ -4153,7 +4153,7 @@ def test_api_project_to_df_transfers_only_bounded_table_projection() -> None:
     )
 
     frame = api.project_to_df(
-        "Контекст.Таблица",
+        "e1cRuntimeКонтекст.Таблица",
         {"offset": 20, "limit": 10},
         refs="both",
         max_bytes=4096,
@@ -4161,7 +4161,7 @@ def test_api_project_to_df_transfers_only_bounded_table_projection() -> None:
 
     assert frame.to_dict("records") == [{"Имя": "А"}]
     assert "Для ИндексПроекции = 20" in controller.main_sources[0]
-    assert "Контекст.Таблица.Скопировать" in controller.main_sources[0]
+    assert "e1cRuntimeКонтекст.Таблица.Скопировать" in controller.main_sources[0]
     assert "ТипыОбъектовWorker, 10, 4096);" in controller.main_sources[0]
     assert controller.context_drops[-1].startswith("__onec_projection_")
 
@@ -4184,7 +4184,7 @@ def test_api_project_value_decodes_only_bounded_array_projection() -> None:
     )
 
     result = api.project_value(
-        "Контекст.Массив",
+        "e1cRuntimeКонтекст.Массив",
         {"offset": 5, "limit": 15},
         max_items=100,
         max_bytes=4096,
@@ -4221,7 +4221,7 @@ def test_api_project_value_preserves_table_materialize_dataframe_semantics() -> 
     )
 
     result = api.project_value(
-        "Контекст.Таблица",
+        "e1cRuntimeКонтекст.Таблица",
         {"offset": 0, "limit": 10},
         refs="both",
         max_items=100,
@@ -4229,7 +4229,7 @@ def test_api_project_value_preserves_table_materialize_dataframe_semantics() -> 
     )
 
     assert result.to_dict("records") == [{"Имя": "А"}]
-    assert "Контекст.Таблица.Скопировать" in controller.main_sources[0]
+    assert "e1cRuntimeКонтекст.Таблица.Скопировать" in controller.main_sources[0]
 
 
 def test_api_project_value_keeps_composite_request_under_one_writer(
@@ -4267,7 +4267,7 @@ def test_api_project_value_keeps_composite_request_under_one_writer(
         try:
             results.append(
                 api.project_value(
-                    "Контекст.Массив",
+                    "e1cRuntimeКонтекст.Массив",
                     {"offset": 0, "limit": 1},
                     max_items=10,
                     max_bytes=4096,
@@ -4326,7 +4326,7 @@ def test_generated_materialization_key_is_read_and_cleaned_by_real_controller() 
         f"R|1|1|{len(payload)}|{sha256(payload).hexdigest()}|{len(encoded)}"
     )
 
-    assert api.materialize_value("Контекст.Данные", max_bytes=4096) == "ready"
+    assert api.materialize_value("e1cRuntimeКонтекст.Данные", max_bytes=4096) == "ready"
 
     key = re.search(r"__onec_materialization_[0-9a-f]{32}", controller.main_sources[0])
     assert key is not None
@@ -4342,7 +4342,7 @@ def test_generated_materialization_cleanup_preserves_admission_error() -> None:
     controller.worker_results.append("invalid admission envelope")
 
     with pytest.raises(CaptureValueCheckError, match="admission result"):
-        api.materialize_value("Контекст.Данные", max_bytes=4096)
+        api.materialize_value("e1cRuntimeКонтекст.Данные", max_bytes=4096)
 
     assert len(expressions) == 1
     assert "УдалитьМатериализациюИзКонтекста" in expressions[0]
@@ -4369,16 +4369,16 @@ def test_api_routes_recursive_value_materialization_without_active_worker() -> N
     )
 
     result = api.materialize_value(
-        "Контекст.Данные", refs="both", max_depth=7, max_items=99, max_bytes=4096
+        "e1cRuntimeКонтекст.Данные", refs="both", max_depth=7, max_items=99, max_bytes=4096
     )
 
     assert result == {"Name": "value"}
     assert len(controller.main_sources) == 1
-    assert "RuntimeValueTransferServer.ДопуститьЗначение(Контекст.Данные" in controller.main_sources[0]
+    assert "RuntimeValueTransferServer.ДопуститьЗначение(e1cRuntimeКонтекст.Данные" in controller.main_sources[0]
     assert controller.main_sources[0].index("ДопуститьЗначение") < controller.main_sources[0].index(
         "ПолучитьВидМатериализации"
     )
-    assert "СериализоватьЗначение(Контекст.Данные, \"both\", 7, 99, 4096, ТипыОбъектовWorker)" in (
+    assert "СериализоватьЗначение(e1cRuntimeКонтекст.Данные, \"both\", 7, 99, 4096, ТипыОбъектовWorker)" in (
         controller.main_sources[0]
     )
     assert len(controller.context_reads) == 1
@@ -4409,7 +4409,7 @@ def test_api_routes_table_materialize_to_existing_dataframe_transport() -> None:
         f"R|1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}"
     )
 
-    result = api.materialize_value("Контекст.Таблица")
+    result = api.materialize_value("e1cRuntimeКонтекст.Таблица")
 
     assert result.to_dict(orient="records") == [{"Имя": "А"}]
     assert controller.table_declared_schema_calls == []
@@ -4434,17 +4434,17 @@ def test_api_materialize_value_uses_one_admitted_dynamic_route_request() -> None
     )
 
     assert api.materialize_value(
-        "Контекст.Данные", max_depth=7, max_items=99, max_bytes=4096
+        "e1cRuntimeКонтекст.Данные", max_depth=7, max_items=99, max_bytes=4096
     ) == [5]
 
     assert len(controller.main_sources) == 1
     source = controller.main_sources[0]
     assert source.index("RuntimeValueTransferServer.ДопуститьЗначение(") < source.index(
-        "ПолучитьВидМатериализации(Контекст.Данные)"
+        "ПолучитьВидМатериализации(e1cRuntimeКонтекст.Данные)"
     )
     assert "СериализоватьКомпактнуюТаблицу(" in source
-    assert "СериализоватьЗначение(Контекст.Данные" in source
-    assert source.index("ПолучитьВидМатериализации") < source.index("Контекст.Вставить")
+    assert "СериализоватьЗначение(e1cRuntimeКонтекст.Данные" in source
+    assert source.index("ПолучитьВидМатериализации") < source.index("e1cRuntimeКонтекст.Вставить")
 
 
 def test_api_project_value_uses_one_admitted_dynamic_route_request() -> None:
@@ -4465,18 +4465,18 @@ def test_api_project_value_uses_one_admitted_dynamic_route_request() -> None:
     )
 
     assert api.project_value(
-        "Контекст.Данные", {"offset": 0, "limit": 1}, max_items=9, max_bytes=4096
+        "e1cRuntimeКонтекст.Данные", {"offset": 0, "limit": 1}, max_items=9, max_bytes=4096
     ) == [5]
 
     assert len(controller.main_sources) == 1
     source = controller.main_sources[0]
     assert source.index("RuntimeValueTransferServer.ДопуститьЗначение(") < source.index(
-        "ПолучитьВидМатериализации(Контекст.Данные)"
+        "ПолучитьВидМатериализации(e1cRuntimeКонтекст.Данные)"
     )
     assert "Если ВидМатериализации = \"table\" Тогда" in source
     assert "RuntimeTableTransferServer.СериализоватьКомпактнуюТаблицу(" in source
     assert "RuntimeValueTransferServer.СериализоватьЗначение(" in source
-    assert source.index("ПолучитьВидМатериализации") < source.index("Контекст.Вставить")
+    assert source.index("ПолучитьВидМатериализации") < source.index("e1cRuntimeКонтекст.Вставить")
 
 
 class _RuntimeApiPreviewBackend:
@@ -4541,7 +4541,7 @@ def _frame_table_preview(
         context_generation=1,
         capture_fence=CaptureFence("intent", "operation", 1, "a" * 64, 1, 1),
         provenance=ProxyProvenance("capture", 1, "a" * 64, "operation"),
-        resolver_handle="Контекст.КонтекстОтладки.Таблица",
+        resolver_handle="e1cRuntimeКонтекст.e1cRuntimeКонтекстОтладки.Таблица",
         capabilities=("preview",),
     )
     return OnecValueResolver(
@@ -4619,7 +4619,7 @@ def test_api_rejects_invalid_dynamic_materialization_envelope() -> None:
     controller.worker_results.append("executable")
 
     with pytest.raises(CaptureValueCheckError, match="admission result"):
-        api.materialize_value("Контекст.Данные")
+        api.materialize_value("e1cRuntimeКонтекст.Данные")
 
     assert controller.context_reads == []
 
@@ -4639,7 +4639,7 @@ def test_api_materializes_recursive_value_while_capture_is_paused() -> None:
         f"R|1|1|{len(content)}|{sha256(content).hexdigest()}|{len(encoded)}"
     )
 
-    assert api.materialize_value("Контекст.Данные") == "capture"
+    assert api.materialize_value("e1cRuntimeКонтекст.Данные") == "capture"
     assert len(controller.capture_sources) == 1
     assert all("РезультатИнструкции = Результат;" in source for source in controller.capture_sources)
 
@@ -5808,7 +5808,7 @@ def test_generation_pin_is_acquired_before_lowering_and_survives_capture_promoti
     assert observed_during_lowering == [g17]
     assert controller.main_mapped_sources[0].startswith(
         "__OnecPinnedWorkerGeneration = "
-        "Контекст.RuntimeWorkerActiveGeneration;\n"
+        "e1cRuntimeКонтекст.RuntimeWorkerActiveGeneration;\n"
     )
 
     g18 = api.load_worker_modules((module_b,), common_modules=catalog)
@@ -5877,7 +5877,7 @@ def test_main_prelude_pins_one_local_generation_before_user_bsl(
     source = controller.main_mapped_sources[-1]
     prelude = (
         "__OnecPinnedWorkerGeneration = "
-        "Контекст.RuntimeWorkerActiveGeneration;"
+        "e1cRuntimeКонтекст.RuntimeWorkerActiveGeneration;"
     )
     assert source.startswith(prelude + "\n")
     manifest_check = (
@@ -5953,7 +5953,7 @@ def test_capture_transition_installs_exact_pin_and_clears_it_before_resume(
         "КонецЕсли;"
     )
     assert capture_source.startswith(
-        "__OnecPinnedWorkerGeneration = Контекст.RuntimeWorkerActiveGeneration;\n"
+        "__OnecPinnedWorkerGeneration = e1cRuntimeКонтекст.RuntimeWorkerActiveGeneration;\n"
         + manifest_check + "\n"
     )
     assert (
@@ -5997,7 +5997,7 @@ def test_local_reference_validation_does_not_run_worker_identity_policy(
     registrations = api._worker_universe_target.privacy_registration_snapshot()
     target.sources.clear()
 
-    assert api.validate_value_reference("Контекст.АлиасМодуля") == "Контекст.АлиасМодуля"
+    assert api.validate_value_reference("e1cRuntimeКонтекст.АлиасМодуля") == "e1cRuntimeКонтекст.АлиасМодуля"
 
     assert target.sources == []
     assert api._worker_universe_target.privacy_registration_snapshot() == registrations
@@ -6025,11 +6025,11 @@ def test_local_reference_validation_accepts_ordinary_values_without_target_io(
     target.sources.clear()
 
     assert (
-        api.validate_value_reference("Контекст.ОбычноеФиксированноеСоответствие")
-        == "Контекст.ОбычноеФиксированноеСоответствие"
+        api.validate_value_reference("e1cRuntimeКонтекст.ОбычноеФиксированноеСоответствие")
+        == "e1cRuntimeКонтекст.ОбычноеФиксированноеСоответствие"
     )
-    assert api.validate_value_reference("Контекст.ОбычныйФиксированныйМассив") == (
-        "Контекст.ОбычныйФиксированныйМассив"
+    assert api.validate_value_reference("e1cRuntimeКонтекст.ОбычныйФиксированныйМассив") == (
+        "e1cRuntimeКонтекст.ОбычныйФиксированныйМассив"
     )
 
     assert target.sources == []
@@ -6038,11 +6038,11 @@ def test_local_reference_validation_accepts_ordinary_values_without_target_io(
 @pytest.mark.parametrize(
     "handle",
     (
-        "Контекст.RuntimeWorkerActiveGeneration.Modules",
+        "e1cRuntimeКонтекст.RuntimeWorkerActiveGeneration.Modules",
         "контекст.runtimeworkerpinnedoperationgeneration",
         "__onecPINNEDworkerGeneration.Modules",
-        "Контекст.Значение; Результат = Ложь",
-        "Контекст.Функция()",
+        "e1cRuntimeКонтекст.Значение; Результат = Ложь",
+        "e1cRuntimeКонтекст.Функция()",
     ),
 )
 def test_local_reference_validation_rejects_reserved_or_malformed_handle_before_target(
@@ -6063,11 +6063,11 @@ def test_local_reference_validation_rejects_reserved_or_malformed_handle_before_
     "descriptor",
     (
         "RuntimeKernelServer.ПолучитьВременнуюТаблицуОтладки("
-        "Контекст.КонтекстОтладки.Значение, \"Итоги\", 0, 0, Новый Массив)",
+        "e1cRuntimeКонтекст.e1cRuntimeКонтекстОтладки.Значение, \"Итоги\", 0, 0, Новый Массив)",
         "RuntimeKernelServer.ПолучитьВременнуюТаблицуОтладки("
-        "Контекст.КонтекстОтладки.Значение, \"Итоги\", 0, 101, Новый Массив)",
+        "e1cRuntimeКонтекст.e1cRuntimeКонтекстОтладки.Значение, \"Итоги\", 0, 101, Новый Массив)",
         "RuntimeKernelServer.ПолучитьВременнуюТаблицуОтладки("
-        "Контекст.КонтекстОтладки.Значение, \"Итоги\", 0, 10, Новый Массив); Результат = 1",
+        "e1cRuntimeКонтекст.e1cRuntimeКонтекстОтладки.Значение, \"Итоги\", 0, 10, Новый Массив); Результат = 1",
     ),
 )
 def test_capture_projection_descriptor_rejects_unbounded_or_injected_source(
@@ -6080,7 +6080,7 @@ def test_capture_projection_descriptor_rejects_unbounded_or_injected_source(
 def test_capture_projection_descriptor_accepts_only_bounded_generated_grammar() -> None:
     descriptor = (
         "RuntimeKernelServer.ПолучитьВременнуюТаблицуОтладки("
-        "Контекст.КонтекстОтладки.Значение.Менеджер, \"Итоги\", 2, 3, "
+        "e1cRuntimeКонтекст.e1cRuntimeКонтекстОтладки.Значение.Менеджер, \"Итоги\", 2, 3, "
         "СтрРазделить(\"Сумма,Количество\", \",\"))"
     )
     assert PrototypeRuntimeApi._capture_projection_expression(descriptor) == descriptor
@@ -6144,7 +6144,7 @@ def test_session_delegates_single_local_reference_validation() -> None:
     session.runtime_api = api
     session._operation_lock = Lock()
 
-    assert session.validate_value_reference("Контекст.Обычное") == "Контекст.Обычное"
+    assert session.validate_value_reference("e1cRuntimeКонтекст.Обычное") == "e1cRuntimeКонтекст.Обычное"
 
     assert target.sources == []
 
@@ -6217,7 +6217,7 @@ def test_ambiguous_resume_keeps_quarantined_g17_without_context_slot(
 
     assert controller.main_mapped_sources[-1].startswith(
         "__OnecPinnedWorkerGeneration = "
-        "Контекст.RuntimeWorkerActiveGeneration;"
+        "e1cRuntimeКонтекст.RuntimeWorkerActiveGeneration;"
     )
     assert not any(
         "onec-worker-operation-root-clear" in source for source in target.sources
@@ -6572,7 +6572,7 @@ def test_runtime_lowers_worker_call_through_the_pinned_nested_module_root(
         '__OnecPinnedWorkerGeneration.Modules.Получить("МодульА").Версия()'
         in controller.main_mapped_sources[-1]
     )
-    assert "Контекст.RuntimeWorker." not in controller.main_mapped_sources[-1]
+    assert "e1cRuntimeКонтекст.RuntimeWorker." not in controller.main_mapped_sources[-1]
 
 
 def test_module_stage_compile_error_maps_through_exact_candidate_manifest(
@@ -7584,9 +7584,9 @@ def test_stale_prepared_main_activation_releases_its_generation_pin(
 @pytest.mark.parametrize(
     "handle",
     (
-        "Контекст.RuntimeWorkerActiveGeneration",
-        "Контекст.RuntimeWorkerActiveGeneration.Modules",
-        "Контекст.RuntimeWorkerActiveGeneration.Modules.МодульА",
+        "e1cRuntimeКонтекст.RuntimeWorkerActiveGeneration",
+        "e1cRuntimeКонтекст.RuntimeWorkerActiveGeneration.Modules",
+        "e1cRuntimeКонтекст.RuntimeWorkerActiveGeneration.Modules.МодульА",
         "__OnecPinnedWorkerGeneration.Modules.МодульА",
     ),
 )

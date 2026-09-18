@@ -47,7 +47,7 @@ def test_inline_context_and_native_sources_use_one_helper_call() -> None:
 
     assert context.source.startswith(
         "RuntimeValueTransferServer.СериализоватьИнспекциюДляОтладки("
-        "Контекст.КонтекстОтладки, "
+        "e1cRuntimeКонтекст.e1cRuntimeКонтекстОтладки, "
     )
     assert 'Новый Структура("ЛокальныйСчетчик", ЛокальныйСчетчик)' in native.source
     for built in (context, native):

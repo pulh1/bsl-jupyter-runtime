@@ -89,7 +89,7 @@ def test_user_capture_cell_dispatches_once_and_waits_without_execution_deadline(
     assert _evaluate(ready_scope(), worker) is result
 
     assert worker.starts == [
-        ('RuntimeKernelServer.ВыполнитьКодВКонтекстеОтладки(Контекст, '
+        ('RuntimeKernelServer.ВыполнитьКодВКонтекстеОтладки(e1cRuntimeКонтекст, '
          '"Результат = ""ok"";")', 307_200, 2, 3)
     ]
     assert worker.waits == [(PENDING, 0.25)] * 3

@@ -22,6 +22,7 @@ from onec_runtime.bsl.source_maps import MappedSource
 from onec_runtime.bsl.notebook_cells import NotebookCellProjection
 from onec_runtime.bsl.notebook_methods import NotebookMethodSet
 from onec_runtime.execution.message_collector import with_message_collector
+from onec_runtime.execution.worker_globals import with_notebook_worker_globals
 from onec_runtime.worker_universe import OperationGenerationPin
 
 
@@ -41,6 +42,8 @@ class RoutePreparationInput:
         [SemanticLoweringResult, OperationGenerationPin | None, LoweringMode],
         SemanticLoweringResult,
     ]
+    worker_globals: tuple[str, ...] = ()
+    worker_messages: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,15 +112,20 @@ def prepare_statement(
                 mode=mode,
                 message_collector_key=message_key,
             )
+    lowering = replace(
+        lowering,
+        mapped_source=with_message_collector(
+            with_notebook_worker_globals(lowering.mapped_source, request.worker_globals),
+            max(lowering.messages_intercepted, int(request.worker_messages)),
+            message_key,
+            worker_messages=request.worker_messages,
+        ),
+    )
+    # The generation check must precede message/global wrappers: both may
+    # access the active Worker before the user's lowered statement begins.
     lowering = request.with_pin_prelude(
         lowering,
         None if request.candidate_catalog is not None else request.operation_pin,
         mode,
-    )
-    lowering = replace(
-        lowering,
-        mapped_source=with_message_collector(
-            lowering.mapped_source, lowering.messages_intercepted, message_key,
-        ),
     )
     return RoutePreparedStatement(lowering, message_key)

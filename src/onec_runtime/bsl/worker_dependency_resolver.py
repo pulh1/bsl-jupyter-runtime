@@ -9,6 +9,7 @@ from onec_runtime.bsl.module_catalog import (
     CommonModuleCatalogSnapshot,
     CommonModuleDescriptor,
 )
+from onec_runtime.bsl.platform_globals import WORKER_PLATFORM_GLOBALS
 from onec_runtime.bsl.source_maps import SourceSpan
 from onec_runtime.bsl.worker_projection_model import (
     BareName,
@@ -22,41 +23,7 @@ from onec_runtime.errors import ModuleUniverseAdmissionError
 MODULE_SCOPE_DEPENDENCY = "module_scope_dependency"
 AMBIGUOUS_BINDING = "ambiguous_module_dependency"
 
-_PLATFORM_GLOBALS = frozenset(
-    {
-        "статуссообщения",
-        "символы",
-        "кодировкатекста",
-        "справочники",
-        "документы",
-        "журналыдокументов",
-        "регистрысведений",
-        "регистрынакопления",
-        "регистрыбухгалтерии",
-        "регистрырасчета",
-        "планывидовхарактеристик",
-        "планысчетов",
-        "планывидоврасчета",
-        "планыобмена",
-        "бизнеспроцессы",
-        "задачи",
-        "критерииотбора",
-        "последовательности",
-        "константы",
-        "перечисления",
-        "внешниеобработки",
-        "внешниеотчеты",
-        "обработки",
-        "отчеты",
-        "метаданные",
-        "параметрысеанса",
-        "частидаты",
-        "обходрезультатазапроса",
-        "видсравнениякомпоновкиданных",
-        "типгруппыэлементовотборакомпоновкиданных",
-        "цветастиля",
-    }
-)
+_PLATFORM_GLOBALS = WORKER_PLATFORM_GLOBALS
 
 
 @dataclass(frozen=True, slots=True)

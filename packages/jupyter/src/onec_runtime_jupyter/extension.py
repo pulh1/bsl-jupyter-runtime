@@ -446,7 +446,7 @@ class OnecValueProxy:
 
     def _context_handle(self) -> str:
         suffix = "".join(f".{item}" for item in self._path)
-        return f"Контекст.{self.name}{suffix}"
+        return f"e1cRuntimeКонтекст.{self.name}{suffix}"
 
     def _display_name(self) -> str:
         return ".".join((self.name, *self._path))
@@ -476,7 +476,7 @@ class _BslNamespaceBridge:
         guard = getattr(runtime, "validate_value_reference", None)
         if not callable(guard):
             raise ProtocolError("1C runtime does not expose local reference validation")
-        handles = tuple(f"Контекст.{name}" for name in snapshot.names)
+        handles = tuple(f"e1cRuntimeКонтекст.{name}" for name in snapshot.names)
         for handle in handles:
             guard(handle)
 

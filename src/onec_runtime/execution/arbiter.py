@@ -578,6 +578,7 @@ class RdbgArbiter:
         self._server_teardown: ServerTeardownAttempt | None = None
         self._file_teardown: FileTeardownAttempt | None = None
         self._cleanup_debt: ExecutionTicket | None = None
+        self._target_termination: TargetTerminated | None = None
         self._closing = False
         self._closed = False
         self._worker = Thread(target=self._run, name='rdbg-arbiter', daemon=True)
@@ -598,6 +599,46 @@ class RdbgArbiter:
         """True while a queued or running ticket owns the admission boundary."""
         with self._mailbox:
             return self._active is not None or bool(self._queue)
+
+    def wait_for_dependent_cleanup(self) -> bool:
+        """Wait only for the cleanup already following a settled parent reply.
+
+        Return false if the current activity is user work. A confirmed cleanup
+        debt needs explicit retry, while an unknown remote outcome keeps its
+        ticket owner. This observer never imposes a BSL execution deadline.
+        """
+
+        with self._mailbox:
+            if get_ident() == self._worker.ident:
+                raise ArbiterBusy('The RDBG worker cannot await its own cleanup')
+            if self._target_termination is not None:
+                raise self._target_termination
+            if self._cleanup_debt is not None:
+                raise ArbiterBusy('Confirmed cleanup debt requires retry')
+            active = self._active
+            cleanup = None
+            if active is not None and active._post_settlement_parent is not None:
+                cleanup = active
+            elif self._queue and self._queue[0]._post_settlement_parent is not None:
+                cleanup = self._queue[0]
+            if cleanup is None:
+                return False
+            self._mailbox.wait_for(lambda: (
+                cleanup._phase == 'unknown' or (
+                    cleanup._phase == 'settled'
+                    and self._active is not cleanup
+                    and cleanup not in self._queue
+                )
+            ))
+            if self._target_termination is not None:
+                raise self._target_termination
+            if cleanup._phase == 'unknown':
+                raise OutcomeUnknown('Dependent cleanup outcome is unknown')
+            if cleanup._error is not None:
+                if isinstance(cleanup._error, TargetTerminated):
+                    raise cleanup._error
+                raise ArbiterBusy('Confirmed cleanup debt requires retry') from cleanup._error
+            return True
 
     def submit(self, route: RouteToken, plan: Plan, *,
                finalizer: Callable[[Any], Any] | None = None) -> ExecutionTicket:
@@ -895,6 +936,8 @@ class RdbgArbiter:
                 ):
                     raise ValueError('File termination proof requires the exact selected file process lease')
 
+            termination = TargetTerminated(evidence)
+            self._target_termination = termination
             self._closed = True
             while self._queue:
                 self._settle(self._queue.popleft(), error=CancelledBeforeEffect())
@@ -902,7 +945,7 @@ class RdbgArbiter:
             ticket._pending_stop = None
             ticket._stop_target = None
             ticket._entered = False
-            self._settle(ticket, error=TargetTerminated(evidence))
+            self._settle(ticket, error=termination)
             self._active = None
             self._mailbox.notify_all()
 

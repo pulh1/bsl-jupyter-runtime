@@ -52,5 +52,5 @@ def test_status_enum_is_a_platform_global_not_persistent_context(
         message_collector_key="__onec_cell_messages_1_0",
     )
 
-    assert "Контекст.СтатусСообщения" not in result.source
+    assert "e1cRuntimeКонтекст.СтатусСообщения" not in result.source
     assert "СтатусСообщения.Важное" not in result.source

@@ -202,7 +202,7 @@ def _older_dump(root: Path) -> Path:
 
 
 def _version_dump(
-    root: Path, artifact_version: str, *, protocol_version: str = "4"
+    root: Path, artifact_version: str, *, protocol_version: str = "5"
 ) -> Path:
     return write_dump_fixture(
         root,
@@ -784,7 +784,7 @@ def test_manual_handshake_accepts_common_custom_artifact_version_without_marker(
     ]
 
 
-@pytest.mark.parametrize("predecessor", ["1", "2", "3"])
+@pytest.mark.parametrize("predecessor", ["1", "2", "3", "4"])
 def test_manual_handshake_rejects_predecessor_protocol_before_target_work(
     tmp_path: Path, predecessor: str,
 ) -> None:
@@ -794,7 +794,7 @@ def test_manual_handshake_rejects_predecessor_protocol_before_target_work(
         tools=tools,
         marker_matches=False,
     )
-    assert fixture.manifest.protocol_version == "4"
+    assert fixture.manifest.protocol_version == "5"
 
     with pytest.raises(ExtensionLifecycleError, match="packaged manifest"):
         fixture.lifecycle.accept_manual_handshake(

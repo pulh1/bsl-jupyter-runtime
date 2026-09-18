@@ -8,7 +8,9 @@ remote side effect. Method projections remain deferred until that admission.
 from __future__ import annotations
 
 from contextlib import AbstractContextManager, nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+
+from onec_runtime.bsl.notebook_method_globals import bind_notebook_method_globals
 
 from onec_runtime.bsl import (
     LoweringMode,
@@ -21,6 +23,10 @@ from onec_runtime.bsl.notebook_methods import (
     NotebookMethodSet, merge_notebook_methods,
 )
 from onec_runtime.bsl.parser_target import PythonParserTarget
+from onec_runtime.bsl.source_maps import (
+    SourceArtifactKind, SourceSpan, SourceTransformBuilder,
+)
+from onec_runtime.experiment import bsl_string_literal
 from onec_runtime.execution.contracts import (
     CommonCell,
     OperationSourceMapBundle,
@@ -29,7 +35,7 @@ from onec_runtime.execution.contracts import (
 from onec_runtime.execution.preparation import (
     RoutePreparationInput, WorkerCandidateIntent,
 )
-from onec_runtime.worker_universe import OperationGenerationPin
+from onec_runtime.worker_universe import OperationGenerationPin, WorkerGenerationHandle
 
 
 class RouteSnapshotMismatch(RuntimeError):
@@ -43,6 +49,7 @@ class RouteSnapshotGuard:
     namespace_names: tuple[str, ...] = field(repr=False)
     worker_exports: tuple[WorkerExport, ...] = field(repr=False)
     previous_methods: NotebookMethodSet | None = field(default=None, repr=False)
+    active_worker_handle: WorkerGenerationHandle | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -54,6 +61,7 @@ class RoutePreparationSnapshot:
     namespace_names: tuple[str, ...] = field(repr=False)
     worker_exports: tuple[WorkerExport, ...] = field(repr=False)
     previous_methods: NotebookMethodSet | None = field(default=None, repr=False)
+    active_worker_handle: WorkerGenerationHandle | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if type(self.version) is not int or self.version < 0:
@@ -77,6 +85,10 @@ class RoutePreparationSnapshot:
             self.previous_methods.exports
         ).issubset(self.worker_exports):
             raise ValueError("previous notebook method catalog is inconsistent")
+        if self.active_worker_handle is not None and not isinstance(
+            self.active_worker_handle, WorkerGenerationHandle
+        ):
+            raise ValueError("active Worker generation handle is invalid")
 
     def for_pipeline(self) -> PreparationSnapshots:
         """Keep the generic pipeline's three snapshot fields mutually bound."""
@@ -87,6 +99,7 @@ class RoutePreparationSnapshot:
             RouteSnapshotGuard(
                 self.owner, self.version, self.namespace_names,
                 self.worker_exports, self.previous_methods,
+                self.active_worker_handle,
             ),
         )
 
@@ -173,6 +186,26 @@ class SnapshotRouteBinding:
             raise ValueError("statement binding requires executable statements")
         intent = self.worker_intent(common, snapshots)
         catalog = guard.worker_exports if intent is None else intent.candidate_catalog
+        method_set = guard.previous_methods if intent is None else intent.method_set_candidate
+        notebook_exports = (
+            set() if method_set is None else
+            {item.public_path.casefold() for item in method_set.exports}
+        )
+        catalog = tuple(
+            WorkerExport(item.public_path, item.method, receiver_module="Worker")
+            if item.receiver_module is None
+            and item.public_path.casefold() in notebook_exports
+            else item
+            for item in catalog
+        )
+        worker_globals = () if method_set is None else method_set.bound_globals
+        worker_messages = False if method_set is None else method_set.intercepts_messages
+        if intent is not None:
+            _, worker_globals = bind_notebook_method_globals(
+                method_set.mapped_source,
+                context_names=guard.namespace_names,
+                exports=method_set.exports,
+            )
         lowerer = SemanticNotebookLowerer(
             self._parser_target,
             context_names=guard.namespace_names,
@@ -187,7 +220,13 @@ class SnapshotRouteBinding:
             complete_catalog=_identity_catalog,
             pinned_catalog=_no_pin_catalog,
             temporary_catalog=_no_temporary_catalog,
-            with_pin_prelude=_no_pin_prelude,
+            with_pin_prelude=lambda lowering, pin, mode: _with_snapshot_worker_prelude(
+                lowering, pin, mode, catalog,
+                None if intent is not None else guard.active_worker_handle,
+                bool(worker_globals or worker_messages),
+            ),
+            worker_globals=worker_globals,
+            worker_messages=worker_messages,
         )
 
 
@@ -207,12 +246,44 @@ def _no_temporary_catalog(
     return nullcontext()
 
 
-def _no_pin_prelude(
+def _with_snapshot_worker_prelude(
     lowering: SemanticLoweringResult,
     pin: OperationGenerationPin | None,
     mode: LoweringMode,
+    catalog: tuple[WorkerExport, ...],
+    handle: WorkerGenerationHandle | None,
+    worker_wrapper: bool,
 ) -> SemanticLoweringResult:
-    del mode
     if pin is not None:
         raise RuntimeError("statement snapshot has no Worker generation pin")
-    return lowering
+    dependencies = {name.casefold() for name in lowering.worker_dependencies}
+    if not worker_wrapper and not any(
+        item.receiver_module is not None
+        and item.public_path.casefold() in dependencies
+        for item in catalog
+    ):
+        return lowering
+    builder = SourceTransformBuilder(lowering.mapped_source)
+    prelude = (
+        "__OnecPinnedWorkerGeneration = "
+        "e1cRuntimeКонтекст.RuntimeWorkerActiveGeneration;\n"
+    )
+    if handle is not None:
+        prelude += (
+            "Если __OnecPinnedWorkerGeneration.ManifestSha256 <> "
+            f"{bsl_string_literal(handle.manifest_sha256)} Тогда\n"
+            '    ВызватьИсключение "Worker generation pin mismatch";\n'
+            "КонецЕсли;\n"
+        )
+    builder.synthetic(
+        prelude,
+        SourceSpan(0, 0),
+        "worker_generation_pin_prelude",
+    )
+    builder.copy(SourceSpan(0, len(lowering.source)))
+    return replace(
+        lowering,
+        mapped_source=builder.build(
+            SourceArtifactKind.EXECUTED_BSL, mode=mode.value,
+        ),
+    )

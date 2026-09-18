@@ -3002,7 +3002,7 @@ class AgentWorkspaceService:
             return
         snapshot = backend.namespace_snapshot()
         for name in snapshot.names:
-            backend.validate_value_reference(f"Контекст.{name}")
+            backend.validate_value_reference(f"e1cRuntimeКонтекст.{name}")
         provenance = ProxyProvenance(
             "runtime-admission",
             1,
@@ -3030,7 +3030,7 @@ class AgentWorkspaceService:
                     "runtime_generation": snapshot.runtime_generation,
                     "context_generation": snapshot.context_generation,
                     "provenance": provenance,
-                    "resolver_handle": f"Контекст.{name}",
+                    "resolver_handle": f"e1cRuntimeКонтекст.{name}",
                     "capabilities": (
                         "describe",
                         "size",

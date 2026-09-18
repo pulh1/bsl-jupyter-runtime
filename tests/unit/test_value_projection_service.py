@@ -75,13 +75,13 @@ def test_table_projection_transfers_only_selected_rows_and_decodes_frame() -> No
 
     port = TicketPort(TABLE_PAYLOAD)
     frame = _service(port).project_to_df(
-        "Контекст.Таблица", {"offset": 10, "limit": 2}, max_rows=2,
+        "e1cRuntimeКонтекст.Таблица", {"offset": 10, "limit": 2}, max_rows=2,
     )
 
     assert frame["Amount"].tolist() == [12.5]
     assert len(port.instructions) == 1
     assert "Скопировать(СтрокиПроекции" in port.instructions[0]
-    assert "Для ИндексПроекции = 10 По Мин(Контекст.Таблица.Количество() - 1, 11)" in port.instructions[0]
+    assert "Для ИндексПроекции = 10 По Мин(e1cRuntimeКонтекст.Таблица.Количество() - 1, 11)" in port.instructions[0]
     assert port.catalogs == [WorkerTransferCatalog(3, ())]
 
 
@@ -90,10 +90,10 @@ def test_value_projection_preserves_typed_result() -> None:
 
     port = TicketPort(VALUE_PAYLOAD)
     assert _service(port).project_value(
-        "Контекст.Числа", {"offset": 2, "limit": 1}, max_items=1,
+        "e1cRuntimeКонтекст.Числа", {"offset": 2, "limit": 1}, max_items=1,
     ) == Decimal("12.50")
     assert port.kind_reads == []
-    assert "Для ИндексПроекции = 2 По Мин(Контекст.Числа.Количество() - 1, 2)" in port.instructions[0]
+    assert "Для ИндексПроекции = 2 По Мин(e1cRuntimeКонтекст.Числа.Количество() - 1, 2)" in port.instructions[0]
 
 
 def test_value_projection_selects_table_decoder_inside_one_ticket() -> None:
@@ -101,7 +101,7 @@ def test_value_projection_selects_table_decoder_inside_one_ticket() -> None:
 
     port = TicketPort(TABLE_PAYLOAD)
     frame = _service(port).project_value(
-        "Контекст.Таблица", {"offset": 5, "limit": 1}, max_items=1,
+        "e1cRuntimeКонтекст.Таблица", {"offset": 5, "limit": 1}, max_items=1,
     )
     assert frame["Amount"].tolist() == [12.5]
     assert len(port.instructions) == 1
@@ -115,7 +115,7 @@ def test_mismatched_projection_payload_is_not_exposed() -> None:
     port = TicketPort(VALUE_PAYLOAD)
     with pytest.raises(ProtocolError, match="payload kind"):
         _service(port).project_value_payload(
-            "Контекст.Таблица", kind="table_rows", offset=0, limit=1,
+            "e1cRuntimeКонтекст.Таблица", kind="table_rows", offset=0, limit=1,
             columns=(), names=(), max_depth=1, max_items=1,
             max_rows=1, max_bytes=1024,
         )
@@ -124,9 +124,9 @@ def test_mismatched_projection_payload_is_not_exposed() -> None:
 @pytest.mark.parametrize(
     ("handle", "selection"),
     [
-        ("Контекст.А;Выполнить(1)", {"offset": 0, "limit": 1}),
-        ("Контекст.Таблица", {"offset": 0, "limit": 0}),
-        ("Контекст.Таблица", {"offset": 10_000_000, "limit": 1}),
+        ("e1cRuntimeКонтекст.А;Выполнить(1)", {"offset": 0, "limit": 1}),
+        ("e1cRuntimeКонтекст.Таблица", {"offset": 0, "limit": 0}),
+        ("e1cRuntimeКонтекст.Таблица", {"offset": 10_000_000, "limit": 1}),
     ],
 )
 def test_invalid_projection_is_rejected_before_dispatch(
@@ -145,8 +145,8 @@ def test_kind_reader_accepts_only_known_materialization_routes() -> None:
 
     port = TicketPort(kind="<debugger-xml>")
     with pytest.raises(ProtocolError, match="kind"):
-        _service(port).materialization_kind("Контекст.Значение")
-    assert port.kind_reads == ["Контекст.Значение"]
+        _service(port).materialization_kind("e1cRuntimeКонтекст.Значение")
+    assert port.kind_reads == ["e1cRuntimeКонтекст.Значение"]
 
 
 def test_invalid_value_budget_is_rejected_before_kind_inspection() -> None:
@@ -155,7 +155,7 @@ def test_invalid_value_budget_is_rejected_before_kind_inspection() -> None:
     port = TicketPort(VALUE_PAYLOAD)
     with pytest.raises((ProtocolError, ValueError)):
         _service(port).project_value(
-            "Контекст.Числа", {"offset": 0, "limit": 1},
+            "e1cRuntimeКонтекст.Числа", {"offset": 0, "limit": 1},
             max_items=1, max_bytes=0,
         )
     assert port.kind_reads == []
@@ -167,7 +167,7 @@ def test_direct_value_payload_is_typed_serialization_not_debugger_text() -> None
 
     port = TicketPort(VALUE_PAYLOAD)
     assert _service(port).materialize_value_payload(
-        "Контекст.Число", max_depth=2, max_items=5, max_bytes=1024,
+        "e1cRuntimeКонтекст.Число", max_depth=2, max_items=5, max_bytes=1024,
     ) == VALUE_PAYLOAD
     assert "СериализоватьЗначение" in port.instructions[0]
     assert b"debugger" not in VALUE_PAYLOAD
@@ -178,7 +178,7 @@ def test_direct_table_payload_uses_compact_serializer_and_bounded_rows() -> None
 
     port = TicketPort(TABLE_PAYLOAD)
     assert _service(port).materialize_table_payload(
-        "Контекст.Таблица", max_rows=2, max_bytes=1024,
+        "e1cRuntimeКонтекст.Таблица", max_rows=2, max_bytes=1024,
     ) == TABLE_PAYLOAD
     assert "СериализоватьКомпактнуюТаблицу" in port.instructions[0]
     assert port.catalogs == [WorkerTransferCatalog(3, ())]

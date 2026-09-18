@@ -157,7 +157,7 @@ def test_public_evaluation_receipt_grammar_is_exported_and_disjoint_from_private
         "__onec_materialization_" + "a" * 32,
         "__onec_projection_" + "a" * 32,
         "__onec_compact_table_" + "a" * 32,
-        "Контекст.Секрет",
+        "e1cRuntimeКонтекст.Секрет",
         "worker://private-handle",
     ):
         assert not is_public_capture_evaluation_id(private_identifier)

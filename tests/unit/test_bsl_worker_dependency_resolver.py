@@ -118,6 +118,16 @@ def test_internal_method_and_platform_global_shadow_catalog_names():
     assert plan.methods[0].dependencies == ()
 
 
+def test_document_write_mode_is_platform_global_even_if_catalog_has_same_name():
+    model = _model(_method(_bare("РежимЗаписиДокумента")))
+
+    plan = resolve_worker_dependencies(
+        model, _snapshot("РежимЗаписиДокумента")
+    )
+
+    assert plan.methods[0].dependencies == ()
+
+
 def test_known_read_is_dependency_in_catalog_order_and_unknown_read_is_ignored():
     model = _model(
         _method(_bare("Бета"), _bare("Неизвестный"), _bare("АЛЬФА"))

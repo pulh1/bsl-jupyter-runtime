@@ -76,6 +76,7 @@ class RuntimeNamespaceOwner:
                 names,
                 worker.worker_exports,
                 worker.active_methods,
+                worker.active_handle,
             )
 
     def namespace_snapshot(self) -> object:

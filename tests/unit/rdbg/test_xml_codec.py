@@ -238,7 +238,7 @@ def test_builds_one_workspace_with_multiple_module_breakpoints() -> None:
 def test_builds_eval_modify_and_continue_requests() -> None:
     result_id = UUID("33333333-3333-3333-3333-333333333333")
     eval_root = ElementTree.fromstring(
-        build_eval_request("DefAlias", UI_ID, TARGET, "Контекст.Счетчик", result_id)
+        build_eval_request("DefAlias", UI_ID, TARGET, "e1cRuntimeКонтекст.Счетчик", result_id)
     )
     modify_root = ElementTree.fromstring(
         build_modify_request(
@@ -247,7 +247,7 @@ def test_builds_eval_modify_and_continue_requests() -> None:
     )
     step_root = ElementTree.fromstring(build_step_request("DefAlias", UI_ID, TARGET))
 
-    assert descendants(eval_root, "expression")[0].text == "Контекст.Счетчик"
+    assert descendants(eval_root, "expression")[0].text == "e1cRuntimeКонтекст.Счетчик"
     assert descendants(eval_root, "expressionResultID")[0].text == str(result_id)
     assert descendants(modify_root, "modifyDataPath")[0].tag == f"{{{RDBG_NS}}}modifyDataPath"
     assert descendants(modify_root, "stackLevel")[0].tag == f"{{{CALC_NS}}}stackLevel"
@@ -266,7 +266,7 @@ def test_builds_eval_request_with_bounded_presentation_size() -> None:
             "DefAlias",
             UI_ID,
             TARGET,
-            "Контекст.Ссылка",
+            "e1cRuntimeКонтекст.Ссылка",
             result_id,
             max_text_size=4096,
         )
@@ -283,7 +283,7 @@ def test_builds_eval_request_for_selected_stack_level() -> None:
             "DefAlias",
             UI_ID,
             TARGET,
-            "Контекст.Счетчик",
+            "e1cRuntimeКонтекст.Счетчик",
             result_id,
             stack_level=2,
         )
@@ -300,7 +300,7 @@ def test_builds_collection_eval_request_for_requested_page() -> None:
             "DefAlias",
             UI_ID,
             TARGET,
-            "Контекст.ZupMaterializationTable",
+            "e1cRuntimeКонтекст.ZupMaterializationTable",
             result_id,
             start_index=4800,
             page_size=2400,
@@ -309,7 +309,7 @@ def test_builds_collection_eval_request_for_requested_page() -> None:
         )
     )
 
-    assert descendants(root, "expression")[0].text == "Контекст.ZupMaterializationTable"
+    assert descendants(root, "expression")[0].text == "e1cRuntimeКонтекст.ZupMaterializationTable"
     assert descendants(root, "interfaces")[0].text == "collection"
     assert descendants(root, "startIndex")[0].text == "4800"
     assert descendants(root, "pageSize")[0].text == "2400"
@@ -329,7 +329,7 @@ def test_rejects_invalid_collection_page(
             "DefAlias",
             UI_ID,
             TARGET,
-            "Контекст.Таблица",
+            "e1cRuntimeКонтекст.Таблица",
             UUID("33333333-3333-3333-3333-333333333333"),
             start_index=start_index,
             page_size=page_size,

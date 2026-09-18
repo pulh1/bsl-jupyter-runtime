@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Protocol, cast
+from typing import Callable, Protocol, cast
 
 from onec_runtime.bsl.diagnostics import DiagnosticStage, VisibleSourceContext
 from onec_runtime.bsl.lexer import BslLexError
@@ -21,6 +21,7 @@ from onec_runtime.execution.contracts import (
 from onec_runtime.execution.preparation import (
     RoutePreparationInput, RoutePreparedStatement, WorkerCandidateIntent,
 )
+from onec_runtime.execution.worker_activation import PrebuiltWorkerIntent
 
 
 class CapturePreparationBinding(Protocol):
@@ -40,7 +41,7 @@ class CapturePreparedPayload:
     common: CommonCell = field(repr=False)
     statement: RoutePreparedStatement | None = field(repr=False)
     dirty_roots: tuple[str, ...] = ()
-    worker_intent: WorkerCandidateIntent | None = field(default=None, repr=False)
+    worker_intent: WorkerCandidateIntent | PrebuiltWorkerIntent | None = field(default=None, repr=False)
     deferred_statement: RoutePreparedStatement | None = field(default=None, repr=False)
 
 
@@ -57,9 +58,14 @@ class CaptureCellPolicy:
         self,
         binding: CapturePreparationBinding,
         preparer: CaptureCellPreparer | None = None,
+        *,
+        prebuild_worker: (
+            Callable[[WorkerCandidateIntent], PrebuiltWorkerIntent] | None
+        ) = None,
     ) -> None:
         self._binding = binding
         self._preparer = preparer or CaptureCellPreparer()
+        self._prebuild_worker = prebuild_worker
 
     def prepare(
         self,
@@ -99,6 +105,8 @@ class CaptureCellPolicy:
                     stage=stage,
                 )
             dirty_roots = lowered.lowering.dirty_roots
+        if worker_intent is not None and self._prebuild_worker is not None:
+            worker_intent = self._prebuild_worker(worker_intent)
         return PreparedCell(
             context.route_token,
             context.preparation_nonce,

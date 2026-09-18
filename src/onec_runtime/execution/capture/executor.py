@@ -128,7 +128,9 @@ class CaptureExecutor:
     def _locate_kernel_context_frame(
         self, stop: StopEvent, rdbg: CaptureRdbgPort
     ) -> int:
-        required = {"контекст", "текущаяинструкция", "идентификаторкоманды"}
+        required = {
+            "e1cruntimeконтекст", "текущаяинструкция", "идентификаторкоманды",
+        }
         stack = stop.stack
         frames = stop.stack_frames
         if not stack or not frames:

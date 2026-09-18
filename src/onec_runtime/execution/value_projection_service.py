@@ -446,7 +446,7 @@ def _build_dynamic_slice_instruction(
         "        Если Не Материализация.Доступ Тогда",
         '            Результат = "D|worker_generation_value";',
         "        Иначе",
-        f"            Контекст.Вставить({bsl_string_literal(context_key)}, Материализация.Base64);",
+        f"            e1cRuntimeКонтекст.Вставить({bsl_string_literal(context_key)}, Материализация.Base64);",
         '            Результат = "R|" + '
         f'Формат({runtime_generation}, "ЧГ=0; ЧДЦ=0") + "|" + '
         f'Формат({context_generation}, "ЧГ=0; ЧДЦ=0") + "|" + '

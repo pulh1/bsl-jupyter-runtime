@@ -300,7 +300,7 @@ def test_transaction_capture_uses_database_write_before_capture_and_rollback() -
     capture = source.index("СинтетическийCapture(100)")
     rollback = source.index("ОтменитьТранзакцию();")
     assert write < read_inside < capture < rollback
-    assert "Контекст" not in source
+    assert "e1cRuntimeКонтекст" not in source
     parse_raw_module(source, PythonParserTarget.from_generated())
     parse_raw_module(
         _settings_delete_source("task9-item"),

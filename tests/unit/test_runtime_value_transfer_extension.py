@@ -320,11 +320,11 @@ def test_bsl_success_structures_execute_the_generated_protocol_two_r_branch() ->
         materialization.update({"Base64": "e30=", "Размер": 2, "Хеш": "a" * 64})
 
     value_instruction = build_value_transfer_instruction(
-        "Контекст.Данные", MaterializationOptions(), "__onec_value_" + "a" * 32,
+        "e1cRuntimeКонтекст.Данные", MaterializationOptions(), "__onec_value_" + "a" * 32,
         runtime_generation=1, context_generation=1,
     )
     table_instruction = build_compact_transfer_instruction(
-        "Контекст.Таблица", ReferencePolicy(), "__onec_compact_table_" + "b" * 32,
+        "e1cRuntimeКонтекст.Таблица", ReferencePolicy(), "__onec_compact_table_" + "b" * 32,
         runtime_generation=1, context_generation=1,
     )
 

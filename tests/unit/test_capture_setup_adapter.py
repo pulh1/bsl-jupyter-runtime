@@ -57,7 +57,7 @@ class WorkerPort:
         else:
             variables = tuple(
                 FrameVariable(name, "Строка", "")
-                for name in ("Контекст", "ТекущаяИнструкция", "ИдентификаторКоманды")
+                for name in ("e1cRuntimeКонтекст", "ТекущаяИнструкция", "ИдентификаторКоманды")
             )
         return LocalVariablesResult(UUID(int=20 + stack_level), variables)
 

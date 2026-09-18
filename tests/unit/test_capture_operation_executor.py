@@ -143,7 +143,7 @@ def test_confirmed_bsl_error_restores_workspace_and_preserves_capture_frame() ->
         ]
         assert session.calls[0][1] == SHIELDED
         assert session.calls[1][1] == (
-            'RuntimeKernelServer.ВыполнитьКодВКонтекстеОтладки(Контекст, '
+            'RuntimeKernelServer.ВыполнитьКодВКонтекстеОтладки(e1cRuntimeКонтекст, '
             '"Результат = 1;")', 2
         )
         assert session.calls[3][1] == FULL
@@ -625,7 +625,7 @@ def test_messages_are_collected_on_the_same_worker_before_pure_policy() -> None:
             "start", "wait", "policy", "cleanup",
         ]
         assert session.calls[4][1] == (
-            'RuntimeKernelServer.ЗабратьСообщенияЯчейкиИзКонтекста(Контекст, '
+            'RuntimeKernelServer.ЗабратьСообщенияЯчейкиИзКонтекста(e1cRuntimeКонтекст, '
             '"__cell_messages")', 2,
         )
         assert operation.confirmed_result is primary

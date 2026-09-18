@@ -114,7 +114,7 @@ def transfer_plan(key: str) -> CaptureTransferPlan:
     return CaptureTransferPlan(
         'Результат = "admission";',
         key,
-        f'Контекст.Удалить("{key}");\nРезультат = Истина;',
+        f'e1cRuntimeКонтекст.Удалить("{key}");\nРезультат = Истина;',
         2048,
         decode,
         admit,
@@ -154,7 +154,7 @@ def test_independent_plan_port_does_not_require_legacy_coordinator_type() -> Non
     plan = IndependentTransferPlan(
         'Результат = "admission";',
         key,
-        f'Контекст.Удалить("{key}");\nРезультат = Истина;',
+        f'e1cRuntimeКонтекст.Удалить("{key}");\nРезультат = Истина;',
         2048,
         lambda metadata, payload: b"a",
         lambda value: AdmissionEnvelopeV1.parse(
@@ -213,7 +213,7 @@ def test_denied_admission_cleans_key_without_payload_read_and_preserves_scope(
     sources = [value[0] for kind, value, _ in session.calls if kind == "start"]
     assert "ВыполнитьКодВКонтекстеОтладки" in sources[0]
     assert "admission" in sources[0]
-    assert "Контекст.Удалить" in sources[1]
+    assert "e1cRuntimeКонтекст.Удалить" in sources[1]
     assert all("ЗабратьКомпактнуюМатериализациюИзКонтекста" not in source for source in sources)
     assert len({thread for _, _, thread in session.calls}) == 1
     assert session.calls[0][2] != get_ident()
@@ -243,7 +243,7 @@ def test_success_reads_payload_then_confirms_key_deletion() -> None:
     sources = [value[0] for kind, value, _ in session.calls if kind == "start"]
     assert len(sources) == 3
     assert "ЗабратьКомпактнуюМатериализациюИзКонтекста" in sources[1]
-    assert "Контекст.Удалить" in sources[2]
+    assert "e1cRuntimeКонтекст.Удалить" in sources[2]
     assert scope.context_state is CaptureContextState.READY
     arbiter.close(timeout=3)
 
@@ -313,7 +313,7 @@ def test_confirmed_cleanup_debt_can_be_retried_without_repeating_transfer() -> N
     assert "admission" in sources[0]
     assert all("admission" not in source for source in sources[1:])
     assert all("ЗабратьКомпактнуюМатериализацию" not in source for source in sources[1:])
-    assert "Контекст.Удалить" in sources[2]
+    assert "e1cRuntimeКонтекст.Удалить" in sources[2]
     assert len({thread for _, _, thread in session.calls}) == 1
     arbiter.close(timeout=3)
 

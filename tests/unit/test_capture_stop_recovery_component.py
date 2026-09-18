@@ -69,7 +69,7 @@ class RecoverySession(CompleteSession):
             self._record("wait_eval")
             self.pending = None
             return EvaluationResult(pending.result_id, "Строка", '"YQ=="', False)
-        if "Контекст.Удалить" in expression and "__onec_compact_table_" in expression:
+        if "e1cRuntimeКонтекст.Удалить" in expression and "__onec_compact_table_" in expression:
             on_transport_dispatch()
             self._record("wait_eval")
             self.pending = None
@@ -166,7 +166,7 @@ def test_capture_error_retry_inspect_materialize_resume_same_main_and_scope() ->
         assert sum("Результат = 2;" in source for source in session.started) == 1
         assert sum("admission" in source for source in session.started) == 1
         assert sum("ЗабратьКомпактнуюМатериализациюИзКонтекста" in source for source in session.started) == 1
-        assert sum("Контекст.Удалить" in source and key in source for source in session.started) == 1
+        assert sum("e1cRuntimeКонтекст.Удалить" in source and key in source for source in session.started) == 1
         assert [root for root, _ in session.modified].count("Результат") == 1
         call_names = [name for name, _ in session.calls]
         assert call_names.count("continue") == 2
@@ -214,7 +214,7 @@ def test_failed_materialization_cleanup_is_repairable_in_same_capture_stop() -> 
         ).wait(3) == 2
         assert controller.submit_resume().wait(3).kind is MainYieldKind.COMPLETED
         assert sum("admission" in source for source in session.started) == 1
-        assert sum("Контекст.Удалить" in source and key in source for source in session.started) == 2
+        assert sum("e1cRuntimeКонтекст.Удалить" in source and key in source for source in session.started) == 2
         assert len({thread for _, thread in session.calls}) == 1
     finally:
         arbiter.close(timeout=3)

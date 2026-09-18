@@ -174,7 +174,7 @@ def test_schema_only_inventory_returns_metadata_handle_and_never_reads_rows() ->
         assert session.metadata_calls[-1][:3] == (
             "schema",
             'RuntimeKernelServer.ПолучитьСхемуВременнойТаблицыОтладки('
-            'Контекст.КонтекстОтладки.Query.Manager, "Staff")',
+            'e1cRuntimeКонтекст.e1cRuntimeКонтекстОтладки.Query.Manager, "Staff")',
             2,
         )
         assert all(call[3] is arbiter._worker for call in session.metadata_calls)
@@ -235,7 +235,7 @@ def test_selected_table_registers_scope_fenced_deferred_descriptor() -> None:
         assert session.metadata_calls[-1][1] == (
             "RuntimeTableTransferServer.ПолучитьКомпактнуюСхему("
             "RuntimeKernelServer.ПолучитьВременнуюТаблицуОтладки("
-            'Контекст.КонтекстОтладки.Query.Manager, "Staff", 3, 5, '
+            'e1cRuntimeКонтекст.e1cRuntimeКонтекстОтладки.Query.Manager, "Staff", 3, 5, '
             'СтрРазделить("Employee", ",")))'
         )
         assert controller.capture_scope is not None
@@ -278,7 +278,7 @@ def test_selected_descriptor_resolves_inside_owned_materialization_ticket(monkey
         assert observed[0][0] is scope
         assert observed[0][2] is arbiter._worker
         assert "ПолучитьВременнуюТаблицуОтладки" in observed[0][1]
-        assert 'Контекст.КонтекстОтладки.Query.Manager, "Staff", 5, 1, Новый Массив)' in observed[0][1]
+        assert 'e1cRuntimeКонтекст.e1cRuntimeКонтекстОтладки.Query.Manager, "Staff", 5, 1, Новый Массив)' in observed[0][1]
         assert "capture_table_" not in observed[0][1]
         assert "private table bytes" not in repr(controller.capture_evaluation_ledger().status())
         controller.invalidate_capture_inspection()

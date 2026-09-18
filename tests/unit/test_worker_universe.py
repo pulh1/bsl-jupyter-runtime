@@ -1227,7 +1227,7 @@ class _PreSwapTimestampFailureExecutor(_UniverseTargetExecutor):
         immutable_root = source.index(
             "Новый ФиксированнаяСтруктура(ДанныеКорня"
         )
-        seal = source.index('Контекст.Вставить("__OnecWorkerPrepared_')
+        seal = source.index('e1cRuntimeКонтекст.Вставить("__OnecWorkerPrepared_')
         timer = timestamps[self.timer_index]
         if self.timer_index == 0:
             assert try_start < timer < create < catch_start < seal
@@ -1736,7 +1736,7 @@ def _prepared_instruction(candidate) -> str:
         previous,
     )
 
-    assert 'Контекст.Вставить("RuntimeWorkerActiveGeneration"' not in source
+    assert 'e1cRuntimeКонтекст.Вставить("RuntimeWorkerActiveGeneration"' not in source
     assert f"__OnecWorkerPrepared_{transaction_id.hex}" in source
     assert source.rindex("ВнешниеОбработки.Создать") < source.index(
         "__OnecDependency_"
@@ -1751,10 +1751,10 @@ def _prepared_instruction(candidate) -> str:
     )
     swap = worker_universe.swap_worker_root_instruction(prepared)
 
-    assert swap.count('Контекст.Вставить("RuntimeWorkerActiveGeneration"') == 1
+    assert swap.count('e1cRuntimeКонтекст.Вставить("RuntimeWorkerActiveGeneration"') == 1
     assert 'ТекущийКореньWorker.RootKey <> "generation-6"' in swap
     assert swap.index("previous root identity mismatch") < swap.index(
-        'Контекст.Вставить("RuntimeWorkerActiveGeneration"'
+        'e1cRuntimeКонтекст.Вставить("RuntimeWorkerActiveGeneration"'
     )
 
 
@@ -1784,16 +1784,16 @@ def test_prepare_and_swap_instructions_time_separate_phases(
     )
     create = source.index("Новый Соответствие")
     immutable_root = source.index("Новый ФиксированнаяСтруктура(ДанныеКорня")
-    seal = source.index('Контекст.Вставить("__OnecWorkerPrepared_')
+    seal = source.index('e1cRuntimeКонтекст.Вставить("__OnecWorkerPrepared_')
     result = source.index(
         'Результат = "onec-worker-prepared-root-receipt-v1|'
     )
     assert len(timestamps) == 2
     assert timestamps[0] < create
     assert immutable_root < timestamps[1] < seal < result
-    assert 'Контекст.Вставить("RuntimeWorkerActiveGeneration"' not in source
+    assert 'e1cRuntimeКонтекст.Вставить("RuntimeWorkerActiveGeneration"' not in source
     assert swap_source.count(
-        'Контекст.Вставить("RuntimeWorkerActiveGeneration"'
+        'e1cRuntimeКонтекст.Вставить("RuntimeWorkerActiveGeneration"'
     ) == 1
     assert swap_source.count("ТекущаяУниверсальнаяДатаВМиллисекундах()") == 2
 
@@ -1982,7 +1982,7 @@ def test_server_promotion_stages_then_confirms_and_returns_only_handle(
         for source in target.calls[:-1]
     )
     assert target.calls[-1].count(
-        'Контекст.Вставить("RuntimeWorkerActiveGeneration", '
+        'e1cRuntimeКонтекст.Вставить("RuntimeWorkerActiveGeneration", '
         "ПодготовленныйКореньWorker.Root);"
     ) == 1
 
@@ -3555,9 +3555,9 @@ def test_promotion_instruction_wires_original_and_overloaded_targets_and_probes_
     assert "Новый ФиксированноеСоответствие" in source
     assert "Новый ФиксированнаяСтруктура" in source
     assert candidate.manifest.sha256 in source
-    assert 'Контекст.Вставить("RuntimeWorkerActiveGeneration"' not in source
+    assert 'e1cRuntimeКонтекст.Вставить("RuntimeWorkerActiveGeneration"' not in source
     assert source.index(
-        'Контекст.Вставить("__OnecWorkerPrepared_'
+        'e1cRuntimeКонтекст.Вставить("__OnecWorkerPrepared_'
     ) < source.index(
         'Результат = "onec-worker-prepared-root-receipt-v1|'
     )
@@ -3750,7 +3750,7 @@ def test_fixed_result_dependency_is_rejected_before_candidate_or_source_generati
     (
         "Результат",
         "рЕзУлЬтАт",
-        "Контекст",
+        "e1cRuntimeКонтекст",
         "ВнешниеОбработки",
         "ПоместитьВоВременноеХранилище",
         "Base64Значение",

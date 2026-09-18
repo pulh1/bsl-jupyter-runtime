@@ -157,7 +157,7 @@ def build_capture_value_inline_expression(
         _enforce_source_budget=False,
     )
     if path.root.kind is ValueRootKind.CONTEXT:
-        roots = "Контекст.КонтекстОтладки"
+        roots = "e1cRuntimeКонтекст.e1cRuntimeКонтекстОтладки"
     elif native_candidates:
         roots = (
             "Новый Структура("
@@ -595,7 +595,7 @@ def _inspection_source(
         f"    {context} = RuntimeContextStoreServer.ПолучитьКонтекст();",
     ]
     if path.root.kind is ValueRootKind.CONTEXT:
-        lines.append(f"    {roots} = {context}.КонтекстОтладки;")
+        lines.append(f"    {roots} = {context}.e1cRuntimeКонтекстОтладки;")
     else:
         lines.append(f"    {roots} = Новый Структура;")
         for name in native_candidates:

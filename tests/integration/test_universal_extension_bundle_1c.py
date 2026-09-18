@@ -532,7 +532,7 @@ def test_unbounded_to_df_keeps_all_rows_after_schema_probe(
 ТаблицаДляPython.Добавить().Значение = "second";
 ''')
         assert reply.succeeded
-        frame = session.to_df("Контекст.ТаблицаДляPython")
+        frame = session.to_df("e1cRuntimeКонтекст.ТаблицаДляPython")
         assert frame["Значение"].tolist() == ["first", "second"]
     finally:
         session.close()
@@ -571,7 +571,7 @@ def test_bounded_to_df_initializes_value_transfer_module(
 ''')
         assert reply.succeeded
         frame = session.project_to_df(
-            "Контекст.ТаблицаДляСреза",
+            "e1cRuntimeКонтекст.ТаблицаДляСреза",
             {"offset": 5, "limit": 5},
             timeout_s=20,
         )
@@ -624,7 +624,7 @@ def test_capture_cell_table_to_df_before_resume(
 ''')
         assert cell.kind is RuntimeReplyKind.CAPTURE_CELL
         assert cell.succeeded, cell.error
-        frame = session.to_df("Контекст.СнимокПосле")
+        frame = session.to_df("e1cRuntimeКонтекст.СнимокПосле")
         assert frame["Значение"].tolist() == ["first", "second"]
         resumed = session.resume_capture()
         assert resumed.kind is RuntimeReplyKind.MAIN_COMPLETED
@@ -674,7 +674,7 @@ def test_capture_table_materialization_after_failed_then_fixed_cell(
         assert cell.kind is RuntimeReplyKind.CAPTURE_CELL
         assert cell.succeeded, cell.error
         page = session.project_to_df(
-            "Контекст.СнимокПоказателей", {"offset": 0, "limit": 1},
+            "e1cRuntimeКонтекст.СнимокПоказателей", {"offset": 0, "limit": 1},
         )
         assert page["Значение"].tolist() == ["after failure"]
         failed = session.execute_bsl('''
@@ -695,7 +695,7 @@ def test_capture_table_materialization_after_failed_then_fixed_cell(
 ''')
         assert fixed.kind is RuntimeReplyKind.CAPTURE_CELL
         assert fixed.succeeded, fixed.error
-        frame = session.to_df("Контекст.СнимокПоказателей")
+        frame = session.to_df("e1cRuntimeКонтекст.СнимокПоказателей")
         assert frame["Значение"].tolist() == ["after failure"]
         resumed = session.resume_capture()
         assert resumed.kind is RuntimeReplyKind.MAIN_COMPLETED

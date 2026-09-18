@@ -7,8 +7,8 @@ from onec_runtime.value_transfer_backend import validate_value_handle
 
 
 _PRIVATE_WORKER_ROOTS = (
-    "Контекст.RuntimeWorkerActiveGeneration".casefold(),
-    "Контекст.RuntimeWorkerPinnedOperationGeneration".casefold(),
+    "e1cRuntimeКонтекст.RuntimeWorkerActiveGeneration".casefold(),
+    "e1cRuntimeКонтекст.RuntimeWorkerPinnedOperationGeneration".casefold(),
 )
 
 

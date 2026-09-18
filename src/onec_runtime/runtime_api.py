@@ -1643,7 +1643,7 @@ class PrototypeRuntimeApi:
             if (
                 not isinstance(handle, str)
                 or len(handle) > 512
-                or not re.fullmatch(r"Контекст\.[^\W\d]\w*(?:\.[^\W\d]\w*){0,7}", handle)
+                or not re.fullmatch(r"e1cRuntimeКонтекст\.[^\W\d]\w*(?:\.[^\W\d]\w*){0,7}", handle)
                 or type(table_row) is not bool
             ):
                 raise ProtocolError("Completion requires a direct or dotted Context path")
@@ -3561,7 +3561,7 @@ class PrototypeRuntimeApi:
         manifest = bsl_string_literal(handle.manifest_sha256)
         local_assignment = (
             "__OnecPinnedWorkerGeneration = "
-            "Контекст.RuntimeWorkerActiveGeneration;\n"
+            "e1cRuntimeКонтекст.RuntimeWorkerActiveGeneration;\n"
         )
         prelude = local_assignment + (
             "Если __OnecPinnedWorkerGeneration.ManifestSha256 <> "
@@ -5670,7 +5670,7 @@ class PrototypeRuntimeApi:
             "        Если Не Материализация.Доступ Тогда",
             '            Результат = "D|worker_generation_value";',
             "        Иначе",
-            f"            Контекст.Вставить({bsl_string_literal(context_key)}, Материализация.Base64);",
+            f"            e1cRuntimeКонтекст.Вставить({bsl_string_literal(context_key)}, Материализация.Base64);",
             '            Результат = "R|" + '
             f'Формат({self._controller.runtime_generation}, "ЧГ=0; ЧДЦ=0") + "|" + '
             f'Формат({self._context_generation}, "ЧГ=0; ЧДЦ=0") + "|" + '
@@ -5950,7 +5950,7 @@ class PrototypeRuntimeApi:
         return CaptureTransferPlan(
             instruction,
             context_key,
-            f"Контекст.Удалить({bsl_string_literal(context_key)});\nРезультат = Истина;",
+            f"e1cRuntimeКонтекст.Удалить({bsl_string_literal(context_key)});\nРезультат = Истина;",
             max_base64_chars,
             decode,
             admit,
@@ -6218,7 +6218,7 @@ class PrototypeRuntimeApi:
             "        Если Не Материализация.Доступ Тогда",
             '            Результат = "D|worker_generation_value";',
             "        Иначе",
-            f"            Контекст.Вставить({bsl_string_literal(context_key)}, Материализация.Base64);",
+            f"            e1cRuntimeКонтекст.Вставить({bsl_string_literal(context_key)}, Материализация.Base64);",
             '            Результат = "R|" + '
             f'Формат({runtime_generation}, "ЧГ=0; ЧДЦ=0") + "|" + '
             f'Формат({context_generation}, "ЧГ=0; ЧДЦ=0") + "|" + '
@@ -6375,7 +6375,7 @@ class PrototypeRuntimeApi:
             "    Если Не Материализация.Доступ Тогда",
             '        Результат = "D|worker_generation_value";',
             "    Иначе",
-            f"        Контекст.Вставить({bsl_string_literal(context_key)}, Материализация.Base64);",
+            f"        e1cRuntimeКонтекст.Вставить({bsl_string_literal(context_key)}, Материализация.Base64);",
             "        Результат = \"R|\" + "
             f"Формат({runtime_generation}, \"ЧГ=0; ЧДЦ=0\") + \"|\" + "
             f"Формат({context_generation}, \"ЧГ=0; ЧДЦ=0\") + \"|\" + "
@@ -6477,7 +6477,7 @@ class PrototypeRuntimeApi:
         manager_parts = manager_path.split(".")
         identifiers = (*manager_parts[2:], table_name)
         if (
-            manager_parts[:2] != ["Контекст", "КонтекстОтладки"]
+            manager_parts[:2] != ["e1cRuntimeКонтекст", "e1cRuntimeКонтекстОтладки"]
             or not 1 <= len(manager_parts[2:]) <= 101
             or any(
                 len(identifier) > 256
@@ -6528,9 +6528,9 @@ class PrototypeRuntimeApi:
             raise ProtocolError("value reference must be a string")
         normalized = handle.casefold()
         if normalized.startswith(
-            "Контекст.RuntimeWorkerActiveGeneration".casefold()
+            "e1cRuntimeКонтекст.RuntimeWorkerActiveGeneration".casefold()
         ) or normalized.startswith(
-            f"Контекст.{_RESERVED_WORKER_ROOT_CONTEXT_SLOT}".casefold()
+            f"e1cRuntimeКонтекст.{_RESERVED_WORKER_ROOT_CONTEXT_SLOT}".casefold()
         ) or normalized.startswith("__OnecPinnedWorkerGeneration".casefold()):
             raise ProtocolError("Worker generation objects are not public values")
         if handle.startswith("capture_table_metadata_"):

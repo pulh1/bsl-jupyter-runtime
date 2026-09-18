@@ -1,7 +1,7 @@
 """Module generations use one stopped-route arbiter owner."""
 
 from pathlib import Path
-from threading import current_thread
+from threading import Event, Thread, current_thread
 from types import SimpleNamespace
 from uuid import UUID
 
@@ -30,6 +30,7 @@ from onec_runtime.execution.worker_breakpoint_workspace import WorkerBreakpointW
 from onec_runtime.execution.worker_catalog_resolver import resolve_worker_module_catalog
 from onec_runtime.execution.worker_module_lifecycle import WorkerModuleLifecycleService
 from onec_runtime.execution.worker_mutation import MainPausedWorkerRoute
+from onec_runtime.performance_profile import PhaseRecorder
 from onec_runtime.rdbg.models import ModuleLocation, TargetId
 from onec_runtime.worker_breakpoints import (
     WorkerBreakpointReloadOutcome, WorkerBreakpointReloadPolicy,
@@ -56,7 +57,8 @@ def test_pure_module_preparer_builds_validated_artifacts_without_rdbg(tmp_path) 
         PythonParserTarget.from_generated(), builder,
     )
 
-    artifacts = preparer((unit,), CATALOG, None)
+    resolution = resolve_worker_module_catalog(CATALOG, (unit,))
+    artifacts = preparer((unit,), resolution, None)
     assert len(artifacts) == 1
     assert artifacts[0].logical_name == unit.logical_name
     assert validate_worker_module_artifact(artifacts[0]) == artifacts[0].exports
@@ -84,6 +86,7 @@ class Publisher:
         self.supports_breakpoint_reload = True
         self.active = None
         self.calls = []
+        self.artifact_batches = []
         self.released = []
         self.failure = None
         self.breakpoints = breakpoints
@@ -98,6 +101,7 @@ class Publisher:
         assert isinstance(port, SessionPort)
         port.heartbeat()
         self.calls.append(tuple(artifact.logical_name for artifact in artifacts))
+        self.artifact_batches.append(artifacts)
         if self.failure is not None:
             raise self.failure
         self.active = WorkerGenerationHandle(1, 1, len(self.calls), "a" * 64)
@@ -129,8 +133,9 @@ def _bound(*, breakpoints=False, changed=None):
     route = [MainPausedWorkerRoute(TARGET)]
     reader = lambda: route[0]
 
-    def prepare(units, catalog, profiler):
-        assert catalog is not None
+    def prepare(units, resolution, profiler):
+        assert isinstance(resolution.catalog, CommonModuleCatalogSnapshot)
+        assert len(resolution.models) == len(units)
         assert profiler is None
         if changed is not None:
             route[0] = changed
@@ -180,12 +185,37 @@ def test_lazy_catalog_resolves_parsed_bare_names_and_required_module(tmp_path) -
     )
     source = SessionCommonModuleCatalog(tmp_path, profile="server-test")
 
-    snapshot = resolve_worker_module_catalog(source, (unit,))
+    resolution = resolve_worker_module_catalog(source, (unit,))
 
-    assert isinstance(snapshot, CommonModuleCatalogSnapshot)
-    assert tuple(item.canonical_name for item in snapshot.modules) == (
+    assert isinstance(resolution.catalog, CommonModuleCatalogSnapshot)
+    assert tuple(item.canonical_name for item in resolution.catalog.modules) == (
         "МодульА", "МодульБ",
     )
+
+
+def test_lazy_catalog_passes_one_parsed_model_into_artifact_preparation(tmp_path) -> None:
+    from onec_runtime.bsl.parser_target import PythonParserTarget
+    from onec_runtime.execution.worker_module_lifecycle import WorkerModuleArtifactPreparer
+
+    _add_common_module(tmp_path, "МодульА")
+    unit = _source_unit(
+        "МодульА",
+        "Функция Версия() Экспорт\nВозврат 1;\nКонецФункции\n",
+    )
+    profiler = PhaseRecorder()
+    resolution = resolve_worker_module_catalog(
+        SessionCommonModuleCatalog(tmp_path, profile="server-test"),
+        (unit,), profiler=profiler,
+    )
+    preparer = WorkerModuleArtifactPreparer(
+        PythonParserTarget.from_generated(), _builder(tmp_path)[0],
+    )
+
+    artifacts = preparer((unit,), resolution, profiler)
+
+    assert len(artifacts) == 1
+    assert artifacts[0].logical_name == unit.logical_name
+    assert profiler.parser_calls.full_module_parses == 1
 
 
 def test_lazy_catalog_uses_retained_units_before_next_publication(tmp_path) -> None:
@@ -212,6 +242,167 @@ def test_lazy_catalog_uses_retained_units_before_next_publication(tmp_path) -> N
         )
         assert publisher.calls == [("МодульА",), ("МодульА", "МодульБ")]
         assert session.calls == [arbiter._worker, arbiter._worker]
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_catalog_growth_preserves_retained_local_binding_and_reuses_its_artifact(
+    tmp_path,
+) -> None:
+    from onec_runtime.bsl.parser_target import PythonParserTarget
+    from onec_runtime.execution.worker_module_lifecycle import WorkerModuleArtifactPreparer
+
+    first = _source_unit(
+        "МодульА",
+        "Функция Версия() Экспорт\n"
+        "    Локальная = 1;\n"
+        "    Возврат Локальная;\n"
+        "КонецФункции\n",
+    )
+    second = _source_unit(
+        "МодульБ",
+        "Функция Версия() Экспорт\nВозврат 2;\nКонецФункции\n",
+    )
+    initial = CommonModuleCatalogSnapshot.create(
+        profile="server-test", preprocessor_profile="server", revision=1,
+        modules=(CommonModuleDescriptor("МодульА", CommonModuleScope.SERVER),),
+    )
+    expanded = CommonModuleCatalogSnapshot.create(
+        profile="server-test", preprocessor_profile="server", revision=2,
+        modules=tuple(
+            CommonModuleDescriptor(name, CommonModuleScope.SERVER)
+            for name in ("МодульА", "МодульБ", "Локальная")
+        ),
+    )
+    arbiter = RdbgArbiter(
+        HeartbeatSession(), RouteToken("worker-test", 1, 0, "main"),
+    )
+    publisher = Publisher()
+    preparer = WorkerModuleArtifactPreparer(
+        PythonParserTarget.from_generated(), _builder(tmp_path)[0],
+    )
+    service = WorkerModuleLifecycleService(
+        arbiter, publisher, prepare_artifacts=preparer,
+        route_provider=lambda: MainPausedWorkerRoute(TARGET),
+        require_mutation_boundary=lambda: None,
+        worker_breakpoints_present=lambda: False,
+    )
+    try:
+        service.load_worker_modules((first,), common_modules=initial)
+        retained = publisher.artifact_batches[0][0]
+        profile = PhaseRecorder()
+        service.load_worker_modules(
+            (second,), common_modules=expanded, profiler=profile,
+        )
+        assert profile.parser_calls.full_module_parses == 1
+        assert publisher.artifact_batches[1][0] is retained
+        assert service.confirmed_worker_module_units(
+            publisher.active,
+        ) == (first, second)
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_nonmonotonic_catalog_is_rejected_before_candidate_dependency_analysis(
+    tmp_path,
+) -> None:
+    from onec_runtime.bsl.parser_target import PythonParserTarget
+    from onec_runtime.execution.worker_module_lifecycle import WorkerModuleArtifactPreparer
+
+    unit = _source_unit(
+        "МодульА",
+        "МодульБ.Версия();\n"
+        "Функция Версия() Экспорт\nВозврат 1;\nКонецФункции\n",
+    )
+    original = CommonModuleCatalogSnapshot.create(
+        profile="server-test", preprocessor_profile="server", revision=1,
+        modules=(CommonModuleDescriptor("МодульА", CommonModuleScope.SERVER),),
+    )
+    changed_in_place = CommonModuleCatalogSnapshot.create(
+        profile="server-test", preprocessor_profile="server", revision=1,
+        modules=tuple(
+            CommonModuleDescriptor(name, CommonModuleScope.SERVER)
+            for name in ("МодульА", "МодульБ")
+        ),
+    )
+    arbiter = RdbgArbiter(
+        HeartbeatSession(), RouteToken("worker-test", 1, 0, "main"),
+    )
+    publisher = Publisher()
+    service = WorkerModuleLifecycleService(
+        arbiter, publisher,
+        prepare_artifacts=WorkerModuleArtifactPreparer(
+            PythonParserTarget.from_generated(), _builder(tmp_path)[0],
+        ),
+        route_provider=lambda: MainPausedWorkerRoute(TARGET),
+        require_mutation_boundary=lambda: None,
+        worker_breakpoints_present=lambda: False,
+    )
+    try:
+        service.load_worker_modules((unit,), common_modules=original)
+        with pytest.raises(ProtocolError, match="not monotonic"):
+            service.load_worker_modules(
+                (unit,), common_modules=changed_in_place,
+            )
+        assert len(publisher.artifact_batches) == 1
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_failed_publication_keeps_only_confirmed_preparation_for_retry(
+    tmp_path,
+) -> None:
+    from onec_runtime.bsl.parser_target import PythonParserTarget
+    from onec_runtime.execution.worker_module_lifecycle import WorkerModuleArtifactPreparer
+
+    original = _source_unit(
+        "МодульА",
+        "Функция Версия() Экспорт\nВозврат 1;\nКонецФункции\n",
+    )
+    changed = _source_unit(
+        "МодульА",
+        "Функция Версия() Экспорт\nВозврат 2;\nКонецФункции\n",
+    )
+    catalog = CommonModuleCatalogSnapshot.create(
+        profile="server-test", preprocessor_profile="server", revision=1,
+        modules=(CommonModuleDescriptor("МодульА", CommonModuleScope.SERVER),),
+    )
+    arbiter = RdbgArbiter(
+        HeartbeatSession(), RouteToken("worker-test", 1, 0, "main"),
+    )
+    publisher = Publisher()
+    service = WorkerModuleLifecycleService(
+        arbiter, publisher,
+        prepare_artifacts=WorkerModuleArtifactPreparer(
+            PythonParserTarget.from_generated(), _builder(tmp_path)[0],
+        ),
+        route_provider=lambda: MainPausedWorkerRoute(TARGET),
+        require_mutation_boundary=lambda: None,
+        worker_breakpoints_present=lambda: False,
+    )
+    try:
+        service.load_worker_modules((original,), common_modules=catalog)
+        confirmed_artifact = publisher.artifact_batches[-1][0]
+        confirmed_handle = publisher.active
+        publisher.failure = ProtocolError("publication rejected")
+        with pytest.raises(ProtocolError, match="publication rejected"):
+            service.load_worker_modules((changed,), common_modules=catalog)
+        publisher.failure = None
+        assert service.confirmed_worker_module_units(
+            confirmed_handle,
+        ) == (original,)
+        profile = PhaseRecorder()
+        service.load_worker_modules(
+            (original,), common_modules=catalog, profiler=profile,
+        )
+        assert profile.parser_calls.full_module_parses == 0
+        assert publisher.artifact_batches[-1][0] is confirmed_artifact
+        profile = PhaseRecorder()
+        service.load_worker_modules(
+            (changed,), common_modules=catalog, profiler=profile,
+        )
+        assert profile.parser_calls.full_module_parses == 1
+        assert publisher.artifact_batches[-1][0] is not confirmed_artifact
     finally:
         arbiter.close(timeout=3)
 
@@ -254,6 +445,49 @@ def test_load_confirms_units_on_one_arbiter_worker_and_release_is_serialized() -
         assert publisher.released == [handle]
         assert session.calls == [arbiter._worker, arbiter._worker]
     finally:
+        arbiter.close(timeout=3)
+
+
+def test_load_waits_for_prior_value_reply_cleanup_before_route_admission() -> None:
+    unit, _session, arbiter, publisher, service = _bound()
+    cleanup_entered = Event()
+    release_cleanup = Event()
+    finished = Event()
+    outcomes = []
+
+    def cleanup_plan(_port):
+        cleanup_entered.set()
+        assert release_cleanup.wait(3)
+        return Settlement(None)
+
+    def parent_plan(port):
+        port.register_post_settlement_cleanup(cleanup_plan)
+        return Settlement(None)
+
+    def load():
+        try:
+            outcomes.append(service.load_worker_modules((unit,), common_modules=CATALOG))
+        except BaseException as error:
+            outcomes.append(error)
+        finally:
+            finished.set()
+
+    parent = arbiter.submit(arbiter.current_route, parent_plan)
+    arbiter.dispatch(parent)
+    worker = Thread(target=load)
+    try:
+        parent.wait_settled(3)
+        assert cleanup_entered.wait(3)
+        worker.start()
+        assert not finished.wait(0.1)
+        release_cleanup.set()
+        assert finished.wait(3)
+        assert len(outcomes) == 1
+        assert isinstance(outcomes[0], WorkerGenerationHandle)
+        assert publisher.calls == [(unit.logical_name,)]
+    finally:
+        release_cleanup.set()
+        worker.join(3) if worker.ident is not None else None
         arbiter.close(timeout=3)
 
 
@@ -374,6 +608,64 @@ def test_existing_activation_owner_can_publish_module_artifacts_on_supplied_port
     assert adapter.snapshot().worker_exports == descriptor.exports
     assert adapter.materialization_snapshot().registrations
     adapter.release_generation(handle, port=port)
+
+
+def test_module_publication_retains_notebook_method_route_names(tmp_path) -> None:
+    from onec_runtime.bsl.parser_target import PythonParserTarget
+    from onec_runtime.execution.common import NotebookCommonParser
+    from onec_runtime.execution.snapshot_binding import (
+        RoutePreparationSnapshot, SnapshotRouteBinding,
+    )
+
+    lowered, context = _lowered()
+    descriptor = _builder(tmp_path)[0].build(
+        lowered, visible_source_context=context,
+    )
+    notebook_source = "Функция Первый() Экспорт\nВозврат 1;\nКонецФункции"
+    unit = SourceUnitRef(
+        SourceUnitKind.NOTEBOOK_CELL, "notebook-before-module", 1,
+        source_sha256(notebook_source),
+    )
+    parser = PythonParserTarget.from_generated()
+    common = NotebookCommonParser(parser).prepare(notebook_source, unit)
+    owner = object()
+    intent = SnapshotRouteBinding(parser, owner=owner, version=1).worker_intent(
+        common, RoutePreparationSnapshot(owner, 1, (), ()).for_pipeline(),
+    )
+    host = WorkerUniverseRegistry(runtime_generation=1, context_generation=1)
+    target = _UniverseTargetExecutor()
+    port = object()
+
+    def execute(supplied_port, source):
+        assert supplied_port is port
+        candidate = host._pending
+        if candidate is not None:
+            target.acknowledge(candidate)
+        return target(source)
+
+    notebook_root = tmp_path / "notebook-after-module"
+    notebook_root.mkdir()
+    adapter = WorkerUniverseActivationAdapter(
+        host, notebook_builder=_notebook_builder(notebook_root),
+        instruction_runner=execute,
+        worker_breakpoints_present=lambda: False,
+        target_profile="server-test",
+    )
+    adapter.activate(intent, port=port)
+    adapter.publish_modules((descriptor,), port=port)
+
+    snapshot = adapter.snapshot()
+    RoutePreparationSnapshot(
+        owner, 3, (), snapshot.worker_exports, snapshot.active_methods,
+    )
+    assert any(
+        export.public_path == "Первый" and export.receiver_module == "Worker"
+        for export in snapshot.worker_exports
+    )
+    assert any(
+        export.public_path.startswith("МодульРасчета.")
+        for export in snapshot.worker_exports
+    )
 
 
 def test_module_publication_uses_shared_breakpoint_workspace_and_reports_policy(

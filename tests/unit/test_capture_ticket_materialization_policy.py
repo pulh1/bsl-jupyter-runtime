@@ -61,13 +61,13 @@ def test_direct_context_value_uses_integrity_checked_ticket_plan_and_decoder():
     port = TransferPort(payload)
 
     value = _policy(port).materialize_value(
-        "Контекст.Сумма",
+        "e1cRuntimeКонтекст.Сумма",
         MaterializationOptions(max_depth=4, max_items=20, max_bytes=4096),
     )
 
     assert value == Decimal("12.50")
     assert len(port.plans) == 1
-    assert "Контекст.Сумма" in port.plans[0].instruction
+    assert "e1cRuntimeКонтекст.Сумма" in port.plans[0].instruction
     assert "СериализоватьЗначение" in port.plans[0].instruction
     assert port.plans[0].private_key in port.plans[0].cleanup_instruction
 
@@ -76,19 +76,19 @@ def test_direct_context_table_materializes_dataframe_on_same_ticket_port():
     port = TransferPort(compact_payload())
 
     frame = _policy(port).to_df(
-        "Контекст.Таблица",
+        "e1cRuntimeКонтекст.Таблица",
         ReferencePolicy(refs="uuid", ref_columns={"Employee": "both"}),
         max_rows=100,
         max_bytes=32_768,
     )
 
     assert frame["Name"].tolist() == ["Alice", "Bob"]
-    assert "Контекст.Таблица" in port.plans[0].instruction
+    assert "e1cRuntimeКонтекст.Таблица" in port.plans[0].instruction
     assert "СериализоватьКомпактнуюТаблицу" in port.plans[0].instruction
     assert port.plans[0].private_key in port.plans[0].cleanup_instruction
 
 
-@pytest.mark.parametrize("handle", ["capture_table_deferred", "Контекст.Сумма; Выполнить(Код)"])
+@pytest.mark.parametrize("handle", ["capture_table_deferred", "e1cRuntimeКонтекст.Сумма; Выполнить(Код)"])
 def test_untrusted_or_deferred_handles_fail_before_ticket_dispatch(handle):
     port = TransferPort(b"unused")
     policy = _policy(port)
@@ -101,8 +101,8 @@ def test_untrusted_or_deferred_handles_fail_before_ticket_dispatch(handle):
 
 
 @pytest.mark.parametrize("handle", [
-    "Контекст.RuntimeWorkerActiveGeneration",
-    "Контекст.RuntimeWorkerPinnedOperationGeneration.Modules",
+    "e1cRuntimeКонтекст.RuntimeWorkerActiveGeneration",
+    "e1cRuntimeКонтекст.RuntimeWorkerPinnedOperationGeneration.Modules",
 ])
 def test_private_worker_roots_fail_before_materialization_ticket(handle):
     port = TransferPort(b"unused")
@@ -124,9 +124,9 @@ def test_confirmed_transfer_error_allows_correction_and_retry_on_same_policy():
     port.error = CaptureValueCheckError("CAPTURE value admission failed")
 
     with pytest.raises(CaptureValueCheckError):
-        policy.materialize_value("Контекст.Флаг")
+        policy.materialize_value("e1cRuntimeКонтекст.Флаг")
     port.error = None
-    assert policy.materialize_value("Контекст.Флаг") is True
+    assert policy.materialize_value("e1cRuntimeКонтекст.Флаг") is True
     assert len(port.plans) == 2
     assert port.plans[0].private_key != port.plans[1].private_key
 
@@ -139,7 +139,7 @@ def test_generation_mismatch_is_rejected_by_plan_before_payload_decode():
     port.context_generation = 5
 
     with pytest.raises(CaptureValueCheckError, match="admission"):
-        _policy(port).materialize_value("Контекст.Флаг")
+        _policy(port).materialize_value("e1cRuntimeКонтекст.Флаг")
 
 
 def test_value_policy_dispatches_through_fenced_controller_ticket_adapter():
@@ -154,7 +154,7 @@ def test_value_policy_dispatches_through_fenced_controller_ticket_adapter():
     data_plane = CaptureTicketDataPlane(controller, scope)
 
     value = _policy(data_plane).materialize_value(
-        "Контекст.Сумма", MaterializationOptions(max_bytes=4096),
+        "e1cRuntimeКонтекст.Сумма", MaterializationOptions(max_bytes=4096),
     )
 
     assert value == Decimal("9")
@@ -193,8 +193,8 @@ def test_bound_capture_transfer_rechecks_exact_worker_catalog_before_eval():
 
     current[0] = WorkerTransferCatalog(5, ("registered-worker-type",))
     with pytest.raises(ProtocolError, match="Worker catalog changed"):
-        policy.materialize_value("Контекст.Сумма")
+        policy.materialize_value("e1cRuntimeКонтекст.Сумма")
     assert len(guards) == 1
     assert controller.capture_scope is scope
     current[0] = initial
-    assert policy.materialize_value("Контекст.Сумма") == Decimal("9")
+    assert policy.materialize_value("e1cRuntimeКонтекст.Сумма") == Decimal("9")

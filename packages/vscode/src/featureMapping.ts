@@ -52,7 +52,7 @@ export function isKernelContextReceiver(prefix: string): boolean {
   // These keywords introduce an expression; an identifier/constructor does not.
   // Do not reinterpret a keyword-looking member of an earlier receiver as syntax.
   const afterKeyword = previous?.kind === 'id' && EXPRESSION_KEYWORDS.has(previous.text.toLowerCase()) && tokens.at(-2)?.kind !== '.';
-  return root.text.toLowerCase() === 'контекст' && (!!newStatementLine || afterKeyword || !['id', 'number', 'literal', '.', ')', ']'].includes(previous?.kind ?? ''));
+  return root.text.toLowerCase() === 'e1cruntimeконтекст' && (!!newStatementLine || afterKeyword || !['id', 'number', 'literal', '.', ')', ']'].includes(previous?.kind ?? ''));
 }
 
 export function validRange(range: Range): boolean {

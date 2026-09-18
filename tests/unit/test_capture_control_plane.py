@@ -377,7 +377,7 @@ class ShutdownBlockingCaptureSession(ControlledCaptureSession):
         self.shutdown_cleanup_dispatches = 0
         self.shutdown_private_values = (
             'ВызватьИсключение "private BSL expression";',
-            "Контекст.__onec_private_value_handle",
+            "e1cRuntimeКонтекст.__onec_private_value_handle",
             "https://private-user:private-password@target.invalid/rdbg",
             "worker-manifest-" + "f" * 64,
             "private session and target identity",
@@ -1696,7 +1696,7 @@ def test_session_completion_uses_one_owned_inspection_ticket(
 
     def first() -> None:
         try:
-            runtime.completion_fields("Контекст.Данные")
+            runtime.completion_fields("e1cRuntimeКонтекст.Данные")
         except BaseException as error:
             first_errors.append(error)
         finally:
@@ -1704,7 +1704,7 @@ def test_session_completion_uses_one_owned_inspection_ticket(
 
     def second() -> None:
         try:
-            runtime.completion_fields("Контекст.Данные")
+            runtime.completion_fields("e1cRuntimeКонтекст.Данные")
         except BaseException as error:
             second_errors.append(error)
         finally:
@@ -2820,7 +2820,7 @@ def _invoke_capture_data_plane_route(
             selection=None,
         )
     elif route == "completion_fields":
-        api.completion_fields("Контекст.Результат")
+        api.completion_fields("e1cRuntimeКонтекст.Результат")
     elif route == "configure_capture_points":
         api.configure_capture_points((CAPTURE_A,))
     elif route == "configure_continuation_capture_points":
@@ -2838,16 +2838,16 @@ def _invoke_capture_data_plane_route(
     elif route == "load_worker_modules":
         api.load_worker_modules((), common_modules=object())  # type: ignore[arg-type]
     elif route == "materialization_kind":
-        api.materialization_kind("Контекст.Результат")
+        api.materialization_kind("e1cRuntimeКонтекст.Результат")
     elif route == "materialize_table":
-        api.materialize_table("Контекст.Результат")
+        api.materialize_table("e1cRuntimeКонтекст.Результат")
     elif route == "materialize_table_payload":
-        api.materialize_table_payload("Контекст.Результат")
+        api.materialize_table_payload("e1cRuntimeКонтекст.Результат")
     elif route == "materialize_value":
-        api.materialize_value("Контекст.Результат")
+        api.materialize_value("e1cRuntimeКонтекст.Результат")
     elif route == "materialize_value_payload":
         api.materialize_value_payload(
-            "Контекст.Результат",
+            "e1cRuntimeКонтекст.Результат",
             max_depth=1,
             max_items=1,
             max_bytes=1024,
@@ -2859,16 +2859,16 @@ def _invoke_capture_data_plane_route(
     elif route == "prepare_main_for_capture":
         api.prepare_main_for_capture("Результат = 902;")
     elif route == "project_to_df":
-        api.project_to_df("Контекст.Результат", {"offset": 0, "limit": 1})
+        api.project_to_df("e1cRuntimeКонтекст.Результат", {"offset": 0, "limit": 1})
     elif route == "project_to_df_invalid_selection":
-        api.project_to_df("Контекст.Результат", {"offset": 0, "limit": 0})
+        api.project_to_df("e1cRuntimeКонтекст.Результат", {"offset": 0, "limit": 0})
     elif route == "project_value":
-        api.project_value("Контекст.Результат", {"offset": 0, "limit": 1})
+        api.project_value("e1cRuntimeКонтекст.Результат", {"offset": 0, "limit": 1})
     elif route == "project_value_invalid_selection":
-        api.project_value("Контекст.Результат", {})
+        api.project_value("e1cRuntimeКонтекст.Результат", {})
     elif route == "project_value_payload":
         api.project_value_payload(
-            "Контекст.Результат",
+            "e1cRuntimeКонтекст.Результат",
             kind="slice",
             offset=0,
             limit=1,

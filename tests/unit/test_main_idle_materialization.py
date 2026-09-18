@@ -86,10 +86,10 @@ def test_main_idle_transfer_rejects_private_worker_root_before_dispatch() -> Non
     )
     try:
         with pytest.raises(ProtocolError, match="Worker generation"):
-            service.materialize_value("Контекст.RuntimeWorkerActiveGeneration")
+            service.materialize_value("e1cRuntimeКонтекст.RuntimeWorkerActiveGeneration")
         with pytest.raises(ProtocolError, match="Worker generation"):
             service.to_df(
-                "Контекст.RuntimeWorkerPinnedOperationGeneration",
+                "e1cRuntimeКонтекст.RuntimeWorkerPinnedOperationGeneration",
                 max_rows=10,
             )
         assert session.calls == []
@@ -114,14 +114,13 @@ def test_direct_value_materialization_runs_all_remote_steps_in_one_arbiter_ticke
     )
     try:
         value = service.materialize_value(
-            "Контекст.Сумма", MaterializationOptions(max_bytes=4096)
+            "e1cRuntimeКонтекст.Сумма", MaterializationOptions(max_bytes=4096)
         )
 
         assert value == Decimal("12.50")
-        assert len([call for call in session.calls if call[0] == "start"]) == 3
+        assert len([call for call in session.calls if call[0] == "start"]) == 2
         assert "СериализоватьЗначение" in session.calls[0][1]
         assert "ЗабратьКомпактнуюМатериализациюИзКонтекста" in session.calls[2][1]
-        assert "Контекст.Удалить" in session.calls[4][1]
         assert {call[2] for call in session.calls} == {arbiter._worker.ident}
     finally:
         arbiter.close(timeout=3)
@@ -151,7 +150,7 @@ def test_main_idle_materialize_timeout_detaches_only_local_waiter() -> None:
     try:
         assert blocker_started.wait(1)
         with pytest.raises(TimeoutError, match="Local waiter interval"):
-            service.materialize("Контекст.Сумма", timeout_s=0.02)
+            service.materialize("e1cRuntimeКонтекст.Сумма", timeout_s=0.02)
 
         pending = arbiter._queue[0]
         assert pending.status().waiter_detached is True
@@ -178,7 +177,7 @@ def test_materialization_rejects_target_changed_before_ticket_admission() -> Non
     )
     try:
         with pytest.raises(ProtocolError, match="confirmed MAIN target"):
-            service.materialize_value("Контекст.Сумма")
+            service.materialize_value("e1cRuntimeКонтекст.Сумма")
         assert session.calls == []
     finally:
         arbiter.close(timeout=3)
@@ -201,7 +200,7 @@ def test_direct_table_materialization_uses_the_same_ticket_transfer_protocol() -
     )
     try:
         frame = service.to_df(
-            "Контекст.Таблица",
+            "e1cRuntimeКонтекст.Таблица",
             ReferencePolicy(refs="uuid", ref_columns={"Employee": "both"}),
             max_rows=100,
             max_bytes=32_768,
@@ -210,15 +209,11 @@ def test_direct_table_materialization_uses_the_same_ticket_transfer_protocol() -
         assert frame["Name"].tolist() == ["Alice", "Bob"]
         assert "СериализоватьКомпактнуюТаблицу" in session.calls[0][1]
         expressions = [call[1] for call in session.calls if call[0] == "start"]
-        assert len(expressions) == 3
+        assert len(expressions) == 2
         assert expressions[0].startswith(
-            "RuntimeKernelServer.ВыполнитьКодВКонтекстеMain(Контекст, "
+            "RuntimeKernelServer.ВыполнитьКодВКонтекстеMain(e1cRuntimeКонтекст, "
         )
         assert " + Символы.ПС + " in expressions[0]
-        assert expressions[2].startswith(
-            "RuntimeKernelServer.ВыполнитьКодВКонтекстеMain(Контекст, "
-        )
-        assert "Контекст.Удалить" in expressions[2]
     finally:
         arbiter.close(timeout=3)
 
@@ -240,16 +235,16 @@ def test_dynamic_main_head_materializes_only_the_requested_table_rows() -> None:
     )
     try:
         frame = service.head_to_df(
-            "Контекст.Таблица", 2,
+            "e1cRuntimeКонтекст.Таблица", 2,
             policy=ReferencePolicy(
                 ref_columns={"Employee": "both", "Department": "uuid"},
             ),
         )
 
         assert frame["Name"].tolist() == ["Alice", "Bob"]
-        assert "Для ИндексПроекции = 0 По Мин(Контекст.Таблица.Количество() - 1, 1)" in session.calls[0][1]
+        assert "Для ИндексПроекции = 0 По Мин(e1cRuntimeКонтекст.Таблица.Количество() - 1, 1)" in session.calls[0][1]
         assert "СериализоватьКомпактнуюТаблицу" in session.calls[0][1]
-        assert len([call for call in session.calls if call[0] == "start"]) == 3
+        assert len([call for call in session.calls if call[0] == "start"]) == 2
     finally:
         arbiter.close(timeout=3)
 
@@ -271,7 +266,7 @@ def test_dynamic_main_materialize_selects_the_table_decoder() -> None:
     )
     try:
         frame = service.materialize(
-            "Контекст.Таблица",
+            "e1cRuntimeКонтекст.Таблица",
             MaterializationOptions(max_bytes=32_768),
             table_policy=ReferencePolicy(
                 ref_columns={"Employee": "both", "Department": "uuid"},
@@ -297,7 +292,7 @@ def test_dynamic_main_head_enforces_the_public_row_bound(count: int) -> None:
     )
     try:
         with pytest.raises(ValueError, match="between 1 and 10000"):
-            service.head_to_df("Контекст.Таблица", count)
+            service.head_to_df("e1cRuntimeКонтекст.Таблица", count)
         assert session.calls == []
     finally:
         arbiter.close(timeout=3)
@@ -316,18 +311,15 @@ def test_materialization_rejects_a_non_main_fence_before_ticket_submission() -> 
     )
     try:
         with pytest.raises(ProtocolError, match="MAIN-idle route"):
-            service.materialize_value("Контекст.Сумма")
+            service.materialize_value("e1cRuntimeКонтекст.Сумма")
         assert session.calls == []
     finally:
         arbiter.close(timeout=3)
 
 
 def test_confirmed_private_key_deletion_failure_is_retryable_arbiter_debt() -> None:
-    payload = b'{"version":1,"root":{"t":"number","v":"1"}}'
-    encoded = b64encode(payload).decode("ascii")
     session = Session([
-        f"R|7|3|{len(payload)}|{sha256(payload).hexdigest()}|{len(encoded)}",
-        encoded,
+        "eval-error",
         "cleanup-error",
         "Истина",
     ])
@@ -339,7 +331,8 @@ def test_confirmed_private_key_deletion_failure_is_retryable_arbiter_debt() -> N
         context_generation=3,
     )
     try:
-        assert service.materialize_value("Контекст.Сумма") == Decimal("1")
+        with pytest.raises(CaptureValueCheckError, match="admission failed"):
+            service.materialize_value("e1cRuntimeКонтекст.Сумма")
         assert session.cleanup_error_seen.wait(1)
         cleanup = arbiter.active_ticket
         if cleanup is not None:
@@ -379,10 +372,10 @@ def test_main_admission_bsl_error_cleans_key_and_allows_next_transfer() -> None:
     )
     try:
         with pytest.raises(CaptureValueCheckError, match="MAIN value admission failed"):
-            service.materialize_value("Контекст.Сумма")
+            service.materialize_value("e1cRuntimeКонтекст.Сумма")
 
         assert service.materialize(
-            "Контекст.Сумма", timeout_s=0.5,
+            "e1cRuntimeКонтекст.Сумма", timeout_s=0.5,
         ) == Decimal("2")
         assert service.retryable_cleanup_keys == ()
     finally:
@@ -390,11 +383,8 @@ def test_main_admission_bsl_error_cleans_key_and_allows_next_transfer() -> None:
 
 
 def test_unknown_private_key_deletion_keeps_its_arbiter_owner() -> None:
-    payload = b'{"version":1,"root":{"t":"number","v":"1"}}'
-    encoded = b64encode(payload).decode("ascii")
     session = Session([
-        f"R|7|3|{len(payload)}|{sha256(payload).hexdigest()}|{len(encoded)}",
-        encoded,
+        "eval-error",
         "cleanup-unknown",
         "Истина",
     ])
@@ -406,7 +396,8 @@ def test_unknown_private_key_deletion_keeps_its_arbiter_owner() -> None:
         context_generation=3,
     )
     try:
-        assert service.materialize_value("Контекст.Сумма") == Decimal("1")
+        with pytest.raises(CaptureValueCheckError, match="admission failed"):
+            service.materialize_value("e1cRuntimeКонтекст.Сумма")
         assert session.cleanup_error_seen.wait(1)
         cleanup = arbiter.active_ticket
         assert cleanup is not None and cleanup.wait_unknown(1)
@@ -449,7 +440,7 @@ def test_worker_catalog_change_after_plan_construction_rejects_ticket_before_eva
 
     def materialize() -> None:
         try:
-            service.materialize_value("Контекст.Сумма")
+            service.materialize_value("e1cRuntimeКонтекст.Сумма")
         except BaseException as error:
             errors.append(error)
 

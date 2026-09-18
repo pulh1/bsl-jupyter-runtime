@@ -15,8 +15,8 @@ from integration.jupyter_bsl_fixture.extension import (
 )
 from onec_runtime.capture_evaluation import CapturePhase
 from onec_runtime.capture_inspection import DebugFrame
-from onec_runtime.capture_values import ValueNode
-from onec_runtime.errors import MaterializationLimitError
+from onec_runtime.capture_values import UnavailableValueNode, ValueNode
+from onec_runtime.errors import CaptureShapeUnsupportedError, MaterializationLimitError
 from onec_runtime.kernel import COMMON_MODULE_PROPERTY_ID
 from onec_runtime.rdbg.models import ModuleLocation
 from onec_runtime.runtime_api import RuntimeReplyKind
@@ -85,8 +85,8 @@ def _corrected_capture_source(value: int) -> str:
 {ARRAY_NAME} = Новый Массив;
 {ARRAY_NAME}.Добавить({value});
 {ARRAY_NAME}.Добавить("corrected");
-КонтекстОтладки.ЛокальныеЧисла = {ARRAY_NAME};
-КонтекстОтладки.ЛокальнаяТаблица = {TABLE_NAME};
+e1cRuntimeКонтекстОтладки.ЛокальныеЧисла = {ARRAY_NAME};
+e1cRuntimeКонтекстОтладки.ЛокальнаяТаблица = {TABLE_NAME};
 РезультатИнструкции = Истина;
 '''
 
@@ -149,8 +149,15 @@ def test_capture_error_retry_inspection_materialization_and_resume_live(
         assert frames[0].physical.object_id == location.object_id
         frame_variables = frames[0].variables[:20]
         assert frame_variables.items
-        assert all(isinstance(item, ValueNode) for item in frame_variables.items)
+        assert all(
+            isinstance(item, UnavailableValueNode)
+            for item in frame_variables.items
+        )
         assert any(item.name == "ЛокальныйСчетчик" for item in frame_variables.items)
+        selected_counter = frames[0].variables["ЛокальныйСчетчик"]
+        assert isinstance(selected_counter, ValueNode)
+        assert selected_counter.type_name == "Число"
+        assert selected_counter.preview == "<captured value>"
         assert any(
             item.name == "ЛокальныйСчетчик"
             for item in frames[0].locals[:20].items
@@ -164,19 +171,25 @@ def test_capture_error_retry_inspection_materialization_and_resume_live(
         table_node = capture.context.variables["ЛокальнаяТаблица"]
         assert array_node.name == "ЛокальныеЧисла"
         assert table_node.name == "ЛокальнаяТаблица"
-        assert array_node.items[0].preview == str(value)
-        assert table_node.rows[0].fields["Значение"].preview == str(value)
+        assert array_node.type_name == "Массив"
+        assert table_node.type_name == "ТаблицаЗначений"
+        assert array_node.preview == "<captured value>"
+        assert table_node.preview == "<captured value>"
+        with pytest.raises(CaptureShapeUnsupportedError):
+            _ = array_node.items[0]
+        with pytest.raises(CaptureShapeUnsupportedError):
+            _ = table_node.rows[0]
 
         with pytest.raises(MaterializationLimitError, match="items limit 1"):
-            harness.session.materialize(f"Контекст.{ARRAY_NAME}", max_items=1)
+            harness.session.materialize(f"e1cRuntimeКонтекст.{ARRAY_NAME}", max_items=1)
         assert capture.status().phase is CapturePhase.PAUSED
         assert _capture_identity(harness.session.current_capture()) == identity
 
-        materialized = harness.session.materialize(f"Контекст.{ARRAY_NAME}")
+        materialized = harness.session.materialize(f"e1cRuntimeКонтекст.{ARRAY_NAME}")
         assert len(materialized) == 2
         assert materialized[0] == value
         assert materialized[1] == "corrected"
-        direct_table = harness.session.to_df(f"Контекст.{TABLE_NAME}")
+        direct_table = harness.session.to_df(f"e1cRuntimeКонтекст.{TABLE_NAME}")
         assert direct_table["Значение"].tolist() == [value]
 
         snapshot = harness.session.namespace_snapshot()
@@ -193,6 +206,6 @@ def test_capture_error_retry_inspection_materialization_and_resume_live(
         assert resumed.succeeded is True
         assert capture.status().phase is CapturePhase.STALE
         returned_table = harness.session.to_df(
-            "Контекст.РезультатИнструкции.Таблица"
+            "e1cRuntimeКонтекст.РезультатИнструкции.Таблица"
         )
         assert returned_table["Значение"].tolist() == [value]

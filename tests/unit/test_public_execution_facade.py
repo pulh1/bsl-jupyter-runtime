@@ -159,15 +159,15 @@ def test_public_facade_routes_value_transfers_without_mode_logic() -> None:
     options = MaterializationOptions(max_bytes=4096)
     policy = ReferencePolicy(refs="uuid")
 
-    assert api.materialize_value("Контекст.X", options) == 42
-    assert api.to_df("Контекст.Таблица", policy, max_rows=10, max_bytes=4096) == "frame"
-    assert api.materialize("Контекст.X", options, table_policy=policy) == "value or frame"
-    assert api.head_to_df("Контекст.Таблица", 2, policy=policy, max_bytes=4096) == "head frame"
+    assert api.materialize_value("e1cRuntimeКонтекст.X", options) == 42
+    assert api.to_df("e1cRuntimeКонтекст.Таблица", policy, max_rows=10, max_bytes=4096) == "frame"
+    assert api.materialize("e1cRuntimeКонтекст.X", options, table_policy=policy) == "value or frame"
+    assert api.head_to_df("e1cRuntimeКонтекст.Таблица", 2, policy=policy, max_bytes=4096) == "head frame"
     assert router.calls == [
-        ("value", "Контекст.X", options),
-        ("table", "Контекст.Таблица", policy, 10, 4096),
-        ("dynamic", "Контекст.X", options, policy),
-        ("head", "Контекст.Таблица", 2, policy, 4096),
+        ("value", "e1cRuntimeКонтекст.X", options),
+        ("table", "e1cRuntimeКонтекст.Таблица", policy, 10, 4096),
+        ("dynamic", "e1cRuntimeКонтекст.X", options, policy),
+        ("head", "e1cRuntimeКонтекст.Таблица", 2, policy, 4096),
     ]
 
 
@@ -220,15 +220,18 @@ def test_public_facade_builds_capture_view_from_bridge_and_local_ledger() -> Non
     assert view.status().phase is CapturePhase.EVALUATING
     assert view.wait(timeout_s=0).evaluation_id == "capture-view"
     assert view.stack[:1].total == 2
+    controller.ledger.fail("capture-view", "expected BSL failure")
+    assert [node.name for node in view.stack[0].variables[:1].items] == ["Сумма"]
+    assert controller.page_requests == [(0, 0, 1)]
     assert view.context is view.context
 
 
 def test_public_facade_validates_direct_value_reference_without_rdbg() -> None:
     api, _, _, _ = facade()
 
-    assert api.validate_value_reference("Контекст.Таблица") == "Контекст.Таблица"
+    assert api.validate_value_reference("e1cRuntimeКонтекст.Таблица") == "e1cRuntimeКонтекст.Таблица"
     with pytest.raises(ProtocolError, match="Worker generation"):
-        api.validate_value_reference("Контекст.RuntimeWorkerActiveGeneration")
+        api.validate_value_reference("e1cRuntimeКонтекст.RuntimeWorkerActiveGeneration")
 
 
 def test_execute_bsl_releases_bound_session_lock_only_at_pipeline_waits() -> None:

@@ -99,9 +99,9 @@ def test_real_lowerer_replaces_and_removes_worker_catalog_entries() -> None:
         "ГДФЛ = Расчет.Ндфл.Посчитать();", mode=LoweringMode.MAIN
     )
 
-    assert "Контекст.RuntimeWorker.Посчитать()" in first.source
-    assert "Контекст.RuntimeWorker.Версия()" in second.source
-    assert "Контекст.RuntimeWorker.Посчитать()" not in stale.source
+    assert "e1cRuntimeКонтекст.RuntimeWorker.Посчитать()" in first.source
+    assert "e1cRuntimeКонтекст.RuntimeWorker.Версия()" in second.source
+    assert "e1cRuntimeКонтекст.RuntimeWorker.Посчитать()" not in stale.source
 
 
 def test_collector_key_must_match_the_bsl_identifier_lexer_rule() -> None:

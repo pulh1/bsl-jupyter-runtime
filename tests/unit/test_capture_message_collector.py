@@ -60,7 +60,7 @@ def test_collects_messages_after_confirmed_user_error_on_the_kernel_frame() -> N
     assert outcome.messages == ("first", "second")
     assert port.starts == [
         (
-            'RuntimeKernelServer.ЗабратьСообщенияЯчейкиИзКонтекста(Контекст, "__cell_""1")',
+            'RuntimeKernelServer.ЗабратьСообщенияЯчейкиИзКонтекста(e1cRuntimeКонтекст, "__cell_""1")',
             307_200, 2, 3,
         )
     ]

@@ -31,7 +31,7 @@ def test_public_facade_binds_completion_service_and_caller_wait_handoff() -> Non
 
     class Controller:
         def submit_completion_helper(self, plan):
-            assert "Контекст.Данные" in plan.expression
+            assert "e1cRuntimeКонтекст.Данные" in plan.expression
             return Ticket()
 
     api = PublicExecutionFacade(
@@ -51,7 +51,7 @@ def test_public_facade_binds_completion_service_and_caller_wait_handoff() -> Non
             in_handoff[0] = False
 
     with api.execution_caller_handoff(handoff):
-        assert api.completion_fields("Контекст.Данные", timeout_s=0.25) == (
+        assert api.completion_fields("e1cRuntimeКонтекст.Данные", timeout_s=0.25) == (
             "Номер", "Название",
         )
     assert in_handoff == [False]
@@ -66,7 +66,7 @@ def test_public_facade_rejects_completion_when_catalog_binding_is_absent() -> No
     )
 
     with pytest.raises(ProtocolError, match="completion fields route"):
-        api.completion_fields("Контекст.Данные")
+        api.completion_fields("e1cRuntimeКонтекст.Данные")
 
 
 @pytest.mark.parametrize("failure", [

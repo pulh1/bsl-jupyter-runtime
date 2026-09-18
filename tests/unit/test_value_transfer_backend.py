@@ -67,7 +67,7 @@ def test_capture_transfer_registers_key_before_dispatch_and_owns_cleanup():
             context_cleaner=caller_cleanups.append, runtime_generation=lambda: 3,
             context_generation=5, key_factory=lambda: KEY, capture_executor=execute_plan,
         )
-        assert transfer.payload("Контекст.Значение", MaterializationOptions(max_bytes=1024)) == payload
+        assert transfer.payload("e1cRuntimeКонтекст.Значение", MaterializationOptions(max_bytes=1024)) == payload
         assert not caller_cleanups
         assert drivers[2].consumed == 1
     finally:
@@ -84,7 +84,7 @@ def _payload() -> bytes:
 
 def test_builds_bounded_recursive_value_instruction_for_safe_path() -> None:
     source = build_value_transfer_instruction(
-        "Контекст.Документ.Товары",
+        "e1cRuntimeКонтекст.Документ.Товары",
         MaterializationOptions(
             refs="both", max_depth=9, max_items=123, max_bytes=4567
         ),
@@ -94,15 +94,15 @@ def test_builds_bounded_recursive_value_instruction_for_safe_path() -> None:
     )
 
     assert source.count("RuntimeValueTransferServer.СериализоватьЗначение(") == 1
-    assert "Контекст.Документ.Товары, \"both\", 9, 123, 4567" in source
-    assert f'Контекст.Вставить("{KEY}"' in source
+    assert "e1cRuntimeКонтекст.Документ.Товары, \"both\", 9, 123, 4567" in source
+    assert f'e1cRuntimeКонтекст.Вставить("{KEY}"' in source
     assert 'Формат(3, "ЧГ=0; ЧДЦ=0")' in source
     assert 'Формат(5, "ЧГ=0; ЧДЦ=0")' in source
 
 
 def test_value_instruction_builds_protocol_two_admission_before_publication() -> None:
     source = build_value_transfer_instruction(
-        "Контекст.Документ.Товары",
+        "e1cRuntimeКонтекст.Документ.Товары",
         MaterializationOptions(max_bytes=4567),
         KEY,
         runtime_generation=3,
@@ -116,7 +116,7 @@ def test_value_instruction_builds_protocol_two_admission_before_publication() ->
     )
     assert "4567, ТипыОбъектовWorker" in source
     assert source.index("Если Не МатериализацияЗначения.Доступ Тогда") < source.index(
-        f'Контекст.Вставить("{KEY}"'
+        f'e1cRuntimeКонтекст.Вставить("{KEY}"'
     )
     assert 'Результат = "D|worker_generation_value"' in source
     assert 'Результат = "E|value_admission_failed"' in source
@@ -145,7 +145,7 @@ def test_nonready_or_predecessor_value_metadata_never_fetches_payload(
     )
 
     with pytest.raises(error_type):
-        transfer.payload("Контекст.Значение", MaterializationOptions())
+        transfer.payload("e1cRuntimeКонтекст.Значение", MaterializationOptions())
 
     assert reads == []
 
@@ -154,12 +154,12 @@ def test_nonready_or_predecessor_value_metadata_never_fetches_payload(
     "handle",
     [
         "Таблица",
-        "Контекст",
-        "Контекст.Таблица[0]",
-        "Контекст.Таблица.Метод()",
-        "Контекст.Таблица; Сообщить(1)",
-        "Контекст. Таблица",
-        "Контекст.Таблица // comment",
+        "e1cRuntimeКонтекст",
+        "e1cRuntimeКонтекст.Таблица[0]",
+        "e1cRuntimeКонтекст.Таблица.Метод()",
+        "e1cRuntimeКонтекст.Таблица; Сообщить(1)",
+        "e1cRuntimeКонтекст. Таблица",
+        "e1cRuntimeКонтекст.Таблица // comment",
     ],
 )
 def test_rejects_executable_or_non_context_value_paths(handle: str) -> None:
@@ -189,7 +189,7 @@ def test_reads_one_atomic_context_value_and_decodes_snapshot() -> None:
     )
 
     result = transfer.materialize(
-        "Контекст.Значение", MaterializationOptions(max_bytes=1024)
+        "e1cRuntimeКонтекст.Значение", MaterializationOptions(max_bytes=1024)
     )
 
     assert result is ONEC_NULL
@@ -220,7 +220,7 @@ def test_small_byte_limit_still_decodes_bounded_error_envelope() -> None:
 
     with pytest.raises(MaterializationLimitError, match="bytes"):
         transfer.materialize(
-            "Контекст.Значение", MaterializationOptions(max_bytes=64)
+            "e1cRuntimeКонтекст.Значение", MaterializationOptions(max_bytes=64)
         )
 
     assert reads == [5464]
@@ -249,7 +249,7 @@ def test_rejects_invalid_transfer_metadata_after_atomic_take(metadata: str) -> N
     )
 
     with pytest.raises(CaptureValueCheckError, match="CAPTURE value admission"):
-        transfer.materialize("Контекст.Значение", MaterializationOptions())
+        transfer.materialize("e1cRuntimeКонтекст.Значение", MaterializationOptions())
 
     assert reads == []
 
@@ -267,7 +267,7 @@ def test_rejects_payload_hash_mismatch() -> None:
     )
 
     with pytest.raises(ProtocolError, match="integrity"):
-        transfer.materialize("Контекст.Значение", MaterializationOptions())
+        transfer.materialize("e1cRuntimeКонтекст.Значение", MaterializationOptions())
 
 
 def test_rejects_runtime_generation_change_before_instruction() -> None:
@@ -283,7 +283,7 @@ def test_rejects_runtime_generation_change_before_instruction() -> None:
     )
 
     with pytest.raises(ProtocolError, match="generation is stale"):
-        transfer.materialize("Контекст.Значение", MaterializationOptions())
+        transfer.materialize("e1cRuntimeКонтекст.Значение", MaterializationOptions())
 
     assert calls == []
 
@@ -300,7 +300,7 @@ def test_cleans_context_token_when_execute_outcome_is_unknown() -> None:
     )
 
     with pytest.raises(ProtocolError, match="lost response"):
-        transfer.materialize("Контекст.Значение", MaterializationOptions())
+        transfer.materialize("e1cRuntimeКонтекст.Значение", MaterializationOptions())
 
     assert cleaned == [KEY]
 
@@ -319,6 +319,6 @@ def test_preserves_primary_error_when_context_cleanup_also_fails() -> None:
     )
 
     with pytest.raises(ProtocolError, match="primary failed") as captured:
-        transfer.materialize("Контекст.Значение", MaterializationOptions())
+        transfer.materialize("e1cRuntimeКонтекст.Значение", MaterializationOptions())
 
     assert any("cleanup failed" in note for note in captured.value.__notes__)

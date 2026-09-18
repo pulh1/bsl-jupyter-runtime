@@ -375,7 +375,7 @@ def test_api_lowers_main_and_capture_once_and_flushes_discovered_dirty_root(tmp_
 
     main = api.execute_bsl("ГДФЛ = Расчет.Ндфл.Посчитать();")
     controller.state = OperationState.CAPTURED
-    capture = api.execute_bsl("КонтекстОтладки.Скаляр = 41;")
+    capture = api.execute_bsl("e1cRuntimeКонтекстОтладки.Скаляр = 41;")
     resumed = api.resume_capture(dirty_roots=("Результат", "Скаляр"))
 
     assert main.kind is RuntimeReplyKind.MAIN_COMPLETED
@@ -383,10 +383,10 @@ def test_api_lowers_main_and_capture_once_and_flushes_discovered_dirty_root(tmp_
     assert resumed.kind is RuntimeReplyKind.MAIN_COMPLETED
     assert lowerer.calls == [
         ("ГДФЛ = Расчет.Ндфл.Посчитать();", LoweringMode.MAIN),
-        ("КонтекстОтладки.Скаляр = 41;", LoweringMode.CAPTURE),
+        ("e1cRuntimeКонтекстОтладки.Скаляр = 41;", LoweringMode.CAPTURE),
     ]
     assert controller.main_sources[0] == "LOWERED[main:] ГДФЛ = Расчет.Ндфл.Посчитать();"
-    assert controller.capture_sources[0] == "LOWERED[capture:] КонтекстОтладки.Скаляр = 41;"
+    assert controller.capture_sources[0] == "LOWERED[capture:] e1cRuntimeКонтекстОтладки.Скаляр = 41;"
     assert controller.resume_roots == [("Скаляр", "Результат")]
 
 
@@ -458,7 +458,7 @@ def test_mixed_cell_loads_methods_before_lowering_and_executing_main_statements(
     assert generation is not None
     assert executed.startswith(
         "__OnecPinnedWorkerGeneration = "
-        "Контекст.RuntimeWorkerActiveGeneration;\n"
+        "e1cRuntimeКонтекст.RuntimeWorkerActiveGeneration;\n"
     )
     assert (
         "Если __OnecPinnedWorkerGeneration.ManifestSha256 <> "
@@ -554,7 +554,7 @@ def test_failed_resume_keeps_discovered_dirty_roots_for_retry() -> None:
     controller.state = OperationState.CAPTURED
     api = PrototypeRuntimeApi(controller)
 
-    api.execute_bsl("КонтекстОтладки.Скаляр = 41;")
+    api.execute_bsl("e1cRuntimeКонтекстОтладки.Скаляр = 41;")
     controller.fail_resume = True
     with pytest.raises(ProtocolError, match="planned resume failure"):
         api.resume_capture()

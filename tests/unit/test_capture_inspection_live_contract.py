@@ -132,5 +132,28 @@ def test_live_capture_uses_typed_surface_and_disposable_infobase_harness() -> No
         "create_empty_infobase",
         "rmtree",
         "_matching_owned_processes",
+        "_close_and_verify_live_session",
     } <= _called_names(live._fresh_live_harness)
-    assert "session.close" in inspect.getsource(live._fresh_live_harness)
+
+    close_session = live._fresh_live_harness.__wrapped__.__globals__[
+        "_close_and_verify_live_session"
+    ]
+
+    class SessionProbe:
+        def __init__(self, *, report_closed: bool) -> None:
+            self.close_calls = 0
+            self.is_closed = False
+            self._report_closed = report_closed
+
+        def close(self) -> None:
+            self.close_calls += 1
+            self.is_closed = self._report_closed
+
+    session = SessionProbe(report_closed=True)
+    close_session(session)
+    assert session.close_calls == 1
+
+    unclosed = SessionProbe(report_closed=False)
+    with pytest.raises(AssertionError, match="runtime session cleanup"):
+        close_session(unclosed)
+    assert unclosed.close_calls == 1

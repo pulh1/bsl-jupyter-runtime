@@ -199,7 +199,7 @@ def test_pages_and_descriptors_render_only_saved_bounded_data():
     page = adapter.context.variables[:2]
     calls = len(backend.calls)
     rendered = repr(page) + str(page) + repr(page.items[0]) + repr(adapter.context)
-    assert "КонтекстОтладки" in rendered and "Локальная" in rendered
+    assert "e1cRuntimeКонтекстОтладки" in rendered and "Локальная" in rendered
     assert len(backend.calls) == calls
     assert "local-old" in rendered
     assert "object at" not in rendered
@@ -331,7 +331,7 @@ def test_runtime_context_projection_is_lazy_and_uses_one_controller_inspection_p
     def build(**kwargs):
         plans.append(kwargs)
         return CaptureValueInspectionPlan(
-            'RuntimeKernelServer.ВыполнитьКодВКонтекстеОтладки(Контекст, "")',
+            'RuntimeKernelServer.ВыполнитьКодВКонтекстеОтладки(e1cRuntimeКонтекст, "")',
             lambda _result: PrivateValueProjection((
                 PrivateProjectedValue(
                     "Оклад",
@@ -470,7 +470,7 @@ def test_runtime_value_binding_rechecks_the_fence_after_private_target_result():
             ), 1, None)
 
         return CaptureValueInspectionPlan(
-            'RuntimeKernelServer.ВыполнитьКодВКонтекстеОтладки(Контекст, "")',
+            'RuntimeKernelServer.ВыполнитьКодВКонтекстеОтладки(e1cRuntimeКонтекст, "")',
             decode,
         )
 
@@ -507,7 +507,7 @@ def test_runtime_value_binding_prioritizes_stale_over_private_target_error():
             raise CaptureValueAccessDeniedError("capture value is private")
 
         return CaptureValueInspectionPlan(
-            'RuntimeKernelServer.ВыполнитьКодВКонтекстеОтладки(Контекст, "")',
+            'RuntimeKernelServer.ВыполнитьКодВКонтекстеОтладки(e1cRuntimeКонтекст, "")',
             decode,
         )
 
@@ -538,7 +538,7 @@ def test_runtime_value_binding_preserves_a_pending_coordinator_outcome():
 
     def build(**_kwargs):
         return CaptureValueInspectionPlan(
-            'RuntimeKernelServer.ВыполнитьКодВКонтекстеОтладки(Контекст, "")',
+            'RuntimeKernelServer.ВыполнитьКодВКонтекстеОтладки(e1cRuntimeКонтекст, "")',
             decode_pending,
         )
 

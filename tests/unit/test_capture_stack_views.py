@@ -752,7 +752,7 @@ def test_runtime_native_frame_projection_keeps_its_physical_level_in_one_plan() 
     def build(**kwargs):
         plans.append(kwargs)
         return CaptureValueInspectionPlan(
-            'RuntimeKernelServer.ВыполнитьКодВКонтекстеОтладки(Контекст, "")',
+            'RuntimeKernelServer.ВыполнитьКодВКонтекстеОтладки(e1cRuntimeКонтекст, "")',
             lambda _result: PrivateValueProjection((
                 PrivateProjectedValue(
                     "Локальная",

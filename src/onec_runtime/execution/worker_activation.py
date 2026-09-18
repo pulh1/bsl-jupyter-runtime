@@ -315,8 +315,15 @@ class WorkerUniverseActivationAdapter:
         if self._host.active_handle is not published.active_handle:
             raise ProtocolError("Worker active generation changed before publication")
         notebook = self._notebook_descriptor
+        public_catalog = tuple(
+            export for artifact in artifacts for export in artifact.exports
+        ) + (
+            () if published.active_methods is None
+            else published.active_methods.exports
+        )
         candidate = self._host.prepare(
             artifacts + (() if notebook is None else (notebook,)),
+            export_catalog=public_catalog,
         )
         self._bound.port = port
         try:
@@ -426,6 +433,11 @@ class WorkerUniverseActivationAdapter:
         )
         prepared.source_provenance
         return prepared
+
+    def prebuild(self, intent: WorkerCandidateIntent) -> PrebuiltWorkerIntent:
+        """Build an exact local artifact for either notebook execution route."""
+
+        return self.prebuild_for_capture(intent)
 
     def _build_artifact(
         self, intent: WorkerCandidateIntent,
@@ -538,8 +550,16 @@ class WorkerUniverseActivationAdapter:
             ) from error
         with self._snapshot_lock:
             self._notebook_descriptor = descriptor
+            published_methods = replace(
+                method_set,
+                exports=tuple(
+                    WorkerExport(item.public_path, item.method, receiver_module="Worker")
+                    for item in method_set.exports
+                ),
+            )
             self._published = WorkerActivationSnapshot(
-                published.revision + 1, intent.candidate_catalog, method_set, handle,
+                published.revision + 1, candidate.export_catalog,
+                published_methods, handle,
             )
         return _GenerationLease(
             self._host, self._target, handle=handle, pin=pin,

@@ -153,7 +153,7 @@ class ControlledCaptureSession(ScriptedSession):
         # wrapper.  A lowered user cell can itself contain a message-context
         # deletion, so identify only the dedicated transfer-key families as
         # auto-completing cleanup helpers.
-        cleanup_transfer = "Контекст.Удалить(" in expression and any(
+        cleanup_transfer = "e1cRuntimeКонтекст.Удалить(" in expression and any(
             key in expression
             for key in (
                 "__onec_compact_table_",
@@ -1221,7 +1221,7 @@ def test_adopted_submit_exception_keeps_controller_evaluating(
         with pytest.raises(type(raised), match=(
             "accepted submit failure" if isinstance(raised, RuntimeError) else None
         )):
-            api.execute_bsl("КонтекстОтладки.Скаляр = 778;")
+            api.execute_bsl("e1cRuntimeКонтекстОтладки.Скаляр = 778;")
         owner._condition.notify_all = notify
         assert session.polling.wait(1)
 
@@ -1267,7 +1267,7 @@ def test_primary_execution_records_dirty_roots_before_message_delivery_failure(
 
     session.wait_evaluation_event = broken_messages  # type: ignore[method-assign]
     source = (
-        'КонтекстОтладки.Скаляр = 778; Сообщить("message"); '
+        'e1cRuntimeКонтекстОтладки.Скаляр = 778; Сообщить("message"); '
         "РезультатИнструкции = 1;"
     )
     candidate = api.prepare_capture_hypothesis(source) if prepared else None
@@ -1412,7 +1412,7 @@ def test_capture_worker_diagnostic_uses_exact_evaluation_generation(
 
 def inspect_temporary_table(controller):  # type: ignore[no-untyped-def]
     controller._capture_manager_paths["manager"] = (
-        "Контекст.КонтекстОтладки.Менеджер"
+        "e1cRuntimeКонтекст.e1cRuntimeКонтекстОтладки.Менеджер"
     )
     return controller.capture_temporary_tables(
         "manager",
@@ -1534,7 +1534,7 @@ def test_controller_owned_internal_evaluations_use_explicit_kind_and_same_owner(
 
 def inspect_temporary_table_metadata(controller):  # type: ignore[no-untyped-def]
     controller._capture_manager_paths["manager"] = (
-        "Контекст.КонтекстОтладки.Менеджер"
+        "e1cRuntimeКонтекст.e1cRuntimeКонтекстОтладки.Менеджер"
     )
     return controller.capture_temporary_tables(
         "manager",

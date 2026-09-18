@@ -81,7 +81,7 @@ def test_namespace_sync_validates_every_name_locally_without_caching() -> None:
     shell = FakeShell()
     runtime = FakeRuntime(names=("Первое", "Второе", "Третье", "Четвертое", "Пятое"))
     install_runtime(shell, runtime)
-    expected = [f"Контекст.{name}" for name in runtime.names]
+    expected = [f"e1cRuntimeКонтекст.{name}" for name in runtime.names]
     assert runtime.guard_calls == expected
     proxies = {name: shell.user_ns[name] for name in runtime.names}
 
@@ -97,15 +97,15 @@ def test_failed_local_validation_keeps_entire_previous_namespace() -> None:
     old_proxy = shell.user_ns["СтароеИмя"]
     old_namespace = shell.user_ns[BSL_NAMESPACE_NAME]
     runtime.names = ("СтароеИмя", "НовоеИмя", "АлиасМодуля")
-    runtime.forbidden_handles.add("Контекст.АлиасМодуля")
+    runtime.forbidden_handles.add("e1cRuntimeКонтекст.АлиасМодуля")
 
     with pytest.raises(ProtocolError, match="Worker generation objects are not public values"):
         synchronize_bsl_namespace(shell)
 
     assert runtime.guard_calls[-3:] == [
-        "Контекст.СтароеИмя",
-        "Контекст.НовоеИмя",
-        "Контекст.АлиасМодуля",
+        "e1cRuntimeКонтекст.СтароеИмя",
+        "e1cRuntimeКонтекст.НовоеИмя",
+        "e1cRuntimeКонтекст.АлиасМодуля",
     ]
     assert shell.user_ns["СтароеИмя"] is old_proxy
     assert shell.user_ns[BSL_NAMESPACE_NAME] is old_namespace
@@ -131,7 +131,7 @@ def test_sync_injects_lazy_proxy_and_delegates_to_symbolic_context_handle() -> N
     assert frame.to_dict("records") == [{"value": 1}]
     assert runtime.materializations == [
         (
-            "Контекст.КадровыеДанныеТЗ",
+            "e1cRuntimeКонтекст.КадровыеДанныеТЗ",
             {
                 "refs": "both",
                 "ref_columns": None,
@@ -145,14 +145,14 @@ def test_sync_injects_lazy_proxy_and_delegates_to_symbolic_context_handle() -> N
 def test_jupyter_namespace_does_not_publish_runtime_rejected_worker_alias() -> None:
     shell = FakeShell()
     runtime = FakeRuntime(names=("АлиасМодуля",))
-    runtime.forbidden_handles.add("Контекст.АлиасМодуля")
+    runtime.forbidden_handles.add("e1cRuntimeКонтекст.АлиасМодуля")
     with pytest.raises(
         ProtocolError,
         match="^Worker generation objects are not public values$",
     ):
         install_runtime(shell, runtime)
 
-    assert runtime.guard_calls == ["Контекст.АлиасМодуля"]
+    assert runtime.guard_calls == ["e1cRuntimeКонтекст.АлиасМодуля"]
     assert "АлиасМодуля" not in shell.user_ns
 
 
@@ -164,7 +164,7 @@ def test_jupyter_sync_validates_whole_snapshot_before_atomic_proxy_commit() -> N
     bsl = shell.user_ns[BSL_NAMESPACE_NAME]
 
     runtime.names = ("СтароеИмя", "НовоеИмя", "АлиасМодуля")
-    runtime.forbidden_handles.add("Контекст.АлиасМодуля")
+    runtime.forbidden_handles.add("e1cRuntimeКонтекст.АлиасМодуля")
 
     with pytest.raises(
         ProtocolError,
@@ -177,9 +177,9 @@ def test_jupyter_sync_validates_whole_snapshot_before_atomic_proxy_commit() -> N
     assert "АлиасМодуля" not in shell.user_ns
     assert dir(bsl) == ["СтароеИмя"]
     assert runtime.guard_calls[-3:] == [
-        "Контекст.СтароеИмя",
-        "Контекст.НовоеИмя",
-        "Контекст.АлиасМодуля",
+        "e1cRuntimeКонтекст.СтароеИмя",
+        "e1cRuntimeКонтекст.НовоеИмя",
+        "e1cRuntimeКонтекст.АлиасМодуля",
     ]
 
 
@@ -194,10 +194,10 @@ def test_proxy_materializes_recursively_through_universal_runtime_api() -> None:
         refs="both", max_depth=8, max_items=123, max_bytes=4096
     )
 
-    assert result == {"handle": "Контекст.КадровыеДанныеТЗ"}
+    assert result == {"handle": "e1cRuntimeКонтекст.КадровыеДанныеТЗ"}
     assert runtime.value_materializations == [
         (
-            "Контекст.КадровыеДанныеТЗ",
+            "e1cRuntimeКонтекст.КадровыеДанныеТЗ",
             {
                 "refs": "both",
                 "ref_columns": None,
@@ -226,7 +226,7 @@ def test_head_returns_lazy_projection_and_to_df_projects_before_transfer() -> No
     assert frame.to_dict("records") == [{"value": 1}, {"value": 2}]
     assert runtime.table_projections == [
         (
-            "Контекст.КадровыеДанныеТЗ",
+            "e1cRuntimeКонтекст.КадровыеДанныеТЗ",
             {"offset": 0, "limit": 10},
             {
                 "refs": "both",
@@ -252,7 +252,7 @@ def test_slice_returns_lazy_projection_for_recursive_materialization() -> None:
     assert selected.materialize(max_items=100) == [5, 6]
     assert runtime.value_projections == [
         (
-            "Контекст.Массив",
+            "e1cRuntimeКонтекст.Массив",
             {"offset": 5, "limit": 15},
             {
                 "refs": "presentation",
@@ -326,7 +326,7 @@ def test_tabular_section_proxy_uses_safe_dotted_context_path() -> None:
     frame = section.to_df(refs="uuid")
 
     assert frame.to_dict("records") == [{"value": 1}]
-    assert runtime.materializations[0][0] == "Контекст.ДокументОбъект.Товары"
+    assert runtime.materializations[0][0] == "e1cRuntimeКонтекст.ДокументОбъект.Товары"
     assert "ДокументОбъект.Товары" in repr(section)
 
 

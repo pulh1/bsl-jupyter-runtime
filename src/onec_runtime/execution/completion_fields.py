@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 MAX_COMPLETION_TEXT_CHARS = 20_000
 _MAX_EXPRESSION_CHARS = 307_200
 _DIRECT_COMPLETION_PATH = re.compile(
-    r"Контекст\.[^\W\d]\w*(?:\.[^\W\d]\w*){0,7}\Z", re.UNICODE,
+    r"e1cRuntimeКонтекст\.[^\W\d]\w*(?:\.[^\W\d]\w*){0,7}\Z", re.UNICODE,
 )
 _FIELD_NAME = re.compile(r"[^\W\d]\w*\Z", re.UNICODE)
 

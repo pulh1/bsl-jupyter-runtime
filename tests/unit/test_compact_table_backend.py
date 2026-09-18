@@ -47,7 +47,7 @@ def test_capture_compact_plan_exists_before_creation_and_caller_does_not_clean()
         runtime_generation=lambda: 3, context_generation=5, key_factory=lambda: KEY,
         capture_executor=execute_plan,
     )
-    assert transfer.payload("Контекст.Таблица", ReferencePolicy(refs="both")) == expected
+    assert transfer.payload("e1cRuntimeКонтекст.Таблица", ReferencePolicy(refs="both")) == expected
     assert len(seen) == 1
 
 
@@ -73,7 +73,7 @@ def payload() -> bytes:
 
 def test_builds_one_compact_preparation_with_safe_reference_overrides() -> None:
     source = build_compact_transfer_instruction(
-        "Контекст.Таблица",
+        "e1cRuntimeКонтекст.Таблица",
         ReferencePolicy(refs="uuid", ref_columns={"Employee": "both"}),
         KEY,
         runtime_generation=3,
@@ -82,14 +82,14 @@ def test_builds_one_compact_preparation_with_safe_reference_overrides() -> None:
 
     assert source.count("СериализоватьКомпактнуюТаблицу") == 1
     assert 'Вставить("Employee", "both")' in source
-    assert f'Контекст.Вставить("{KEY}"' in source
+    assert f'e1cRuntimeКонтекст.Вставить("{KEY}"' in source
     assert "ПолучитьЧасть" not in source
     assert "RuntimeWorker" not in source
 
 
 def test_compact_instruction_builds_protocol_two_admission_before_publication() -> None:
     source = build_compact_transfer_instruction(
-        "Контекст.Таблица",
+        "e1cRuntimeКонтекст.Таблица",
         ReferencePolicy(),
         KEY,
         runtime_generation=3,
@@ -105,7 +105,7 @@ def test_compact_instruction_builds_protocol_two_admission_before_publication() 
         "RuntimeTableTransferServer.СериализоватьКомпактнуюТаблицу(", 1
     )[1]
     assert source.index("Если Не Материализация.Доступ Тогда") < source.index(
-        f'Контекст.Вставить("{KEY}"'
+        f'e1cRuntimeКонтекст.Вставить("{KEY}"'
     )
     assert 'Результат = "D|worker_generation_value"' in source
     assert 'Результат = "E|value_admission_failed"' in source
@@ -114,7 +114,7 @@ def test_compact_instruction_builds_protocol_two_admission_before_publication() 
 
 def test_compact_instruction_reports_only_allowlisted_server_failure_codes() -> None:
     source = build_compact_transfer_instruction(
-        "Контекст.Таблица", ReferencePolicy(), KEY,
+        "e1cRuntimeКонтекст.Таблица", ReferencePolicy(), KEY,
         runtime_generation=3, context_generation=5,
     )
 
@@ -149,7 +149,7 @@ def test_nonready_or_predecessor_table_metadata_never_fetches_payload(
     )
 
     with pytest.raises(error_type):
-        transfer.payload("Контекст.Таблица", ReferencePolicy())
+        transfer.payload("e1cRuntimeКонтекст.Таблица", ReferencePolicy())
 
     assert reads == []
 
@@ -180,7 +180,7 @@ def test_main_table_failure_has_safe_specific_message_without_payload_fetch(
     )
 
     with pytest.raises(TableMaterializationError, match=message) as raised:
-        transfer.payload("Контекст.Таблица", ReferencePolicy())
+        transfer.payload("e1cRuntimeКонтекст.Таблица", ReferencePolicy())
 
     assert "CAPTURE" not in str(raised.value)
     assert reads == []
@@ -201,7 +201,7 @@ def test_capture_table_failure_keeps_admission_error_type_with_safe_reason() -> 
     )
 
     with pytest.raises(CaptureValueCheckError, match="byte limit"):
-        transfer.payload("Контекст.Таблица", ReferencePolicy())
+        transfer.payload("e1cRuntimeКонтекст.Таблица", ReferencePolicy())
 
 
 def test_table_failure_code_rejects_extra_target_text_without_leaking_it() -> None:
@@ -215,31 +215,31 @@ def test_table_failure_code_rejects_extra_target_text_without_leaking_it() -> No
     )
 
     with pytest.raises(TableMaterializationError) as raised:
-        transfer.payload("Контекст.Таблица", ReferencePolicy())
+        transfer.payload("e1cRuntimeКонтекст.Таблица", ReferencePolicy())
 
     assert "private-value" not in str(raised.value)
 
 
 def test_builds_compact_transfer_for_validated_tabular_section_path() -> None:
     source = build_compact_transfer_instruction(
-        "Контекст.Документ.Товары",
+        "e1cRuntimeКонтекст.Документ.Товары",
         ReferencePolicy(),
         KEY,
         runtime_generation=3,
         context_generation=5,
     )
 
-    assert "Контекст.Документ.Товары" in source
+    assert "e1cRuntimeКонтекст.Документ.Товары" in source
 
 
 @pytest.mark.parametrize(
     "handle",
     (
-        "Контекст.Документ[0]",
-        "Контекст.Документ.Товары()",
-        "Контекст.Документ; Сообщить(1)",
+        "e1cRuntimeКонтекст.Документ[0]",
+        "e1cRuntimeКонтекст.Документ.Товары()",
+        "e1cRuntimeКонтекст.Документ; Сообщить(1)",
         "RuntimeKernelServer.ПолучитьВременнуюТаблицуОтладки("
-        "Контекст.КонтекстОтладки.Результат, \"Итоги\", 0, 10, Новый Массив)",
+        "e1cRuntimeКонтекст.e1cRuntimeКонтекстОтладки.Результат, \"Итоги\", 0, 10, Новый Массив)",
     ),
 )
 def test_rejects_executable_compact_table_path(handle: str) -> None:
@@ -268,7 +268,7 @@ def test_reads_one_scalar_and_verifies_compact_payload() -> None:
     )
 
     frame = transfer.to_df(
-        "Контекст.Таблица",
+        "e1cRuntimeКонтекст.Таблица",
         ReferencePolicy(refs="uuid", ref_columns={"Employee": "both"}),
     )
 
@@ -304,7 +304,7 @@ def test_to_df_keeps_unfilled_table_column_as_missing_values() -> None:
         key_factory=lambda: KEY,
     )
 
-    frame = transfer.to_df("Контекст.ТЗ", ReferencePolicy())
+    frame = transfer.to_df("e1cRuntimeКонтекст.ТЗ", ReferencePolicy())
 
     assert frame.shape == (20, 5)
     assert frame.loc[0, "Поле1"] == 1
@@ -326,7 +326,7 @@ def test_rejects_payload_integrity_mismatch_after_atomic_take() -> None:
     )
 
     with pytest.raises(ProtocolError, match="integrity"):
-        transfer.to_df("Контекст.Таблица", ReferencePolicy())
+        transfer.to_df("e1cRuntimeКонтекст.Таблица", ReferencePolicy())
 
     assert reads == [KEY]
 
@@ -346,7 +346,7 @@ def test_rejects_declared_payload_over_byte_budget_before_atomic_take() -> None:
     )
 
     with pytest.raises(TableMaterializationError, match="invalid"):
-        transfer.payload("Контекст.Таблица", ReferencePolicy())
+        transfer.payload("e1cRuntimeКонтекст.Таблица", ReferencePolicy())
 
     assert reads == []
 
@@ -358,7 +358,7 @@ def test_generic_table_transport_has_no_specialized_schema_compatibility_surface
 
 def test_generic_instruction_passes_budgets_to_server_serializer() -> None:
     source = build_compact_transfer_instruction(
-        "Контекст.Таблица",
+        "e1cRuntimeКонтекст.Таблица",
         ReferencePolicy(),
         KEY,
         runtime_generation=3,
@@ -485,7 +485,7 @@ def test_records_each_materialization_boundary_without_payload_values() -> None:
     )
 
     transfer.to_df(
-        "Контекст.Таблица",
+        "e1cRuntimeКонтекст.Таблица",
         ReferencePolicy(refs="uuid", ref_columns={"Employee": "both"}),
     )
 

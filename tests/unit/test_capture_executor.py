@@ -65,7 +65,7 @@ class SetupPort:
             UUID(int=6),
             tuple(
                 FrameVariable(name, "Строка", "")
-                for name in ("Контекст", "ТекущаяИнструкция", "ИдентификаторКоманды")
+                for name in ("e1cRuntimeКонтекст", "ТекущаяИнструкция", "ИдентификаторКоманды")
             ),
         )
 

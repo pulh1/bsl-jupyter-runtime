@@ -79,7 +79,7 @@ class CaptureMessageCollector:
 
             return CaptureRemoteOutcome(evaluation, ())
         expression = (
-            "RuntimeKernelServer.ЗабратьСообщенияЯчейкиИзКонтекста(Контекст, "
+            "RuntimeKernelServer.ЗабратьСообщенияЯчейкиИзКонтекста(e1cRuntimeКонтекст, "
             + bsl_string_literal(message_collector_key)
             + ")"
         )

@@ -20,6 +20,8 @@ from onec_runtime.execution.contracts import CommonCell, PreparedCell
 from onec_runtime.execution.main.policy import MainPreparedPayload
 from onec_runtime.execution.preparation import RoutePreparedStatement
 from onec_runtime.execution.provenance import PreparedExecutionProvenanceReader
+from onec_runtime.execution.worker_activation import PrebuiltWorkerIntent
+from onec_runtime.server_worker import WorkerArtifact, WorkerSourceProvenance
 
 
 def prepared(*, capture: bool, worker: bool = False, statement: bool = True):
@@ -71,6 +73,26 @@ def test_worker_only_provenance_fails_before_worker_artifact_exists() -> None:
     cell, _, _ = prepared(capture=True, worker=True, statement=False)
     with pytest.raises(ProtocolError, match="Worker artifact"):
         PreparedExecutionProvenanceReader()(cell)
+
+
+@pytest.mark.parametrize("capture", [False, True])
+def test_worker_only_provenance_uses_prebuilt_compiled_artifact(capture: bool) -> None:
+    cell, _, unit = prepared(capture=capture, worker=True, statement=False)
+    compiled_hash = source_sha256("compiled Worker")
+    map_hash = source_sha256("Worker source map")
+    artifact = WorkerArtifact(
+        "Worker", compiled_hash, source_sha256("Worker binary"), (),
+        WorkerSourceProvenance(compiled_hash, map_hash, 7),
+    )
+    prebuilt = PrebuiltWorkerIntent(object(), object(), object(), artifact, 0)
+    cell = replace(cell, payload=replace(cell.payload, worker_intent=prebuilt))
+
+    provenance = PreparedExecutionProvenanceReader()(cell)
+    assert provenance.visible_source_sha256 == unit.source_sha256
+    assert provenance.executed_source_sha256 == compiled_hash
+    assert provenance.source_map_sha256 == map_hash
+    assert provenance.worker_generation == 7
+    assert provenance.mode == ("capture" if capture else "main")
 
 
 def test_reader_rejects_mismatched_visible_identity() -> None:

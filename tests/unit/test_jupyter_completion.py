@@ -43,7 +43,7 @@ def test_live_table_fields_use_kernel_completion_with_correct_replacement(shell)
     fields = [item for item in items if item.text == "ФОТ"]
     assert len(fields) == 1 and fields[0].type == "property"
     assert (fields[0].start, fields[0].end) == (len(source), len(source))
-    assert shell.user_ns["_onec_runtime"].calls == [("Контекст.КадровыеДанные", True, 1.0)]
+    assert shell.user_ns["_onec_runtime"].calls == [("e1cRuntimeКонтекст.КадровыеДанные", True, 1.0)]
 
 
 def test_structures_nested_paths_and_case_insensitive_prefix(shell):
@@ -53,7 +53,7 @@ def test_structures_nested_paths_and_case_insensitive_prefix(shell):
     items = complete(shell, source)
     assert [item.text for item in items] == ["Название"]
     assert (items[0].start, items[0].end) == (len(source)-2, len(source))
-    assert runtime.calls == [("Контекст.Данные.Вложенные", False, 1.0)]
+    assert runtime.calls == [("e1cRuntimeКонтекст.Данные.Вложенные", False, 1.0)]
 
 
 def test_fields_are_read_again_after_value_replacement_and_runtime_reinstall(shell):
@@ -107,7 +107,7 @@ def test_cursor_in_middle_of_cell_uses_only_code_before_cursor(shell):
         items = list(shell.Completer.completions(source, position))
     assert [item.text for item in items] == ["ФОТ"]
     assert (items[0].start, items[0].end) == (position - 2, position)
-    assert shell.user_ns["_onec_runtime"].calls == [("Контекст.Данные", False, 1.0)]
+    assert shell.user_ns["_onec_runtime"].calls == [("e1cRuntimeКонтекст.Данные", False, 1.0)]
 
 
 def test_bsl_fields_coexist_with_default_jedi_and_python_completion(shell):

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from onec_runtime.execution.arbiter import SessionPort
 from onec_runtime.execution.arbiter import OutcomeUnknown
 from onec_runtime.execution.preparation import WorkerCandidateIntent
+
+if TYPE_CHECKING:
+    from onec_runtime.execution.worker_activation import PrebuiltWorkerIntent
 
 
 class WorkerActivationLease(Protocol):
@@ -35,5 +38,12 @@ class WorkerActivationPort(Protocol):
         ...
 
     def activate(
-        self, intent: WorkerCandidateIntent, *, port: SessionPort
+        self, intent: WorkerCandidateIntent | PrebuiltWorkerIntent, *, port: SessionPort
     ) -> WorkerActivationLease: ...
+
+
+@runtime_checkable
+class WorkerArtifactPrebuildPort(Protocol):
+    """Build a local Worker artifact before provenance and admission."""
+
+    def prebuild(self, intent: WorkerCandidateIntent) -> PrebuiltWorkerIntent: ...

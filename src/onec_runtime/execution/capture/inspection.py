@@ -11,6 +11,7 @@ from onec_runtime.capture_values import (
     MAX_TYPE_CHARS,
     SafePathSegment,
     ValuePathSegmentKind,
+    VariableRole,
 )
 from onec_runtime.errors import CapturePathError, ProtocolError
 from onec_runtime.execution.capture.scope import (
@@ -56,7 +57,7 @@ class TypedNativeVariable:
     """Bounded frame metadata with no RDBG value presentation."""
 
     name: str
-    type_name: str
+    type_name: str | None
     collection_size: int | None
 
 
@@ -118,6 +119,8 @@ class CaptureInspectionExecutor:
         start: int,
         stop: int,
         port: CaptureInspectionPort,
+        role: VariableRole = VariableRole.VARIABLES,
+        parameter_names: tuple[str, ...] = (),
     ) -> NativeVariablePage:
         """Read one bounded page of safe native-frame variable names.
 
@@ -129,13 +132,56 @@ class CaptureInspectionExecutor:
         """
 
         self._require_page_request(scope, stack_level, start, stop)
-        variables, names = self._read_inventory(scope, stack_level, port)
+        checked_parameters = self._checked_role_parameters(role, parameter_names)
+        _variables, names = self._read_inventory(scope, stack_level, port)
+        names = self._names_for_role(names, role, checked_parameters)
         selected = names[start:stop]
         return NativeVariablePage(
             selected,
-            len(variables),
-            stop if selected and stop < len(variables) else None,
+            len(names),
+            stop if selected and stop < len(names) else None,
         )
+
+    @staticmethod
+    def _checked_role_parameters(
+        role: VariableRole, parameter_names: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        if type(role) is not VariableRole:
+            raise TypeError("CAPTURE variable role is invalid")
+        if (
+            type(parameter_names) is not tuple
+            or len(parameter_names) > MAX_NATIVE_VARIABLE_INVENTORY
+        ):
+            raise ValueError("CAPTURE parameter inventory is invalid")
+        try:
+            checked_parameters = tuple(
+                SafePathSegment(ValuePathSegmentKind.VARIABLE, name).key
+                for name in parameter_names
+            )
+        except CapturePathError as error:
+            raise ValueError("CAPTURE parameter inventory is invalid") from error
+        folded = tuple(name.casefold() for name in checked_parameters)
+        if len(set(folded)) != len(folded):
+            raise ValueError("CAPTURE parameter inventory is ambiguous")
+        if role is VariableRole.VARIABLES:
+            if folded:
+                raise ValueError("Unclassified CAPTURE page cannot name parameters")
+        return folded
+
+    @staticmethod
+    def _names_for_role(
+        names: tuple[str, ...], role: VariableRole,
+        folded: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        if role is VariableRole.VARIABLES:
+            return names
+        by_name = {name.casefold(): name for name in names}
+        if any(name not in by_name for name in folded):
+            raise CaptureInspectionUnavailable("CAPTURE method parameters are unavailable")
+        if role is VariableRole.PARAMETERS:
+            return tuple(by_name[name] for name in folded)
+        excluded = set(folded)
+        return tuple(name for name in names if name.casefold() not in excluded)
 
     def read_typed_variable_page(
         self,
@@ -145,14 +191,19 @@ class CaptureInspectionExecutor:
         start: int,
         stop: int,
         port: CaptureInspectionPort,
+        role: VariableRole = VariableRole.VARIABLES,
+        parameter_names: tuple[str, ...] = (),
     ) -> TypedNativeVariablePage:
         """Read bounded name/type/size metadata; keep presentations private."""
 
         self._require_page_request(scope, stack_level, start, stop)
+        checked_parameters = self._checked_role_parameters(role, parameter_names)
         variables, names = self._read_inventory(scope, stack_level, port)
+        selected_names = self._names_for_role(names, role, checked_parameters)
+        by_name = {name.casefold(): variable for name, variable in zip(names, variables)}
         selected: list[TypedNativeVariable] = []
-        for index in range(start, min(stop, len(variables))):
-            variable = variables[index]
+        for name in selected_names[start:stop]:
+            variable = by_name[name.casefold()]
             type_name = variable.type_name
             size = variable.collection_size
             if (
@@ -161,12 +212,13 @@ class CaptureInspectionExecutor:
                 or size is not None
                 and (type(size) is not int or not 0 <= size <= MAX_NATIVE_VARIABLE_INVENTORY)
             ):
-                raise CaptureInspectionUnavailable("CAPTURE frame inventory is unavailable")
-            selected.append(TypedNativeVariable(names[index], type_name, size))
+                selected.append(TypedNativeVariable(name, None, None))
+            else:
+                selected.append(TypedNativeVariable(name, type_name, size))
         return TypedNativeVariablePage(
             tuple(selected),
-            len(variables),
-            stop if selected and stop < len(variables) else None,
+            len(selected_names),
+            stop if selected and stop < len(selected_names) else None,
         )
 
     @staticmethod

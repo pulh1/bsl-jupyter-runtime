@@ -18,7 +18,7 @@ from onec_runtime.errors import ProtocolError
 from onec_runtime.execution.arbiter import (
     RdbgArbiter, RouteToken, Settlement, TargetTerminated,
 )
-from onec_runtime.execution.termination import FileTerminationConfirmed
+from arbiter_test_cleanup import confirm_test_server_terminated
 from onec_runtime.execution.worker_breakpoint_service import WorkerBreakpointService
 from onec_runtime.rdbg.models import DebugTarget, ModuleLocation, TargetId
 from onec_runtime.worker_breakpoints import (
@@ -32,7 +32,7 @@ from test_worker_breakpoints import _debug_view
 SERVICE = ModuleLocation("ExtensionModule", "", UUID(int=1), UUID(int=2), 1)
 CAPTURE = ModuleLocation("ExtensionModule", "", UUID(int=1), UUID(int=3), 7)
 USER = ModuleLocation("ConfigurationModule", "", UUID(int=4), UUID(int=5), 9)
-TARGET = TargetId(UUID(int=6), "test")
+TARGET = TargetId(UUID(int=6), "test", UUID(int=7))
 
 
 class _Session:
@@ -82,8 +82,8 @@ def service():
     session.release.set()
     active = arbiter.active_ticket
     if active is not None and active.status().phase == "unknown":
-        arbiter.retire_terminated_target(
-            active, arbiter.current_route, FileTerminationConfirmed(TARGET, 123, -15),
+        confirm_test_server_terminated(
+            arbiter, active, arbiter.current_route, session, TARGET,
         )
         with pytest.raises(TargetTerminated):
             active.wait_settled(5)

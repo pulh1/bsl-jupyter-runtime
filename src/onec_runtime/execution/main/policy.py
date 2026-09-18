@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Protocol, cast
+from typing import Callable, Protocol, cast
 
 from onec_runtime.bsl.diagnostics import DiagnosticStage, VisibleSourceContext
 from onec_runtime.bsl.lexer import BslLexError
@@ -21,6 +21,7 @@ from onec_runtime.execution.main.preparation import MainCellPreparer
 from onec_runtime.execution.preparation import (
     RoutePreparationInput, RoutePreparedStatement, WorkerCandidateIntent,
 )
+from onec_runtime.execution.worker_activation import PrebuiltWorkerIntent
 
 
 class MainPreparationBinding(Protocol):
@@ -43,7 +44,7 @@ class MainPreparationBinding(Protocol):
 class MainPreparedPayload:
     common: CommonCell = field(repr=False)
     statement: RoutePreparedStatement | None = field(repr=False)
-    worker_intent: WorkerCandidateIntent | None = field(default=None, repr=False)
+    worker_intent: WorkerCandidateIntent | PrebuiltWorkerIntent | None = field(default=None, repr=False)
     deferred_statement: RoutePreparedStatement | None = field(default=None, repr=False)
 
 
@@ -58,9 +59,14 @@ class MainCellPolicy:
         self,
         binding: MainPreparationBinding,
         preparer: MainCellPreparer | None = None,
+        *,
+        prebuild_worker: (
+            Callable[[WorkerCandidateIntent], PrebuiltWorkerIntent] | None
+        ) = None,
     ) -> None:
         self._binding = binding
         self._preparer = preparer or MainCellPreparer()
+        self._prebuild_worker = prebuild_worker
 
     def prepare(
         self,
@@ -98,6 +104,8 @@ class MainCellPolicy:
                     ),
                     stage=stage,
                 )
+        if worker_intent is not None and self._prebuild_worker is not None:
+            worker_intent = self._prebuild_worker(worker_intent)
         return PreparedCell(
             context.route_token,
             context.preparation_nonce,

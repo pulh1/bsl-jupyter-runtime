@@ -1,7 +1,7 @@
 """Source-mapped message collector around a notebook statement.
 
 The semantic lowerer replaces ``Сообщить`` with an append to a per-cell array
-in ``Контекст``. This wrapper owns that array for both successful and failed
+in ``e1cRuntimeКонтекст``. This wrapper owns that array for both successful and failed
 BSL execution, then makes it available to the completion reader.
 """
 
@@ -13,7 +13,8 @@ from onec_runtime.bsl import (
 
 
 def with_message_collector(
-    source: MappedSource, messages_intercepted: int, key: str,
+    source: MappedSource, messages_intercepted: int, key: str, *,
+    worker_messages: bool = False,
 ) -> MappedSource:
     """Wrap an intercepted statement without losing visible source locations."""
 
@@ -21,20 +22,34 @@ def with_message_collector(
         return source
     start = SourceSpan(0, 0)
     end = SourceSpan(len(source.text), len(source.text))
+    worker = "__OnecPinnedWorkerGenerationMessageObject"
+    previous_sink = "__OnecPinnedWorkerGenerationPreviousMessageSink"
+    restore_sink = (
+        f"{worker}.__OnecWorkerMessageSink = {previous_sink};\n"
+        if worker_messages else ""
+    )
     finalize = (
-        'Контекст.Вставить("__onec_cell_messages_result_key", "'
+        restore_sink
+        + 'e1cRuntimeКонтекст.Вставить("__onec_cell_messages_result_key", "'
         + key
         + '");\n'
-        + 'Контекст.Вставить("__onec_cell_messages_result", Контекст.'
+        + 'e1cRuntimeКонтекст.Вставить("__onec_cell_messages_result", e1cRuntimeКонтекст.'
         + key
         + ');\n'
-        + 'Контекст.Удалить("'
+        + 'e1cRuntimeКонтекст.Удалить("'
         + key
         + '");'
     )
     builder = SourceTransformBuilder(source)
+    initialize = f'e1cRuntimeКонтекст.Вставить("{key}", Новый Массив);\n'
+    if worker_messages:
+        initialize += (
+            f'{worker} = e1cRuntimeКонтекст.RuntimeWorkerActiveGeneration.Modules.Получить("Worker");\n'
+            f"{previous_sink} = {worker}.__OnecWorkerMessageSink;\n"
+            f"{worker}.__OnecWorkerMessageSink = e1cRuntimeКонтекст.{key};\n"
+        )
     builder.synthetic(
-        f'Контекст.Вставить("{key}", Новый Массив);\n',
+        initialize,
         start, "message_collector_initialize",
     )
     builder.synthetic("Попытка\n", start, "message_collector_try")

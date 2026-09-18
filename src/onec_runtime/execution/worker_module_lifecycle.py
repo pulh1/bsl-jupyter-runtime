@@ -18,8 +18,9 @@ from onec_runtime.bsl.module_catalog import (
     CommonModuleCatalogSnapshot, SessionCommonModuleCatalog,
 )
 from onec_runtime.bsl.module_universe import (
-    WorkerModuleUnit, analyze_worker_module, lower_worker_module,
+    WorkerModuleUnit, lower_resolved_worker_module,
 )
+from onec_runtime.bsl.worker_dependency_resolver import ResolvedModulePlan
 from onec_runtime.bsl.diagnostics import VisibleSourceContext
 from onec_runtime.bsl.parser_target import PythonParserTarget
 from onec_runtime.bsl.source_maps import SourceUnitRef
@@ -27,7 +28,10 @@ from onec_runtime.errors import ProtocolError, StaleWorkerGeneration
 from onec_runtime.execution.arbiter import (
     OutcomeUnknown, RdbgArbiter, SessionPort, Settlement,
 )
-from onec_runtime.execution.worker_catalog_resolver import resolve_worker_module_catalog
+from onec_runtime.execution.worker_catalog_resolver import (
+    ConfirmedWorkerModulePreparation, WorkerCatalogResolution,
+    resolve_worker_module_catalog,
+)
 from onec_runtime.execution.worker_mutation import (
     CapturePausedWorkerRoute, MainPausedWorkerRoute, WorkerMutationRoute,
 )
@@ -45,9 +49,9 @@ from onec_runtime.worker_universe import (
 class WorkerModuleArtifactPreparer:
     """Analyze and package a complete source graph without target access.
 
-    This bounded preparer accepts an already confirmed common-module catalog
-    snapshot. Resolving a SessionCommonModuleCatalog's lazy dependencies is a
-    separate composition port and must happen before calling this preparer.
+    The catalog resolver passes its exact parsed models into this preparer.
+    Dependency resolution and artifact lowering reuse those models without
+    parsing the same module again.
     """
 
     def __init__(
@@ -63,15 +67,37 @@ class WorkerModuleArtifactPreparer:
     def __call__(
         self,
         units: tuple[WorkerModuleUnit, ...],
-        catalog: CommonModuleCatalogSnapshot,
+        resolution: WorkerCatalogResolution,
         profiler: PhaseRecorder | None,
     ) -> tuple[WorkerModuleArtifact, ...]:
-        artifacts: list[WorkerModuleArtifact] = []
-        for unit in units:
-            analysis = analyze_worker_module(
-                unit, catalog, self._parser, profiler=profiler,
+        if not isinstance(resolution, WorkerCatalogResolution) or (
+            len(units) != len(resolution.units)
+            or any(
+                proposed is not parsed
+                for proposed, parsed in zip(units, resolution.units, strict=True)
             )
-            lowered = lower_worker_module(analysis, profiler=profiler)
+        ):
+            raise ProtocolError("Worker parsed source graph does not match preparation")
+        parser_identity = (
+            self._parser.metadata.parser_identity_sha256,
+            self._parser.metadata.parsergen_package_sha256 or "",
+        )
+        artifacts: list[WorkerModuleArtifact] = []
+        for unit, model, plan, retained in zip(
+            units, resolution.models, resolution.plans, resolution.retained,
+            strict=True,
+        ):
+            if model.parser_identity != parser_identity:
+                raise ProtocolError("Worker parsed source has another parser provenance")
+            if (
+                retained is not None
+                and isinstance(retained.artifact, WorkerModuleArtifact)
+                and _unit_descriptor_key(unit) == _unit_descriptor_key(retained.unit)
+                and _semantic_plan_key(plan) == _semantic_plan_key(retained.plan)
+            ):
+                artifacts.append(retained.artifact)
+                continue
+            lowered = lower_resolved_worker_module(unit, plan, profiler=profiler)
             references = {
                 reference
                 for segment in unit.mapped_source.source_map.segments
@@ -122,7 +148,7 @@ class WorkerModuleLifecycleService:
         publisher: WorkerModulePublisher,
         *,
         prepare_artifacts: Callable[
-            [tuple[WorkerModuleUnit, ...], CommonModuleCatalogSnapshot,
+            [tuple[WorkerModuleUnit, ...], WorkerCatalogResolution,
              PhaseRecorder | None], tuple[WorkerModuleArtifact, ...]
         ],
         route_provider: Callable[[], WorkerMutationRoute],
@@ -151,7 +177,7 @@ class WorkerModuleLifecycleService:
         self._worker_breakpoints_present = worker_breakpoints_present
         self._wait_handoff = wait_handoff
         self._lock = RLock()
-        self._units: dict[str, WorkerModuleUnit] = {}
+        self._confirmed: dict[str, ConfirmedWorkerModulePreparation] = {}
         self._catalog: CommonModuleCatalogSnapshot | None = None
         self._revision = 0
         self._api_owned_handle: WorkerGenerationHandle | None = None
@@ -193,22 +219,24 @@ class WorkerModuleLifecycleService:
 
         route = self._admit_route()
         with self._lock:
-            desired = dict(self._units)
+            confirmed = dict(self._confirmed)
+            desired = {name: entry.unit for name, entry in confirmed.items()}
             desired.update((unit.logical_name.casefold(), unit) for unit in units)
             ordered = tuple(desired[name] for name in sorted(desired))
             revision = self._revision
-        catalog = (
-            common_modules
-            if isinstance(common_modules, CommonModuleCatalogSnapshot)
-            else resolve_worker_module_catalog(
-                common_modules, ordered, profiler=profiler,
-            )
+
+        def validate_catalog(candidate: CommonModuleCatalogSnapshot) -> None:
+            with self._lock:
+                self._require_monotonic_catalog(candidate)
+            for unit in ordered:
+                candidate.require(unit.logical_name)
+
+        resolution = resolve_worker_module_catalog(
+            common_modules, ordered, profiler=profiler, previous=confirmed,
+            validate_catalog=validate_catalog,
         )
-        with self._lock:
-            self._require_monotonic_catalog(catalog)
-        for unit in ordered:
-            catalog.require(unit.logical_name)
-        artifacts = self._prepare_artifacts(ordered, catalog, profiler)
+        catalog = resolution.catalog
+        artifacts = self._prepare_artifacts(ordered, resolution, profiler)
         if (
             type(artifacts) is not tuple
             or len(artifacts) != len(ordered)
@@ -253,7 +281,15 @@ class WorkerModuleLifecycleService:
                         "Worker breakpoint publication report is unconfirmed"
                     )
             with self._lock:
-                self._units = desired
+                self._confirmed = {
+                    unit.logical_name.casefold(): ConfirmedWorkerModulePreparation(
+                        unit, model, resolved, artifact,
+                    )
+                    for unit, model, resolved, artifact in zip(
+                        ordered, resolution.models, resolution.plans, artifacts,
+                        strict=True,
+                    )
+                }
                 self._catalog = catalog
                 self._revision += 1
                 self._api_owned_handle = handle
@@ -272,7 +308,9 @@ class WorkerModuleLifecycleService:
             active = getattr(self._publisher.snapshot(), "active_handle", None)
             if active is not handle:
                 raise ProtocolError("Worker source generation is not current")
-            return tuple(self._units[name] for name in sorted(self._units))
+            return tuple(
+                self._confirmed[name].unit for name in sorted(self._confirmed)
+            )
 
     def release_worker_generation(self, handle: WorkerGenerationHandle) -> None:
         """Release only the currently API-owned handle on the arbiter worker."""
@@ -316,6 +354,11 @@ class WorkerModuleLifecycleService:
         return report
 
     def _admit_route(self) -> WorkerMutationRoute:
+        # A settled value reply may still own its mandatory private-key
+        # cleanup. Module publication is the next user operation, so observe
+        # that exact dependent ticket before checking stopped-route admission.
+        with self._wait_handoff():
+            self._arbiter.wait_for_dependent_cleanup()
         self._require_mutation_boundary()
         if self._worker_breakpoints_present() and not getattr(
             self._publisher, "supports_breakpoint_reload", False
@@ -372,12 +415,41 @@ class WorkerModuleLifecycleService:
             raise
 
 
+def _unit_descriptor_key(unit: WorkerModuleUnit) -> tuple[str, str, int, str, str]:
+    return (
+        unit.logical_name.casefold(), unit.kind, unit.revision,
+        unit.mapped_source.artifact.source_sha256,
+        unit.mapped_source.source_map_sha256,
+    )
+
+
+def _semantic_plan_key(plan: ResolvedModulePlan) -> tuple[object, ...]:
+    return (
+        plan.source.source_sha256,
+        plan.source.parser_identity,
+        plan.implicit_local_names,
+        plan.forbidden_global_writes,
+        plan.dependencies,
+        tuple(
+            (
+                method.source.normalized_name,
+                method.local_names,
+                method.implicit_local_names,
+                method.dependencies,
+                method.forbidden_global_writes,
+            )
+            for method in plan.methods
+        ),
+    )
+
+
 def _same_route(expected: WorkerMutationRoute, current: object) -> bool:
     if isinstance(expected, MainPausedWorkerRoute):
         return (
             isinstance(current, MainPausedWorkerRoute)
             and expected.target_id == current.target_id
             and expected.previous_main is current.previous_main
+            and expected.route_token == current.route_token
         )
     return (
         isinstance(current, CapturePausedWorkerRoute)

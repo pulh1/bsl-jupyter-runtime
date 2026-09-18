@@ -450,6 +450,11 @@ class LiveWorkerUniverseHarness:
         return self.session.runtime_api._worker_universe_target
 
 
+def _close_and_verify_live_session(session: RuntimeSession) -> None:
+    session.close()
+    assert session.is_closed, "runtime session cleanup did not finish"
+
+
 @contextmanager
 def _fresh_live_harness(
     tmp_path: Path,
@@ -484,8 +489,7 @@ def _fresh_live_harness(
     process_evidence: list[dict[str, object]] = []
     target_evidence: dict[str, object] = {}
     cleanup = {
-        "host_registry_empty": False,
-        "target_registry_empty": False,
+        "session_closed": False,
         "owned_processes_gone": False,
         "owned_root_removed": False,
     }
@@ -636,20 +640,11 @@ def _fresh_live_harness(
         cleanup_errors: list[BaseException] = []
         if session is not None:
             try:
-                measured("cleanup.session_close", session.close)
-            except BaseException as error:
-                cleanup_errors.append(error)
-            try:
-                host = session.runtime_api._worker_universe
-                target = session.runtime_api._worker_universe_target
-                assert host._state.value == "closed"
-                assert host._registration_refcounts == {}
-                assert host._registration_artifacts == {}
-                assert host._quarantine_holds == set()
-                assert target._registrations == {}
-                assert target._candidate_registrations == {}
-                cleanup["host_registry_empty"] = True
-                cleanup["target_registry_empty"] = True
+                measured(
+                    "cleanup.session_close",
+                    lambda: _close_and_verify_live_session(session),
+                )
+                cleanup["session_closed"] = True
             except BaseException as error:
                 cleanup_errors.append(error)
         try:
@@ -718,6 +713,25 @@ def _fresh_live_harness(
                 failures.append(active_error)
             failures.extend(cleanup_errors)
             raise ExceptionGroup("Task 9 live cleanup failed", failures)
+
+
+def test_live_harness_cleanup_uses_public_session_closed_contract() -> None:
+    class PublicOnlySession:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+        @property
+        def is_closed(self) -> bool:
+            return self.closed
+
+    session = PublicOnlySession()
+
+    _close_and_verify_live_session(session)
+
+    assert session.is_closed
 
 
 class _CountingRealArtifactBuilder:

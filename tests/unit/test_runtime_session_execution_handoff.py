@@ -331,7 +331,7 @@ def test_generic_materialization_wait_allows_public_namespace_snapshot(
 
     def materialize() -> None:
         try:
-            assert runtime.materialization_kind("Контекст.Таблица") == "table"
+            assert runtime.materialization_kind("e1cRuntimeКонтекст.Таблица") == "table"
         except BaseException as error:
             materialization_errors.append(error)
 

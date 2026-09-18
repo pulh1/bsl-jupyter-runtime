@@ -207,7 +207,7 @@ def test_extension_separates_metadata_from_bounded_descriptor_data_result() -> N
         "РезультатДанных.Выбрать()"
     )
     assert "ПолучитьВременнуюТаблицуОтладки(" in storage
-    assert "Контекст.Вставить(Ключ, Результат)" in storage
+    assert "e1cRuntimeКонтекст.Вставить(Ключ, Результат)" in storage
 
 
 class CacheBackend:

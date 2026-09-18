@@ -67,8 +67,8 @@ class RuntimeResource:
 
 
 class _ShutdownHeartbeat:
-    def join(self, timeout: float) -> None:
-        assert timeout == 2.0
+    def join(self, timeout: float | None = None) -> None:
+        assert timeout is None
 
 
 class _ShutdownProcesses:

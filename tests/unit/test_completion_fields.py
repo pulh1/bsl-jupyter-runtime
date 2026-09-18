@@ -103,7 +103,7 @@ def test_captured_session_completion_returns_admitted_schema_in_one_inspection()
 
     def complete() -> None:
         try:
-            fields.append(runtime.completion_fields("Контекст.Данные"))
+            fields.append(runtime.completion_fields("e1cRuntimeКонтекст.Данные"))
         except BaseException as error:
             errors.append(error)
 
@@ -151,7 +151,7 @@ def test_captured_session_completion_interrupt_detaches_only_the_waiter(
     try:
         monkeypatch.setattr(CaptureEvaluationTicket, "wait_initiator", interrupt_after_ack)
         with pytest.raises(KeyboardInterrupt):
-            runtime.completion_fields("Контекст.Данные")
+            runtime.completion_fields("e1cRuntimeКонтекст.Данные")
 
         assert runtime._operation_lock.acquire(blocking=False)
         runtime._operation_lock.release()
@@ -203,7 +203,7 @@ def test_captured_session_completion_classifies_confirmed_outcomes(
 
     def complete() -> None:
         try:
-            runtime.completion_fields("Контекст.Данные")
+            runtime.completion_fields("e1cRuntimeКонтекст.Данные")
         except BaseException as caught:
             errors.append(caught)
 
@@ -232,7 +232,7 @@ def test_captured_session_completion_dispatch_uncertainty_is_not_a_worker_error(
     runtime, api, controller = _captured_completion_runtime(session)
     try:
         with pytest.raises(CaptureOutcomeUnknownError):
-            runtime.completion_fields("Контекст.Данные")
+            runtime.completion_fields("e1cRuntimeКонтекст.Данные")
         status = api.current_capture().status()
         assert status.phase is CapturePhase.OUTCOME_UNKNOWN
         assert status.evaluation_kind is None
@@ -248,7 +248,7 @@ def test_captured_session_completion_restore_failure_requires_recovery() -> None
 
     def complete() -> None:
         try:
-            runtime.completion_fields("Контекст.Данные")
+            runtime.completion_fields("e1cRuntimeКонтекст.Данные")
         except BaseException as caught:
             errors.append(caught)
 
@@ -274,18 +274,18 @@ def test_captured_session_completion_restore_failure_requires_recovery() -> None
 def test_completion_reads_only_current_schema_without_inferencing_value_types():
     controller = Controller()
     api = PrototypeRuntimeApi(controller)
-    assert api.completion_fields("Контекст.Данные", table_row=True) == ("Номер", "Название")
-    assert "СериализоватьДопущенныеИменаСвойствДляПодсказки(Контекст.Данные, Истина" in controller.calls[0][0]
+    assert api.completion_fields("e1cRuntimeКонтекст.Данные", table_row=True) == ("Номер", "Название")
+    assert "СериализоватьДопущенныеИменаСвойствДляПодсказки(e1cRuntimeКонтекст.Данные, Истина" in controller.calls[0][0]
     assert 0 < controller.calls[0][1] <= 1.0
     assert controller.command_timeout_s == 30.0
     assert controller.operation_id == 7
     controller.fields = ("ОбновленнаяКолонка",)
-    assert api.completion_fields("Контекст.Данные", table_row=True) == ("ОбновленнаяКолонка",)
+    assert api.completion_fields("e1cRuntimeКонтекст.Данные", table_row=True) == ("ОбновленнаяКолонка",)
 
 
 @pytest.mark.parametrize("handle", [
-    "Контекст.Данные[0]", "Контекст.Данные.Удалить()", "Контекст.Данные;Удалить()",
-    "Контекст.Несуществующая", "Контекст.RuntimeWorkerActiveGeneration",
+    "e1cRuntimeКонтекст.Данные[0]", "e1cRuntimeКонтекст.Данные.Удалить()", "e1cRuntimeКонтекст.Данные;Удалить()",
+    "e1cRuntimeКонтекст.Несуществующая", "e1cRuntimeКонтекст.RuntimeWorkerActiveGeneration",
 ])
 def test_completion_rejects_unregistered_reserved_and_executable_paths(handle):
     controller = Controller()
@@ -299,19 +299,19 @@ def test_completion_rejects_running_and_uncertain_state(state):
     controller = Controller()
     controller.state = state
     with pytest.raises(ProtocolError):
-        PrototypeRuntimeApi(controller).completion_fields("Контекст.Данные")
+        PrototypeRuntimeApi(controller).completion_fields("e1cRuntimeКонтекст.Данные")
     assert not controller.calls
 
 
 def test_completion_does_not_reuse_previous_fields_after_schema_failure():
     controller = Controller()
     api = PrototypeRuntimeApi(controller)
-    assert api.completion_fields("Контекст.Данные") == ("Номер", "Название")
+    assert api.completion_fields("e1cRuntimeКонтекст.Данные") == ("Номер", "Название")
     controller.fields = ("Имя", "имя")
     with pytest.raises(ProtocolError):
-        api.completion_fields("Контекст.Данные")
+        api.completion_fields("e1cRuntimeКонтекст.Данные")
     controller.fields = ()
-    assert api.completion_fields("Контекст.Данные") == ()
+    assert api.completion_fields("e1cRuntimeКонтекст.Данные") == ()
 
 
 def test_completion_is_one_consumer_owned_admission_and_schema_request():
@@ -319,7 +319,7 @@ def test_completion_is_one_consumer_owned_admission_and_schema_request():
     api = PrototypeRuntimeApi(controller)
     api._worker_generation_handle = object()
     controller.state = OperationState.FAILED
-    assert api.completion_fields("Контекст.Данные") == ("Номер", "Название")
+    assert api.completion_fields("e1cRuntimeКонтекст.Данные") == ("Номер", "Название")
     assert controller.state is OperationState.FAILED and controller.operation_id == 7
     assert [request[0] for request in controller.target_requests] == ["completion"]
     assert "ДопущенныеИменаСвойств" in controller.calls[-1][0]
@@ -329,7 +329,7 @@ def test_completion_preserves_the_marker_and_all_128_admitted_names():
     controller = Controller()
     controller.fields = tuple(f"Поле{index}" for index in range(128))
 
-    fields = PrototypeRuntimeApi(controller).completion_fields("Контекст.Данные")
+    fields = PrototypeRuntimeApi(controller).completion_fields("e1cRuntimeКонтекст.Данные")
 
     assert fields == controller.fields
     assert len(fields) == 128
@@ -341,7 +341,7 @@ def test_completion_rejects_a_truncated_marker_plus_128_name_result():
     controller.collection_row_limit = 128
 
     with pytest.raises(ProtocolError, match="Invalid completion field schema"):
-        PrototypeRuntimeApi(controller).completion_fields("Контекст.Данные")
+        PrototypeRuntimeApi(controller).completion_fields("e1cRuntimeКонтекст.Данные")
 
 
 @pytest.mark.parametrize(
@@ -354,7 +354,7 @@ def test_completion_denial_or_failure_has_no_second_schema_target_read(outcome, 
     controller.admission_outcome = outcome
 
     with pytest.raises(error_type):
-        PrototypeRuntimeApi(controller).completion_fields("Контекст.Данные")
+        PrototypeRuntimeApi(controller).completion_fields("e1cRuntimeКонтекст.Данные")
 
     assert [request[0] for request in controller.target_requests] == ["completion"]
 
@@ -364,12 +364,12 @@ def test_admission_closed_api_and_quarantined_capture_refuse_inspection():
     api = PrototypeRuntimeApi(controller)
     api._admission_closed = True
     with pytest.raises(ProtocolError):
-        api.completion_fields("Контекст.Данные")
+        api.completion_fields("e1cRuntimeКонтекст.Данные")
     api._admission_closed = False
     api._capture_inspection_quarantined = True
     controller.state = OperationState.CAPTURED
     with pytest.raises(ProtocolError):
-        api.completion_fields("Контекст.Данные")
+        api.completion_fields("e1cRuntimeКонтекст.Данные")
     assert not controller.calls
 
 
@@ -388,11 +388,11 @@ def test_session_completion_does_not_wait_for_another_operation():
     assert locked.wait(2)
     try:
         with pytest.raises(ProtocolError):
-            session.completion_fields("Контекст.Данные")
+            session.completion_fields("e1cRuntimeКонтекст.Данные")
     finally:
         release.set()
         thread.join(2)
-    assert session.completion_fields("Контекст.Данные") == ("Номер", "Название")
+    assert session.completion_fields("e1cRuntimeКонтекст.Данные") == ("Номер", "Название")
 
 
 def test_ready_completion_releases_session_and_api_locks_while_ticket_waits() -> None:
@@ -416,7 +416,7 @@ def test_ready_completion_releases_session_and_api_locks_while_ticket_waits() ->
 
     def complete() -> None:
         try:
-            fields.append(runtime.completion_fields("Контекст.Данные", timeout_s=1.0))
+            fields.append(runtime.completion_fields("e1cRuntimeКонтекст.Данные", timeout_s=1.0))
         except BaseException as error:
             errors.append(error)
 
@@ -434,7 +434,7 @@ def test_ready_completion_releases_session_and_api_locks_while_ticket_waits() ->
         api._lock.release()
         assert runtime.status().state is OperationState.RECOVERING
         with pytest.raises(ProtocolError):
-            runtime.completion_fields("Контекст.Данные", timeout_s=0.1)
+            runtime.completion_fields("e1cRuntimeКонтекст.Данные", timeout_s=0.1)
         assert session.capture_start_count == 1
 
         session.complete(_completion_wire(), type_name="Строка")
@@ -485,7 +485,7 @@ def test_completion_handoff_defers_heartbeat_while_controller_owns_debug_stream(
 
     def complete() -> None:
         try:
-            fields.append(runtime.completion_fields("Контекст.Данные", timeout_s=1.0))
+            fields.append(runtime.completion_fields("e1cRuntimeКонтекст.Данные", timeout_s=1.0))
         except BaseException as error:
             errors.append(error)
 
@@ -596,7 +596,7 @@ def test_ready_completion_submit_interruption_detaches_adopted_ticket(
     )
     try:
         with pytest.raises(RuntimeError, match="planned submit-return interruption"):
-            runtime.completion_fields("Контекст.Данные", timeout_s=1.0)
+            runtime.completion_fields("e1cRuntimeКонтекст.Данные", timeout_s=1.0)
 
         assert session.accepted.wait(1)
         owner = controller.ready_inspection_evaluation_owner()
@@ -606,7 +606,7 @@ def test_ready_completion_submit_interruption_detaches_adopted_ticket(
         assert runtime._operation_lock.acquire(blocking=False)
         runtime._operation_lock.release()
         with pytest.raises(ProtocolError):
-            runtime.completion_fields("Контекст.Данные", timeout_s=0.1)
+            runtime.completion_fields("e1cRuntimeКонтекст.Данные", timeout_s=0.1)
         assert session.capture_start_count == 1
 
         session.complete(_completion_wire(), type_name="Строка")

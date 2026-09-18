@@ -789,7 +789,7 @@ def test_evaluate_targets_selected_stack_frame(
     monkeypatch.setattr("onec_runtime.rdbg.session.uuid4", lambda: result_id)
 
     session.evaluate(
-        "RuntimeKernelServer.НачатьКонтекстОтладки(Неопределено, Контекст)",
+        "RuntimeKernelServer.НачатьКонтекстОтладки(Неопределено, e1cRuntimeКонтекст)",
         stack_level=2,
     )
 
@@ -1107,7 +1107,7 @@ def test_evaluate_collection_returns_absolute_row_indices_and_page_request(
     monkeypatch.setattr("onec_runtime.rdbg.session.uuid4", lambda: result_id)
 
     result = session.evaluate_collection(
-        "Контекст.ZupMaterializationTable",
+        "e1cRuntimeКонтекст.ZupMaterializationTable",
         start_index=4800,
         page_size=2400,
         stack_level=2,
@@ -1155,7 +1155,7 @@ def test_evaluate_collection_correlates_deferred_ping_result(
     session.profiler = recorder
     monkeypatch.setattr("onec_runtime.rdbg.session.uuid4", lambda: result_id)
 
-    result = session.evaluate_collection("Контекст.Таблица", start_index=0, timeout_s=1)
+    result = session.evaluate_collection("e1cRuntimeКонтекст.Таблица", start_index=0, timeout_s=1)
 
     assert result.collection_size == 1
     assert result.collection_rows[0].cells[0].value_decimal == "1"
@@ -1202,7 +1202,7 @@ def test_started_collection_evaluation_retains_one_capability_until_late_result(
     dispatches: list[str] = []
 
     pending = session.start_collection_evaluation(
-        "Контекст.Таблица",
+        "e1cRuntimeКонтекст.Таблица",
         start_index=100,
         page_size=101,
         stack_level=2,
@@ -1237,7 +1237,7 @@ def test_collection_uses_one_deadline_for_http_dispatch_and_result_polling(monke
     monkeypatch.setattr("onec_runtime.rdbg.session.monotonic", lambda: now[0])
     session = ready_session(SlowTransport())
     with pytest.raises(CommandTimeout):
-        session.evaluate_collection("Контекст.Данные", start_index=0, timeout_s=1.0)
+        session.evaluate_collection("e1cRuntimeКонтекст.Данные", start_index=0, timeout_s=1.0)
     assert requests[0] == ("evalExpr", pytest.approx(1.0))
     assert requests[1] == ("pingDebugUIParams", pytest.approx(0.02))
     assert len(requests) == 2
@@ -1263,7 +1263,7 @@ def test_collection_rejects_direct_result_received_after_deadline(monkeypatch):
     monkeypatch.setattr("onec_runtime.rdbg.session.monotonic", lambda: now[0])
     session = ready_session(LateTransport())
     with pytest.raises(CommandTimeout):
-        session.evaluate_collection("Контекст.Данные", start_index=0, timeout_s=1.0)
+        session.evaluate_collection("e1cRuntimeКонтекст.Данные", start_index=0, timeout_s=1.0)
 
 
 def test_modify_returns_correlated_error_state(

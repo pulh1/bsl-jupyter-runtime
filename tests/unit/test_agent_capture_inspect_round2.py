@@ -162,7 +162,7 @@ def test_real_controller_api_session_backend_capture_metadata_path_is_bounded_an
     )
 
     assert variables == {
-        "items": ({"name": "Amount", "type_name": "Number", "role": "local", "handle": "Контекст.КонтекстОтладки.Amount"},),
+        "items": ({"name": "Amount", "type_name": "Number", "role": "local", "handle": "e1cRuntimeКонтекст.e1cRuntimeКонтекстОтладки.Amount"},),
         "total": 1,
         "next_cursor": None,
     }

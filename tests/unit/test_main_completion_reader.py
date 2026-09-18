@@ -87,7 +87,7 @@ def _normal_script(*, completed: str = "17") -> dict[str, list[object]]:
         "ЗавершеннаяКоманда": [("Число", completed, False, "", "")],
         "Результат": [("Число", "42", False, "", "")],
         "Ошибка": [("Строка", '""', False, "", "")],
-        'RuntimeKernelServer.ЗабратьСообщенияЯчейкиИзКонтекста(Контекст, "msg")': [
+        'RuntimeKernelServer.ЗабратьСообщенияЯчейкиИзКонтекста(e1cRuntimeКонтекст, "msg")': [
             ("Строка", '"[\\"готово\\"]"', False, "", '["готово"]')
         ],
     }
@@ -116,7 +116,7 @@ def test_matching_command_reads_result_error_and_messages() -> None:
         "ЗавершеннаяКоманда",
         "Результат",
         "Ошибка",
-        'RuntimeKernelServer.ЗабратьСообщенияЯчейкиИзКонтекста(Контекст, "msg")',
+        'RuntimeKernelServer.ЗабратьСообщенияЯчейкиИзКонтекста(e1cRuntimeКонтекст, "msg")',
     ]
 
 
@@ -157,7 +157,7 @@ def test_completion_record_repr_does_not_expose_result_or_messages() -> None:
         ("Строка", f'"{private_marker}"', False, "", private_marker)
     ]
     script[
-        'RuntimeKernelServer.ЗабратьСообщенияЯчейкиИзКонтекста(Контекст, "msg")'
+        'RuntimeKernelServer.ЗабратьСообщенияЯчейкиИзКонтекста(e1cRuntimeКонтекст, "msg")'
     ] = [("Строка", "", False, "", f'["{private_marker}"]')]
 
     result = contract.read_main_completion(

@@ -533,7 +533,7 @@ def test_backend_derives_public_summary_from_allowlisted_diagnostic_stage() -> N
         ),
     )
 
-    outcome = backend.execute_bsl("КонтекстОтладки.Значение = 1;")
+    outcome = backend.execute_bsl("e1cRuntimeКонтекстОтладки.Значение = 1;")
 
     assert outcome.terminal_state is AgentOperationState.FAILED
     assert outcome.diagnostic is not None

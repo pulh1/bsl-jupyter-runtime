@@ -158,7 +158,7 @@ class CaptureMaterializationExecutor:
                     response = self._evaluate(
                         port,
                         "RuntimeKernelServer."
-                        "ЗабратьКомпактнуюМатериализациюИзКонтекста(Контекст, "
+                        "ЗабратьКомпактнуюМатериализациюИзКонтекста(e1cRuntimeКонтекст, "
                         + bsl_string_literal(key)
                         + ")",
                         stack_level=scope.kernel_stack_level,
@@ -268,7 +268,7 @@ class CaptureMaterializationExecutor:
         except BaseException as error:
             raise CaptureOperationRepairRequired("workspace_restore") from error
         expression = build_live_current_capture_call(
-            "Контекст.Удалить(" + bsl_string_literal(key) + ");\n"
+            "e1cRuntimeКонтекст.Удалить(" + bsl_string_literal(key) + ");\n"
             "Результат = Истина;\nРезультатИнструкции = Результат;"
         )
         try:

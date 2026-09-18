@@ -82,7 +82,7 @@ def build_projection_transfer_plan(
     return CaptureTransferPlan(
         instruction,
         context_key,
-        f"Контекст.Удалить({bsl_string_literal(context_key)});\nРезультат = Истина;",
+        f"e1cRuntimeКонтекст.Удалить({bsl_string_literal(context_key)});\nРезультат = Истина;",
         max_base64_chars,
         decode,
         admit,
@@ -248,4 +248,4 @@ def _override_lines(overrides: dict[str, str | ReferenceMode], *, indent: str) -
 
 
 def _store_result_lines(context_key: str, runtime: int, context: int, *, indent: str) -> tuple[str, ...]:
-    return (f"{indent}Если Не Материализация.Доступ Тогда", f'{indent}    Результат = "D|worker_generation_value";', f"{indent}Иначе", f"{indent}    Контекст.Вставить({bsl_string_literal(context_key)}, Материализация.Base64);", f'{indent}    Результат = "R|" + Формат({runtime}, "ЧГ=0; ЧДЦ=0") + "|" + Формат({context}, "ЧГ=0; ЧДЦ=0") + "|" + Формат(Материализация.Размер, "ЧГ=0; ЧДЦ=0") + "|" + Материализация.Хеш + "|" + Формат(СтрДлина(Материализация.Base64), "ЧГ=0; ЧДЦ=0");', f"{indent}КонецЕсли;")
+    return (f"{indent}Если Не Материализация.Доступ Тогда", f'{indent}    Результат = "D|worker_generation_value";', f"{indent}Иначе", f"{indent}    e1cRuntimeКонтекст.Вставить({bsl_string_literal(context_key)}, Материализация.Base64);", f'{indent}    Результат = "R|" + Формат({runtime}, "ЧГ=0; ЧДЦ=0") + "|" + Формат({context}, "ЧГ=0; ЧДЦ=0") + "|" + Формат(Материализация.Размер, "ЧГ=0; ЧДЦ=0") + "|" + Материализация.Хеш + "|" + Формат(СтрДлина(Материализация.Base64), "ЧГ=0; ЧДЦ=0");', f"{indent}КонецЕсли;")

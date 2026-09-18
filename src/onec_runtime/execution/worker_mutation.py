@@ -1,21 +1,19 @@
 """Run trusted Worker universe mutations inside the current arbiter activity.
 
 The persistent Worker adapter calls this runner with its already admitted
-``SessionPort``. MAIN helpers use reserved negative command IDs and leave the
-user's ``MainOperation`` untouched. CAPTURE helpers evaluate in the confirmed
-scope without writing the suspended MAIN command fields or issuing Continue.
+``SessionPort``. MAIN helpers evaluate on the stopped service frame and leave
+the user's ``MainOperation`` untouched. CAPTURE helpers evaluate in the
+confirmed scope without writing the suspended MAIN command fields.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from itertools import count
-from threading import Lock
 from typing import Callable
 
 from onec_runtime.errors import BslExecutionError, ProtocolError
 from onec_runtime.execution.arbiter import (
-    ConfirmedFailure, OutcomeUnknown, SessionPort, Settlement,
+    ConfirmedFailure, OutcomeUnknown, RouteToken, SessionPort, Settlement,
 )
 from onec_runtime.execution.breakpoint_routes import RouteBreakpointWorkspace
 from onec_runtime.execution.capture.operation_executor import (
@@ -24,13 +22,11 @@ from onec_runtime.execution.capture.operation_executor import (
 from onec_runtime.execution.capture.scope import (
     CaptureContextState, CaptureFrameIdentity, CaptureScope,
 )
-from onec_runtime.execution.evaluation import EvaluationSuspended
-from onec_runtime.execution.main import MainExecutor, MainOperation, MainPhase
-from onec_runtime.execution.main.completion import (
-    MainCommandMismatchError, read_main_completion,
-)
-from onec_runtime.rdbg.models import EvaluationResult, StopEvent, TargetId
-from onec_runtime.stop_routing import BreakpointRegistry, StopReason, classify_stop
+from onec_runtime.execution.evaluation import wait_for_pending_result
+from onec_runtime.execution.main import MainOperation, MainPhase
+from onec_runtime.execution.main.instruction_call import build_main_instruction_call
+from onec_runtime.rdbg.models import EvaluationResult, TargetId
+from onec_runtime.stop_routing import BreakpointRegistry
 from onec_runtime.table_value import evaluation_to_python
 
 
@@ -40,6 +36,7 @@ class MainPausedWorkerRoute:
 
     target_id: TargetId
     previous_main: MainOperation | None = field(default=None, repr=False)
+    route_token: RouteToken | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,14 +50,6 @@ class CapturePausedWorkerRoute:
 WorkerMutationRoute = MainPausedWorkerRoute | CapturePausedWorkerRoute
 
 
-class WorkerMutationUnexpectedStop(OutcomeUnknown):
-    """A system command stopped away from its completion service point."""
-
-    def __init__(self, stop: StopEvent) -> None:
-        self.stop = stop
-        super().__init__("Worker mutation stopped before matching MAIN completion")
-
-
 class WorkerMutationInstructionRunner:
     """Route one trusted mutation through an existing arbiter ``SessionPort``.
 
@@ -71,15 +60,12 @@ class WorkerMutationInstructionRunner:
 
     def __init__(
         self,
-        main_executor: MainExecutor,
         capture_executor: CaptureCellOperationExecutor,
         *,
         registry_provider: Callable[[], BreakpointRegistry],
         breakpoint_routes: RouteBreakpointWorkspace,
         route_provider: Callable[[], WorkerMutationRoute],
     ) -> None:
-        if not isinstance(main_executor, MainExecutor):
-            raise TypeError("MAIN executor is required")
         if not isinstance(capture_executor, CaptureCellOperationExecutor):
             raise TypeError("CAPTURE cell executor is required")
         if not callable(registry_provider):
@@ -88,13 +74,10 @@ class WorkerMutationInstructionRunner:
             raise TypeError("Shared breakpoint route workspace is required")
         if not callable(route_provider):
             raise TypeError("Worker mutation route provider is required")
-        self._main = main_executor
         self._capture = capture_executor
         self._registry_provider = registry_provider
         self._breakpoint_routes = breakpoint_routes
         self._route_provider = route_provider
-        self._system_ids = count(-1, -1)
-        self._id_lock = Lock()
 
     def __call__(self, port: SessionPort, instruction: str) -> object:
         if not isinstance(port, SessionPort):
@@ -121,37 +104,20 @@ class WorkerMutationInstructionRunner:
             (previous.target is not None and previous.target != route.target_id)
         ):
             raise ProtocolError("Worker MAIN helper requires a free service stop")
-        with self._id_lock:
-            system_id = next(self._system_ids)
-        operation = MainOperation(system_id, route.target_id)
-        stop = self._main.dispatch(
-            operation, instruction,
-            install_workspace=lambda: self._install_main_helper_workspace(
-                registry, port,
-            ),
-            before_command_write=lambda: None,
-            before_continue=lambda: None,
-            port=port,
+        self._install_main_helper_workspace(registry, port)
+        pending = port.start_evaluation(
+            build_main_instruction_call(instruction),
+            max_text_size=307_200, stack_level=0, timeout_s=30.0,
         )
-        if (
-            stop.target_id != route.target_id
-            or classify_stop(stop, registry).reason is not StopReason.MAIN_SERVICE
-        ):
-            raise WorkerMutationUnexpectedStop(stop)
-        try:
-            completion = read_main_completion(port, operation)
-        except MainCommandMismatchError as error:
-            raise OutcomeUnknown("Worker MAIN helper completion ID is mismatched") from error
-        except BaseException as error:
-            if operation.terminal and not isinstance(
-                error, (OutcomeUnknown, EvaluationSuspended)
-            ):
-                self._breakpoint_routes.restore_capture(port=port)
-            raise
+        if pending.target_id != route.target_id:
+            raise OutcomeUnknown("Worker MAIN helper evaluation belongs to another target")
+        result = wait_for_pending_result(port, pending)
+        # Only a matched result retires the pending capability. An unknown
+        # outcome keeps the workspace and exact ticket owned for reconciliation.
         self._breakpoint_routes.restore_capture(port=port)
-        if completion.error:
-            raise BslExecutionError(completion.error, messages=completion.messages)
-        return completion.result
+        if result.error_occurred:
+            raise BslExecutionError(result.error_text)
+        return evaluation_to_python(result)
 
     def _install_main_helper_workspace(
         self, registry: BreakpointRegistry, port: SessionPort,
@@ -192,7 +158,12 @@ class WorkerMutationInstructionRunner:
         return outcome.value
 
     @staticmethod
-    def _decode_capture_result(result: EvaluationResult) -> object:
-        if result.error_occurred:
-            raise BslExecutionError(result.error_text)
-        return evaluation_to_python(result)
+    def _decode_capture_result(result: object) -> object:
+        from onec_runtime.execution.reply_publication import CaptureRemoteOutcome
+
+        evaluation = result.evaluation if isinstance(result, CaptureRemoteOutcome) else result
+        if not isinstance(evaluation, EvaluationResult):
+            raise TypeError("Worker CAPTURE helper result is invalid")
+        if evaluation.error_occurred:
+            raise BslExecutionError(evaluation.error_text)
+        return evaluation_to_python(evaluation)

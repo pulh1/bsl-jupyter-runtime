@@ -6,7 +6,7 @@ Only their CAPTURE executor path is used here. The supplied data plane sends
 the plan through ``ExecutionController.submit_capture_materialization``; this
 module cannot issue an RDBG command or read temporary storage directly.
 
-This policy supports direct/dotted ``Контекст.<identifier>`` handles. Bind
+This policy supports direct/dotted ``e1cRuntimeКонтекст.<identifier>`` handles. Bind
 through ``bind_capture_ticket_materialization`` to recheck the Worker catalog
 inside the admitted ticket. The value router sends deferred ``capture_table_*``
 handles through the controller's separate selected-table request.

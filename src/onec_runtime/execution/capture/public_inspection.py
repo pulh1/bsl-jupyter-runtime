@@ -9,7 +9,9 @@ from typing import Callable, Protocol, TypeAlias
 from onec_runtime.capture_inspection import (
     DebugFrame, ResolvedFrameSource, StackDescriptor,
 )
-from onec_runtime.capture_values import CaptureContextView, CaptureValuePolicy
+from onec_runtime.capture_values import (
+    CaptureContextView, CaptureValuePolicy, ValueRoot, ValueRootKind,
+)
 from onec_runtime.errors import ProtocolError
 from onec_runtime.execution.capture.data_plane import CaptureTicketDataPlane
 from onec_runtime.execution.capture.scope import CaptureScope
@@ -107,13 +109,26 @@ class CaptureInspectionBridge:
             resolve_sources = self._resolve_sources
         if not isinstance(scope, CaptureScope):
             raise ProtocolError("CAPTURE inspection requires an active scope")
-        data = CaptureTicketDataPlane(
-            self._controller, scope, wait_handoff=self._wait_handoff,  # type: ignore[arg-type]
-            resolve_sources=resolve_sources,
-        )
+        data: CaptureTicketDataPlane
+
+        def resolve_parameters(root: ValueRoot) -> tuple[str, ...]:
+            native_level = (
+                root.native_level if root.kind is ValueRootKind.FRAME
+                else scope.frame_stack_level
+            )
+            if type(native_level) is not int or native_level < 0:
+                raise ProtocolError("CAPTURE source frame is unavailable")
+            return data.frame_parameters(native_level)
+
         values = CaptureTicketValueProjection(
             self._controller, scope, policy=self._policy,  # type: ignore[arg-type]
             wait_handoff=self._wait_handoff,
+            resolve_parameters=resolve_parameters,
+        )
+        data = CaptureTicketDataPlane(
+            self._controller, scope, wait_handoff=self._wait_handoff,  # type: ignore[arg-type]
+            resolve_sources=resolve_sources,
+            bind_frame=values.bind_frame,
         )
         return CaptureInspection(data, values)
 

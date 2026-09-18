@@ -39,7 +39,7 @@ def test_dynamic_materialize_selects_the_value_payload_decoder() -> None:
     catalog = [WorkerTransferCatalog(1, ())]
 
     assert _service(controller, scope, catalog).materialize(
-        "Контекст.Сумма", MaterializationOptions(max_bytes=4096),
+        "e1cRuntimeКонтекст.Сумма", MaterializationOptions(max_bytes=4096),
     ) == 9
     assert "СериализоватьКомпактнуюТаблицу" in controller.requested[0][1].instruction
     assert "СериализоватьЗначение" in controller.requested[0][1].instruction
@@ -52,7 +52,7 @@ def test_head_to_df_transfers_only_selected_table_rows() -> None:
     catalog = [WorkerTransferCatalog(1, ())]
 
     frame = _service(controller, scope, catalog).head_to_df(
-        "Контекст.Таблица",
+        "e1cRuntimeКонтекст.Таблица",
         2,
         policy=ReferencePolicy(
             ref_columns={"Employee": "both", "Department": "uuid"},
@@ -61,7 +61,7 @@ def test_head_to_df_transfers_only_selected_table_rows() -> None:
 
     assert frame["Name"].tolist() == ["Alice", "Bob"]
     instruction = controller.requested[0][1].instruction
-    assert "Для ИндексПроекции = 0 По Мин(Контекст.Таблица.Количество() - 1, 1)" in instruction
+    assert "Для ИндексПроекции = 0 По Мин(e1cRuntimeКонтекст.Таблица.Количество() - 1, 1)" in instruction
     assert "СериализоватьКомпактнуюТаблицу" in instruction
     assert "СериализоватьЗначение" not in instruction
 
@@ -73,7 +73,7 @@ def test_head_to_df_enforces_the_public_row_bound(count: int) -> None:
     catalog = [WorkerTransferCatalog(1, ())]
 
     with pytest.raises(ValueError, match="between 1 and 10000"):
-        _service(controller, scope, catalog).head_to_df("Контекст.Таблица", count)
+        _service(controller, scope, catalog).head_to_df("e1cRuntimeКонтекст.Таблица", count)
     assert controller.requested == []
 
 
@@ -84,7 +84,7 @@ def test_capture_bsl_failure_keeps_the_ready_scope() -> None:
     catalog = [WorkerTransferCatalog(1, ())]
 
     with pytest.raises(BslExecutionError, match="planned"):
-        _service(controller, scope, catalog).materialize("Контекст.Сумма")
+        _service(controller, scope, catalog).materialize("e1cRuntimeКонтекст.Сумма")
     assert controller.capture_scope is scope
 
 
@@ -94,9 +94,9 @@ def test_dynamic_value_rejects_private_worker_root_before_ticket() -> None:
     service = _service(controller, scope, [WorkerTransferCatalog(1, ())])
 
     with pytest.raises(ProtocolError, match="Worker generation"):
-        service.materialize("Контекст.RuntimeWorkerActiveGeneration")
+        service.materialize("e1cRuntimeКонтекст.RuntimeWorkerActiveGeneration")
     with pytest.raises(ProtocolError, match="Worker generation"):
-        service.head_to_df("Контекст.RuntimeWorkerPinnedOperationGeneration", 2)
+        service.head_to_df("e1cRuntimeКонтекст.RuntimeWorkerPinnedOperationGeneration", 2)
     assert controller.requested == []
 
 
@@ -114,7 +114,7 @@ def test_worker_catalog_change_rejects_before_capture_dispatch() -> None:
 
     controller.submit_capture_materialization = submit
     with pytest.raises(ProtocolError, match="Worker catalog changed"):
-        _service(controller, scope, catalog).materialize("Контекст.Сумма")
+        _service(controller, scope, catalog).materialize("e1cRuntimeКонтекст.Сумма")
     assert controller.capture_scope is scope
 
 
@@ -144,7 +144,7 @@ def test_capture_materialize_timeout_detaches_only_local_waiter() -> None:
     service = _service(controller, scope, [WorkerTransferCatalog(1, ())])
     try:
         with pytest.raises(TimeoutError, match="Local waiter interval"):
-            service.materialize("Контекст.Сумма", timeout_s=0.02)
+            service.materialize("e1cRuntimeКонтекст.Сумма", timeout_s=0.02)
         assert entered.is_set()
         ticket = controller.materialization_ticket
         assert ticket.status().waiter_detached is True
@@ -154,7 +154,7 @@ def test_capture_materialize_timeout_detaches_only_local_waiter() -> None:
         release.set()
         assert ticket.wait_settled(1) == payload
         assert ticket.status().settled is True
-        assert service.materialize("Контекст.Сумма", timeout_s=1) == 9
+        assert service.materialize("e1cRuntimeКонтекст.Сумма", timeout_s=1) == 9
         assert controller.capture_scope is scope
     finally:
         release.set()

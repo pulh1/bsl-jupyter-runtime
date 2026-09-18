@@ -94,7 +94,7 @@ class CaptureTableSchemaPlan:
 
     @property
     def expression(self) -> str:
-        path = "Контекст.КонтекстОтладки." + ".".join((self.root, *self.fields))
+        path = "e1cRuntimeКонтекст.e1cRuntimeКонтекстОтладки." + ".".join((self.root, *self.fields))
         return (
             "RuntimeKernelServer.ПолучитьСхемуВременнойТаблицыОтладки("
             + path + ", " + bsl_string_literal(self.table) + ")"
@@ -166,7 +166,7 @@ class CaptureSelectedTableDescriptor:
 
     @property
     def expression(self) -> str:
-        path = "Контекст.КонтекстОтладки." + ".".join((self.root, *self.fields))
+        path = "e1cRuntimeКонтекст.e1cRuntimeКонтекстОтладки." + ".".join((self.root, *self.fields))
         columns = (
             "Новый Массив" if not self.columns else
             "СтрРазделить(" + bsl_string_literal(",".join(self.columns)) + ', ",")'

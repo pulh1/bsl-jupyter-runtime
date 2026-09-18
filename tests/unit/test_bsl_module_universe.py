@@ -325,7 +325,7 @@ def test_parameter_and_local_shadowing_are_not_dependencies(
     assert analyze_worker_module(unit, catalog, parser).dependencies == ()
 
 
-def test_analysis_rejects_an_unknown_qualified_target_with_private_diagnostics(
+def test_unknown_qualified_method_target_passes_through_to_1c(
     unit_factory,
     catalog,
     parser,
@@ -337,16 +337,87 @@ def test_analysis_rejects_an_unknown_qualified_target_with_private_diagnostics(
         "КонецФункции"
     )
 
+    analysis = analyze_worker_module(unit_factory(source), catalog, parser)
+    lowered = lower_worker_module(analysis)
+    target = "Неизвестный.Метод()"
+    assert analysis.dependencies == ()
+    assert lowered.mapped_source.text == source
+    mapped = lowered.mapped_source.source_map.map_offset(source.index(target))
+    assert mapped.relation is MappingRelation.EXACT
+    assert mapped.origin_span == SourceSpan(
+        source.index(target), source.index(target) + 1
+    )
+
+
+def test_catalog_confirmed_ambiguous_target_keeps_private_diagnostics(
+    unit_factory,
+    catalog,
+    parser,
+) -> None:
+    source = (
+        "Функция Проверить()\n"
+        "// sentinel-secret-source-fragment\n"
+        "Возврат КадровыйУчет();\n"
+        "КонецФункции"
+    )
+
     with pytest.raises(ModuleUniverseAdmissionError) as caught:
         analyze_worker_module(unit_factory(source), catalog, parser)
 
-    target = "Неизвестный.Метод()"
     assert caught.value.code == AMBIGUOUS_BINDING
-    assert caught.value.span == SourceSpan(
-        source.index(target),
-        source.index(target) + len(target),
-    )
     assert "sentinel-secret-source-fragment" not in str(caught.value)
+
+
+def test_only_catalog_confirmed_qualified_root_becomes_worker_dependency(
+    unit_factory,
+    parser,
+) -> None:
+    source = (
+        "Функция Проверить() Экспорт\n"
+        "Возврат НоваяПлатформа.Получить();\n"
+        "КонецФункции"
+    )
+    unit = unit_factory(source)
+
+    native = analyze_worker_module(unit, _catalog("КадровыйУчет"), parser)
+    confirmed = analyze_worker_module(
+        unit, _catalog("КадровыйУчет", "НоваяПлатформа"), parser
+    )
+
+    assert native.dependencies == ()
+    assert lower_worker_module(native).mapped_source.text == source
+    assert tuple(item.target_module for item in confirmed.dependencies) == (
+        "НоваяПлатформа",
+    )
+    confirmed_source = lower_worker_module(confirmed).mapped_source.text
+    assert "Перем НоваяПлатформа;" in confirmed_source
+    assert (
+        f"НоваяПлатформа = {dependency_export_name('НоваяПлатформа')};"
+        in confirmed_source
+    )
+
+
+def test_document_write_mode_without_catalog_needs_no_worker_allowlist(
+    unit_factory,
+    catalog,
+    parser,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = (
+        "Функция Проверить() Экспорт\n"
+        "Возврат РежимЗаписиДокумента.Проведение;\n"
+        "КонецФункции"
+    )
+    monkeypatch.setattr(
+        module_universe,
+        "_PLATFORM_GLOBALS",
+        module_universe._PLATFORM_GLOBALS - {"режимзаписидокумента"},
+    )
+
+    analysis = analyze_worker_module(unit_factory(source), catalog, parser)
+
+    assert analysis.dependencies == ()
+    assert lower_worker_module(analysis).mapped_source.text == source
 
 
 def test_known_module_member_is_admitted_without_method_catalog(
@@ -379,18 +450,18 @@ def test_analysis_rejects_dependency_use_in_executable_module_scope(
     assert caught.value.span == SourceSpan(0, len(source) - 1)
 
 
-def test_analysis_rejects_module_scope_unknown_qualified_root(
+def test_unknown_qualified_module_scope_target_passes_through_to_1c(
     unit_factory,
     catalog,
     parser,
 ) -> None:
     source = "Неизвестный.Метод();"
 
-    with pytest.raises(ModuleUniverseAdmissionError) as caught:
-        analyze_worker_module(unit_factory(source), catalog, parser)
+    analysis = analyze_worker_module(unit_factory(source), catalog, parser)
+    lowered = lower_worker_module(analysis)
 
-    assert caught.value.code == AMBIGUOUS_BINDING
-    assert caught.value.span == SourceSpan(0, len(source) - 1)
+    assert analysis.dependencies == ()
+    assert lowered.mapped_source.text == source
 
 
 @pytest.mark.parametrize(
@@ -401,6 +472,7 @@ def test_analysis_rejects_module_scope_unknown_qualified_root(
         "ВидСравненияКомпоновкиДанных",
         "ТипГруппыЭлементовОтбораКомпоновкиДанных",
         "ЦветаСтиля",
+        "РежимЗаписиДокумента",
     ),
 )
 def test_confirmed_platform_namespace_is_not_a_dependency(root, parser) -> None:

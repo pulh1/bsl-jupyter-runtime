@@ -23,7 +23,7 @@ def test_payload_classifier_keeps_table_and_value_decoders_on_separate_routes() 
 
 def test_head_to_df_builds_only_the_selected_table_rows() -> None:
     source = build_bounded_projection_instruction(
-        "Контекст.Таблица",
+        "e1cRuntimeКонтекст.Таблица",
         context_key="__onec_projection_" + "a" * 32,
         kind="table_rows",
         offset=0,
@@ -32,7 +32,7 @@ def test_head_to_df_builds_only_the_selected_table_rows() -> None:
         names=(),
     )
 
-    assert "Для ИндексПроекции = 0 По Мин(Контекст.Таблица.Количество() - 1, 1)" in source
-    assert "ПроекцияЗначения = Контекст.Таблица.Скопировать(СтрокиПроекции);" in source
+    assert "Для ИндексПроекции = 0 По Мин(e1cRuntimeКонтекст.Таблица.Количество() - 1, 1)" in source
+    assert "ПроекцияЗначения = e1cRuntimeКонтекст.Таблица.Скопировать(СтрокиПроекции);" in source
     assert "СериализоватьКомпактнуюТаблицу(" in source
     assert "СериализоватьЗначение(" not in source

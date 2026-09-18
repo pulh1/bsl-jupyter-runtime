@@ -35,7 +35,7 @@ class FakeRuntimeApi:
         self.guard_calls.append(handle)
         if handle in self.forbidden_handles or handle.casefold().startswith(
             (
-                "контекст.runtimeworkeractivegeneration",
+                "e1cruntimeконтекст.runtimeworkeractivegeneration",
                 "__onecpinnedworkergeneration",
             )
         ):
@@ -130,17 +130,17 @@ def test_runtime_session_exposes_value_proxy_materialization_surface() -> None:
     session = _session(api)
 
     assert session.materialize_value(
-        "Контекст.Счетчик", max_depth=8, max_items=32, max_bytes=65536
+        "e1cRuntimeКонтекст.Счетчик", max_depth=8, max_items=32, max_bytes=65536
     ) == {"value": 5}
     assert session.project_value(
-        "Контекст.Числа",
+        "e1cRuntimeКонтекст.Числа",
         {"offset": 0, "limit": 2},
         max_depth=8,
         max_items=32,
         max_bytes=65536,
     ) == [3, 5]
     assert session.project_to_df(
-        "Контекст.Таблица",
+        "e1cRuntimeКонтекст.Таблица",
         {"offset": 0, "limit": 2},
         chunk_size=128,
     ) == "frame"
@@ -150,7 +150,7 @@ def test_runtime_session_exposes_value_proxy_materialization_surface() -> None:
         "project_value",
         "project_to_df",
     ]
-    assert api.calls[0][1] == "Контекст.Счетчик"
+    assert api.calls[0][1] == "e1cRuntimeКонтекст.Счетчик"
     assert api.calls[1][2] == {"offset": 0, "limit": 2}
     assert api.calls[2][2] == {"offset": 0, "limit": 2}
     assert len(api.capture_handoff_factories) == 3
@@ -159,40 +159,40 @@ def test_runtime_session_exposes_value_proxy_materialization_surface() -> None:
 @pytest.mark.parametrize(
     ("route", "invoke"),
     (
-        ("to_df", lambda session: session.to_df("Контекст.Таблица")),
+        ("to_df", lambda session: session.to_df("e1cRuntimeКонтекст.Таблица")),
         (
             "project_to_df",
             lambda session: session.project_to_df(
-                "Контекст.Таблица", {"offset": 0, "limit": 1}
+                "e1cRuntimeКонтекст.Таблица", {"offset": 0, "limit": 1}
             ),
         ),
-        ("materialize", lambda session: session.materialize("Контекст.Значение")),
+        ("materialize", lambda session: session.materialize("e1cRuntimeКонтекст.Значение")),
         (
             "materialize_value",
-            lambda session: session.materialize_value("Контекст.Значение"),
+            lambda session: session.materialize_value("e1cRuntimeКонтекст.Значение"),
         ),
         (
             "project_value",
             lambda session: session.project_value(
-                "Контекст.Значение", {"offset": 0, "limit": 1}
+                "e1cRuntimeКонтекст.Значение", {"offset": 0, "limit": 1}
             ),
         ),
         (
             "materialization_kind",
-            lambda session: session.materialization_kind("Контекст.Таблица"),
+            lambda session: session.materialization_kind("e1cRuntimeКонтекст.Таблица"),
         ),
         (
             "materialize_value_payload",
-            lambda session: session.materialize_value_payload("Контекст.Значение"),
+            lambda session: session.materialize_value_payload("e1cRuntimeКонтекст.Значение"),
         ),
         (
             "materialize_table_payload",
-            lambda session: session.materialize_table_payload("Контекст.Таблица"),
+            lambda session: session.materialize_table_payload("e1cRuntimeКонтекст.Таблица"),
         ),
         (
             "project_value_payload",
             lambda session: session.project_value_payload(
-                "Контекст.Значение",
+                "e1cRuntimeКонтекст.Значение",
                 SimpleNamespace(
                     kind=SimpleNamespace(value="slice"),
                     offset=0,
@@ -222,7 +222,7 @@ def test_every_session_materialization_route_binds_capture_waiter(
     assert len(api.capture_handoff_factories) == 1
     # The synthetic API enters the callback immediately, proving the Session
     # operation lock is restored before the public call returns.
-    session.validate_value_reference("Контекст.ПовторнаяПроверка")
+    session.validate_value_reference("e1cRuntimeКонтекст.ПовторнаяПроверка")
 
 
 def test_runtime_session_forwards_worker_universe_descriptors() -> None:
@@ -275,11 +275,11 @@ def test_runtime_session_forwards_worker_universe_descriptors() -> None:
 @pytest.mark.parametrize(
     ("method", "arguments"),
     (
-        ("materialize_value", ("Контекст.RuntimeWorkerActiveGeneration",)),
+        ("materialize_value", ("e1cRuntimeКонтекст.RuntimeWorkerActiveGeneration",)),
         (
             "project_value",
             (
-                "Контекст.RuntimeWorkerActiveGeneration.Modules.МодульА",
+                "e1cRuntimeКонтекст.RuntimeWorkerActiveGeneration.Modules.МодульА",
                 {"offset": 0, "limit": 1},
             ),
         ),
@@ -311,14 +311,14 @@ def test_runtime_session_rejects_worker_generation_objects_before_proxy_backend(
 
 def test_runtime_session_uses_runtime_identity_guard_for_worker_alias() -> None:
     api = FakeRuntimeApi()
-    api.forbidden_handles.add("Контекст.АлиасМодуля")
+    api.forbidden_handles.add("e1cRuntimeКонтекст.АлиасМодуля")
     session = _session(api)
 
     with pytest.raises(
         ProtocolError,
         match="^Worker generation objects are not public values$",
     ):
-        session.materialize_value("Контекст.АлиасМодуля")
+        session.materialize_value("e1cRuntimeКонтекст.АлиасМодуля")
 
-    assert api.guard_calls == ["Контекст.АлиасМодуля"]
+    assert api.guard_calls == ["e1cRuntimeКонтекст.АлиасМодуля"]
     assert api.calls == []

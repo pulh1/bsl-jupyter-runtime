@@ -150,7 +150,7 @@ def test_post_bootstrap_facade_materializes_on_initial_main_idle_route() -> None
     encoded = b64encode(payload).decode("ascii")
     response = [
         f"R|7|3|{len(payload)}|{sha256(payload).hexdigest()}|{len(encoded)}",
-        encoded, "Истина",
+        encoded,
     ]
     session = ValueSession(response + response)
     worker = lambda: WorkerActivationSnapshot(0, (), None, None)
@@ -166,16 +166,16 @@ def test_post_bootstrap_facade_materializes_on_initial_main_idle_route() -> None
     )
     try:
         assert composed.facade.materialize_value(
-            "Контекст.Сумма", MaterializationOptions(max_bytes=4096),
+            "e1cRuntimeКонтекст.Сумма", MaterializationOptions(max_bytes=4096),
         ) == Decimal("12.50")
         kind, projected = composed.facade.project_value_payload(
-            "Контекст.Сумма", kind="slice", offset=0, limit=1,
+            "e1cRuntimeКонтекст.Сумма", kind="slice", offset=0, limit=1,
             columns=(), names=(), max_depth=2, max_items=1,
             max_rows=1, max_bytes=4096,
         )
         assert kind == "value"
         assert projected == payload
-        assert len([call for call in session.calls if call[0] == "start"]) == 6
+        assert len([call for call in session.calls if call[0] == "start"]) == 4
     finally:
         composed.facade.close()
 
@@ -203,7 +203,7 @@ def test_failed_capture_cell_can_be_repaired_then_materialized_and_resumed() -> 
                 "RuntimeKernelServer.ЗабратьКомпактнуюМатериализациюИзКонтекста("
             ):
                 value = encoded
-            elif "Контекст.Удалить(" in expression:
+            elif "e1cRuntimeКонтекст.Удалить(" in expression:
                 value = "Истина"
             else:
                 return super().wait_evaluation_event(
@@ -240,7 +240,7 @@ def test_failed_capture_cell_can_be_repaired_then_materialized_and_resumed() -> 
         assert repaired.kind is RuntimeReplyKind.CAPTURE_CELL
         assert repaired.succeeded is True
         frame = composed.facade.to_df(
-            "Контекст.Таблица",
+            "e1cRuntimeКонтекст.Таблица",
             ReferencePolicy(ref_columns={"Employee": "both", "Department": "uuid"}),
             max_rows=10, max_bytes=4096,
         )

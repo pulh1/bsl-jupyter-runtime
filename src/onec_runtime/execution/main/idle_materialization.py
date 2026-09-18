@@ -19,6 +19,7 @@ from onec_runtime.execution.arbiter import (
     Settlement,
 )
 from onec_runtime.execution.evaluation import wait_for_pending_result
+from onec_runtime.execution.main.instruction_call import build_main_instruction_call
 from onec_runtime.execution.local_wait import (
     validate_local_wait_timeout, wait_initiator_locally,
 )
@@ -353,11 +354,12 @@ class MainIdleMaterializationService:
         self._require_current_fence(fence)
         self._require_same_worker_catalog(catalog)
         first = self._evaluate(
-            port, _main_instruction_call(plan.instruction),
+            port, build_main_instruction_call(plan.instruction),
             fence.target, plan.max_text_size,
         )
         policy_error: BaseException | None = None
         payload: bytes | None = None
+        private_key_consumed = False
         if first.error_occurred:
             policy_error = CaptureValueCheckError("MAIN value admission failed")
         else:
@@ -366,12 +368,15 @@ class MainIdleMaterializationService:
                 content_result = self._evaluate(
                     port,
                     "RuntimeKernelServer.ЗабратьКомпактнуюМатериализациюИзКонтекста("
-                    "Контекст, " + bsl_string_literal(plan.private_key) + ")",
+                    "e1cRuntimeКонтекст, " + bsl_string_literal(plan.private_key) + ")",
                     fence.target,
                     plan.max_text_size,
                 )
                 if content_result.error_occurred:
                     raise CaptureValueCheckError("MAIN materialization payload is unavailable")
+                # The confirmed BSL read removes the private key before it
+                # returns. Decoding in Python cannot recreate that key.
+                private_key_consumed = True
                 content = evaluation_to_python(content_result)
                 if not isinstance(content, str) or len(content) > plan.max_text_size:
                     raise CaptureValueCheckError("MAIN materialization payload is invalid")
@@ -380,9 +385,10 @@ class MainIdleMaterializationService:
                     raise CaptureValueCheckError("MAIN materialization payload is invalid")
             except BaseException as error:
                 policy_error = error
-        port.register_post_settlement_cleanup(
-            lambda cleanup_port: self._run_cleanup(plan, fence, cleanup_port, parent)
-        )
+        if not private_key_consumed:
+            port.register_post_settlement_cleanup(
+                lambda cleanup_port: self._run_cleanup(plan, fence, cleanup_port, parent)
+            )
         if policy_error is not None:
             raise policy_error
         assert payload is not None
@@ -398,7 +404,7 @@ class MainIdleMaterializationService:
         try:
             self._require_current_fence(fence)
             deletion = self._evaluate(
-                port, _main_instruction_call(plan.cleanup_instruction),
+                port, build_main_instruction_call(plan.cleanup_instruction),
                 fence.target, plan.max_text_size,
             )
             if deletion.error_occurred:
@@ -463,13 +469,3 @@ class MainIdleMaterializationService:
 
 def _no_direct_rdbg(*_args: object) -> object:
     raise ProtocolError("MAIN materialization requires its arbiter ticket")
-
-
-def _main_instruction_call(instruction: str) -> str:
-    """Execute BSL statements in the stopped MAIN frame via one evalExpr call."""
-
-    return (
-        "RuntimeKernelServer.ВыполнитьКодВКонтекстеMain(Контекст, "
-        + bsl_string_literal(instruction + "\nРезультатИнструкции = Результат;")
-        + ")"
-    )

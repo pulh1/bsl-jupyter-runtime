@@ -232,6 +232,35 @@ def test_isolated_literal_edit_matches_independent_full_snapshot(
     _assert_semantically_equal(result, independent)
 
 
+def test_unknown_qualified_root_in_changed_method_matches_full_snapshot() -> None:
+    old_source = (
+        "Функция Первый() Экспорт\n"
+        "    Возврат 1;\n"
+        "КонецФункции\n"
+    )
+    new_source = old_source.replace(
+        "Возврат 1;", "Возврат НоваяПлатформа.Получить();"
+    )
+    catalog = _catalog(5, "МодульА", "МодульБ")
+    parser = PythonParserTarget.from_generated()
+    previous = build_full_worker_semantic_snapshot(
+        _unit_from_source(old_source, 10), catalog, parser
+    )
+    candidate = _unit_from_source(new_source, 11)
+
+    actual = try_build_worker_semantic_delta(
+        previous, candidate, catalog, parser
+    )
+    expected = build_full_worker_semantic_snapshot(
+        candidate, catalog, PythonParserTarget.from_generated()
+    )
+
+    assert actual is not None
+    assert actual.delta_evidence is not None
+    assert actual.analysis.dependencies == ()
+    _assert_semantically_equal(actual, expected)
+
+
 @pytest.mark.parametrize(
     ("line_ending", "old_first", "new_first", "old_second", "new_second"),
     (
@@ -1104,7 +1133,6 @@ def test_unsupported_or_ambiguous_edits_request_one_full_fallback(
     (
         "Возврат (",
         'Выполнить("ВнутреннийМетод()");',
-        "Неизвестный.Получить();",
         "МодульБ();",
     ),
 )
@@ -1158,7 +1186,7 @@ def test_admitted_method_errors_are_exact_and_never_masked_by_fallback(
     assert caught.value.span == full_caught.value.span
     if replacement.startswith("Выполнить"):
         assert caught.value.code == "dynamic_execute"
-    elif replacement.startswith(("Неизвестный", "МодульБ")):
+    elif replacement.startswith("МодульБ"):
         assert caught.value.code == "ambiguous_module_dependency"
     else:
         assert caught.value.code == "unexpected_token"

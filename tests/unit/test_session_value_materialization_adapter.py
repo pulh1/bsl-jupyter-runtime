@@ -31,7 +31,7 @@ def test_materialize_preserves_public_reference_and_value_limits() -> None:
     adapter = SessionValueMaterializationAdapter(router)
 
     result = adapter.materialize(
-        "Контекст.Значение",
+        "e1cRuntimeКонтекст.Значение",
         refs="both",
         ref_columns={"Ссылка": "uuid"},
         uuid_suffix="_ид",
@@ -43,7 +43,7 @@ def test_materialize_preserves_public_reference_and_value_limits() -> None:
     assert result == {"value": 7}
     assert router.calls == [(
         "materialize",
-        "Контекст.Значение",
+        "e1cRuntimeКонтекст.Значение",
         MaterializationOptions(refs="both", max_depth=5, max_items=40, max_bytes=8192),
         ReferencePolicy(refs="both", ref_columns={"Ссылка": "uuid"}, uuid_suffix="_ид"),
     )]
@@ -56,14 +56,14 @@ def test_to_df_applies_explicit_row_and_byte_budgets() -> None:
     adapter = SessionValueMaterializationAdapter(router)
 
     assert adapter.to_df(
-        "Контекст.Таблица",
+        "e1cRuntimeКонтекст.Таблица",
         refs="uuid",
         ref_columns={"Сотрудник": "both"},
         uuid_suffix="_uuid",
     ) == "frame"
     assert router.calls == [(
         "to_df",
-        "Контекст.Таблица",
+        "e1cRuntimeКонтекст.Таблица",
         ReferencePolicy(refs="uuid", ref_columns={"Сотрудник": "both"}, uuid_suffix="_uuid"),
         100_000,
         64 * 1024 * 1024,
@@ -76,10 +76,10 @@ def test_materialize_value_keeps_proxy_alias_signature() -> None:
     router = RecordingRouter()
     adapter = SessionValueMaterializationAdapter(router)
 
-    assert adapter.materialize_value("Контекст.X", max_items=3) == {"value": 7}
+    assert adapter.materialize_value("e1cRuntimeКонтекст.X", max_items=3) == {"value": 7}
     assert router.calls == [(
         "materialize",
-        "Контекст.X",
+        "e1cRuntimeКонтекст.X",
         MaterializationOptions(max_items=3),
         ReferencePolicy(refs="presentation", ref_columns=None, uuid_suffix="__uuid"),
     )]
@@ -96,7 +96,7 @@ def test_timeout_is_forwarded_to_routed_materialization() -> None:
     router = TimeoutRouter()
     adapter = SessionValueMaterializationAdapter(router)
 
-    assert adapter.materialize("Контекст.Значение", timeout_s=0.25) == 7
+    assert adapter.materialize("e1cRuntimeКонтекст.Значение", timeout_s=0.25) == 7
     assert router.calls == [("timeout", 0.25)]
 
 
@@ -108,7 +108,7 @@ def test_invalid_local_wait_timeout_fails_before_router(timeout_s) -> None:
     adapter = SessionValueMaterializationAdapter(router)
 
     with pytest.raises(ValueError, match="timeout_s"):
-        adapter.materialize("Контекст.Значение", timeout_s=timeout_s)
+        adapter.materialize("e1cRuntimeКонтекст.Значение", timeout_s=timeout_s)
     assert router.calls == []
 
 
@@ -125,7 +125,7 @@ def test_invalid_reference_options_fail_before_table_transfer(options) -> None:
     adapter = SessionValueMaterializationAdapter(router)
 
     with pytest.raises((TypeError, ValueError)):
-        adapter.to_df("Контекст.Таблица", **options)
+        adapter.to_df("e1cRuntimeКонтекст.Таблица", **options)
     assert router.calls == []
 
 
@@ -148,7 +148,7 @@ def test_current_session_default_chunk_size_is_advisory(method, expected_route) 
         _capture_materialization_caller_handoff=nullcontext,
     )
 
-    getattr(RuntimeSession, method)(session, "Контекст.Таблица")
+    getattr(RuntimeSession, method)(session, "e1cRuntimeКонтекст.Таблица")
     assert len(router.calls) == 1
     assert router.calls[0][0] == expected_route
 
@@ -175,9 +175,9 @@ def test_runtime_session_value_calls_reach_composed_facade_adapter() -> None:
         _capture_materialization_caller_handoff=nullcontext,
     )
 
-    assert RuntimeSession.to_df(session, "Контекст.Таблица", refs="uuid") == "frame"
+    assert RuntimeSession.to_df(session, "e1cRuntimeКонтекст.Таблица", refs="uuid") == "frame"
     assert RuntimeSession.materialize(
-        session, "Контекст.Значение", max_items=3, timeout_s=0.25,
+        session, "e1cRuntimeКонтекст.Значение", max_items=3, timeout_s=0.25,
     ) == {"value": 7}
     assert router.calls[0][0] == "to_df"
     assert router.calls[0][2].refs == "uuid"
@@ -185,9 +185,9 @@ def test_runtime_session_value_calls_reach_composed_facade_adapter() -> None:
     assert router.calls[1][2].max_items == 3
 
     with pytest.raises(ValueError, match="chunk_size"):
-        RuntimeSession.to_df(session, "Контекст.Таблица", chunk_size=0)
+        RuntimeSession.to_df(session, "e1cRuntimeКонтекст.Таблица", chunk_size=0)
     with pytest.raises(ValueError, match="chunk_size"):
-        RuntimeSession.materialize(session, "Контекст.Значение", chunk_size=0)
+        RuntimeSession.materialize(session, "e1cRuntimeКонтекст.Значение", chunk_size=0)
     assert len(router.calls) == 2
 
 
@@ -200,7 +200,7 @@ def test_chunk_hint_must_be_positive_integer(method, chunk_size) -> None:
     adapter = SessionValueMaterializationAdapter(router)
 
     with pytest.raises(ValueError, match="chunk_size"):
-        getattr(adapter, method)("Контекст.Таблица", chunk_size=chunk_size)
+        getattr(adapter, method)("e1cRuntimeКонтекст.Таблица", chunk_size=chunk_size)
     assert router.calls == []
 
 
@@ -212,7 +212,7 @@ def test_invalid_profiler_fails_before_routed_transfer(method) -> None:
     adapter = SessionValueMaterializationAdapter(router)
 
     with pytest.raises(TypeError, match="profiler"):
-        getattr(adapter, method)("Контекст.Значение", profiler=object())
+        getattr(adapter, method)("e1cRuntimeКонтекст.Значение", profiler=object())
     assert router.calls == []
 
 
@@ -227,7 +227,7 @@ def test_profiler_records_routed_transfer_phase(method, phase) -> None:
     adapter = SessionValueMaterializationAdapter(router)
     profiler = PhaseRecorder()
 
-    getattr(adapter, method)("Контекст.Значение", profiler=profiler)
+    getattr(adapter, method)("e1cRuntimeКонтекст.Значение", profiler=profiler)
 
     assert len(router.calls) == 1
     assert [event.phase for event in profiler.events] == [phase]
@@ -245,7 +245,7 @@ def test_profiler_records_routed_failure_without_private_payload() -> None:
     adapter = SessionValueMaterializationAdapter(FailingRouter())
 
     with pytest.raises(RuntimeError, match="remote transfer failed"):
-        adapter.materialize("Контекст.Секрет", profiler=profiler)
+        adapter.materialize("e1cRuntimeКонтекст.Секрет", profiler=profiler)
 
     assert [event.phase for event in profiler.events] == ["materialization.routed_transfer"]
     assert profiler.events[0].error_present is True

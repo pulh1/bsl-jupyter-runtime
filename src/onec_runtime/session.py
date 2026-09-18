@@ -2275,7 +2275,7 @@ class RuntimeSession:
     ) -> pd.DataFrame:
         """Copy a persistent BSL table at ``handle`` into a DataFrame.
 
-        A handle has a form such as ``Контекст.Таблица``. ``refs`` selects
+        A handle has a form such as ``e1cRuntimeКонтекст.Таблица``. ``refs`` selects
         presentation, UUID or both for references; ``ref_columns`` overrides
         that policy by column, and ``uuid_suffix`` names added UUID columns.
         ``chunk_size`` is an advisory hint on the composed execution route;

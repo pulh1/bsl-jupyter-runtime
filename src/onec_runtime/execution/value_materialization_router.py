@@ -83,6 +83,7 @@ class ValueMaterializationRouter:
         if not callable(wait_handoff):
             raise TypeError("value transfer wait handoff is invalid")
         self._controller = controller
+        self._arbiter = arbiter
         self._worker_catalog_snapshot = worker_catalog_snapshot
         self._runtime_generation = runtime_generation
         self._context_generation = context_generation
@@ -155,7 +156,7 @@ class ValueMaterializationRouter:
                 catalog=self._transfer_catalog(), timeout_s=local_wait,
             )
             return _decode_selected_table(payload, policy)
-        route = self._controller.value_route_snapshot()
+        route = self._route_snapshot()
         if isinstance(route, CaptureScope):
             return self._capture_dynamic(route).materialize(
                 handle, options, table_policy=table_policy, timeout_s=local_wait,
@@ -184,7 +185,7 @@ class ValueMaterializationRouter:
                 timeout_s=None, relative_limit=count,
             )
             return _decode_selected_table(payload, selected_policy)
-        route = self._controller.value_route_snapshot()
+        route = self._route_snapshot()
         if isinstance(route, CaptureScope):
             return self._capture_dynamic(route).head_to_df(
                 handle, count, policy=policy, max_bytes=max_bytes,
@@ -212,7 +213,7 @@ class ValueMaterializationRouter:
             raise TypeError("projection Worker catalog is invalid")
         wait = validate_local_wait_timeout(timeout_s)
         self._require_catalog(catalog)
-        route = self._controller.value_route_snapshot()
+        route = self._route_snapshot()
         if isinstance(route, CaptureScope):
             def require_same_catalog() -> None:
                 self._require_catalog(catalog)
@@ -236,7 +237,7 @@ class ValueMaterializationRouter:
     def validate_selected_table_handle(self, handle: str) -> None:
         """Check a controller-owned selected table key without debugger I/O."""
 
-        route = self._controller.value_route_snapshot()
+        route = self._route_snapshot()
         if not isinstance(route, CaptureScope):
             raise ProtocolError("CAPTURE selected table route is unavailable")
         self._controller.require_capture_table_descriptor(handle, route)
@@ -259,7 +260,7 @@ class ValueMaterializationRouter:
             raise TypeError("projection Worker catalog is invalid")
         wait = validate_local_wait_timeout(timeout_s)
         self._require_catalog(catalog)
-        route = self._controller.value_route_snapshot()
+        route = self._route_snapshot()
         if not isinstance(route, CaptureScope):
             raise ProtocolError("CAPTURE selected table route is unavailable")
         request = CaptureSelectedTableTransferRequest(
@@ -309,7 +310,7 @@ class ValueMaterializationRouter:
         return kind
 
     def _select(self):
-        route = self._controller.value_route_snapshot()
+        route = self._route_snapshot()
         if isinstance(route, CaptureScope):
             return bind_capture_ticket_materialization(
                 self._controller, route,
@@ -321,6 +322,14 @@ class ValueMaterializationRouter:
         if isinstance(route, MainIdleTargetFence):
             return self._main
         raise ProtocolError("No confirmed stopped value route is available")
+
+    def _route_snapshot(self) -> CaptureScope | MainIdleTargetFence | None:
+        # A parent value reply can settle before its mandatory private-key
+        # cleanup. Wait for that exact dependent ticket, then inspect the
+        # controller again; another user operation may already own the route.
+        with self._wait_handoff():
+            self._arbiter.wait_for_dependent_cleanup()
+        return self._controller.value_route_snapshot()
 
     def _worker_snapshot(self) -> WorkerMaterializationSnapshot:
         snapshot = self._worker_catalog_snapshot()
@@ -374,7 +383,7 @@ def _kind_instruction(
         "        Если Не Материализация.Доступ Тогда",
         '            Результат = "D|worker_generation_value";',
         "        Иначе",
-        f"            Контекст.Вставить({bsl_string_literal(context_key)}, Материализация.Base64);",
+        f"            e1cRuntimeКонтекст.Вставить({bsl_string_literal(context_key)}, Материализация.Base64);",
         '            Результат = "R|" + '
         f'Формат({runtime_generation}, "ЧГ=0; ЧДЦ=0") + "|" + '
         f'Формат({context_generation}, "ЧГ=0; ЧДЦ=0") + "|" + '

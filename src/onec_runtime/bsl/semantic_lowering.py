@@ -8,6 +8,7 @@ from typing import Any
 
 from onec_runtime.bsl.lexer import BslLexError, tokenize
 from onec_runtime.bsl.parser_target import PythonParserTarget, parse_raw_module
+from onec_runtime.bsl.platform_globals import NOTEBOOK_PLATFORM_GLOBALS
 from onec_runtime.bsl.source_maps import (
     MappedSource,
     SourceArtifactKind,
@@ -229,37 +230,7 @@ class SemanticNotebookLowerer:
     _CONTEXT_UNSTRUCTURED_TRANSFERS = frozenset(
         {"BreakStatement", "ContinueStatement", "GotoStatement"}
     )
-    _KNOWN_PLATFORM_GLOBALS = frozenset(
-        {
-            "статуссообщения",
-            "режимзаписидокумента",
-            "символы",
-            "кодировкатекста",
-            "справочники",
-            "документы",
-            "журналыдокументов",
-            "регистрысведений",
-            "регистрынакопления",
-            "регистрыбухгалтерии",
-            "регистрырасчета",
-            "планывидовхарактеристик",
-            "планысчетов",
-            "планывидоврасчета",
-            "планыобмена",
-            "бизнеспроцессы",
-            "задачи",
-            "критерииотбора",
-            "последовательности",
-            "константы",
-            "перечисления",
-            "внешниеобработки",
-            "внешниеотчеты",
-            "обработки",
-            "отчеты",
-            "метаданные",
-            "параметрысеанса",
-        }
-    )
+    _KNOWN_PLATFORM_GLOBALS = NOTEBOOK_PLATFORM_GLOBALS
 
     def __init__(
         self,
@@ -675,7 +646,7 @@ class SemanticNotebookLowerer:
                 if first_argument is not None:
                     stack.append(first_argument)
                 return
-            if normalized == "контекстотладки":
+            if normalized == "e1cruntimeконтекстотладки":
                 self._bind_access(target)
             elif not self._has_call(target):
                 raise SemanticLoweringError(
@@ -686,15 +657,15 @@ class SemanticNotebookLowerer:
             else:
                 self._bind_access(target)
         elif self._is_direct_name(target) and normalized in {
-            "контекст",
-            "контекстотладки",
+            "e1cruntimeконтекст",
+            "e1cruntimeконтекстотладки",
         }:
             raise SemanticLoweringError(
                 f"runtime namespace {target.Root!r} is reserved at {target.span.start}",
                 span=SourceSpan(target.span.start, target.span.end),
                 code="reserved_runtime_namespace",
             )
-        elif normalized == "контекстотладки":
+        elif normalized == "e1cruntimeконтекстотладки":
             self._bind_capture_target(target)
         elif normalized in self._cell_local_names:
             self._bind_access(target)
@@ -1001,7 +972,7 @@ class SemanticNotebookLowerer:
                     self._raise_context_alias_escape(item)
 
         normalized = node.Root.casefold()
-        tainted_receiver = normalized == "контекст" or normalized in aliases
+        tainted_receiver = normalized == "e1cruntimeконтекст" or normalized in aliases
         if not tainted_receiver or not node.Postfix:
             return
         first = node.Postfix[0]
@@ -1039,7 +1010,7 @@ class SemanticNotebookLowerer:
                 node.Arguments is None
                 and not node.Postfix
                 and (
-                    node.Root.casefold() == "контекст"
+                    node.Root.casefold() == "e1cruntimeконтекст"
                     or node.Root.casefold() in aliases
                 )
             )
@@ -1072,7 +1043,7 @@ class SemanticNotebookLowerer:
     @staticmethod
     def _raise_context_alias_escape(node: Any) -> None:
         raise SemanticLoweringError(
-            f"Контекст cannot escape into opaque state at {node.span.start}",
+            f"e1cRuntimeКонтекст cannot escape into opaque state at {node.span.start}",
             span=SourceSpan(node.span.start, node.span.end),
             code="context_alias_escape",
         )
@@ -1131,7 +1102,7 @@ class SemanticNotebookLowerer:
                 equals.end,
                 "persistent-assignment-target",
                 _SyntheticFragment(
-                    'Контекст.Вставить("',
+                    'e1cRuntimeКонтекст.Вставить("',
                     SourceSpan(target.span.start, target.span.end),
                     "persistent_assignment_open",
                 ),
@@ -1152,7 +1123,7 @@ class SemanticNotebookLowerer:
                 target.span.end,
                 "persistent-assignment-target",
                 _SyntheticFragment(
-                    'Контекст.Вставить("',
+                    'e1cRuntimeКонтекст.Вставить("',
                     SourceSpan(target.span.start, target.span.end),
                     "persistent_assignment_open",
                 ),
@@ -1198,10 +1169,10 @@ class SemanticNotebookLowerer:
         root = node.Root
         normalized = root.casefold()
         self._reject_reserved_worker_local(node)
-        if normalized == "контекст":
+        if normalized == "e1cruntimeконтекст":
             if self._is_context_capture_alias(node):
                 raise SemanticLoweringError(
-                    "Контекст.КонтекстОтладки is forbidden at "
+                    "e1cRuntimeКонтекст.e1cRuntimeКонтекстОтладки is forbidden at "
                     f"{node.Postfix[0].span.start}",
                     span=SourceSpan(
                         node.Postfix[0].span.start,
@@ -1210,7 +1181,7 @@ class SemanticNotebookLowerer:
                     code="capture_namespace_alias",
                 )
             return
-        if normalized == "контекстотладки":
+        if normalized == "e1cruntimeконтекстотладки":
             self._require_capture_namespace(node)
             return
         if normalized in self._cell_local_names:
@@ -1231,7 +1202,7 @@ class SemanticNotebookLowerer:
                 node.span.start,
                 "persistent-reference",
                 _SyntheticFragment(
-                    "Контекст.",
+                    "e1cRuntimeКонтекст.",
                     SourceSpan(node.span.start, node.span.start),
                     "persistent_reference_prefix",
                 ),
@@ -1246,7 +1217,7 @@ class SemanticNotebookLowerer:
     def _bind_message_call(self, node: Any) -> Any | None:
         arguments = node.Arguments.Items
         items = () if arguments is None else arguments.Items
-        prefix = "Контекст." + self._message_collector_key + ".Добавить(Строка("
+        prefix = "e1cRuntimeКонтекст." + self._message_collector_key + ".Добавить(Строка("
         if not items:
             self._edit(
                 node.span.start,
@@ -1299,7 +1270,7 @@ class SemanticNotebookLowerer:
         return (
             bool(node.Postfix)
             and type(node.Postfix[0]).__name__ == "MemberAccess"
-            and node.Postfix[0].Name.casefold() == "контекстотладки"
+            and node.Postfix[0].Name.casefold() == "e1cruntimeконтекстотладки"
         )
 
     def _loop_variables(self, root: Any) -> dict[str, str]:
@@ -1329,7 +1300,10 @@ class SemanticNotebookLowerer:
                     and normalized not in self._cell_local_names
                     and normalized not in self._module_names
                     and normalized not in self._platform_globals
-                    and normalized not in {"сообщить", "контекст", "контекстотладки"}
+                    and normalized not in {
+                        "сообщить", "e1cruntimeконтекст",
+                        "e1cruntimeконтекстотладки",
+                    }
                 ):
                     names.setdefault(normalized, target.Root)
             self._push_children(stack, node)
@@ -1367,7 +1341,7 @@ class SemanticNotebookLowerer:
             else _DerivedFragment(export.method, method_span, "worker_method")
         )
         receiver = (
-            "Контекст.RuntimeWorker."
+            "e1cRuntimeКонтекст.RuntimeWorker."
             if export.receiver_module is None
             else (
                 "__OnecPinnedWorkerGeneration.Modules.Получить("
@@ -1417,7 +1391,7 @@ class SemanticNotebookLowerer:
     def _require_capture_namespace(self, node: Any) -> None:
         if self._profile.capture_namespace_rule is CaptureNamespaceRule.FORBIDDEN:
             raise SemanticLoweringError(
-                f"КонтекстОтладки is only available in CAPTURE at {node.span.start}",
+                f"e1cRuntimeКонтекстОтладки is only available in CAPTURE at {node.span.start}",
                 span=SourceSpan(node.span.start, node.span.end),
                 code="capture_namespace_mode",
             )

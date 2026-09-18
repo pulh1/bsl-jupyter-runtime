@@ -327,6 +327,61 @@ def test_close_drains_queued_post_settlement_cleanup(runtime, monkeypatch):
     assert cleanup_ticket.wait_settled(0) == 'released'
 
 
+def test_dependent_cleanup_observer_waits_when_cleanup_is_still_queued(
+    runtime, monkeypatch,
+):
+    _session, route, arbiter = runtime
+    parent_finished = Event()
+    release_worker = Event()
+    observer_finished = Event()
+    observed = []
+    parent_holder = {}
+    original_port = arbiter_module.SessionPort
+
+    class PausingPort(original_port):
+        def __setattr__(self, name, value):
+            if (
+                name == '_live' and value is False
+                and getattr(self, '_ticket', None) is parent_holder.get('ticket')
+            ):
+                parent_finished.set()
+                assert release_worker.wait(3)
+            super().__setattr__(name, value)
+
+    monkeypatch.setattr(arbiter_module, 'SessionPort', PausingPort)
+
+    def parent_plan(port):
+        port.register_post_settlement_cleanup(lambda _port: Settlement('released'))
+        return Settlement('reply')
+
+    parent = arbiter.submit(route, parent_plan)
+    parent_holder['ticket'] = parent
+    arbiter.dispatch(parent)
+    assert parent.wait_settled(3) == 'reply'
+    cleanup = parent.post_settlement_cleanup
+    assert cleanup is not None and parent_finished.wait(3)
+    assert cleanup.status().phase == 'queued'
+
+    def observe() -> None:
+        try:
+            observed.append(arbiter.wait_for_dependent_cleanup())
+        finally:
+            observer_finished.set()
+
+    observer = Thread(target=observe)
+    try:
+        observer.start()
+        assert not observer_finished.wait(0.05)
+        release_worker.set()
+        observer.join(3)
+        assert not observer.is_alive()
+        assert observed == [True]
+        assert cleanup.wait_settled(0) == 'released'
+    finally:
+        release_worker.set()
+        observer.join(3) if observer.ident is not None else None
+
+
 def test_close_retains_confirmed_post_settlement_cleanup_debt(runtime):
     _session, route, arbiter = runtime
     attempts = 0
@@ -900,6 +955,9 @@ def test_termination_retirement_requires_exact_route_target_and_confirmed_eviden
         ticket.wait_settled(3)
     assert raised.value.evidence is proof
     assert ticket.status().pending_capability is None
+    with pytest.raises(arbiter_module.TargetTerminated) as route_error:
+        arbiter.wait_for_dependent_cleanup()
+    assert route_error.value.evidence is proof
     arbiter.close(timeout=3)
 
 

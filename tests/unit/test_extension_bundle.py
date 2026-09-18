@@ -222,17 +222,17 @@ def test_dump_fingerprint_binds_each_protocol_serializer(
     assert after.artifact_sha256 != before.artifact_sha256
 
 
-def test_manifest_parser_accepts_protocol_four(tmp_path: Path) -> None:
+def test_manifest_parser_accepts_protocol_five(tmp_path: Path) -> None:
     path = write_manifest_fixture(
         tmp_path,
         cfe_sha256="0" * 64,
-        protocol_version="4",
+        protocol_version="5",
     )
 
-    assert read_extension_manifest(path).protocol_version == "4"
+    assert read_extension_manifest(path).protocol_version == "5"
 
 
-@pytest.mark.parametrize("predecessor", ["1", "2", "3"])
+@pytest.mark.parametrize("predecessor", ["1", "2", "3", "4"])
 def test_manifest_parser_rejects_predecessor_protocol(
     tmp_path: Path, predecessor: str
 ) -> None:
@@ -242,7 +242,7 @@ def test_manifest_parser_rejects_predecessor_protocol(
         protocol_version=predecessor,
     )
 
-    with pytest.raises(ExtensionBundleError, match="protocol 4"):
+    with pytest.raises(ExtensionBundleError, match="protocol 5"):
         read_extension_manifest(path)
 
 
@@ -346,7 +346,7 @@ def test_dump_fingerprint_rejects_handshake_disagreement(tmp_path: Path) -> None
     source = server.read_text(encoding="utf-8-sig")
     server.write_text(
         source.replace(
-            'ВерсияПротоколаRuntime = "4";', 'ВерсияПротоколаRuntime = "1";'
+            'ВерсияПротоколаRuntime = "5";', 'ВерсияПротоколаRuntime = "1";'
         ),
         encoding="utf-8-sig",
     )
