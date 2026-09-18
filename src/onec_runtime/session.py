@@ -1550,7 +1550,9 @@ class RuntimeSession:
                 raise ProtocolError("ZUP demo runtime session is closed")
             self._require_capture_fence(capture)
             if isinstance(self.runtime_api, PublicExecutionFacade):
-                return self.runtime_api.prepare_bsl(source)
+                prepared = self.runtime_api.prepare_bsl(source)
+                self._require_capture_fence(capture)
+                return prepared
             return self.runtime_api.prepare_capture_hypothesis(source)
 
     def execute_prepared_capture_hypothesis(

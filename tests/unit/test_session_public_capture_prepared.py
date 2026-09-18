@@ -3,6 +3,9 @@
 from contextlib import nullcontext
 from threading import RLock
 
+import pytest
+
+from onec_runtime.errors import StaleCaptureError
 from onec_runtime.execution.public_facade import PublicExecutionFacade
 from onec_runtime.session import RuntimeSession
 
@@ -37,7 +40,30 @@ def test_session_capture_hypothesis_uses_public_prepared_cell_contract() -> None
     assert calls == [
         ("fence", capture),
         ("prepare", "Результат = 1;"),
+        ("fence", capture),
         ("provenance", prepared),
         ("fence", capture),
         ("execute", prepared),
     ]
+
+
+def test_capture_stop_change_during_preparation_rejects_new_handle() -> None:
+    facade = object.__new__(PublicExecutionFacade)
+    prepared = object()
+    facade.prepare_bsl = lambda source: prepared
+    session = object.__new__(RuntimeSession)
+    session.runtime_api = facade
+    session._operation_lock = RLock()
+    session._closed = False
+    checks = 0
+
+    def check_fence(capture: object) -> None:
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            raise StaleCaptureError()
+
+    session._require_capture_fence = check_fence
+    with pytest.raises(StaleCaptureError):
+        session.prepare_capture_hypothesis("Результат = 1;", object())
+    assert checks == 2
