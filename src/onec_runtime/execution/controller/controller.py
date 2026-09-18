@@ -33,6 +33,8 @@ from onec_runtime.execution.arbiter import (
     SessionPort,
     Settlement,
     StaleRoute,
+    StopRequestOutcome,
+    TargetTerminated,
 )
 from onec_runtime.execution.capture.adapter import CaptureSetupAdapter
 from onec_runtime.execution.capture.cell_evaluator import CaptureCellEvaluator
@@ -79,6 +81,9 @@ from onec_runtime.execution.main.policy import MainCellPolicy, MainPreparedPaylo
 from onec_runtime.execution.preparation import WorkerCandidateIntent
 from onec_runtime.execution.snapshot_binding import (
     RoutePreparationSnapshot, RouteSnapshotGuard, SnapshotRouteBinding,
+)
+from onec_runtime.execution.termination import (
+    FileTerminationConfirmed, ServerTerminationConfirmed,
 )
 from onec_runtime.execution.worker import (
     WorkerActivationLease, WorkerActivationPort, WorkerActivationUnknown,
@@ -254,6 +259,8 @@ class ExecutionController:
     def _value_route_snapshot_locked(
         self, *, allow_pending: bool = False,
     ) -> CaptureScope | MainIdleTargetFence | None:
+        if self._confirmed_target_termination is not None:
+            return None
         if self._arbiter.has_pending_operations and not allow_pending:
             return None
         route = self._arbiter.current_route
@@ -289,6 +296,8 @@ class ExecutionController:
         )
 
         with self._lock:
+            if self._confirmed_target_termination is not None:
+                raise ProtocolError("The target was terminated")
             if self._continuation_admission is not None:
                 raise ProtocolError(
                     "Worker mutation is blocked by a continuation admission"
@@ -419,7 +428,10 @@ class ExecutionController:
                     self._command_sequence if operation is None
                     else operation.command_id
                 ),
-                main_phase=None if operation is None else operation.phase,
+                main_phase=(
+                    MainPhase.LOST if self._confirmed_target_termination is not None
+                    else None if operation is None else operation.phase
+                ),
                 capture_context_state=(
                     None if scope is None else scope.context_state
                 ),
@@ -661,6 +673,21 @@ class ExecutionController:
         self._main_dispatch_operations: WeakKeyDictionary[
             ExecutionTicket, MainOperation | None
         ] = WeakKeyDictionary()
+        self._observed_stop_tickets: WeakKeyDictionary[ExecutionTicket, bool] = (
+            WeakKeyDictionary()
+        )
+        self._confirmed_target_termination: (
+            FileTerminationConfirmed | ServerTerminationConfirmed | None
+        ) = None
+
+    @property
+    def confirmed_target_termination(
+        self,
+    ) -> FileTerminationConfirmed | ServerTerminationConfirmed | None:
+        """Return exact target-exit proof observed from an owned Stop ticket."""
+
+        with self._lock:
+            return self._confirmed_target_termination
 
     def await_preparation_context(self) -> PreparationContext | Unavailable:
         """Select one stable statement route without reserving RDBG for lowering.
@@ -675,6 +702,8 @@ class ExecutionController:
             return Unavailable("Statement preparation is not configured")
         while True:
             with self._lock:
+                if self._confirmed_target_termination is not None:
+                    return Unavailable("The target was terminated")
                 stop_ticket = self._main_stop_ticket
                 if stop_ticket is not None and stop_ticket.status().settled:
                     self._main_stop_ticket = None
@@ -710,6 +739,8 @@ class ExecutionController:
             if not isinstance(snapshot, RoutePreparationSnapshot):
                 raise TypeError("snapshot provider must return RoutePreparationSnapshot")
             with self._lock:
+                if self._confirmed_target_termination is not None:
+                    return Unavailable("The target was terminated")
                 stop_ticket = self._main_stop_ticket
                 if stop_ticket is not None:
                     if not stop_ticket.status().settled:
@@ -777,6 +808,8 @@ class ExecutionController:
         record = self._preparations.get(context.preparation_nonce)
         if record is None or record.context is not context:
             return StalePreparation("preparation nonce is stale")
+        if self._confirmed_target_termination is not None:
+            return StalePreparation("The target was terminated")
         if (
             context.route_token is not record.context.route_token
             or context.policy is not record.context.policy
@@ -1100,7 +1133,75 @@ class ExecutionController:
         return ticket
 
     def request_stop(self, ticket: ExecutionTicket) -> object:
-        return self._arbiter.request_stop(ticket)
+        """Fence the exact ticket and observe confirmed target exit locally.
+
+        The observer waits on the ticket's mailbox only. It never reads RDBG
+        events or infers target loss from an unknown/failed Stop attempt.
+        """
+
+        with self._lock:
+            operation = self.main_operation
+            scope = self.capture_scope
+            target = (
+                scope.identity.target_id if scope is not None else
+                operation.target if operation is not None and operation.target is not None
+                else self._initial_target_id
+            )
+        outcome = self._arbiter.request_stop(ticket)
+        if outcome is StopRequestOutcome.CANCELLED_BEFORE_EFFECT:
+            with self._lock:
+                if self.main_operation is operation and operation is not None and (
+                    self._main_dispatch_operations.get(ticket) is operation
+                    and operation.phase is MainPhase.ADMITTED
+                ):
+                    operation.fail_before_dispatch()
+                if self._main_stop_ticket is ticket:
+                    self._main_stop_ticket = None
+                if self._worker_activation_main_ticket is ticket:
+                    self._worker_activation_main_ticket = None
+                self._preparation_revision += 1
+        elif outcome is StopRequestOutcome.REQUESTED:
+            with self._lock:
+                if ticket not in self._observed_stop_tickets:
+                    self._observed_stop_tickets[ticket] = True
+                    Thread(
+                        target=self._observe_stop_ticket,
+                        args=(ticket, operation, scope, target),
+                        name="onec-target-stop-observer",
+                        daemon=True,
+                    ).start()
+        return outcome
+
+    def _observe_stop_ticket(
+        self, ticket: ExecutionTicket, operation: MainOperation | None,
+        scope: CaptureScope | None, target: TargetId | None,
+    ) -> None:
+        try:
+            ticket.wait_settled()
+        except TargetTerminated as terminated:
+            evidence = terminated.evidence
+            if target is not None and evidence.expected_target != target:
+                return
+        except BaseException:
+            # A settled cell error or unconfirmed teardown changes neither
+            # the target nor its stopped frame. Unknown outcomes keep waiting.
+            return
+        else:
+            return
+
+        with self._lock:
+            if self._confirmed_target_termination is not None:
+                return
+            if self.main_operation is operation and operation is not None and not operation.terminal:
+                operation.mark_lost()
+            if self.capture_scope is scope and scope is not None:
+                scope.mark_lost()
+                self._capture_route = None
+                ledger = self._capture_evaluation_ledger
+                if ledger is not None:
+                    ledger.notify_scope_changed()
+            self._confirmed_target_termination = evidence
+            self._preparation_revision += 1
 
     def require_main_prepared_cell(
         self, context: PreparationContext, prepared: PreparedCell,
@@ -1195,6 +1296,8 @@ class ExecutionController:
         with self._lock:
             if self._main_worker_activation_pending():
                 raise ProtocolError("A MAIN Worker activation is still active")
+            if self._confirmed_target_termination is not None:
+                raise ProtocolError("The target was terminated")
             if self.main_operation is not None and not self.main_operation.terminal:
                 raise ProtocolError("A MAIN command is still active")
             route = self._arbiter.current_route

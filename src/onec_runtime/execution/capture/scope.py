@@ -313,3 +313,10 @@ class CaptureScope:
         self.frame_identity = CaptureFrameIdentity.UNVERIFIED
         self.context_state = CaptureContextState.CLOSING
         self.invalidate_inspection()
+
+    def mark_lost(self) -> None:
+        """Retire this frame only after the exact target is confirmed absent."""
+
+        self.frame_identity = CaptureFrameIdentity.LOST
+        self.context_state = CaptureContextState.CLOSED
+        self.invalidate_inspection()
