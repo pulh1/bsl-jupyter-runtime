@@ -331,6 +331,16 @@ class PublicExecutionFacade:
             cursor=cursor, limit=limit, timeout_s=timeout_s,
         )
 
+    def capture_frame_variables(
+        self, *, filters: Mapping[str, object], cursor: int, limit: int,
+        timeout_s: float | None = None,
+    ) -> Mapping[str, object]:
+        """Page saved root-frame names and types for a fenced Session caller."""
+
+        return self._session_capture_inspection.capture_frame_variables(
+            filters=filters, cursor=cursor, limit=limit, timeout_s=timeout_s,
+        )
+
     def capture_frame(
         self, *, level: int, cursor: int, limit: int,
         name: str | None = None, timeout_s: float | None = None,

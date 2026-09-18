@@ -105,6 +105,54 @@ class SessionCaptureInspectionAdapter:
             "next_cursor": next_cursor if next_cursor < len(frames) else None,
         }
 
+    def capture_frame_variables(
+        self, *, filters: Mapping[str, object], cursor: int, limit: int,
+        timeout_s: float | None = None,
+    ) -> Mapping[str, object]:
+        """Page saved root-frame metadata with safe Context handles."""
+
+        if not isinstance(filters, Mapping) or set(filters) - {"name", "type", "role"}:
+            raise ProtocolError("capture frame filters are invalid")
+        expected = {
+            key: value.casefold()
+            for key, value in filters.items()
+            if isinstance(value, str) and value
+        }
+        if len(expected) != len(filters):
+            raise ProtocolError("capture frame filters must be non-empty strings")
+        _page(cursor, limit, "frame")
+        deadline = self._deadline(timeout_s)
+        scope = self._scope()
+        inspection = self._bridge.current()
+        level = scope.frame_stack_level
+        if level is None:
+            raise ProtocolError("CAPTURE root frame is unavailable")
+        inspection.frame(level)
+        items = tuple(
+            metadata
+            for metadata in _saved_root_metadata(scope)
+            if (
+                ("name" not in expected or expected["name"] in str(metadata["name"]).casefold())
+                and ("type" not in expected or expected["type"] in str(metadata["type_name"]).casefold())
+                and ("role" not in expected or expected["role"] == "local")
+            )
+        )
+        if cursor > len(items):
+            raise ProtocolError("capture frame cursor exceeds metadata")
+        page = items[cursor:cursor + limit]
+        self._require_scope(scope)
+        self._check_deadline(deadline)
+        next_cursor = cursor + len(page)
+        return {
+            "items": tuple({
+                **item,
+                "role": "local",
+                "handle": "Контекст.КонтекстОтладки." + str(item["name"]),
+            } for item in page),
+            "total": len(items),
+            "next_cursor": next_cursor if next_cursor < len(items) else None,
+        }
+
     def capture_frame(
         self,
         *,
@@ -136,17 +184,16 @@ class SessionCaptureInspectionAdapter:
             return self._typed_frame_page(
                 scope, inspection, frame, cursor, limit, deadline,
             )
-        variables = scope.frame_variables
+        variables = _saved_root_metadata(scope)
         if cursor > len(variables):
             raise ProtocolError("capture frame cursor exceeds variables")
         page = variables[cursor:cursor + limit]
-        result = tuple(_variable_wire(item) for item in page)
         self._require_scope(scope)
         self._check_deadline(deadline)
         next_cursor = cursor + len(page)
         return {
             "frame": _frame_wire(frame),
-            "variables": result,
+            "variables": page,
             "total": len(variables),
             "next_cursor": next_cursor if next_cursor < len(variables) else None,
         }
@@ -319,6 +366,17 @@ def _variable_wire(variable: FrameVariable) -> Mapping[str, object]:
     ):
         raise ProtocolError("capture frame variable metadata is invalid")
     return {"name": variable.name, "type_name": variable.type_name}
+
+
+def _saved_root_metadata(scope: CaptureScope) -> tuple[Mapping[str, object], ...]:
+    variables = scope.frame_variables
+    if type(variables) is not tuple or len(variables) > MAX_NATIVE_VARIABLE_INVENTORY:
+        raise ProtocolError("capture root frame inventory is invalid")
+    metadata = tuple(_variable_wire(variable) for variable in variables)
+    names = tuple(str(item["name"]).casefold() for item in metadata)
+    if len(set(names)) != len(names):
+        raise ProtocolError("capture root frame inventory is invalid")
+    return metadata
 
 
 def _typed_variable_wire(variable: TypedNativeVariable) -> Mapping[str, object]:

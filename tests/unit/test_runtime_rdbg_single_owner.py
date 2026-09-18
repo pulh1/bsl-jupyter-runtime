@@ -179,6 +179,12 @@ def test_runtime_session_routes_main_capture_resume_and_heartbeat_through_one_ow
         )
         stack_page = runtime.capture_stack(capture_fence, cursor=0, limit=10)
         assert stack_page["total"] >= 2
+        variables_page = runtime.frame_variables(
+            capture_fence, filters={"name": "Amount"}, cursor=0, limit=10,
+        )
+        assert variables_page["items"][0]["handle"] == (
+            "Контекст.КонтекстОтладки.Amount"
+        )
         frame_page = runtime.capture_frame(
             capture_fence, level=0, cursor=0, limit=10,
         )

@@ -80,6 +80,56 @@ def test_root_frame_page_exposes_saved_name_and_type_without_presentation() -> N
     assert "secret" not in str(first) + str(second)
 
 
+def test_saved_capture_frame_variables_preserve_filter_and_safe_handle_contract() -> None:
+    from onec_runtime.execution.capture.session_inspection_adapter import (
+        SessionCaptureInspectionAdapter,
+    )
+
+    scope = ready_scope()
+    scope.frame_variables = (
+        FrameVariable("Amount", "Число", "private 42"),
+        FrameVariable("Rows", "ТаблицаЗначений", "private rows"),
+    )
+    controller = Controller(scope)
+    adapter = SessionCaptureInspectionAdapter(controller, CaptureInspectionBridge(controller))
+
+    page = adapter.capture_frame_variables(
+        filters={"type": "таблица", "role": "local"}, cursor=0, limit=1,
+    )
+
+    assert page == {
+        "items": ({
+            "name": "Rows", "type_name": "ТаблицаЗначений", "role": "local",
+            "handle": "Контекст.КонтекстОтладки.Rows",
+        },),
+        "total": 1,
+        "next_cursor": None,
+    }
+    assert "private" not in str(page)
+
+
+def test_saved_root_inventory_rejects_ambiguous_public_handles() -> None:
+    from onec_runtime.execution.capture.session_inspection_adapter import (
+        SessionCaptureInspectionAdapter,
+    )
+
+    scope = ready_scope()
+    scope.frame_variables = (
+        FrameVariable("Rows", "Массив", "private A"),
+        FrameVariable("rows", "Массив", "private B"),
+    )
+    controller = Controller(scope)
+    adapter = SessionCaptureInspectionAdapter(controller, CaptureInspectionBridge(controller))
+
+    for read in (
+        lambda: adapter.capture_frame(level=0, cursor=0, limit=1),
+        lambda: adapter.capture_frame_variables(filters={}, cursor=0, limit=1),
+    ):
+        with pytest.raises(ProtocolError, match="inventory") as failure:
+            read()
+        assert "private" not in str(failure.value)
+
+
 def test_named_frame_variable_uses_ticket_metadata_without_raw_presentation() -> None:
     from onec_runtime.execution.capture.session_inspection_adapter import (
         SessionCaptureInspectionAdapter,
