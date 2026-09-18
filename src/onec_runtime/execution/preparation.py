@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import AbstractContextManager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from onec_runtime.bsl import (
     LoweringMode,
@@ -21,6 +21,7 @@ from onec_runtime.bsl import (
 from onec_runtime.bsl.source_maps import MappedSource
 from onec_runtime.bsl.notebook_cells import NotebookCellProjection
 from onec_runtime.bsl.notebook_methods import NotebookMethodSet
+from onec_runtime.execution.message_collector import with_message_collector
 from onec_runtime.worker_universe import OperationGenerationPin
 
 
@@ -112,5 +113,11 @@ def prepare_statement(
         lowering,
         None if request.candidate_catalog is not None else request.operation_pin,
         mode,
+    )
+    lowering = replace(
+        lowering,
+        mapped_source=with_message_collector(
+            lowering.mapped_source, lowering.messages_intercepted, message_key,
+        ),
     )
     return RoutePreparedStatement(lowering, message_key)

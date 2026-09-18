@@ -109,6 +109,34 @@ def test_route_policies_apply_distinct_profiles_and_preserve_opaque_fence() -> N
     )
 
 
+@pytest.mark.parametrize("policy_name,key", [
+    ("MainCellPolicy", "__main_messages"),
+    ("CaptureCellPolicy", "__capture_messages"),
+])
+def test_message_call_gets_a_context_collector_before_remote_dispatch(
+    policy_name: str, key: str,
+) -> None:
+    parser = PythonParserTarget.from_generated()
+    common = _common('Сообщить("hello");', parser)
+    binding = _Binding(parser)
+    module = _policies()[0 if policy_name == "MainCellPolicy" else 1]
+    policy = getattr(module, policy_name)(binding)
+    context = PreparationContext(object(), object(), policy, object())
+    snapshots = PreparationSnapshots(("existing",), ("worker-version",), (1, 2))
+
+    prepared = policy.prepare(common, snapshots, context)
+
+    assert isinstance(prepared, PreparedCell)
+    statement = prepared.payload.statement
+    assert statement.lowering.messages_intercepted == 1
+    source = statement.lowering.source
+    assert source.index(f'Контекст.Вставить("{key}", Новый Массив);') < source.index(
+        f"Контекст.{key}.Добавить"
+    )
+    assert source.count('Контекст.Вставить("__onec_cell_messages_result",') == 2
+    assert source.count("ВызватьИсключение;") == 1
+
+
 def test_capture_policy_exposes_dirty_roots_before_dispatch() -> None:
     _, capture = _policies()
     parser = PythonParserTarget.from_generated()
