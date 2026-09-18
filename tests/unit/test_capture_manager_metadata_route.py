@@ -1,5 +1,6 @@
 """Manager origin and temporary-table schema stay on one CAPTURE arbiter."""
 
+from dataclasses import replace
 from threading import Event, current_thread
 from types import SimpleNamespace
 from uuid import UUID
@@ -8,10 +9,15 @@ import pytest
 
 from onec_runtime.errors import ProtocolError, StaleCaptureError
 from onec_runtime.execution.arbiter import RdbgArbiter, RouteToken
+from onec_runtime.execution.capture.selected_table_materialization import (
+    CaptureSelectedTableTransferRequest,
+)
 from onec_runtime.execution.capture.cell_evaluator import CaptureCellEvaluator
 from onec_runtime.execution.capture.executor import CaptureExecutor
 from onec_runtime.execution.controller.controller import ExecutionController
 from onec_runtime.execution.main import MainExecutor, MainPhase
+from onec_runtime.execution.value_materialization_router import ValueMaterializationRouter
+from onec_runtime.execution.worker_activation import WorkerMaterializationSnapshot
 from onec_runtime.observation import ManagerOrigin, SelectionKind, ValueSelection
 from onec_runtime.execution.public_facade import PublicExecutionFacade
 from onec_runtime.rdbg.models import (
@@ -20,6 +26,7 @@ from onec_runtime.rdbg.models import (
 )
 from onec_runtime.stop_routing import BreakpointRegistry
 from onec_runtime.table_value import evaluation_to_python
+from onec_runtime.table_materialization import ReferencePolicy
 
 from test_execution_controller_routes import BUSINESS, KERNEL, CompleteSession
 from test_execution_route_sequence import TARGET
@@ -85,9 +92,10 @@ class MetadataSession(CompleteSession):
                 pending.result_id, "Ошибка", self.private_error, True,
                 error_text=self.private_error,
             )
-        if self.expression.startswith(
-            "RuntimeKernelServer.ПолучитьСхемуВременнойТаблицыОтладки("
-        ):
+        if self.expression.startswith((
+            "RuntimeKernelServer.ПолучитьСхемуВременнойТаблицыОтладки(",
+            "RuntimeTableTransferServer.ПолучитьКомпактнуюСхему(",
+        )):
             assert pending is self.pending
             on_transport_dispatch()
             self._record("wait_eval")
@@ -175,15 +183,27 @@ def test_schema_only_inventory_returns_metadata_handle_and_never_reads_rows() ->
         arbiter.close(timeout=3)
 
 
-def test_selected_table_and_unsafe_name_reject_before_any_new_ticket() -> None:
+def test_unsafe_name_rejects_before_any_new_ticket() -> None:
     session, arbiter, _controller, service = _bound()
     try:
         manager = service.resolve_manager_origin(ManagerOrigin("frame", "Query", ("Manager",)))
         before = tuple(session.metadata_calls)
-        with pytest.raises(ProtocolError, match="selected table"):
+        with pytest.raises(ProtocolError, match="selection"):
             service.temporary_tables(
                 manager["handle"], names=("Staff",), cursor=0, limit=1,
-                selection=ValueSelection(SelectionKind.TABLE_ROWS, limit=5),
+                selection=ValueSelection(SelectionKind.FIELDS, names=("Amount",)),
+            )
+        with pytest.raises(ProtocolError, match="bounds"):
+            service.temporary_tables(
+                manager["handle"], names=("Staff",), cursor=0, limit=1,
+                selection=ValueSelection(SelectionKind.TABLE_ROWS, limit=101),
+            )
+        with pytest.raises(ProtocolError, match="bounds"):
+            service.temporary_tables(
+                manager["handle"], names=("Staff",), cursor=0, limit=1,
+                selection=ValueSelection(
+                    SelectionKind.TABLE_ROWS, offset=10_000_000, limit=1,
+                ),
             )
         with pytest.raises(ProtocolError):
             service.temporary_tables(
@@ -192,6 +212,126 @@ def test_selected_table_and_unsafe_name_reject_before_any_new_ticket() -> None:
             )
         assert tuple(session.metadata_calls) == before
     finally:
+        arbiter.close(timeout=3)
+
+
+def test_selected_table_registers_scope_fenced_deferred_descriptor() -> None:
+    session, arbiter, controller, service = _bound()
+    try:
+        manager = service.resolve_manager_origin(
+            ManagerOrigin("frame", "Query", ("Manager",)),
+        )
+        result = service.temporary_tables(
+            manager["handle"], names=("Staff",), cursor=0, limit=1,
+            selection=ValueSelection(
+                SelectionKind.TABLE_ROWS, offset=3, limit=5,
+                columns=("Employee",),
+            ),
+        )
+        handle = result["items"][0]["handle"]
+        assert handle.startswith("capture_table_")
+        assert result["items"][0]["schema"] == ("Employee", "Amount")
+        assert service.validate_value_reference(handle) == handle
+        assert session.metadata_calls[-1][1] == (
+            "RuntimeTableTransferServer.ПолучитьКомпактнуюСхему("
+            "RuntimeKernelServer.ПолучитьВременнуюТаблицуОтладки("
+            'Контекст.КонтекстОтладки.Query.Manager, "Staff", 3, 5, '
+            'СтрРазделить("Employee", ",")))'
+        )
+        assert controller.capture_scope is not None
+        controller.invalidate_capture_inspection()
+        with pytest.raises((ProtocolError, StaleCaptureError)):
+            service.validate_value_reference(handle)
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_selected_descriptor_resolves_inside_owned_materialization_ticket(monkeypatch) -> None:
+    from onec_runtime.execution.arbiter import Settlement
+
+    session, arbiter, controller, service = _bound()
+    try:
+        manager = service.resolve_manager_origin(
+            ManagerOrigin("frame", "Query", ("Manager",)),
+        )
+        handle = service.temporary_tables(
+            manager["handle"], names=("Staff",), cursor=0, limit=1,
+            selection=ValueSelection(SelectionKind.TABLE_ROWS, offset=3, limit=5),
+        )["items"][0]["handle"]
+        scope = controller.capture_scope
+        assert scope is not None
+        observed = []
+
+        def fake_execute(actual_scope, plan, *, port, shield_workspace,
+                         restore_workspace):
+            observed.append((actual_scope, plan.instruction, current_thread()))
+            return Settlement(b"private table bytes")
+
+        monkeypatch.setattr(controller._capture_materialization_executor, "execute", fake_execute)
+        request = CaptureSelectedTableTransferRequest(
+            handle, scope, ReferencePolicy(), max_rows=1, max_bytes=2048,
+            runtime_generation=1, context_generation=1,
+            worker_registrations=(),
+            relative_offset=2, relative_limit=1,
+        )
+        assert controller.submit_capture_materialization(request).wait_settled(3) == b"private table bytes"
+        assert observed[0][0] is scope
+        assert observed[0][2] is arbiter._worker
+        assert "ПолучитьВременнуюТаблицуОтладки" in observed[0][1]
+        assert 'Контекст.КонтекстОтладки.Query.Manager, "Staff", 5, 1, Новый Массив)' in observed[0][1]
+        assert "capture_table_" not in observed[0][1]
+        assert "private table bytes" not in repr(controller.capture_evaluation_ledger().status())
+        controller.invalidate_capture_inspection()
+        with pytest.raises((ProtocolError, StaleCaptureError)):
+            controller.submit_capture_materialization(request)
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_bad_selected_key_retires_ledger_before_caller_retries(monkeypatch) -> None:
+    import onec_runtime.execution.controller.controller as controller_module
+    from onec_runtime.execution.arbiter import Settlement
+
+    session, arbiter, controller, service = _bound()
+    gate = Event()
+    entered = Event()
+    try:
+        manager = service.resolve_manager_origin(
+            ManagerOrigin("frame", "Query", ("Manager",)),
+        )
+        handle = service.temporary_tables(
+            manager["handle"], names=("Staff",), cursor=0, limit=1,
+            selection=ValueSelection(SelectionKind.TABLE_ROWS, limit=2),
+        )["items"][0]["handle"]
+        scope = controller.capture_scope
+        assert scope is not None
+        original = controller_module._observe_capture_ticket
+
+        def delayed(ticket, ledger, receipt_id):
+            entered.set()
+            gate.wait(3)
+            original(ticket, ledger, receipt_id)
+
+        monkeypatch.setattr(controller_module, "_observe_capture_ticket", delayed)
+        monkeypatch.setattr(
+            controller._capture_materialization_executor, "execute",
+            lambda *args, **kwargs: Settlement(b"confirmed"),
+        )
+        request = CaptureSelectedTableTransferRequest(
+            handle, scope, ReferencePolicy(), 2, 2048, 1, 1, (),
+        )
+        with pytest.raises(ProtocolError):
+            controller.submit_capture_materialization(
+                replace(request, handle="capture_table_" + "0" * 32),
+            ).wait_settled(3)
+        assert entered.wait(3)
+        with pytest.raises(ProtocolError, match="generation"):
+            controller.submit_capture_materialization(
+                replace(request, runtime_generation=2),
+            ).wait_settled(3)
+        assert controller.submit_capture_materialization(request).wait_settled(3) == b"confirmed"
+    finally:
+        gate.set()
         arbiter.close(timeout=3)
 
 
@@ -333,6 +473,62 @@ def test_public_facade_routes_manager_and_schema_calls_through_controller() -> N
         )["items"][0]
         assert table["schema"] == ("Employee", "Amount")
         assert facade.validate_value_reference(table["handle"]) == table["handle"]
-        assert len(session.metadata_calls) == 2
+        selected = facade.capture_temporary_tables(
+            manager["handle"], names=("Staff",), cursor=0, limit=1,
+            selection=ValueSelection(SelectionKind.TABLE_ROWS, limit=2),
+            timeout_s=1.0,
+        )["items"][0]
+        assert facade.validate_value_reference(selected["handle"]) == selected["handle"]
+        assert len(session.metadata_calls) == 3
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_selected_handle_materializes_through_facade_value_ports(monkeypatch) -> None:
+    from onec_runtime.execution.arbiter import Settlement
+    from test_value_projection_service import TABLE_PAYLOAD
+
+    session, arbiter, controller, _service = _bound()
+    session.schema_names = ("Amount",)
+    observed = []
+
+    def fake_execute(scope, plan, *, port, shield_workspace, restore_workspace):
+        observed.append((scope, plan.instruction, current_thread()))
+        return Settlement(TABLE_PAYLOAD)
+
+    monkeypatch.setattr(controller._capture_materialization_executor, "execute", fake_execute)
+    catalog = lambda: WorkerMaterializationSnapshot(0, ())
+    router = ValueMaterializationRouter(
+        controller, arbiter, runtime_generation=1, context_generation=1,
+        worker_catalog_snapshot=catalog,
+    )
+    facade = PublicExecutionFacade(
+        _Pipeline(), controller, arbiter,
+        source_unit_factory=unit, status_reader=lambda: SimpleNamespace(),
+        namespace_reader=lambda: SimpleNamespace(),
+        worker_catalog_snapshot=catalog, value_router=router,
+        runtime_generation=1, context_generation=1,
+    )
+    try:
+        manager = facade.resolve_capture_manager_origin(
+            ManagerOrigin("frame", "Query", ("Manager",)),
+        )
+        handle = facade.capture_temporary_tables(
+            manager["handle"], names=("Staff",), cursor=0, limit=1,
+            selection=ValueSelection(SelectionKind.TABLE_ROWS, limit=2),
+        )["items"][0]["handle"]
+        assert facade.validate_value_reference(handle) == handle
+        assert facade.materialization_kind(handle) == "table"
+        assert facade.materialize_table_payload(
+            handle, max_rows=2, max_bytes=2048,
+        ) == TABLE_PAYLOAD
+        frame = facade.project_to_df(
+            handle, {"offset": 0, "limit": 1},
+            max_rows=2, max_bytes=2048,
+        )
+        assert frame["Amount"].tolist() == [12.5]
+        assert len(observed) == 2
+        assert all(item[2] is arbiter._worker for item in observed)
+        assert all("capture_table_" not in item[1] for item in observed)
     finally:
         arbiter.close(timeout=3)

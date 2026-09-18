@@ -4,16 +4,21 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
+from re import fullmatch
 from typing import Protocol
 from uuid import uuid4
 
 import pandas as pd
 
 from onec_runtime.capture_evaluation import CaptureTransferPlan
+from onec_runtime.compact_table import decode_compact_table_payload
 from onec_runtime.errors import ProtocolError
 from onec_runtime.execution.arbiter import RdbgArbiter
 from onec_runtime.execution.capture.data_plane import CaptureTicketDataPlane
 from onec_runtime.execution.capture.scope import CaptureScope
+from onec_runtime.execution.capture.selected_table_materialization import (
+    CaptureSelectedTableTransferRequest,
+)
 from onec_runtime.execution.capture.ticket_materialization import (
     WorkerTransferCatalog, bind_capture_ticket_materialization,
 )
@@ -49,10 +54,13 @@ class ValueRouteController(Protocol):
     def submit_capture_materialization(
         self, plan: object, *, _before_first_effect: Callable[[], None] | None = None,
     ) -> object: ...
+    def require_capture_table_descriptor(
+        self, handle: str, scope: CaptureScope,
+    ) -> object: ...
 
 
 class ValueMaterializationRouter:
-    """Bind direct Context transfers to the controller's current stopped route.
+    """Bind value transfers to the controller's current stopped route.
 
     The router contains the only MAIN/CAPTURE value-route choice. Neither
     RuntimeSession nor PublicExecutionFacade needs a mode branch. Every remote
@@ -111,8 +119,16 @@ class ValueMaterializationRouter:
         self, handle: str, policy: ReferencePolicy | None = None,
         *, max_rows: int, max_bytes: int = 64 * 1024 * 1024,
     ) -> pd.DataFrame:
-        """Materialize one direct Context table on the selected stopped route."""
+        """Materialize one direct or deferred table on the stopped route."""
 
+        if _is_selected_table_handle(handle):
+            selected_policy = policy or ReferencePolicy()
+            payload = self.transfer_selected_table(
+                handle, selected_policy, max_rows=max_rows,
+                max_bytes=max_bytes, catalog=self._transfer_catalog(),
+                timeout_s=None,
+            )
+            return _decode_selected_table(payload, selected_policy)
         return self._select().to_df(
             handle, policy, max_rows=max_rows, max_bytes=max_bytes,
         )
@@ -128,6 +144,17 @@ class ValueMaterializationRouter:
         """Materialize on the confirmed route with an optional local wait limit."""
 
         local_wait = validate_local_wait_timeout(timeout_s)
+        if _is_selected_table_handle(handle):
+            selected_options = options or MaterializationOptions()
+            if not isinstance(selected_options, MaterializationOptions):
+                raise TypeError("value materialization options are invalid")
+            policy = table_policy or ReferencePolicy()
+            payload = self.transfer_selected_table(
+                handle, policy, max_rows=selected_options.max_items,
+                max_bytes=selected_options.max_bytes,
+                catalog=self._transfer_catalog(), timeout_s=local_wait,
+            )
+            return _decode_selected_table(payload, policy)
         route = self._controller.value_route_snapshot()
         if isinstance(route, CaptureScope):
             return self._capture_dynamic(route).materialize(
@@ -149,6 +176,14 @@ class ValueMaterializationRouter:
     ) -> pd.DataFrame:
         """Return the bounded leading table rows on the confirmed route."""
 
+        if _is_selected_table_handle(handle):
+            selected_policy = policy or ReferencePolicy()
+            payload = self.transfer_selected_table(
+                handle, selected_policy, max_rows=count,
+                max_bytes=max_bytes, catalog=self._transfer_catalog(),
+                timeout_s=None, relative_limit=count,
+            )
+            return _decode_selected_table(payload, selected_policy)
         route = self._controller.value_route_snapshot()
         if isinstance(route, CaptureScope):
             return self._capture_dynamic(route).head_to_df(
@@ -197,6 +232,51 @@ class ValueMaterializationRouter:
                 timeout_s=wait,
             )
         raise ProtocolError("No confirmed stopped value route is available")
+
+    def validate_selected_table_handle(self, handle: str) -> None:
+        """Check a controller-owned selected table key without debugger I/O."""
+
+        route = self._controller.value_route_snapshot()
+        if not isinstance(route, CaptureScope):
+            raise ProtocolError("CAPTURE selected table route is unavailable")
+        self._controller.require_capture_table_descriptor(handle, route)
+
+    def transfer_selected_table(
+        self,
+        handle: str,
+        policy: ReferencePolicy,
+        *,
+        max_rows: int,
+        max_bytes: int,
+        catalog: WorkerTransferCatalog,
+        timeout_s: float | None,
+        relative_offset: int = 0,
+        relative_limit: int | None = None,
+    ) -> bytes:
+        """Resolve a selected descriptor and build its plan inside the ticket."""
+
+        if not isinstance(catalog, WorkerTransferCatalog):
+            raise TypeError("projection Worker catalog is invalid")
+        wait = validate_local_wait_timeout(timeout_s)
+        self._require_catalog(catalog)
+        route = self._controller.value_route_snapshot()
+        if not isinstance(route, CaptureScope):
+            raise ProtocolError("CAPTURE selected table route is unavailable")
+        request = CaptureSelectedTableTransferRequest(
+            handle, route, policy, max_rows, max_bytes,
+            self._runtime_generation, self._context_generation,
+            catalog.registrations, relative_offset, relative_limit,
+        )
+
+        def require_same_catalog() -> None:
+            self._require_catalog(catalog)
+
+        data = CaptureTicketDataPlane(
+            self._controller, route,
+            wait_handoff=self._wait_handoff,
+            before_materialization=require_same_catalog,
+        )
+        return data.materialize_private_payload(request, timeout_s=wait)
 
     def inspect_kind(
         self, handle: str, *, catalog: WorkerTransferCatalog,
@@ -311,3 +391,13 @@ def _kind_instruction(
         "КонецПопытки;",
     ))
     return "\n".join(lines)
+
+
+def _is_selected_table_handle(handle: object) -> bool:
+    return type(handle) is str and fullmatch(r"capture_table_[0-9a-f]{32}", handle) is not None
+
+
+def _decode_selected_table(payload: bytes, policy: ReferencePolicy) -> pd.DataFrame:
+    if classify_materialization_payload(payload) != "table":
+        raise ProtocolError("selected table returned an invalid payload kind")
+    return decode_compact_table_payload(payload, policy)

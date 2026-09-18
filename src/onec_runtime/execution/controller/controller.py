@@ -41,11 +41,15 @@ from onec_runtime.execution.capture.executor import CaptureExecutor
 from onec_runtime.execution.capture.inspection import CaptureInspectionExecutor
 from onec_runtime.execution.capture.manager_metadata import (
     CaptureManagerMetadataPlan, CaptureManagerProbePlan, CaptureTableSchemaPlan,
+    CaptureSelectedTableDescriptor, CaptureSelectedTableSchemaPlan,
     evaluate_capture_manager_metadata,
 )
 from onec_runtime.execution.capture.materialization import (
     CaptureMaterializationExecutor,
     CaptureMaterializationPlan,
+)
+from onec_runtime.execution.capture.selected_table_materialization import (
+    CaptureSelectedTableTransferRequest,
 )
 from onec_runtime.execution.capture.messages import CaptureMessageCollector
 from onec_runtime.execution.capture.operation_executor import (
@@ -621,6 +625,8 @@ class ExecutionController:
         self._capture_message_collector = message_collector
         self._capture_inspection_executor = CaptureInspectionExecutor()
         self._capture_materialization_executor = CaptureMaterializationExecutor()
+        self._capture_table_descriptors: dict[str, CaptureSelectedTableDescriptor] = {}
+        self._capture_table_descriptor_scope: CaptureScope | None = None
         self._capture_writeback_executor = CaptureWritebackExecutor()
         self._registry = registry
         self._breakpoint_routes = breakpoint_routes
@@ -1985,6 +1991,42 @@ class ExecutionController:
         with self._lock:
             self._require_capture_manager_metadata_ready_locked(scope)
 
+    def register_capture_table_descriptor(
+        self, descriptor: CaptureSelectedTableDescriptor,
+    ) -> str:
+        """Mint a selected-table key only after its schema was confirmed."""
+
+        if not isinstance(descriptor, CaptureSelectedTableDescriptor):
+            raise TypeError("CAPTURE selected table descriptor is invalid")
+        with self._lock:
+            self._require_capture_manager_metadata_ready_locked(descriptor.scope)
+            if self._capture_table_descriptor_scope is not descriptor.scope:
+                self._capture_table_descriptors.clear()
+                self._capture_table_descriptor_scope = descriptor.scope
+            if len(self._capture_table_descriptors) >= 128:
+                raise ProtocolError("CAPTURE selected table descriptor limit exceeded")
+            handle = "capture_table_" + uuid4().hex
+            self._capture_table_descriptors[handle] = descriptor
+            return handle
+
+    def require_capture_table_descriptor(
+        self, handle: str, scope: CaptureScope,
+        *, allow_pending: bool = False,
+    ) -> CaptureSelectedTableDescriptor:
+        """Resolve one controller-owned key against the exact stopped scope."""
+
+        with self._lock:
+            self._require_capture_manager_metadata_ready_locked(
+                scope, allow_pending=allow_pending,
+            )
+            if (
+                type(handle) is not str
+                or self._capture_table_descriptor_scope is not scope
+                or handle not in self._capture_table_descriptors
+            ):
+                raise ProtocolError("CAPTURE selected table handle is stale or invalid")
+            return self._capture_table_descriptors[handle]
+
     def _require_capture_manager_metadata_ready_locked(
         self, scope: CaptureScope, *, allow_pending: bool = False,
     ) -> None:
@@ -2017,7 +2059,8 @@ class ExecutionController:
         """Evaluate one private manager proof or bounded schema on this stop."""
 
         if not isinstance(
-            metadata_plan, (CaptureManagerProbePlan, CaptureTableSchemaPlan),
+            metadata_plan,
+            (CaptureManagerProbePlan, CaptureTableSchemaPlan, CaptureSelectedTableSchemaPlan),
         ):
             raise TypeError("CAPTURE manager metadata plan is required")
         with self._lock:
@@ -2224,7 +2267,8 @@ class ExecutionController:
             return ticket
 
     def submit_capture_materialization(
-        self, transfer_plan: CaptureMaterializationPlan,
+        self,
+        transfer_plan: CaptureMaterializationPlan | CaptureSelectedTableTransferRequest,
         *, _before_first_effect: Callable[[], None] | None = None,
     ) -> ExecutionTicket:
         """Execute one private value transfer inside the current stop."""
@@ -2243,18 +2287,36 @@ class ExecutionController:
                 or route is None
             ):
                 raise ProtocolError("No ready CAPTURE stop is available")
+            if isinstance(transfer_plan, CaptureSelectedTableTransferRequest):
+                if transfer_plan.scope is not scope:
+                    raise ProtocolError("CAPTURE selected table scope is stale")
+                self._require_capture_manager_metadata_ready_locked(scope)
 
             ledger = self._capture_evaluation_ledger
             if ledger is None or ledger.identity != scope.identity:
                 raise ProtocolError("CAPTURE evaluation ledger is unavailable")
             receipt_id = f"materialization-{uuid4().hex}"
 
-            def plan(port: SessionPort) -> ReadyForPolicy:
-                if _before_first_effect is not None:
-                    _before_first_effect()
+            def plan(port: SessionPort) -> ReadyForPolicy | ConfirmedFailure:
+                try:
+                    if _before_first_effect is not None:
+                        _before_first_effect()
+                    selected_plan = transfer_plan
+                    if isinstance(selected_plan, CaptureSelectedTableTransferRequest):
+                        if selected_plan.runtime_generation != self._generation:
+                            raise ProtocolError("CAPTURE selected table generation is stale")
+                        descriptor = self.require_capture_table_descriptor(
+                            selected_plan.handle, scope, allow_pending=True,
+                        )
+                        selected_plan = selected_plan.prepare(descriptor)
+                except Exception as error:
+                    # These local checks precede RDBG. A confirmed rejection
+                    # must release the ledger before the ticket wakes a caller.
+                    ledger.fail(receipt_id, "CAPTURE materialization preparation failed")
+                    return ConfirmedFailure(error)
                 result = self._capture_materialization_executor.execute(
                     scope,
-                    transfer_plan,
+                    selected_plan,
                     port=port,
                     shield_workspace=self._shield_capture_workspace,
                     restore_workspace=self._restore_capture_workspace,

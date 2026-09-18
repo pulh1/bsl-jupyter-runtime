@@ -6,10 +6,10 @@ Only their CAPTURE executor path is used here. The supplied data plane sends
 the plan through ``ExecutionController.submit_capture_materialization``; this
 module cannot issue an RDBG command or read temporary storage directly.
 
-This supports direct/dotted ``Контекст.<identifier>`` handles. Bind through
-``bind_capture_ticket_materialization`` to recheck the Worker catalog inside
-the admitted ticket. Deferred ``capture_table_*`` handles still need a
-controller-owned descriptor resolver before public exposure.
+This policy supports direct/dotted ``Контекст.<identifier>`` handles. Bind
+through ``bind_capture_ticket_materialization`` to recheck the Worker catalog
+inside the admitted ticket. The value router sends deferred ``capture_table_*``
+handles through the controller's separate selected-table request.
 """
 
 from __future__ import annotations

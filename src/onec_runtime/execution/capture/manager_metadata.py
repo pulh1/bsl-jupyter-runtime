@@ -1,8 +1,8 @@
-"""Fenced CAPTURE manager origins and schema-only temporary-table metadata.
+"""Fenced CAPTURE manager origins and temporary-table metadata.
 
 Only validated identifiers enter trusted helper expressions. The service keeps
 opaque handles local to one recognized stop; the controller owns all RDBG I/O.
-Selected table values need a separate materialization descriptor port.
+Selected tables retain a bounded descriptor for later controller tickets.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from onec_runtime.execution.local_wait import (
     validate_local_wait_timeout, wait_initiator_locally,
 )
 from onec_runtime.experiment import bsl_string_literal
-from onec_runtime.observation import ManagerOrigin, ValueSelection
+from onec_runtime.observation import ManagerOrigin, SelectionKind, ValueSelection
 from onec_runtime.rdbg.models import (
     CollectionCell, CollectionRow, EvaluationResult, FrameVariable,
 )
@@ -33,6 +33,7 @@ from onec_runtime.table_value import evaluation_to_python
 
 
 MAX_SCHEMA_COLUMNS = 100
+MAX_TABLE_POSITION = 10_000_000
 
 
 def _identifier(value: object, *, label: str) -> str:
@@ -137,7 +138,78 @@ class CaptureTableSchemaPlan:
         return tuple(names)
 
 
-CaptureManagerMetadataPlan = CaptureManagerProbePlan | CaptureTableSchemaPlan
+@dataclass(frozen=True, slots=True)
+class CaptureSelectedTableDescriptor:
+    """Validated CAPTURE table recipe; the controller owns its opaque key."""
+
+    scope: CaptureScope
+    root: str
+    fields: tuple[str, ...]
+    table: str
+    offset: int
+    limit: int
+    columns: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        CaptureTableSchemaPlan(self.scope, self.root, self.fields, self.table)
+        if (
+            type(self.offset) is not int or self.offset < 0
+            or type(self.limit) is not int or not 1 <= self.limit <= 100
+            or self.offset + self.limit > MAX_TABLE_POSITION
+            or type(self.columns) is not tuple or len(self.columns) > 100
+        ):
+            raise ProtocolError("CAPTURE table selection bounds are invalid")
+        for column in self.columns:
+            _identifier(column, label="table column")
+        if len({column.casefold() for column in self.columns}) != len(self.columns):
+            raise ProtocolError("CAPTURE table selection columns are ambiguous")
+
+    @property
+    def expression(self) -> str:
+        path = "Контекст.КонтекстОтладки." + ".".join((self.root, *self.fields))
+        columns = (
+            "Новый Массив" if not self.columns else
+            "СтрРазделить(" + bsl_string_literal(",".join(self.columns)) + ', ",")'
+        )
+        return (
+            "RuntimeKernelServer.ПолучитьВременнуюТаблицуОтладки("
+            + path + ", " + bsl_string_literal(self.table)
+            + f", {self.offset}, {self.limit}, " + columns + ")"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureSelectedTableSchemaPlan:
+    descriptor: CaptureSelectedTableDescriptor
+
+    @property
+    def scope(self) -> CaptureScope:
+        return self.descriptor.scope
+
+    @property
+    def expression(self) -> str:
+        return (
+            "RuntimeTableTransferServer.ПолучитьКомпактнуюСхему("
+            + self.descriptor.expression + ")"
+        )
+
+    @property
+    def stack_level(self) -> int:
+        return CaptureTableSchemaPlan(
+            self.scope, self.descriptor.root, self.descriptor.fields,
+            self.descriptor.table,
+        ).stack_level
+
+    def decode(self, result: EvaluationResult) -> tuple[str, ...]:
+        return CaptureTableSchemaPlan(
+            self.scope, self.descriptor.root, self.descriptor.fields,
+            self.descriptor.table,
+        ).decode(result)
+
+
+CaptureManagerMetadataPlan = (
+    CaptureManagerProbePlan | CaptureTableSchemaPlan | CaptureSelectedTableSchemaPlan
+)
 
 
 def evaluate_capture_manager_metadata(
@@ -145,7 +217,7 @@ def evaluate_capture_manager_metadata(
 ) -> EvaluationResult:
     """Run one private helper on the owned arbiter port, retaining its pending ID."""
 
-    if isinstance(plan, CaptureTableSchemaPlan):
+    if isinstance(plan, (CaptureTableSchemaPlan, CaptureSelectedTableSchemaPlan)):
         pending = port.start_collection_evaluation(
             plan.expression, start_index=0, page_size=MAX_SCHEMA_COLUMNS + 1,
             max_text_size=4096, stack_level=plan.stack_level, timeout_s=30.0,
@@ -175,6 +247,12 @@ class _MetadataController(Protocol):
     def submit_capture_manager_metadata(
         self, plan: CaptureManagerMetadataPlan,
     ) -> _MetadataTicket: ...
+    def register_capture_table_descriptor(
+        self, descriptor: CaptureSelectedTableDescriptor,
+    ) -> str: ...
+    def require_capture_table_descriptor(
+        self, handle: str, scope: CaptureScope,
+    ) -> CaptureSelectedTableDescriptor: ...
 
 
 class CaptureManagerMetadataService:
@@ -256,21 +334,34 @@ class CaptureManagerMetadataService:
         ):
             raise ProtocolError("CAPTURE table page is invalid")
         name = _identifier(names[0], label="table name")
-        if selection is not None:
-            if not isinstance(selection, ValueSelection):
-                raise ProtocolError("CAPTURE table selection is invalid")
-            raise ProtocolError("CAPTURE selected table resolver is unavailable")
         root, fields = manager
-        plan = CaptureTableSchemaPlan(scope, root, fields, name)
+        descriptor = None
+        if selection is None:
+            plan = CaptureTableSchemaPlan(scope, root, fields, name)
+        else:
+            if (
+                not isinstance(selection, ValueSelection)
+                or selection.kind is not SelectionKind.TABLE_ROWS
+                or selection.limit is None or selection.names
+            ):
+                raise ProtocolError("CAPTURE table selection is invalid")
+            descriptor = CaptureSelectedTableDescriptor(
+                scope, root, fields, name,
+                selection.offset, selection.limit, selection.columns,
+            )
+            plan = CaptureSelectedTableSchemaPlan(descriptor)
         schema = self._wait(
             self._controller.submit_capture_manager_metadata(plan), deadline,
         )
         self._require_same_scope(scope)
         if type(schema) is not tuple or any(type(item) is not str for item in schema):
             raise ProtocolError("CAPTURE table schema is invalid")
-        handle = "capture_table_metadata_" + uuid4().hex
-        with self._lock:
-            self._metadata_handles.add(handle)
+        if descriptor is None:
+            handle = "capture_table_metadata_" + uuid4().hex
+            with self._lock:
+                self._metadata_handles.add(handle)
+        else:
+            handle = self._controller.register_capture_table_descriptor(descriptor)
         return {
             "items": ({"name": name, "schema": schema, "handle": handle},),
             "total": 1,
@@ -278,7 +369,14 @@ class CaptureManagerMetadataService:
         }
 
     def validate_value_reference(self, handle: str) -> str:
-        self._current_scope()
+        scope = self._current_scope()
+        if (
+            type(handle) is str
+            and handle.startswith("capture_table_")
+            and not handle.startswith("capture_table_metadata_")
+        ):
+            self._controller.require_capture_table_descriptor(handle, scope)
+            return handle
         with self._lock:
             if handle in self._managers or handle in self._metadata_handles:
                 return handle
@@ -356,5 +454,6 @@ class CaptureManagerMetadataService:
 __all__ = [
     "CaptureManagerMetadataService", "CaptureManagerMetadataPlan",
     "CaptureManagerProbePlan", "CaptureTableSchemaPlan",
+    "CaptureSelectedTableDescriptor", "CaptureSelectedTableSchemaPlan",
     "evaluate_capture_manager_metadata",
 ]

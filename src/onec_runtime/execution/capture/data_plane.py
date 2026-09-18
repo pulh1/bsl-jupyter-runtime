@@ -21,6 +21,9 @@ from onec_runtime.execution.capture.scope import (
     CaptureContextState, CaptureFrameIdentity, CaptureScope,
 )
 from onec_runtime.execution.capture.materialization import CaptureMaterializationPlan
+from onec_runtime.execution.capture.selected_table_materialization import (
+    CaptureSelectedTableTransferRequest,
+)
 from onec_runtime.execution.capture.stack import CaptureStackInventoryAdapter
 from onec_runtime.execution.local_wait import (
     LocalWaitStatus, validate_local_wait_timeout, wait_initiator_locally,
@@ -46,7 +49,7 @@ class CaptureTicketController(Protocol):
     ) -> _CaptureTicket: ...
 
     def submit_capture_materialization(
-        self, plan: CaptureMaterializationPlan,
+        self, plan: CaptureMaterializationPlan | CaptureSelectedTableTransferRequest,
         *, _before_first_effect: Callable[[], None] | None = None,
     ) -> _CaptureTicket: ...
 
@@ -149,9 +152,11 @@ class CaptureTicketDataPlane:
         return result
 
     def materialize_private_payload(
-        self, plan: CaptureMaterializationPlan, *, timeout_s: float | None = None,
+        self,
+        plan: CaptureMaterializationPlan | CaptureSelectedTableTransferRequest,
+        *, timeout_s: float | None = None,
     ) -> bytes:
-        """Run an already qualified transfer plan; return private encoded bytes."""
+        """Run a qualified plan or deferred selected-table request."""
 
         local_wait = validate_local_wait_timeout(timeout_s)
         self._require_current()

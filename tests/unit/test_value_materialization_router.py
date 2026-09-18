@@ -6,6 +6,10 @@ from decimal import Decimal
 import pytest
 
 from onec_runtime.execution.arbiter import RdbgArbiter, RouteToken
+from onec_runtime.execution.capture.manager_metadata import CaptureSelectedTableDescriptor
+from onec_runtime.execution.capture.selected_table_materialization import CaptureSelectedTableTransferRequest
+from onec_runtime.execution.capture.ticket_materialization import WorkerTransferCatalog
+from onec_runtime.errors import ProtocolError
 from onec_runtime.execution.main.idle_materialization import MainIdleTargetFence
 from onec_runtime.execution.worker_activation import WorkerMaterializationSnapshot
 from onec_runtime.table_materialization import ReferencePolicy
@@ -203,5 +207,111 @@ def test_dynamic_materialize_forwards_local_wait_budget_on_both_routes() -> None
         assert router.materialize("Контекст.X", timeout_s=0.5) == "value"
         assert capture_service.calls == [("Контекст.X", 0.25)]
         assert main_service.calls == [("Контекст.X", 0.5)]
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_selected_table_router_passes_deferred_request_on_capture_only() -> None:
+    from onec_runtime.execution.value_materialization_router import ValueMaterializationRouter
+
+    scope = ready_scope()
+    handle = "capture_table_" + "b" * 32
+    descriptor = CaptureSelectedTableDescriptor(
+        scope, "Query", ("Manager",), "Staff", 3, 5, (),
+    )
+
+    class Controller:
+        capture_scope = scope
+        selected = scope
+        request = None
+
+        def value_route_snapshot(self):
+            return self.selected
+
+        def main_idle_fence(self):
+            return None
+
+        def main_idle_fence_in_ticket(self):
+            return None
+
+        def require_capture_table_descriptor(self, requested, actual_scope):
+            assert requested == handle and actual_scope is scope
+            return descriptor
+
+        def submit_capture_materialization(self, request, *, _before_first_effect=None):
+            assert _before_first_effect is not None
+            _before_first_effect()
+            self.request = request
+            return Ticket(b"private verified bytes")
+
+    arbiter = RdbgArbiter(Session([]), RouteToken("runtime", 1, 0, "main"))
+    controller = Controller()
+    router = ValueMaterializationRouter(
+        controller, arbiter,
+        runtime_generation=7, context_generation=4,
+        worker_catalog_snapshot=lambda: WorkerMaterializationSnapshot(3, ()),
+    )
+    try:
+        router.validate_selected_table_handle(handle)
+        assert router.transfer_selected_table(
+            handle, ReferencePolicy(), max_rows=5, max_bytes=2048,
+            catalog=WorkerTransferCatalog(3, ()), timeout_s=None,
+            relative_offset=2, relative_limit=1,
+        ) == b"private verified bytes"
+        assert isinstance(controller.request, CaptureSelectedTableTransferRequest)
+        assert controller.request.relative_offset == 2
+        assert controller.request.relative_limit == 1
+        controller.selected = None
+        with pytest.raises(ProtocolError):
+            router.transfer_selected_table(
+                handle, ReferencePolicy(), max_rows=5, max_bytes=2048,
+                catalog=WorkerTransferCatalog(3, ()), timeout_s=None,
+            )
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_selected_table_to_df_uses_same_deferred_route() -> None:
+    from test_compact_table import compact_payload
+    from onec_runtime.execution.value_materialization_router import ValueMaterializationRouter
+
+    scope = ready_scope()
+    handle = "capture_table_" + "c" * 32
+
+    class Controller:
+        capture_scope = scope
+        request = None
+
+        def value_route_snapshot(self):
+            return scope
+
+        def main_idle_fence(self):
+            return None
+
+        def main_idle_fence_in_ticket(self):
+            return None
+
+        def submit_capture_materialization(self, request, *, _before_first_effect=None):
+            _before_first_effect()
+            self.request = request
+            return Ticket(compact_payload())
+
+    arbiter = RdbgArbiter(Session([]), RouteToken("runtime", 1, 0, "main"))
+    controller = Controller()
+    router = ValueMaterializationRouter(
+        controller, arbiter,
+        runtime_generation=7, context_generation=4,
+        worker_catalog_snapshot=lambda: WorkerMaterializationSnapshot(3, ()),
+    )
+    try:
+        frame = router.to_df(
+            handle, max_rows=5,
+            policy=ReferencePolicy(
+                ref_columns={"Employee": "both", "Department": "uuid"},
+            ),
+        )
+        assert frame["Name"].tolist() == ["Alice", "Bob"]
+        assert isinstance(controller.request, CaptureSelectedTableTransferRequest)
+        assert controller.request.handle == handle
     finally:
         arbiter.close(timeout=3)

@@ -663,10 +663,10 @@ class PublicExecutionFacade:
         return adapter.materialize_table(handle, **options)
 
     def validate_value_reference(self, handle: str) -> str:
-        """Validate direct Context or exact-stop metadata references locally."""
+        """Validate direct Context or exact-stop CAPTURE references locally."""
 
         if isinstance(handle, str) and handle.startswith((
-            "capture_manager_", "capture_table_metadata_",
+            "capture_manager_", "capture_table_",
         )):
             return self._capture_manager_metadata.validate_value_reference(handle)
         return validate_public_direct_handle(handle)
@@ -690,7 +690,7 @@ class PublicExecutionFacade:
         selection: ValueSelection | None,
         timeout_s: float | None = None,
     ) -> Mapping[str, object]:
-        """Read only a bounded schema; selected rows await a resolver port."""
+        """Read a bounded schema and optionally mint a selected table key."""
 
         return self._capture_manager_metadata.temporary_tables(
             manager_handle, names=names, cursor=cursor, limit=limit,

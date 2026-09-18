@@ -49,6 +49,14 @@ class ProjectionTicketPort(Protocol):
         timeout_s: float | None,
     ) -> str: ...
 
+    def validate_selected_table_handle(self, handle: str) -> None: ...
+
+    def transfer_selected_table(
+        self, handle: str, policy: ReferencePolicy, *, max_rows: int,
+        max_bytes: int, catalog: WorkerTransferCatalog, timeout_s: float | None,
+        relative_offset: int = 0, relative_limit: int | None = None,
+    ) -> bytes: ...
+
 
 class ValueProjectionService:
     """Plan and decode bounded projections without knowing MAIN or CAPTURE.
@@ -87,6 +95,9 @@ class ValueProjectionService:
     ) -> str:
         """Read only the supported serializer kind from an admitted ticket."""
 
+        if _is_selected_table_handle(handle):
+            self._ticket.validate_selected_table_handle(handle)
+            return "table"
         safe_handle = validate_public_direct_handle(handle)
         catalog = self._catalog()
         kind = self._ticket.inspect_kind(
@@ -142,9 +153,8 @@ class ValueProjectionService:
         timeout_s: float | None = None,
         profiler: PhaseRecorder | None = None,
     ) -> bytes:
-        """Return only an admitted, integrity-checked compact table payload."""
+        """Return an admitted, integrity-checked compact table payload."""
 
-        safe_handle = validate_public_direct_handle(handle)
         if max_rows is not None and (type(max_rows) is not int or max_rows <= 0):
             raise ProtocolError("table row budget must be positive")
         if type(max_bytes) is not int or max_bytes <= 0:
@@ -152,6 +162,21 @@ class ValueProjectionService:
         policy = ReferencePolicy(refs, ref_columns, uuid_suffix)
         catalog = self._catalog()
         wait = validate_local_wait_timeout(timeout_s)
+        if _is_selected_table_handle(handle):
+            def selected_transfer() -> bytes:
+                return self._ticket.transfer_selected_table(
+                    handle, policy, max_rows=max_rows or 100,
+                    max_bytes=max_bytes, catalog=catalog, timeout_s=wait,
+                )
+
+            payload = (
+                selected_transfer() if profiler is None else
+                profiler.measure("table.routed_transfer", selected_transfer)
+            )
+            if classify_materialization_payload(payload) != "table":
+                raise ProtocolError("table materialization returned an invalid payload kind")
+            return payload
+        safe_handle = validate_public_direct_handle(handle)
         backend = CompactRuntimeTableTransfer(
             _no_direct_debugger, _no_direct_debugger,
             runtime_generation=lambda: self._runtime_generation,
@@ -191,7 +216,6 @@ class ValueProjectionService:
     ) -> tuple[str, bytes]:
         """Serialize only a validated slice, row set, or named projection."""
 
-        safe_handle = validate_public_direct_handle(handle)
         _validate_projection(
             kind, offset, limit, columns, names,
             max_depth=max_depth, max_items=max_items,
@@ -201,6 +225,19 @@ class ValueProjectionService:
         if kind != "table_rows":
             MaterializationOptions(_reference_mode(refs), max_depth, max_items, max_bytes)
         catalog = self._catalog()
+        if _is_selected_table_handle(handle):
+            if kind != "table_rows" or columns:
+                raise ProtocolError("CAPTURE selected table supports row projection only")
+            assert limit is not None
+            payload = self._ticket.transfer_selected_table(
+                handle, policy, max_rows=max_rows, max_bytes=max_bytes,
+                catalog=catalog, timeout_s=validate_local_wait_timeout(timeout_s),
+                relative_offset=offset, relative_limit=limit,
+            )
+            if classify_materialization_payload(payload) != "table":
+                raise ProtocolError("projection returned an invalid payload kind")
+            return "compact_table", payload
+        safe_handle = validate_public_direct_handle(handle)
         key = f"__onec_projection_{uuid4().hex}"
         instruction = build_bounded_projection_instruction(
             safe_handle,
@@ -329,6 +366,10 @@ class ValueProjectionService:
 
 def _reference_mode(refs: str | ReferenceMode) -> str:
     return refs.value if isinstance(refs, ReferenceMode) else refs
+
+
+def _is_selected_table_handle(handle: object) -> bool:
+    return type(handle) is str and fullmatch(r"capture_table_[0-9a-f]{32}", handle) is not None
 
 
 def _build_dynamic_slice_instruction(

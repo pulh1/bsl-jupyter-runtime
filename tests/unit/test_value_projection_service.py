@@ -12,6 +12,7 @@ import pytest
 from onec_runtime.errors import ProtocolError
 from onec_runtime.execution.capture.ticket_materialization import WorkerTransferCatalog
 from onec_runtime.execution.value_projection_service import ValueProjectionService
+from onec_runtime.performance_profile import PhaseRecorder
 
 
 VALUE_PAYLOAD = b'{"version":1,"root":{"t":"number","v":"12.50"}}'
@@ -30,6 +31,7 @@ class TicketPort:
         self.instructions: list[str] = []
         self.catalogs: list[WorkerTransferCatalog] = []
         self.kind_reads: list[str] = []
+        self.selected: list[tuple[object, ...]] = []
 
     def transfer(self, plan, *, catalog, timeout_s):  # type: ignore[no-untyped-def]
         self.instructions.append(plan.instruction)
@@ -45,6 +47,18 @@ class TicketPort:
         self.kind_reads.append(handle)
         self.catalogs.append(catalog)
         return self.kind
+
+    def validate_selected_table_handle(self, handle):  # type: ignore[no-untyped-def]
+        self.kind_reads.append(handle)
+
+    def transfer_selected_table(self, handle, policy, *, max_rows, max_bytes,
+                                catalog, timeout_s, relative_offset=0,
+                                relative_limit=None):  # type: ignore[no-untyped-def]
+        self.selected.append((
+            handle, policy, max_rows, max_bytes, catalog, timeout_s,
+            relative_offset, relative_limit,
+        ))
+        return self.payloads.popleft()
 
 
 def _service(port: TicketPort) -> ValueProjectionService:
@@ -168,3 +182,23 @@ def test_direct_table_payload_uses_compact_serializer_and_bounded_rows() -> None
     ) == TABLE_PAYLOAD
     assert "СериализоватьКомпактнуюТаблицу" in port.instructions[0]
     assert port.catalogs == [WorkerTransferCatalog(3, ())]
+
+
+def test_selected_table_payload_and_relative_projection_use_opaque_ticket_port() -> None:
+    handle = "capture_table_" + "a" * 32
+    port = TicketPort(TABLE_PAYLOAD, TABLE_PAYLOAD)
+    service = _service(port)
+    profiler = PhaseRecorder()
+    assert service.materialization_kind(handle) == "table"
+    assert service.materialize_table_payload(
+        handle, max_rows=5, max_bytes=1024, profiler=profiler,
+    ) == TABLE_PAYLOAD
+    assert [event.phase for event in profiler.events] == ["table.routed_transfer"]
+    frame = service.project_to_df(
+        handle, {"offset": 2, "limit": 1}, max_rows=5, max_bytes=1024,
+    )
+    assert frame["Amount"].tolist() == [12.5]
+    assert port.instructions == []
+    assert port.selected[0][0] == handle
+    assert port.selected[1][-2:] == (2, 1)
+    assert port.kind_reads == [handle]
