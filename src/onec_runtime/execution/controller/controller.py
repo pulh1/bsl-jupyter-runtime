@@ -11,9 +11,11 @@ from dataclasses import dataclass, field
 from enum import Enum
 from threading import RLock
 from typing import Callable
+from uuid import uuid4
 from weakref import WeakKeyDictionary
 
 from onec_runtime.capture import build_live_capture_root_transfer_call
+from onec_runtime.capture_evaluation import CaptureEvaluationKind
 from onec_runtime.bsl.parser_target import PythonParserTarget
 from onec_runtime.errors import BslExecutionError, ProtocolError
 from onec_runtime.execution.arbiter import (
@@ -30,6 +32,7 @@ from onec_runtime.execution.arbiter import (
 )
 from onec_runtime.execution.capture.adapter import CaptureSetupAdapter
 from onec_runtime.execution.capture.cell_evaluator import CaptureCellEvaluator
+from onec_runtime.execution.capture.evaluation_ledger import CaptureEvaluationLedger
 from onec_runtime.execution.capture.executor import CaptureExecutor
 from onec_runtime.execution.capture.inspection import CaptureInspectionExecutor
 from onec_runtime.execution.capture.materialization import (
@@ -97,6 +100,8 @@ class _CaptureCellRepair:
     scope: CaptureScope
     result_policy: Callable[[object], object]
     policy_bound: bool
+    ledger: CaptureEvaluationLedger
+    receipt_id: str
 
 
 class _RawSettlementServices:
@@ -147,14 +152,23 @@ class ExecutionController:
             snapshot = self._value_route_snapshot_locked()
             return snapshot if isinstance(snapshot, MainIdleTargetFence) else None
 
+    def main_idle_fence_in_ticket(self) -> MainIdleTargetFence | None:
+        """Recheck the idle target within its already admitted arbiter ticket."""
+
+        with self._lock:
+            snapshot = self._value_route_snapshot_locked(allow_pending=True)
+            return snapshot if isinstance(snapshot, MainIdleTargetFence) else None
+
     def value_route_snapshot(self) -> CaptureScope | MainIdleTargetFence | None:
         """Copy the one route currently safe for value work without RDBG I/O."""
 
         with self._lock:
             return self._value_route_snapshot_locked()
 
-    def _value_route_snapshot_locked(self) -> CaptureScope | MainIdleTargetFence | None:
-        if self._arbiter.has_pending_operations:
+    def _value_route_snapshot_locked(
+        self, *, allow_pending: bool = False,
+    ) -> CaptureScope | MainIdleTargetFence | None:
+        if self._arbiter.has_pending_operations and not allow_pending:
             return None
         route = self._arbiter.current_route
         operation = self.main_operation
@@ -209,6 +223,32 @@ class ExecutionController:
                 if target_id is not None:
                     return MainPausedWorkerRoute(target_id, operation)
             raise ProtocolError("Worker mutation has no confirmed stopped route")
+
+    def capture_evaluation_ledger(self) -> CaptureEvaluationLedger:
+        """Return the local public-evaluation ledger for the ready CAPTURE stop."""
+
+        with self._lock:
+            scope = self.capture_scope
+            ledger = self._capture_evaluation_ledger
+            if (
+                scope is None
+                or ledger is None
+                or not self._capture_view_scope_is_current(scope)
+            ):
+                raise ProtocolError("No ready CAPTURE evaluation ledger is available")
+            return ledger
+
+    def _capture_view_scope_is_current(self, expected: CaptureScope) -> bool:
+        # Ledger waits hold their own condition.  This predicate must not
+        # acquire the controller lock, because admission can call the ledger
+        # while holding that lock.  Identity reads are local evidence only;
+        # the controller still validates its route under lock before dispatch.
+        return (
+            self.capture_scope is expected
+            and expected.context_state is CaptureContextState.READY
+            and expected.frame_identity is CaptureFrameIdentity.CONFIRMED
+            and self._capture_route == self._arbiter.current_route
+        )
 
     def status_facts(self):
         """Copy local operation and stop evidence for public status projection.
@@ -390,6 +430,7 @@ class ExecutionController:
         self._stop_sequence = 0
         self.main_operation: MainOperation | None = None
         self.capture_scope: CaptureScope | None = None
+        self._capture_evaluation_ledger: CaptureEvaluationLedger | None = None
         self._capture_route: RouteToken | None = None
         self._resume_ticket: ExecutionTicket | None = None
         self._main_stop_ticket: ExecutionTicket | None = None
@@ -906,6 +947,10 @@ class ExecutionController:
             )
             self.main_operation = operation
             self.capture_scope = None
+            retired_ledger = self._capture_evaluation_ledger
+            self._capture_evaluation_ledger = None
+            if retired_ledger is not None:
+                retired_ledger.notify_scope_changed()
             self._capture_route = None
             self._resume_ticket = None
 
@@ -1009,6 +1054,21 @@ class ExecutionController:
                 raise ProtocolError("No ready CAPTURE stop is available")
             selected_policy = result_policy or (lambda result: result)
             cell_operation = CaptureCellOperation(scope.identity)
+            ledger = self._capture_evaluation_ledger
+            if ledger is None or ledger.identity != scope.identity:
+                raise ProtocolError("CAPTURE evaluation ledger is unavailable")
+            receipt_id = f"capture-{uuid4().hex}"
+
+            def settle_ledger(outcome: object) -> object:
+                assert _finalizer is not None
+                published = _finalizer(outcome)
+                if getattr(published, "succeeded", False) is True:
+                    ledger.complete(receipt_id)
+                else:
+                    # Only the finalizer's already-public success bit crosses
+                    # this boundary; raw BSL result/error text remains private.
+                    ledger.fail(receipt_id, "CAPTURE evaluation failed")
+                return published
 
             def plan(port: SessionPort) -> Settlement | ReadyForPolicy | ConfirmedFailure:
                 if _before_first_effect is not None:
@@ -1034,32 +1094,56 @@ class ExecutionController:
                     ),
                 )
                 if isinstance(outcome, ConfirmedFailure):
+                    ledger.fail(receipt_id, "CAPTURE evaluation failed")
                     return outcome
                 if _finalizer is None:
+                    ledger.complete(receipt_id)
                     return outcome
                 return ReadyForPolicy(
                     outcome.value, next_route=outcome.next_route
                 )
 
             settlement = self._route_settlement_service()
-            if settlement is not None and _prepared_payload is not None:
-                settlement.register_capture(
-                    scope, _prepared_payload,
-                    base_namespace_names=_prepared_namespace_names,
-                )
+            # Reserve the sole per-stop CAPTURE slot before placing an arbiter
+            # ticket in its queue. A competing client therefore cannot leave
+            # an undispatchable queued ticket behind.
+            ledger.begin(receipt_id, CaptureEvaluationKind.USER_BSL)
             try:
-                ticket = self._arbiter.submit(route, plan, finalizer=_finalizer)
+                if settlement is not None and _prepared_payload is not None:
+                    settlement.register_capture(
+                        scope, _prepared_payload,
+                        base_namespace_names=_prepared_namespace_names,
+                    )
             except BaseException:
+                ledger.discard_unstarted(receipt_id)
+                raise
+            try:
+                ticket = self._arbiter.submit(
+                    route, plan,
+                    finalizer=settle_ledger if _finalizer is not None else None,
+                )
+            except BaseException:
+                ledger.discard_unstarted(receipt_id)
                 if settlement is not None and _prepared_payload is not None:
                     settlement.discard_capture(_prepared_payload)
                 raise
             if _receipt is not None:
                 _receipt.adopt(ticket)
             self._capture_cell_operations[ticket] = _CaptureCellRepair(
-                cell_operation, scope, selected_policy, _finalizer is not None
+                cell_operation, scope, selected_policy, _finalizer is not None,
+                ledger, receipt_id,
             )
             self._preparation_revision += 1
-            self._arbiter.dispatch(ticket)
+            try:
+                self._arbiter.dispatch(ticket)
+            except BaseException:
+                # ``dispatch`` has not entered transport. Retire both local
+                # reservations instead of retaining a queued inert ticket.
+                if ticket.cancel_queued():
+                    ledger.discard_unstarted(receipt_id)
+                    if settlement is not None and _prepared_payload is not None:
+                        settlement.discard_capture(_prepared_payload)
+                raise
             return ticket
 
     def _route_settlement_service(self):
@@ -1105,11 +1189,15 @@ class ExecutionController:
                     result_policy=repair.result_policy,
                 )
                 if isinstance(outcome, ConfirmedFailure):
+                    repair.ledger.fail(
+                        repair.receipt_id, "CAPTURE evaluation failed",
+                    )
                     return outcome
                 if repair.policy_bound:
                     return ReadyForPolicy(
                         outcome.value, next_route=outcome.next_route
                     )
+                repair.ledger.complete(repair.receipt_id)
                 return outcome
 
             self._arbiter.reconcile(ticket, plan)
@@ -1160,11 +1248,15 @@ class ExecutionController:
                     result_policy=repair.result_policy,
                 )
                 if isinstance(outcome, ConfirmedFailure):
+                    repair.ledger.fail(
+                        repair.receipt_id, "CAPTURE evaluation failed",
+                    )
                     return outcome
                 if repair.policy_bound:
                     return ReadyForPolicy(
                         outcome.value, next_route=outcome.next_route
                     )
+                repair.ledger.complete(repair.receipt_id)
                 return outcome
 
             self._arbiter.reconcile(ticket, plan)
@@ -1252,8 +1344,12 @@ class ExecutionController:
                 scope.mark_closed()
                 with self._lock:
                     self.capture_scope = None
+                    retired_ledger = self._capture_evaluation_ledger
+                    self._capture_evaluation_ledger = None
                     self._capture_route = None
                     self._resume_ticket = None
+                if retired_ledger is not None:
+                    retired_ledger.notify_scope_changed()
                 next_route = self._next_route("main")
                 port.handoff_route(next_route)
                 stop = self._main_executor.await_stop(port=port)
@@ -1264,11 +1360,26 @@ class ExecutionController:
                     outcome.value, next_route=outcome.next_route
                 )
 
-            ticket = self._arbiter.submit(route, plan, finalizer=operation.settler)
+            active_ledger = self._capture_evaluation_ledger
+            if active_ledger is None or active_ledger.identity != scope.identity:
+                raise ProtocolError("CAPTURE evaluation ledger is unavailable")
+            active_ledger.mark_resuming()
+            try:
+                ticket = self._arbiter.submit(route, plan, finalizer=operation.settler)
+            except BaseException:
+                active_ledger.discard_resuming()
+                raise
             self._resume_ticket = ticket
             self._main_stop_ticket = ticket
             self._preparation_revision += 1
-            self._arbiter.dispatch(ticket)
+            try:
+                self._arbiter.dispatch(ticket)
+            except BaseException:
+                if ticket.cancel_queued():
+                    active_ledger.discard_resuming()
+                    self._resume_ticket = None
+                    self._main_stop_ticket = None
+                raise
             return ticket
 
     def submit_capture_variable(
@@ -1524,6 +1635,15 @@ class ExecutionController:
                 scope.note_setup_uncertain(error)
                 raise
             scope.mark_ready()
+            with self._lock:
+                if self.capture_scope is scope:
+                    self._capture_evaluation_ledger = CaptureEvaluationLedger(
+                        scope,
+                        is_current=(
+                            lambda captured=scope:
+                            self._capture_view_scope_is_current(captured)
+                        ),
+                    )
             return Settlement(MainYield(MainYieldKind.CAPTURE, operation, scope=scope))
         phase = MainPhase.SUSPENDED_USER if reason is StopReason.USER_BREAKPOINT else MainPhase.UNKNOWN
         operation.stopped(stop, phase)

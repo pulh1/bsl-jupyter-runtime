@@ -74,6 +74,9 @@ class MainIdleMaterializationService:
         arbiter: RdbgArbiter,
         *,
         main_idle_fence: Callable[[], MainIdleTargetFence | None],
+        main_idle_fence_in_ticket: (
+            Callable[[], MainIdleTargetFence | None] | None
+        ) = None,
         runtime_generation: int,
         context_generation: int,
         worker_type_registrations: Callable[[], tuple[str, ...]] = lambda: (),
@@ -86,6 +89,8 @@ class MainIdleMaterializationService:
             raise TypeError("MAIN materialization requires an RDBG arbiter")
         if not callable(main_idle_fence) or not callable(worker_type_registrations):
             raise TypeError("MAIN materialization readers must be callable")
+        if main_idle_fence_in_ticket is not None and not callable(main_idle_fence_in_ticket):
+            raise TypeError("MAIN ticket fence reader must be callable")
         if worker_catalog_snapshot is not None and not callable(worker_catalog_snapshot):
             raise TypeError("Worker materialization snapshot reader must be callable")
         if not callable(wait_handoff):
@@ -96,6 +101,10 @@ class MainIdleMaterializationService:
             raise ValueError("MAIN materialization context generation must be positive")
         self._arbiter = arbiter
         self._main_idle_fence = main_idle_fence
+        self._main_idle_fence_in_ticket = (
+            main_idle_fence if main_idle_fence_in_ticket is None
+            else main_idle_fence_in_ticket
+        )
         self._runtime_generation = runtime_generation
         self._context_generation = context_generation
         self._worker_type_registrations = worker_type_registrations
@@ -393,7 +402,13 @@ class MainIdleMaterializationService:
         return fence
 
     def _require_current_fence(self, expected: MainIdleTargetFence) -> None:
-        if self._require_fence() != expected:
+        current = self._main_idle_fence_in_ticket()
+        if (
+            not isinstance(current, MainIdleTargetFence)
+            or current.route.context_id != "main"
+            or self._arbiter.current_route != current.route
+            or current != expected
+        ):
             raise ProtocolError("confirmed MAIN route or target changed before materialization")
 
     def _freeze_worker_catalog(self) -> WorkerMaterializationSnapshot:

@@ -7,7 +7,9 @@ from uuid import UUID
 
 import pytest
 
+from onec_runtime.errors import ProtocolError
 from onec_runtime.execution.arbiter import RdbgArbiter, RouteToken, Settlement
+from onec_runtime.capture_evaluation import CapturePhase
 from onec_runtime.execution.capture.cell_evaluator import CaptureCellEvaluator
 from onec_runtime.execution.capture.executor import CaptureExecutor
 from onec_runtime.execution.main import MainExecutor, MainPhase
@@ -104,6 +106,62 @@ def test_capture_variable_page_uses_owned_ticket_and_safe_names() -> None:
         arbiter.close(timeout=3)
 
 
+def test_busy_capture_ledger_rejects_before_arbiter_ticket_is_queued() -> None:
+    from onec_runtime.capture_evaluation import CaptureEvaluationKind
+    from onec_runtime.execution.controller.controller import ExecutionController
+
+    session = CompleteSession()
+    arbiter = RdbgArbiter(session, RouteToken("runtime-1", 1, 0, "main"))
+    controller = ExecutionController(
+        arbiter,
+        MainExecutor(poll_interval_s=0.1),
+        CaptureExecutor(None, KERNEL, decode_command_id=evaluation_to_python),
+        CaptureCellEvaluator(),
+        BreakpointRegistry(KERNEL, (BUSINESS,)),
+        runtime_generation=1,
+    )
+    try:
+        controller.submit_main("Результат = 1;").wait_settled(3)
+        ledger = controller.capture_evaluation_ledger()
+        ledger.begin("other-client", CaptureEvaluationKind.USER_BSL)
+
+        with pytest.raises(ProtocolError, match="already active"):
+            controller.submit_capture_cell("Результат = 2;")
+
+        assert not arbiter.has_pending_operations
+        assert ledger.status().pending_evaluation_id == "other-client"
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_active_capture_ledger_rejects_resume_before_arbiter_ticket_is_queued() -> None:
+    from onec_runtime.capture_evaluation import CaptureEvaluationKind
+    from onec_runtime.execution.controller.controller import ExecutionController
+
+    session = CompleteSession()
+    arbiter = RdbgArbiter(session, RouteToken("runtime-1", 1, 0, "main"))
+    controller = ExecutionController(
+        arbiter,
+        MainExecutor(poll_interval_s=0.1),
+        CaptureExecutor(None, KERNEL, decode_command_id=evaluation_to_python),
+        CaptureCellEvaluator(),
+        BreakpointRegistry(KERNEL, (BUSINESS,)),
+        runtime_generation=1,
+    )
+    try:
+        controller.submit_main("Результат = 1;").wait_settled(3)
+        ledger = controller.capture_evaluation_ledger()
+        ledger.begin("other-client", CaptureEvaluationKind.USER_BSL)
+
+        with pytest.raises(ProtocolError, match="prevents resume"):
+            controller.submit_resume()
+
+        assert not arbiter.has_pending_operations
+        assert ledger.status().pending_evaluation_id == "other-client"
+    finally:
+        arbiter.close(timeout=3)
+
+
 def test_controller_runs_main_capture_cell_resume_and_completion_with_one_owner() -> None:
     from onec_runtime.execution.controller.controller import (
         ExecutionController,
@@ -130,10 +188,14 @@ def test_controller_runs_main_capture_cell_resume_and_completion_with_one_owner(
         assert main.phase is MainPhase.SUSPENDED_CAPTURE
         scope = controller.capture_scope
         assert scope is first.scope and scope.published
+        capture_ledger = controller.capture_evaluation_ledger()
+        assert capture_ledger.status().phase is CapturePhase.PAUSED
 
         cell_ticket = controller.submit_capture_cell("Результат = 2;")
         cell_result = cell_ticket.wait(3)
         assert cell_result.error_occurred is False
+        assert capture_ledger.status().phase is CapturePhase.PAUSED
+        assert capture_ledger.status().last_user_evaluation_id is not None
         assert controller.main_operation is main
         assert controller.capture_scope is scope
 
@@ -143,6 +205,7 @@ def test_controller_runs_main_capture_cell_resume_and_completion_with_one_owner(
         assert completed.completion.result == 3
         assert main.phase is MainPhase.COMPLETED
         assert controller.capture_scope is None
+        assert capture_ledger.status().phase is CapturePhase.STALE
         assert scope.frame_identity.value == "released"
         assert len({thread for _, thread in session.calls}) == 1
     finally:

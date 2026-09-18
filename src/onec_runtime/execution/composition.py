@@ -39,7 +39,6 @@ class ExecutionCore:
     arbiter: RdbgArbiter
     controller: ExecutionController
     pipeline: CellExecutionPipeline
-    registry: BreakpointRegistry
     parser_target: PythonParserTarget
     breakpoint_routes: RouteBreakpointWorkspace | None
     worker_activation: WorkerUniverseActivationAdapter | None = None
@@ -108,7 +107,7 @@ def build_execution_core(
         arbiter.close(timeout=3)
         raise
     return ExecutionCore(
-        arbiter, controller, pipeline, registry, parser, breakpoint_routes,
+        arbiter, controller, pipeline, parser, breakpoint_routes,
     )
 
 

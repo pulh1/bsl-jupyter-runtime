@@ -30,8 +30,8 @@ class RouteBreakpointWorkspace:
     ``plan_idle_captures`` is local only. The controller must call it under
     its idle admission lock, atomically replace its stop registry, and pass
     that registry to ``install_main`` on the next MAIN ticket. A stopped
-    CAPTURE successor requires a separate fenced arbiter transaction and is
-    rejected here until that controller contract exists.
+    CAPTURE successor replacement runs in the same fenced resume ticket as
+    writeback and Continue; the controller publishes it only after a receipt.
     """
 
     def __init__(self, owner: BreakpointWorkspaceController) -> None:

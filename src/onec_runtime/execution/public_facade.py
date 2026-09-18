@@ -15,6 +15,8 @@ from typing import Callable, Iterator, Protocol
 import pandas as pd
 
 from onec_runtime.bsl.source_maps import SourceUnitRef, source_sha256
+from onec_runtime.capture_evaluation import CapturePhase
+from onec_runtime.capture_inspection import CaptureView
 from onec_runtime.errors import ProtocolError
 from onec_runtime.execution.arbiter import ExecutionTicket, RdbgArbiter
 from onec_runtime.execution.contracts import PreparedCell
@@ -24,6 +26,7 @@ from onec_runtime.execution.capture.public_inspection import (
 from onec_runtime.execution.controller.controller import ExecutionController
 from onec_runtime.execution.pipeline import CellExecutionPipeline
 from onec_runtime.execution.source_identity import NotebookSourceIdentityFactory
+from onec_runtime.execution.value_reference import validate_public_direct_handle
 from onec_runtime.runtime_contracts import OperationExecutionProvenance
 from onec_runtime.rdbg.models import ModuleLocation
 from onec_runtime.table_materialization import ReferencePolicy
@@ -73,6 +76,11 @@ class PublicExecutionFacade:
         source_identity: NotebookSourceIdentityFactory | None = None,
         namespace_reader: Callable[[], object] | None = None,
         value_router: ValueTransferPort | None = None,
+        value_router_factory: (
+            Callable[
+                [Callable[[], AbstractContextManager[None]]], ValueTransferPort
+            ] | None
+        ) = None,
         provenance_reader: (
             Callable[[PreparedCell], OperationExecutionProvenance] | None
         ) = None,
@@ -87,6 +95,10 @@ class PublicExecutionFacade:
             source_identity, NotebookSourceIdentityFactory
         ):
             raise TypeError("notebook source identity owner is invalid")
+        if value_router is not None and value_router_factory is not None:
+            raise TypeError("value route must have one owner")
+        if value_router_factory is not None and not callable(value_router_factory):
+            raise TypeError("value route factory is invalid")
         self._pipeline = pipeline
         self._controller = controller
         self._arbiter = arbiter
@@ -94,9 +106,12 @@ class PublicExecutionFacade:
         self._source_identity = source_identity
         self._status_reader = status_reader
         self._namespace_reader = namespace_reader
-        self._value_router = value_router
         self._provenance_reader = provenance_reader
         self._caller_handoff = local()
+        self._value_router = (
+            value_router_factory(self._wait_handoff)
+            if value_router_factory is not None else value_router
+        )
         self._capture_inspection = CaptureInspectionBridge(
             controller, wait_handoff=self._wait_handoff,
         )
@@ -240,6 +255,11 @@ class PublicExecutionFacade:
             raise ProtocolError("value transfer route is not configured")
         return router.materialize_value(handle, options)
 
+    def validate_value_reference(self, handle: str) -> str:
+        """Validate a direct public Context handle without reading target data."""
+
+        return validate_public_direct_handle(handle)
+
     def to_df(
         self,
         handle: str,
@@ -259,6 +279,23 @@ class PublicExecutionFacade:
         """Return stack, frame, and context handles for the current stop."""
 
         return self._capture_inspection.current()
+
+    def current_capture(self) -> CaptureView:
+        """Return the established CaptureView contract over controller evidence."""
+
+        inspection = self._capture_inspection.current()
+        ledger = self._controller.capture_evaluation_ledger()
+        identity = ledger.identity
+        return CaptureView(
+            identity.main_command_id,
+            identity.runtime_generation,
+            identity.local_stop_sequence,
+            lambda: ledger.status().phase is not CapturePhase.STALE,
+            ledger.status,
+            lambda timeout_s, evaluation_id: ledger.wait(timeout_s, evaluation_id),
+            inspection.stack,
+            inspection.context,
+        )
 
     def materialize(
         self,

@@ -4,6 +4,8 @@ Design authority: [MAIN/CAPTURE execution spec](../../../docs/superpowers/specs/
 
 Public startup still selects `../runtime_api.py`, `../prototype_runtime.py` and `../capture_evaluation.py`. `composition.py` builds one `RdbgArbiter`, controller and pipeline after bootstrap; `public_facade.py` supports MAIN/CAPTURE cells, resume, status, namespace, heartbeat, bounded value routes and stopped CAPTURE inspection when explicitly injected in tests. `value_materialization_router.py` selects the exact stopped route for direct and dynamic transfers. The default `RuntimeSession.start()` has not switched, and Worker, capture-intent, proxy and full inspection surfaces are not all bound. Keep component verification distinct from public or live 1C qualification.
 
+`post_bootstrap.py` is the explicit synthetic composition seam for a verified stopped target. It must receive authoritative namespace, Worker catalog, settlement, reply, source identity and breakpoint owners from startup before product cutover. `reply_presenter.py` maps pre-dispatch diagnostics to the existing public reply type without raw exception text. The MAIN idle value route first admits with no pending RDBG activity, then rechecks its exact target inside its own ticket; do not require an empty arbiter queue at that second check.
+
 ```text
 RuntimeSession -> RuntimeApi -> CellExecutionPipeline -> controller port
                                       |                    |

@@ -57,6 +57,14 @@ class WorkerMaterializationSnapshot:
     revision: int
     registrations: tuple[str, ...] = field(repr=False)
 
+    def __post_init__(self) -> None:
+        if type(self.revision) is not int or self.revision < 0:
+            raise ValueError("Worker materialization revision is invalid")
+        if type(self.registrations) is not tuple or any(
+            not isinstance(item, str) or not item for item in self.registrations
+        ):
+            raise ValueError("Worker materialization registrations are invalid")
+
 
 class _GenerationLease:
     """Retain an exact Worker pin, including an incomplete activation."""

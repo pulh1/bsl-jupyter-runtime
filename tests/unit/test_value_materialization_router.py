@@ -34,6 +34,9 @@ def test_value_router_uses_capture_ticket_for_current_scope() -> None:
         def main_idle_fence(self):
             return None
 
+        def main_idle_fence_in_ticket(self):
+            return None
+
         def submit_capture_materialization(self, plan, *, _before_first_effect=None):
             assert _before_first_effect is not None
             _before_first_effect()
@@ -85,6 +88,9 @@ def test_value_router_uses_main_idle_ticket_after_capture_is_gone() -> None:
         def main_idle_fence(self):
             return fence
 
+        def main_idle_fence_in_ticket(self):
+            return fence
+
     router = ValueMaterializationRouter(
         Controller(), arbiter,
         runtime_generation=7, context_generation=4,
@@ -116,6 +122,9 @@ def test_value_router_builds_bounded_head_on_the_capture_ticket() -> None:
             return scope
 
         def main_idle_fence(self):
+            return None
+
+        def main_idle_fence_in_ticket(self):
             return None
 
         def submit_capture_materialization(self, plan, *, _before_first_effect=None):

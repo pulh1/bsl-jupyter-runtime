@@ -14,6 +14,7 @@ from threading import RLock
 from typing import TYPE_CHECKING, Protocol
 
 from onec_runtime.bsl.diagnostics import VisibleSourceContext
+from onec_runtime.bsl.source_maps import SourceUnitRef
 from onec_runtime.execution.capture.policy import CapturePreparedPayload
 from onec_runtime.execution.capture.scope import CaptureScope
 from onec_runtime.execution.controller.controller import MainYield, MainYieldKind
@@ -100,6 +101,19 @@ class RouteSettlementService:
         self._main_policy = MainReplyPolicy()
         self._capture_policy = CaptureReplyPolicy()
         self._lock = RLock()
+
+    def retained_source_units(self) -> tuple[SourceUnitRef, ...]:
+        """Return source identities held by live MAIN and CAPTURE publications.
+
+        Registrations leave these maps on confirmed settlement or explicit
+        discard, so this snapshot does not retain completed cell history.
+        """
+
+        with self._lock:
+            return tuple(
+                registration.payload.common.source_unit
+                for registration in (*self._main.values(), *self._capture.values())
+            )
 
     def register_main(
         self,

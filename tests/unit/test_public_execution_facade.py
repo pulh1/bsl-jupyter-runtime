@@ -183,6 +183,49 @@ def test_public_facade_exposes_fenced_capture_inspection() -> None:
     assert inspection.stack[:1].total == 2
 
 
+def test_public_facade_builds_capture_view_from_bridge_and_local_ledger() -> None:
+    from onec_runtime.capture_evaluation import CaptureEvaluationKind, CapturePhase
+    from onec_runtime.capture_inspection import CaptureView
+    from onec_runtime.execution.capture.evaluation_ledger import CaptureEvaluationLedger
+    from test_capture_inspection_bridge import _Controller as InspectionController
+    from test_capture_stack_inventory_adapter import ready_scope
+
+    scope = ready_scope()
+
+    class Controller(InspectionController):
+        def __init__(self):
+            super().__init__(scope)
+            self.ledger = CaptureEvaluationLedger(scope, is_current=lambda: self.capture_scope is scope)
+
+        def capture_evaluation_ledger(self):
+            return self.ledger
+
+    controller = Controller()
+    api = PublicExecutionFacade(
+        _Pipeline(), controller, _Arbiter(),
+        source_unit_factory=unit, status_reader=lambda: "status",
+    )
+    controller.ledger.begin("capture-view", CaptureEvaluationKind.USER_BSL)
+
+    view = api.current_capture()
+    assert isinstance(view, CaptureView)
+    assert view.operation_id == scope.identity.main_command_id
+    assert view.capture_generation == scope.identity.runtime_generation
+    assert view.stop_sequence == scope.identity.local_stop_sequence
+    assert view.status().phase is CapturePhase.EVALUATING
+    assert view.wait(timeout_s=0).evaluation_id == "capture-view"
+    assert view.stack[:1].total == 2
+    assert view.context is view.context
+
+
+def test_public_facade_validates_direct_value_reference_without_rdbg() -> None:
+    api, _, _, _ = facade()
+
+    assert api.validate_value_reference("Контекст.Таблица") == "Контекст.Таблица"
+    with pytest.raises(ProtocolError, match="Worker generation"):
+        api.validate_value_reference("Контекст.RuntimeWorkerActiveGeneration")
+
+
 def test_execute_bsl_releases_bound_session_lock_only_at_pipeline_waits() -> None:
     api, pipeline, _, _ = facade()
     events: list[str] = []

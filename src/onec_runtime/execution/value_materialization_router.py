@@ -32,6 +32,7 @@ class ValueRouteController(Protocol):
 
     def value_route_snapshot(self) -> CaptureScope | MainIdleTargetFence | None: ...
     def main_idle_fence(self) -> MainIdleTargetFence | None: ...
+    def main_idle_fence_in_ticket(self) -> MainIdleTargetFence | None: ...
     def submit_capture_materialization(
         self, plan: object, *, _before_first_effect: Callable[[], None] | None = None,
     ) -> object: ...
@@ -68,6 +69,7 @@ class ValueMaterializationRouter:
         self._main = MainIdleMaterializationService(
             arbiter,
             main_idle_fence=controller.main_idle_fence,
+            main_idle_fence_in_ticket=controller.main_idle_fence_in_ticket,
             runtime_generation=runtime_generation,
             context_generation=context_generation,
             worker_catalog_snapshot=self._worker_snapshot,
