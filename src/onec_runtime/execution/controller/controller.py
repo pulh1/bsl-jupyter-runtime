@@ -9,15 +9,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from threading import RLock
+from threading import RLock, Thread
 from typing import Callable
 from uuid import uuid4
 from weakref import WeakKeyDictionary
 
 from onec_runtime.capture import build_live_capture_root_transfer_call
-from onec_runtime.capture_evaluation import CaptureEvaluationKind
+from onec_runtime.capture_evaluation import (
+    CaptureEvaluationKind, CaptureFailureDiagnostic,
+)
 from onec_runtime.bsl.parser_target import PythonParserTarget
-from onec_runtime.errors import BslExecutionError, ProtocolError
+from onec_runtime.errors import BslExecutionError, ProtocolError, StaleCaptureError
 from onec_runtime.execution.arbiter import (
     CancelledBeforeEffect,
     ConfirmedFailure,
@@ -1144,6 +1146,12 @@ class ExecutionController:
                     if settlement is not None and _prepared_payload is not None:
                         settlement.discard_capture(_prepared_payload)
                 raise
+            Thread(
+                target=_observe_capture_ticket,
+                args=(ticket, ledger, receipt_id),
+                name="onec-capture-outcome-observer",
+                daemon=True,
+            ).start()
             return ticket
 
     def _route_settlement_service(self):
@@ -1652,3 +1660,39 @@ class ExecutionController:
     def _next_route(self, context_id: str) -> RouteToken:
         current = self._arbiter.current_route
         return RouteToken(current.incarnation, current.epoch + 1, 0, context_id)
+
+
+def _observe_capture_ticket(
+    ticket: ExecutionTicket,
+    ledger: CaptureEvaluationLedger,
+    receipt_id: str,
+) -> None:
+    """Mirror arbiter terminal or unknown evidence into a public local wait.
+
+    This observer does no RDBG work. At most one CAPTURE cell can be active in
+    a scope, and the thread exits as soon as its ticket is unknown or settled.
+    Reconciliation still belongs to the original arbiter ticket.
+    """
+
+    try:
+        if ticket.wait_unknown():
+            ledger.mark_unknown(
+                receipt_id,
+                CaptureFailureDiagnostic(
+                    "outcome_unknown",
+                    "CAPTURE evaluation outcome is not yet confirmed",
+                    "Wait for reconciliation before sending another CAPTURE command",
+                ),
+            )
+        else:
+            try:
+                ticket.wait_settled(0)
+            except BaseException:
+                # A confirmed pre-effect rejection may bypass the executor's
+                # result policy. Its public record still has to retire, with
+                # no private exception text copied into the ledger.
+                ledger.fail(receipt_id, "CAPTURE evaluation failed")
+    except (ProtocolError, StaleCaptureError):
+        # A confirmed reconciliation or scope replacement can win this local
+        # notification race. Neither permits reviving an older result.
+        return

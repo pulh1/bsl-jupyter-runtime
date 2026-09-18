@@ -310,6 +310,15 @@ def test_controller_repairs_confirmed_capture_restore_without_repeating_cell() -
         scope = controller.capture_scope
         ticket = controller.submit_capture_cell("Результат = 2;")
         assert ticket.wait_unknown(3)
+        from onec_runtime.capture_evaluation import (
+            CaptureEvaluationState, CapturePhase,
+        )
+
+        ledger = controller.capture_evaluation_ledger()
+        pending_id = ledger.status().pending_evaluation_id
+        assert pending_id is not None
+        assert ledger.wait(1, pending_id).state is CaptureEvaluationState.UNKNOWN
+        assert ledger.status().phase is CapturePhase.OUTCOME_UNKNOWN
         assert session.user_evals == 1
         assert controller.capture_scope is scope
 
@@ -324,6 +333,43 @@ def test_controller_repairs_confirmed_capture_restore_without_repeating_cell() -
     finally:
         if arbiter.active_ticket is None:
             arbiter.close(timeout=3)
+
+
+def test_pre_effect_capture_rejection_retires_public_evaluation_record() -> None:
+    from onec_runtime.capture_evaluation import CaptureEvaluationState, CapturePhase
+    from onec_runtime.execution.controller.controller import ExecutionController
+
+    session = CompleteSession()
+    arbiter = RdbgArbiter(session, RouteToken("runtime-1", 1, 0, "main"))
+    controller = ExecutionController(
+        arbiter,
+        MainExecutor(poll_interval_s=0.1),
+        CaptureExecutor(None, KERNEL, decode_command_id=evaluation_to_python),
+        CaptureCellEvaluator(),
+        BreakpointRegistry(KERNEL, (BUSINESS,)),
+        runtime_generation=1,
+    )
+    try:
+        controller.submit_main("Результат = 1;").wait_settled(3)
+        scope = controller.capture_scope
+
+        def reject() -> None:
+            raise ValueError("private preparation rejection")
+
+        ticket = controller.submit_capture_cell(
+            "Результат = 2;", _before_first_effect=reject,
+        )
+        with pytest.raises(ValueError, match="private preparation rejection"):
+            ticket.wait_settled(3)
+        ledger = controller.capture_evaluation_ledger()
+        outcome = ledger.wait(1)
+        assert outcome.state is CaptureEvaluationState.FAILED
+        assert "private preparation rejection" not in (outcome.error or "")
+        assert ledger.status().phase is CapturePhase.PAUSED
+        assert controller.capture_scope is scope
+        assert controller.submit_capture_cell("Результат = 3;").wait_settled(3).error_occurred is False
+    finally:
+        arbiter.close(timeout=3)
 
 
 def test_second_capture_stop_has_new_scope_but_same_main_operation() -> None:
