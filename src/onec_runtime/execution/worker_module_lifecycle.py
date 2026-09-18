@@ -14,7 +14,9 @@ from contextlib import AbstractContextManager, nullcontext
 from threading import RLock
 from typing import Protocol
 
-from onec_runtime.bsl.module_catalog import CommonModuleCatalogSnapshot
+from onec_runtime.bsl.module_catalog import (
+    CommonModuleCatalogSnapshot, SessionCommonModuleCatalog,
+)
 from onec_runtime.bsl.module_universe import (
     WorkerModuleUnit, analyze_worker_module, lower_worker_module,
 )
@@ -25,6 +27,7 @@ from onec_runtime.errors import ProtocolError, StaleWorkerGeneration
 from onec_runtime.execution.arbiter import (
     OutcomeUnknown, RdbgArbiter, SessionPort, Settlement,
 )
+from onec_runtime.execution.worker_catalog_resolver import resolve_worker_module_catalog
 from onec_runtime.execution.worker_mutation import (
     CapturePausedWorkerRoute, MainPausedWorkerRoute, WorkerMutationRoute,
 )
@@ -162,7 +165,7 @@ class WorkerModuleLifecycleService:
         self,
         units: tuple[WorkerModuleUnit, ...],
         *,
-        common_modules: CommonModuleCatalogSnapshot,
+        common_modules: CommonModuleCatalogSnapshot | SessionCommonModuleCatalog,
         breakpoint_policy: WorkerBreakpointReloadPolicy = (
             WorkerBreakpointReloadPolicy.STRICT
         ),
@@ -179,8 +182,10 @@ class WorkerModuleLifecycleService:
             raise ProtocolError("Worker module names must be unique")
         if "worker" in names:
             raise ProtocolError("Worker is reserved for notebook methods")
-        if not isinstance(common_modules, CommonModuleCatalogSnapshot):
-            raise ProtocolError("A confirmed common-module catalog snapshot is required")
+        if not isinstance(
+            common_modules, (CommonModuleCatalogSnapshot, SessionCommonModuleCatalog),
+        ):
+            raise ProtocolError("A common-module source or confirmed snapshot is required")
         if type(breakpoint_policy) is not WorkerBreakpointReloadPolicy:
             raise TypeError("Worker breakpoint reload policy is invalid")
         if profiler is not None and not isinstance(profiler, PhaseRecorder):
@@ -188,14 +193,22 @@ class WorkerModuleLifecycleService:
 
         route = self._admit_route()
         with self._lock:
-            self._require_monotonic_catalog(common_modules)
             desired = dict(self._units)
             desired.update((unit.logical_name.casefold(), unit) for unit in units)
             ordered = tuple(desired[name] for name in sorted(desired))
             revision = self._revision
+        catalog = (
+            common_modules
+            if isinstance(common_modules, CommonModuleCatalogSnapshot)
+            else resolve_worker_module_catalog(
+                common_modules, ordered, profiler=profiler,
+            )
+        )
+        with self._lock:
+            self._require_monotonic_catalog(catalog)
         for unit in ordered:
-            common_modules.require(unit.logical_name)
-        artifacts = self._prepare_artifacts(ordered, common_modules, profiler)
+            catalog.require(unit.logical_name)
+        artifacts = self._prepare_artifacts(ordered, catalog, profiler)
         if (
             type(artifacts) is not tuple
             or len(artifacts) != len(ordered)
@@ -241,7 +254,7 @@ class WorkerModuleLifecycleService:
                     )
             with self._lock:
                 self._units = desired
-                self._catalog = common_modules
+                self._catalog = catalog
                 self._revision += 1
                 self._api_owned_handle = handle
             return Settlement(handle)

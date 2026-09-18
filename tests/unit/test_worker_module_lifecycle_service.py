@@ -1,5 +1,6 @@
 """Module generations use one stopped-route arbiter owner."""
 
+from pathlib import Path
 from threading import current_thread
 from types import SimpleNamespace
 from uuid import UUID
@@ -9,11 +10,15 @@ import pytest
 from onec_runtime.breakpoint_workspace import (
     BreakpointWorkspaceController, WorkspaceSnapshot,
 )
-from onec_runtime.bsl.source_maps import SourceUnitKind, SourceUnitRef, source_sha256
+from onec_runtime.bsl.source_maps import (
+    SourceUnitKind, SourceUnitRef, mapped_visible_source, source_sha256,
+)
 from onec_runtime.errors import ProtocolError, StaleWorkerGeneration
 from onec_runtime.bsl.module_catalog import (
     CommonModuleCatalogSnapshot, CommonModuleDescriptor, CommonModuleScope,
+    SessionCommonModuleCatalog,
 )
+from onec_runtime.bsl.module_universe import WorkerModuleUnit
 from onec_runtime.execution.arbiter import (
     OutcomeUnknown, RdbgArbiter, RouteToken, SessionPort, Settlement,
 )
@@ -22,6 +27,7 @@ from onec_runtime.execution.worker_activation import (
 )
 from onec_runtime.execution.worker import WorkerActivationUnknown
 from onec_runtime.execution.worker_breakpoint_workspace import WorkerBreakpointWorkspace
+from onec_runtime.execution.worker_catalog_resolver import resolve_worker_module_catalog
 from onec_runtime.execution.worker_module_lifecycle import WorkerModuleLifecycleService
 from onec_runtime.execution.worker_mutation import MainPausedWorkerRoute
 from onec_runtime.rdbg.models import ModuleLocation, TargetId
@@ -141,6 +147,91 @@ def _bound(*, breakpoints=False, changed=None):
         worker_breakpoints_present=lambda: publisher.breakpoints,
     )
     return unit, session, arbiter, publisher, service
+
+
+def _source_unit(name: str, source: str) -> WorkerModuleUnit:
+    reference = SourceUnitRef(
+        SourceUnitKind.MODULE, name, 1, source_sha256(source),
+    )
+    return WorkerModuleUnit(
+        name, "module", 1, mapped_visible_source(source, reference),
+    )
+
+
+def _add_common_module(root: Path, name: str) -> None:
+    directory = root / "CommonModules"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / f"{name}.xml").write_text(
+        "<MetaDataObject><CommonModule><Properties>"
+        f"<Name>{name}</Name><Global>false</Global><Server>true</Server>"
+        "<ClientManagedApplication>false</ClientManagedApplication>"
+        "<ClientOrdinaryApplication>false</ClientOrdinaryApplication>"
+        "</Properties></CommonModule></MetaDataObject>",
+        encoding="utf-8",
+    )
+
+
+def test_lazy_catalog_resolves_parsed_bare_names_and_required_module(tmp_path) -> None:
+    _add_common_module(tmp_path, "МодульА")
+    _add_common_module(tmp_path, "МодульБ")
+    unit = _source_unit(
+        "МодульА",
+        "Функция Версия() Экспорт\nВозврат МодульБ.Версия();\nКонецФункции\n",
+    )
+    source = SessionCommonModuleCatalog(tmp_path, profile="server-test")
+
+    snapshot = resolve_worker_module_catalog(source, (unit,))
+
+    assert isinstance(snapshot, CommonModuleCatalogSnapshot)
+    assert tuple(item.canonical_name for item in snapshot.modules) == (
+        "МодульА", "МодульБ",
+    )
+
+
+def test_lazy_catalog_uses_retained_units_before_next_publication(tmp_path) -> None:
+    _add_common_module(tmp_path, "МодульА")
+    first = _source_unit(
+        "МодульА",
+        "Функция Версия() Экспорт\nВозврат Поздний.Версия();\nКонецФункции\n",
+    )
+    source = SessionCommonModuleCatalog(tmp_path, profile="server-test")
+    _, session, arbiter, publisher, service = _bound()
+    try:
+        service.load_worker_modules((first,), common_modules=source)
+        _add_common_module(tmp_path, "Поздний")
+        _add_common_module(tmp_path, "МодульБ")
+        second = _source_unit(
+            "МодульБ",
+            "Функция Версия() Экспорт\nВозврат 2;\nКонецФункции\n",
+        )
+
+        service.load_worker_modules((second,), common_modules=source)
+
+        assert tuple(item.canonical_name for item in service._catalog.modules) == (
+            "МодульА", "МодульБ", "Поздний",
+        )
+        assert publisher.calls == [("МодульА",), ("МодульА", "МодульБ")]
+        assert session.calls == [arbiter._worker, arbiter._worker]
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_missing_required_module_fails_before_arbiter_dispatch(tmp_path) -> None:
+    (tmp_path / "CommonModules").mkdir()
+    unit = _source_unit(
+        "Отсутствует",
+        "Функция Версия() Экспорт\nВозврат 1;\nКонецФункции\n",
+    )
+    source = SessionCommonModuleCatalog(tmp_path, profile="server-test")
+    _, session, arbiter, publisher, service = _bound()
+    try:
+        with pytest.raises(ProtocolError, match="missing common module"):
+            service.load_worker_modules((unit,), common_modules=source)
+        assert publisher.calls == []
+        assert session.calls == []
+        assert arbiter.active_ticket is None
+    finally:
+        arbiter.close(timeout=3)
 
 
 def test_lifecycle_exposes_exact_arbiter_owner_read_only() -> None:
