@@ -668,7 +668,7 @@ class RuntimeSession:
         processes: FileModeProcesses,
         transport: RdbgTransport,
         rdbg: RdbgSession,
-        runtime_api: PrototypeRuntimeApi,
+        runtime_api: PrototypeRuntimeApi | PublicExecutionFacade,
         artifacts: ArtifactWriter,
         *,
         heartbeat_interval_s: float = 15.0,
