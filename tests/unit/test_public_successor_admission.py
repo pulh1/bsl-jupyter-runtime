@@ -4,6 +4,7 @@ The post-bootstrap facade is injected manually; RuntimeSession.start() is not
 part of this contract until the full public cutover.
 """
 
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,11 +12,38 @@ import pytest
 
 from onec_runtime.config import RuntimeConfig
 from onec_runtime.errors import ProtocolError
+from onec_runtime.execution.capture.writeback import CaptureExportFailed
 from onec_runtime.execution.post_bootstrap import compose_fresh_post_bootstrap_execution
+from onec_runtime.rdbg.models import EvaluationResult
 from onec_runtime.runtime_api import RuntimeReplyKind
 from onec_runtime.session import RuntimeSession, RuntimeSessionConfig
 
 from test_execution_controller_routes import BUSINESS, KERNEL, CompleteSession
+
+
+class ExportFailsOnce(CompleteSession):
+    def __init__(self) -> None:
+        super().__init__(capture_count=2)
+        self.fail_export = True
+
+    def wait_evaluation_event(self, pending, *, timeout_s, on_transport_dispatch):
+        if (
+            self.fail_export
+            and self.expression.startswith(
+                "RuntimeKernelServer.ПоместитьЗначениеКонтекстаОтладки("
+            )
+        ):
+            self.fail_export = False
+            on_transport_dispatch()
+            self._record("wait_eval")
+            self.pending = None
+            return EvaluationResult(
+                pending.result_id, "Ошибка", "", True, "planned export failure",
+            )
+        return super().wait_evaluation_event(
+            pending, timeout_s=timeout_s,
+            on_transport_dispatch=on_transport_dispatch,
+        )
 
 
 def test_session_successor_ticket_correlates_second_stop_of_same_main(
@@ -36,7 +64,7 @@ def test_session_successor_ticket_correlates_second_stop_of_same_main(
         ),
         evidence_root=tmp_path / "evidence",
     )
-    rdbg = CompleteSession(capture_count=2)
+    rdbg = ExportFailsOnce()
     composed = compose_fresh_post_bootstrap_execution(
         rdbg, KERNEL,
         runtime_generation=7,
@@ -69,6 +97,35 @@ def test_session_successor_ticket_correlates_second_stop_of_same_main(
         assert first.capture_ticket == first_arming.ticket_id
 
         runtime._capture_locations[("capture", 50)] = BUSINESS
+        other = replace(BUSINESS, line=51)
+        other_point = SimpleNamespace(name="other", line=51)
+        runtime._capture_locations[("other", 51)] = other
+        failed_attempt = SimpleNamespace(
+            attempt_id="continue-failed", capture_generation=1,
+            request_operation_id="request-failed", dirty_roots=("Amount",),
+        )
+        failed_intent = SimpleNamespace(
+            points=(other_point,), capture_intent_id="intent-failed",
+            operation_id="request-failed", capture_generation=2,
+            source_revision=1, source_sha256="source-hash",
+        )
+        failed_admission = runtime.prepare_capture_successor(
+            failed_intent, attempt=failed_attempt,
+        )
+        with pytest.raises(CaptureExportFailed):
+            runtime.resume_capture(
+                dirty_roots=("Amount",),
+                continuation_attempt_id="continue-failed",
+            )
+        failed_evidence = runtime.continuation_attempt_evidence("continue-failed")
+        assert failed_evidence.root_statuses == (("Amount", "failed"),)
+        assert failed_evidence.continue_state == "unattempted"
+        failed_admission.rollback()
+        assert runtime._active_capture_ticket.ticket_id == first_arming.ticket_id
+        assert composed.breakpoint_workspace.confirmed_snapshot.captures == (BUSINESS,)
+        assert runtime.continuation_attempt_evidence("continue-failed") == failed_evidence
+        assert runtime.execute_bsl("Результат = 2;").kind is RuntimeReplyKind.CAPTURE_CELL
+
         attempt = SimpleNamespace(
             attempt_id="continue-1", capture_generation=1,
             request_operation_id="request-2", dirty_roots=(),
@@ -84,7 +141,6 @@ def test_session_successor_ticket_correlates_second_stop_of_same_main(
         before = runtime.continuation_attempt_evidence("continue-1")
         assert before.root_statuses == ()
         assert before.continue_state == "unattempted"
-        admission.commit()
 
         with pytest.raises(ProtocolError, match="continuation attempt"):
             runtime.resume_capture()
@@ -97,6 +153,7 @@ def test_session_successor_ticket_correlates_second_stop_of_same_main(
         after = runtime.continuation_attempt_evidence("continue-1")
         assert after.root_statuses == ()
         assert after.continue_state == "acknowledged"
+        admission.commit()
 
         completed = runtime.resume_capture()
         assert completed.kind is RuntimeReplyKind.MAIN_COMPLETED

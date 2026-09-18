@@ -51,7 +51,7 @@ from onec_runtime.execution.capture.scope import (
     CaptureContextState, CaptureFrameIdentity, CaptureScope,
 )
 from onec_runtime.execution.capture.writeback import (
-    CaptureWritebackExecutor, RootWritePhase,
+    CaptureWritebackExecutor, RootWritePhase, WritebackDisposition,
 )
 from onec_runtime.execution.breakpoint_routes import RouteBreakpointWorkspace
 from onec_runtime.execution.contracts import (
@@ -121,6 +121,7 @@ class _ContinuationAdmission:
         spec: ContinuationAttemptSpec,
         locations: tuple[ModuleLocation, ...],
         ticket: CaptureCorrelationTicket | None,
+        original_registry: BreakpointRegistry,
     ) -> None:
         self._controller = controller
         self.scope = scope
@@ -129,30 +130,41 @@ class _ContinuationAdmission:
         self.spec = spec
         self.locations = locations
         self.ticket = ticket
-        self.committed = False
+        self.original_registry = original_registry
         self.consumed = False
         self.closed = False
         self.continue_state = "unattempted"
+        self.frozen_root_statuses: tuple[tuple[str, str], ...] | None = None
 
     def commit(self) -> None:
         with self._controller._lock:
-            self._controller._require_continuation_admission(self)
-            self.committed = True
+            if (
+                self.closed
+                or not self.consumed
+                or self.continue_state != "acknowledged"
+                or self._controller._continuation_admission is not self
+            ):
+                raise ProtocolError("Continuation has no confirmed result to commit")
+            self.frozen_root_statuses = (
+                self._controller.continuation_attempt_evidence(
+                    self.spec.attempt_id,
+                ).root_statuses
+            )
+            self._controller._continuation_admission = None
+            self.closed = True
 
     def rollback(self) -> None:
+        self._controller._rollback_continuation_admission(self)
+
+    def quarantine(self) -> None:
+        # Unknown remote effects must not be retried or undone by assumption.
+        # Frame identity and resource debts remain with the controller.
         with self._controller._lock:
             if self.closed:
                 return
-            if self.consumed:
-                raise ProtocolError("Dispatched continuation cannot be rolled back")
             if self._controller._continuation_admission is self:
                 self._controller._continuation_admission = None
             self.closed = True
-
-    def quarantine(self) -> None:
-        # Preparing the successor has no remote effect. Revoking its public
-        # admission cannot by itself invalidate the confirmed old frame.
-        self.rollback()
 
 
 class _RawSettlementServices:
@@ -1399,6 +1411,7 @@ class ExecutionController:
             )
             admission = _ContinuationAdmission(
                 self, scope, operation, route, spec, locations, ticket,
+                self._registry,
             )
             self._continuation_admission = admission
             self._continuation_attempts[spec.attempt_id] = admission
@@ -1420,6 +1433,83 @@ class ExecutionController:
         ):
             raise ProtocolError("Continuation admission belongs to another stop")
 
+    def _rollback_continuation_admission(
+        self, admission: _ContinuationAdmission,
+    ) -> None:
+        """Restore a confirmed export failure to the same paused frame."""
+
+        with self._lock:
+            if admission.closed:
+                return
+            if self._continuation_admission is not admission:
+                raise ProtocolError("Continuation admission is no longer current")
+            if not admission.consumed:
+                self._continuation_admission = None
+                admission.closed = True
+                return
+            scope = admission.scope
+            ledger = scope.writeback_ledger
+            active_ledger = self._capture_evaluation_ledger
+            if (
+                admission.continue_state != "unattempted"
+                or self.capture_scope is not scope
+                or self.main_operation is not admission.operation
+                or admission.operation.phase is not MainPhase.SUSPENDED_CAPTURE
+                or scope.context_state is not CaptureContextState.READY
+                or scope.frame_identity is not CaptureFrameIdentity.CONFIRMED
+                or self._capture_route != admission.route
+                or self._arbiter.current_route != admission.route
+                or self._resume_in_flight()
+                or self._arbiter.has_pending_operations
+                or ledger is None
+                or ledger.disposition is not WritebackDisposition.PAUSED_EXPORT_FAILED
+                or active_ledger is None
+                or active_ledger.identity != scope.identity
+                or any(
+                    ledger.record(root).phase not in {
+                        RootWritePhase.UNATTEMPTED, RootWritePhase.FAILED,
+                    }
+                    or (
+                        ledger.record(root).phase is RootWritePhase.FAILED
+                        and ledger.record(root).failed_stage != "export"
+                    )
+                    for root in ledger.roots
+                )
+            ):
+                raise ProtocolError("Continuation cannot restore this CAPTURE stop")
+            restore_workspace = self._registry != admission.original_registry
+            if restore_workspace:
+                routes = self._breakpoint_routes
+                if routes is None:
+                    raise ProtocolError("CAPTURE breakpoint workspace cannot be restored")
+
+                def restore(port: SessionPort) -> Settlement:
+                    routes.rearm_captured_successor(
+                        self._registry, admission.original_registry.captures,
+                        port=port,
+                    )
+                    with self._lock:
+                        self._registry = admission.original_registry
+                    return Settlement(None)
+
+                ticket = self._arbiter.submit(admission.route, restore)
+                self._arbiter.dispatch(ticket)
+            else:
+                ticket = None
+        if ticket is not None:
+            ticket.wait_settled()
+        with self._lock:
+            if self._continuation_admission is not admission:
+                raise ProtocolError("Continuation admission changed during rollback")
+            assert ledger is not None and active_ledger is not None
+            admission.frozen_root_statuses = self.continuation_attempt_evidence(
+                admission.spec.attempt_id,
+            ).root_statuses
+            scope.discard_unmodified_writeback()
+            active_ledger.discard_resuming()
+            self._continuation_admission = None
+            admission.closed = True
+
     def continuation_attempt_evidence(
         self, attempt_id: str,
     ) -> ContinuationAttemptEvidence:
@@ -1432,6 +1522,10 @@ class ExecutionController:
                 admission = self._continuation_attempts[attempt_id]
             except KeyError as error:
                 raise ProtocolError("continuation attempt is unknown") from error
+            if admission.frozen_root_statuses is not None:
+                return ContinuationAttemptEvidence(
+                    admission.frozen_root_statuses, admission.continue_state,
+                )
             ledger = admission.scope.writeback_ledger
             statuses: list[tuple[str, str]] = []
             for root in admission.spec.dirty_roots:
@@ -1469,7 +1563,6 @@ class ExecutionController:
                 if (
                     admission is None
                     or admission.spec.attempt_id != continuation_attempt_id
-                    or not admission.committed
                     or admission.consumed
                     or successor_locations is not None
                     or dirty_roots != admission.spec.dirty_roots
@@ -1605,13 +1698,9 @@ class ExecutionController:
                     self._main_stop_ticket = None
                 elif admission is not None:
                     admission.consumed = True
-                    admission.closed = True
-                    self._continuation_admission = None
                 raise
             if admission is not None:
                 admission.consumed = True
-                admission.closed = True
-                self._continuation_admission = None
             return ticket
 
     def submit_capture_variable(

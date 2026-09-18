@@ -12,7 +12,9 @@ from onec_runtime.execution.capture.resources import (
     TemporaryCleanupDebt,
     TemporaryCleanupState,
 )
-from onec_runtime.execution.capture.writeback import RootWritebackLedger
+from onec_runtime.execution.capture.writeback import (
+    RootWritePhase, RootWritebackLedger, WritebackDisposition,
+)
 from onec_runtime.rdbg.models import (
     FrameVariable,
     ModuleLocation,
@@ -229,6 +231,30 @@ class CaptureScope:
         if self._writeback_ledger is None:
             self._writeback_ledger = RootWritebackLedger(self.dirty_roots)
         return self._writeback_ledger
+
+    def discard_unmodified_writeback(self) -> None:
+        """Reopen cell admission after a confirmed export-only failure.
+
+        No frame root may have reached ``modifyValue``. Dirty-root names stay
+        registered because earlier CAPTURE cells may already have side effects.
+        """
+
+        self._require_ready_frame()
+        ledger = self._writeback_ledger
+        if ledger is None or ledger.disposition is not WritebackDisposition.PAUSED_EXPORT_FAILED:
+            raise RuntimeError("capture writeback cannot be discarded")
+        if any(
+            ledger.record(root).phase not in {
+                RootWritePhase.UNATTEMPTED, RootWritePhase.FAILED,
+            }
+            or (
+                ledger.record(root).phase is RootWritePhase.FAILED
+                and ledger.record(root).failed_stage != "export"
+            )
+            for root in ledger.roots
+        ):
+            raise RuntimeError("capture writeback may have modified the frame")
+        self._writeback_ledger = None
 
     def track_temporary_key(self, key: str) -> None:
         """Adopt a created key before any attempt to delete it."""
