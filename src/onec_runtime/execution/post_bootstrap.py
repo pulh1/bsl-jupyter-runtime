@@ -35,7 +35,8 @@ from onec_runtime.execution.worker_breakpoint_service import WorkerBreakpointSer
 from onec_runtime.execution.worker_module_lifecycle import (
     WorkerModuleArtifactPreparer, WorkerModuleLifecycleService,
 )
-from onec_runtime.rdbg.models import DebugTarget, ModuleLocation, TargetId
+from onec_runtime.rdbg.models import DebugTarget, ModuleLocation, StopEvent, TargetId
+from onec_runtime.rdbg.session import SessionState
 from onec_runtime.runtime_contracts import OperationExecutionProvenance
 from onec_runtime.server_worker import NotebookWorkerArtifactBuilder
 from onec_runtime.worker_breakpoints import WorkerBreakpointCoordinator
@@ -173,6 +174,7 @@ def compose_fresh_post_bootstrap_execution(
     stopped_target: DebugTarget,
     capture_locations: tuple[ModuleLocation, ...],
     notebook_builder: NotebookWorkerArtifactBuilder,
+    bootstrap_stop: StopEvent | None = None,
     target_profile: str = "notebook-worker",
     worker_module_builder: WorkerModuleArtifactBuilder | None = None,
     resolve_capture_sources: CaptureSourceResolver | None = None,
@@ -187,7 +189,9 @@ def compose_fresh_post_bootstrap_execution(
     target and completed the extension handshake.
     """
 
-    target = _fresh_stopped_target(session, stopped_target)
+    target = _fresh_stopped_target(
+        session, stopped_target, service_location, bootstrap_stop,
+    )
     if target.target_type == "ServerEmulation":
         if file_target_lease is None:
             raise ProtocolError("fresh file runtime requires its owned file debuggee lease")
@@ -314,9 +318,12 @@ def compose_fresh_post_bootstrap_execution(
 
 
 def _fresh_stopped_target(
-    session: EvaluationSession, stopped_target: DebugTarget,
+    session: EvaluationSession,
+    stopped_target: DebugTarget,
+    service_location: ModuleLocation,
+    bootstrap_stop: StopEvent | None,
 ) -> DebugTarget:
-    """Return the exact target a completed fresh bootstrap left stopped."""
+    """Verify the final stop, not the possibly old target registry state."""
 
     target = getattr(session, "target", None)
     if (
@@ -324,7 +331,18 @@ def _fresh_stopped_target(
         or not isinstance(target, DebugTarget)
         or target.target_id != stopped_target.target_id
         or target.target_type != stopped_target.target_type
-        or target.state.casefold() != "stopped"
+    ):
+        raise ProtocolError("fresh post-bootstrap composition requires an exact stopped target")
+    if bootstrap_stop is not None:
+        if (
+            not isinstance(bootstrap_stop, StopEvent)
+            or bootstrap_stop.target_id != target.target_id
+            or bootstrap_stop.location != service_location
+            or getattr(session, "state", None) is not SessionState.READY
+        ):
+            raise ProtocolError("fresh post-bootstrap composition requires an exact stopped target")
+    elif (
+        target.state.casefold() != "stopped"
         or stopped_target.state.casefold() != "stopped"
     ):
         raise ProtocolError("fresh post-bootstrap composition requires an exact stopped target")

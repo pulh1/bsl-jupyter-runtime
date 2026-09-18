@@ -51,6 +51,7 @@ from onec_runtime.rdbg.models import (
     StopEvent,
     TargetId,
 )
+from onec_runtime.rdbg.session import SessionState
 from onec_runtime.session import (
     ExtensionMode,
     RuntimeSession,
@@ -929,6 +930,7 @@ def patch_successful_runtime_attempt(
         on_entry(rdbg)
         service_target_id = probe.service_target_id or probe.server_target_id
         rdbg.target = DebugTarget(service_target_id, server_target_type, "stopped")
+        rdbg.state = SessionState.READY
         error = probe.service_errors.get(rdbg.attempt)
         if error is not None:
             raise error

@@ -1242,6 +1242,7 @@ class RuntimeSession:
                 service_location,
                 runtime_generation=_allocate_runtime_generation(),
                 stopped_target=server_target,
+                bootstrap_stop=service_stop,
                 capture_locations=(),
                 notebook_builder=notebook_worker_builder,
                 target_profile="runtime-session-server-v1",

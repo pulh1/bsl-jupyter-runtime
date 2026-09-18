@@ -17,7 +17,8 @@ from onec_runtime.execution.termination import FileTargetProcessLease
 from onec_runtime.execution.worker_activation import WorkerActivationSnapshot
 from onec_runtime.execution.worker_activation import WorkerMaterializationSnapshot
 from onec_runtime.execution.value_materialization_router import ValueMaterializationRouter
-from onec_runtime.rdbg.models import DebugTarget
+from onec_runtime.rdbg.models import DebugTarget, StopEvent
+from onec_runtime.rdbg.session import SessionState
 from onec_runtime.runtime_api import RuntimeReplyKind
 from onec_runtime.rdbg.models import EvaluationResult
 from onec_runtime.table_materialization import ReferencePolicy
@@ -338,6 +339,43 @@ def test_fresh_post_bootstrap_rejects_a_different_stopped_target() -> None:
             session, KERNEL,
             runtime_generation=7,
             stopped_target=foreign,
+            capture_locations=(),
+            notebook_builder=lambda *_args, **_kwargs: None,
+        )
+
+
+def test_fresh_post_bootstrap_accepts_exact_observed_stop_over_old_registry_state() -> None:
+    session = CompleteSession()
+    session.target = DebugTarget(TARGET, "Server", "Started", 1)
+    session.state = SessionState.READY
+    stop = StopEvent(TARGET, KERNEL, "breakpoint")
+
+    composed = compose_fresh_post_bootstrap_execution(
+        session, KERNEL,
+        runtime_generation=7,
+        stopped_target=session.target,
+        bootstrap_stop=stop,
+        capture_locations=(),
+        notebook_builder=lambda *_args, **_kwargs: None,
+    )
+    try:
+        assert composed.execution.core.controller._initial_target_id == TARGET
+    finally:
+        composed.execution.facade.close()
+
+
+def test_fresh_post_bootstrap_rejects_foreign_observed_stop() -> None:
+    session = CompleteSession()
+    session.target = DebugTarget(TARGET, "Server", "Started", 1)
+    session.state = SessionState.READY
+    foreign = type(TARGET)(TARGET.id, "another-target")
+
+    with pytest.raises(ProtocolError, match="exact stopped target"):
+        compose_fresh_post_bootstrap_execution(
+            session, KERNEL,
+            runtime_generation=7,
+            stopped_target=session.target,
+            bootstrap_stop=StopEvent(foreign, KERNEL, "breakpoint"),
             capture_locations=(),
             notebook_builder=lambda *_args, **_kwargs: None,
         )
