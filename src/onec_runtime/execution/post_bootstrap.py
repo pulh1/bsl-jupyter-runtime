@@ -16,6 +16,7 @@ from onec_runtime.execution.composition import (
     ExecutionCore, bind_worker_universe_activation, build_execution_core,
 )
 from onec_runtime.execution.contracts import PreparedCell, ReplyPresenter
+from onec_runtime.execution.capture.public_inspection import CaptureSourceResolver
 from onec_runtime.execution.namespace import RuntimeNamespaceOwner
 from onec_runtime.execution.provenance import PreparedExecutionProvenanceReader
 from onec_runtime.execution.public_facade import PublicExecutionFacade
@@ -80,6 +81,7 @@ def compose_post_bootstrap_execution(
     ) = None,
     worker_activation: WorkerActivationPort | None = None,
     breakpoint_routes: RouteBreakpointWorkspace | None = None,
+    resolve_capture_sources: CaptureSourceResolver | None = None,
 ) -> PostBootstrapExecution:
     """Compose the new owner path from already-verified bootstrap resources.
 
@@ -130,6 +132,8 @@ def compose_post_bootstrap_execution(
             source_identity=source_identity,
             status_reader=status.status,
             namespace_reader=status.namespace_snapshot,
+            worker_catalog_snapshot=worker_materialization_snapshot,
+            resolve_capture_sources=resolve_capture_sources,
             provenance_reader=(
                 PreparedExecutionProvenanceReader()
                 if provenance_reader is None
@@ -158,6 +162,7 @@ def compose_fresh_post_bootstrap_execution(
     capture_locations: tuple[ModuleLocation, ...],
     notebook_builder: NotebookWorkerArtifactBuilder,
     target_profile: str = "notebook-worker",
+    resolve_capture_sources: CaptureSourceResolver | None = None,
 ) -> FreshPostBootstrapExecution:
     """Create all new execution owners after bootstrap stopped one exact target.
 
@@ -230,6 +235,7 @@ def compose_fresh_post_bootstrap_execution(
         reply_presenter=RuntimeReplyPresenter(reply_status),
         retained_source_units=settlement.retained_source_units,
         breakpoint_routes=routes,
+        resolve_capture_sources=resolve_capture_sources,
     )
     status["projection"] = composed.status
     try:

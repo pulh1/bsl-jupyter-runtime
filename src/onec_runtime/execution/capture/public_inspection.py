@@ -3,14 +3,22 @@
 from __future__ import annotations
 
 from contextlib import AbstractContextManager, nullcontext
-from typing import Callable, Protocol
+from typing import Callable, Protocol, TypeAlias
 
-from onec_runtime.capture_inspection import DebugFrame, StackDescriptor
+from onec_runtime.capture_inspection import (
+    DebugFrame, ResolvedFrameSource, StackDescriptor,
+)
 from onec_runtime.capture_values import CaptureContextView, CaptureValuePolicy
 from onec_runtime.errors import ProtocolError
 from onec_runtime.execution.capture.data_plane import CaptureTicketDataPlane
 from onec_runtime.execution.capture.scope import CaptureScope
 from onec_runtime.execution.capture.value_projection import CaptureTicketValueProjection
+from onec_runtime.rdbg.models import StackFrame
+
+
+CaptureSourceResolver: TypeAlias = Callable[
+    [tuple[StackFrame, ...]], tuple[ResolvedFrameSource | None, ...]
+]
 
 
 class CaptureInspectionController(Protocol):
@@ -64,14 +72,18 @@ class CaptureInspectionBridge:
         *,
         policy: CaptureValuePolicy = CaptureValuePolicy(),
         wait_handoff: Callable[[], AbstractContextManager[None]] = nullcontext,
+        resolve_sources: CaptureSourceResolver | None = None,
     ) -> None:
         if not isinstance(policy, CaptureValuePolicy):
             raise TypeError("CAPTURE value policy is invalid")
         if not callable(wait_handoff):
             raise TypeError("CAPTURE ticket wait handoff is invalid")
+        if resolve_sources is not None and not callable(resolve_sources):
+            raise TypeError("CAPTURE source resolver is invalid")
         self._controller = controller
         self._policy = policy
         self._wait_handoff = wait_handoff
+        self._resolve_sources = resolve_sources
 
     def current(self) -> CaptureInspection:
         """Bind a stack/frame/context API to the active ready CAPTURE scope."""
@@ -81,6 +93,7 @@ class CaptureInspectionBridge:
             raise ProtocolError("CAPTURE inspection requires an active scope")
         data = CaptureTicketDataPlane(
             self._controller, scope, wait_handoff=self._wait_handoff,  # type: ignore[arg-type]
+            resolve_sources=self._resolve_sources,
         )
         values = CaptureTicketValueProjection(
             self._controller, scope, policy=self._policy,  # type: ignore[arg-type]
@@ -89,4 +102,7 @@ class CaptureInspectionBridge:
         return CaptureInspection(data, values)
 
 
-__all__ = ["CaptureInspection", "CaptureInspectionBridge", "CaptureInspectionController"]
+__all__ = [
+    "CaptureInspection", "CaptureInspectionBridge",
+    "CaptureInspectionController", "CaptureSourceResolver",
+]

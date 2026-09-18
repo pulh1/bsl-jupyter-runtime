@@ -42,6 +42,11 @@ def test_post_bootstrap_factory_builds_one_core_with_public_facade() -> None:
     namespace = RuntimeNamespaceOwner(7, 3, worker_snapshot=worker)
     settlement = RouteSettlementService(namespace)
     retained: list[SourceUnitRef] = []
+    resolved_frames: list[tuple[int, ...]] = []
+
+    def resolve_sources(frames):  # type: ignore[no-untyped-def]
+        resolved_frames.append(tuple(frame.level for frame in frames))
+        return (None,) * len(frames)
 
     composed = compose_post_bootstrap_execution(
         session,
@@ -56,6 +61,7 @@ def test_post_bootstrap_factory_builds_one_core_with_public_facade() -> None:
         settlement_services=settlement,
         reply_presenter=_Replies(),
         retained_source_units=lambda: tuple(retained),
+        resolve_capture_sources=resolve_sources,
     )
     try:
         assert composed.core.arbiter is composed.facade._arbiter
@@ -76,6 +82,7 @@ def test_post_bootstrap_factory_builds_one_core_with_public_facade() -> None:
         first = composed.facade.execute_bsl("Результат = 1;")
         assert first.kind is RuntimeReplyKind.CAPTURED
         assert composed.facade.capture_inspection().stack[:1].total >= 1
+        assert resolved_frames
         cell = composed.facade.execute_bsl("Результат = 2;")
         assert cell.kind is RuntimeReplyKind.CAPTURE_CELL
         final = composed.facade.resume_capture()

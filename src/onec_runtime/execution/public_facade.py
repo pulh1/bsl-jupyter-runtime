@@ -22,7 +22,7 @@ from onec_runtime.errors import NoActiveCaptureError, ProtocolError
 from onec_runtime.execution.arbiter import ExecutionTicket, RdbgArbiter
 from onec_runtime.execution.contracts import PreparedCell
 from onec_runtime.execution.capture.public_inspection import (
-    CaptureInspection, CaptureInspectionBridge,
+    CaptureInspection, CaptureInspectionBridge, CaptureSourceResolver,
 )
 from onec_runtime.execution.capture.session_inspection_adapter import (
     SessionCaptureInspectionAdapter,
@@ -91,6 +91,7 @@ class PublicExecutionFacade:
         worker_catalog_snapshot: (
             Callable[[], WorkerMaterializationSnapshot] | None
         ) = None,
+        resolve_capture_sources: CaptureSourceResolver | None = None,
         value_router: ValueTransferPort | None = None,
         value_router_factory: (
             Callable[
@@ -111,6 +112,8 @@ class PublicExecutionFacade:
             raise TypeError("completion Worker catalog reader must be callable")
         if worker_catalog_snapshot is not None and namespace_reader is None:
             raise TypeError("completion fields require a namespace reader")
+        if resolve_capture_sources is not None and not callable(resolve_capture_sources):
+            raise TypeError("CAPTURE source resolver must be callable")
         if source_identity is not None and not isinstance(
             source_identity, NotebookSourceIdentityFactory
         ):
@@ -147,6 +150,7 @@ class PublicExecutionFacade:
         )
         self._capture_inspection = CaptureInspectionBridge(
             controller, wait_handoff=self._wait_handoff,
+            resolve_sources=resolve_capture_sources,
         )
         self._session_capture_inspection = SessionCaptureInspectionAdapter(
             controller, self._capture_inspection, wait_handoff=self._wait_handoff,

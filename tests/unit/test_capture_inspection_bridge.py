@@ -2,6 +2,9 @@
 
 import pytest
 
+from onec_runtime.bsl.module_syntax import ModuleIdentity
+from onec_runtime.capture_inspection import ResolvedFrameSource
+from onec_runtime.capture_source import SourceVersionRef
 from onec_runtime.capture_values import UnavailableValueNode
 from onec_runtime.errors import StaleCaptureError
 from onec_runtime.execution.capture.inspection import NativeVariablePage
@@ -65,3 +68,27 @@ def test_inspection_handle_becomes_stale_after_capture_resume() -> None:
         inspection.frame(0)
     with pytest.raises(StaleCaptureError):
         _ = inspection.context.variables[:1]
+
+
+def test_bridge_passes_session_source_resolution_to_saved_stack() -> None:
+    scope = ready_scope()
+    controller = _Controller(scope)
+    source = "Procedure RunFixture()\nEndProcedure"
+    resolved = ResolvedFrameSource(
+        "Common.RunFixture", 1,
+        ModuleIdentity("opaque", "worker", "common", "fixture", "Module"),
+        SourceVersionRef.worker(
+            artifact_id="bridge-fixture", generation=1, source_text=source,
+        ),
+    )
+    calls: list[tuple[int, ...]] = []
+
+    def resolve_sources(frames):  # type: ignore[no-untyped-def]
+        calls.append(tuple(frame.level for frame in frames))
+        return tuple(resolved if frame.level == 0 else None for frame in frames)
+
+    inspection = CaptureInspectionBridge(
+        controller, resolve_sources=resolve_sources,
+    ).current()
+    assert inspection.stack[:1].frames[0].source == "Common.RunFixture"
+    assert calls == [(0,)]
