@@ -1,4 +1,4 @@
-"""Explicit composition seam for a post-bootstrap execution cutover."""
+"""Compose one execution owner from a verified post-bootstrap stop."""
 
 from __future__ import annotations
 
@@ -94,7 +94,7 @@ def compose_post_bootstrap_execution(
 
     This factory does not inspect or start a RuntimeSession. Callers provide
     all state owners and public reply/provenance adapters explicitly so a
-    later cutover can occur without inheriting legacy RuntimeApi ownership.
+    RuntimeSession startup can transfer ownership without a legacy RuntimeApi.
     """
 
     if not isinstance(namespace, RuntimeNamespaceOwner):
@@ -179,8 +179,8 @@ def compose_fresh_post_bootstrap_execution(
     This helper is valid only for a fresh bootstrap: no notebook statement has
     run, no namespace name is confirmed, and no Worker generation exists.
     Those facts justify the empty namespace and context generation ``1``.
-    It deliberately remains separate from ``RuntimeSession.start`` until that
-    path supplies equivalent authoritative bootstrap evidence.
+    ``RuntimeSession.start`` calls this only after it has verified the server
+    target and completed the extension handshake.
     """
 
     target = _fresh_stopped_target(session, stopped_target)

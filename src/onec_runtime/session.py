@@ -82,6 +82,9 @@ from onec_runtime.extension_lifecycle import (
 )
 from onec_runtime.extension_state import ExtensionStateStore
 from onec_runtime.execution.arbiter import ArbiterBusy
+from onec_runtime.execution.post_bootstrap import (
+    FreshPostBootstrapExecution, compose_fresh_post_bootstrap_execution,
+)
 from onec_runtime.execution.public_facade import PublicExecutionFacade
 from onec_runtime.performance_profile import PhaseRecorder
 from onec_runtime.processes import FileModeProcesses
@@ -89,12 +92,10 @@ from onec_runtime.prototype_runtime import (
     ContinuationAttemptEvidence,
     ContinuationAttemptSpec,
     OperationState,
-    PrototypeRuntimeController,
 )
 from onec_runtime.rdbg.models import ModuleLocation, StackFrame, TargetId
 from onec_runtime.rdbg.session import RdbgSession
 from onec_runtime.rdbg.transport import RdbgTransport, TranscriptEntry
-from onec_runtime.recovery_journal import RecoveryJournal
 from onec_runtime.runtime_api import (
     PrototypeRuntimeApi,
     RuntimeNamespaceSnapshot,
@@ -138,22 +139,6 @@ def _allocate_runtime_generation() -> int:
     with _runtime_generation_lock:
         _next_runtime_generation += 1
         return _next_runtime_generation
-
-
-def _bootstrap_runtime_controller(
-    rdbg: RdbgSession,
-    service_location: ModuleLocation,
-    journal: RecoveryJournal,
-) -> PrototypeRuntimeController:
-    """Create the controller for one newly bootstrapped runtime target."""
-
-    return PrototypeRuntimeController(
-        rdbg,
-        service_location,
-        command_timeout_s=90.0,
-        runtime_generation=_allocate_runtime_generation(),
-        journal=journal,
-    )
 
 
 class ExtensionMode(StrEnum):
@@ -1099,6 +1084,7 @@ class RuntimeSession:
         rdbg: RdbgSession | None = None
         registration_candidates: list[RdbgSession] = []
         runtime_session: RuntimeSession | None = None
+        execution: FreshPostBootstrapExecution | None = None
         stage = "process-start"
         try:
             managed_location, entry_location, service_location = (
@@ -1233,12 +1219,6 @@ class RuntimeSession:
                     progress("Проверка безопасного режима расширения 1С")
                 verify_extension_safe_mode_disabled(rdbg)
 
-            journal = RecoveryJournal(artifacts.append_jsonl)
-            controller = _bootstrap_runtime_controller(
-                rdbg,
-                service_location,
-                journal,
-            )
             notebook_worker_builder = NotebookWorkerArtifactBuilder(runtime)
             worker_module_builder = WorkerModuleArtifactBuilder(
                 notebook_worker_builder,
@@ -1246,13 +1226,21 @@ class RuntimeSession:
                 packer_version="worker-epf-v1",
                 target_profile="runtime-session-server-v1",
             )
-            api = PrototypeRuntimeApi(
-                controller,
-                journal=journal,
-                notebook_worker_builder=notebook_worker_builder,
+            stage = "execution-composition"
+            execution = compose_fresh_post_bootstrap_execution(
+                rdbg,
+                service_location,
+                runtime_generation=_allocate_runtime_generation(),
+                stopped_target=server_target,
+                capture_locations=(),
+                notebook_builder=notebook_worker_builder,
+                target_profile="runtime-session-server-v1",
                 worker_module_builder=worker_module_builder,
             )
-            runtime_session = cls(config, processes, transport, rdbg, api, artifacts)
+            runtime_session = cls(
+                config, processes, transport, rdbg, execution.execution.facade,
+                artifacts,
+            )
             runtime_session._attempt_bootstrap_evidence = _AttemptBootstrapEvidence(
                 managed_stop=_stop_summary(
                     managed_stop,
@@ -1294,6 +1282,11 @@ class RuntimeSession:
                     cleanup_errors.append(cleanup_error)
                     cleanup_retry = runtime_session.close
             else:
+                if execution is not None:
+                    try:
+                        execution.execution.facade.close()
+                    except BaseException as cleanup_error:
+                        cleanup_errors.append(cleanup_error)
                 cleanup = _StartupAttemptCleanup(
                     runtime, processes, transport, rdbg
                 )

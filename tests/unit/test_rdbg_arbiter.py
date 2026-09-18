@@ -2223,6 +2223,248 @@ def _unknown_server_stop(*, absence_results, block_confirmation=None,
     return session, capture_route if handoff_to_capture else route, arbiter, ticket, target, evidence
 
 
+def test_stop_automatically_terminates_fenced_server_target_on_same_worker():
+    from onec_runtime.execution.termination import ServerTerminationConfirmed
+
+    session, route, arbiter, ticket, target, evidence = _unknown_server_stop(
+        absence_results=[None],
+    )
+
+    assert arbiter.request_stop(ticket).name == 'REQUESTED'
+    attempt = ticket.stop_teardown
+    assert attempt is not None
+    result = attempt.wait(3)
+    assert isinstance(result, ServerTerminationConfirmed)
+    assert result.expected_target == target and result.absence is evidence
+    with pytest.raises(arbiter_module.TargetTerminated):
+        ticket.wait_settled(3)
+    assert [call[0] for call in session.calls] == ['continue', 'terminate', 'confirm']
+    assert len({call[1] for call in session.calls}) == 1
+    arbiter.close(timeout=3)
+
+
+def test_stop_during_main_wait_automatically_terminates_after_worker_checkpoint():
+    from onec_runtime.errors import StopWaitIntervalElapsed
+    from onec_runtime.execution.termination import ServerTerminationConfirmed
+    from onec_runtime.rdbg.models import DebugTarget
+    from onec_runtime.rdbg.session import BoundServerTargetAbsence
+
+    target = TargetId(uuid4(), 'DefAlias', uuid4())
+    client = TargetId(uuid4(), 'DefAlias', target.seance_id)
+    evidence = BoundServerTargetAbsence(client, target, 1.0, 1)
+    entered_wait = Event()
+    release_wait = Event()
+
+    class ServerSession:
+        def __init__(self):
+            self.target = DebugTarget(target, 'Server', 'running')
+            self.calls = []
+
+        def continue_(self, *, on_transport_dispatch):
+            on_transport_dispatch()
+            self.calls.append(('continue', get_ident()))
+
+        def wait_for_any_stop(self, *, timeout_s, expected_target, on_transport_dispatch):
+            assert expected_target == target
+            on_transport_dispatch()
+            self.calls.append(('wait', get_ident()))
+            entered_wait.set()
+            assert release_wait.wait(3)
+            raise StopWaitIntervalElapsed('poll interval')
+
+        def terminate_bound_server_session(self):
+            self.calls.append(('terminate', get_ident()))
+            return True
+
+        def wait_for_bound_server_targets_absent(self, expected_target, *, timeout_s):
+            self.calls.append(('confirm', get_ident()))
+            assert expected_target == target
+            return evidence
+
+    session = ServerSession()
+    route = RouteToken('main-auto-stop', 1, 0, 'main')
+    arbiter = RdbgArbiter(session, route)
+
+    def main(port):
+        port.continue_()
+        while True:
+            try:
+                return Settlement(port.wait_for_any_stop(timeout_s=0.01))
+            except StopWaitIntervalElapsed:
+                continue
+
+    ticket = arbiter.submit(route, main)
+    arbiter.dispatch(ticket)
+    assert entered_wait.wait(3)
+    assert arbiter.request_stop(ticket).name == 'REQUESTED'
+    assert ticket.stop_teardown is None  # One worker still owns the wait.
+    release_wait.set()
+    with pytest.raises(arbiter_module.TargetTerminated):
+        ticket.wait_settled(3)
+    attempt = ticket.stop_teardown
+    assert attempt is not None
+    assert isinstance(attempt.wait(3), ServerTerminationConfirmed)
+    assert [name for name, _ in session.calls] == ['continue', 'wait', 'terminate', 'confirm']
+    assert len({thread for _, thread in session.calls}) == 1
+    arbiter.close(timeout=3)
+
+
+def test_stop_during_capture_eval_retains_pending_until_target_absence():
+    from onec_runtime.execution.termination import ServerTerminationConfirmed
+    from onec_runtime.rdbg.models import DebugTarget
+    from onec_runtime.rdbg.session import BoundServerTargetAbsence
+
+    target = TargetId(uuid4(), 'DefAlias', uuid4())
+    client = TargetId(uuid4(), 'DefAlias', target.seance_id)
+    evidence = BoundServerTargetAbsence(client, target, 1.0, 1)
+    entered_wait = Event()
+    release_wait = Event()
+    entered_confirmation = Event()
+    release_confirmation = Event()
+
+    class ServerSession:
+        def __init__(self):
+            self.target = DebugTarget(target, 'Server', 'stopped')
+            self.pending = PendingEvaluation(target, uuid4(), self)
+            self.calls = []
+
+        def start_evaluation(self, expression, *, on_transport_dispatch, **kwargs):
+            on_transport_dispatch()
+            self.calls.append(('eval', get_ident()))
+            return self.pending
+
+        def wait_evaluation_event(self, pending, *, timeout_s, on_transport_dispatch):
+            assert pending is self.pending
+            on_transport_dispatch()
+            self.calls.append(('wait', get_ident()))
+            entered_wait.set()
+            assert release_wait.wait(3)
+            raise CommandTimeout('empty poll interval')
+
+        def terminate_bound_server_session(self):
+            self.calls.append(('terminate', get_ident()))
+            return True
+
+        def wait_for_bound_server_targets_absent(self, expected_target, *, timeout_s):
+            assert expected_target == target
+            self.calls.append(('confirm', get_ident()))
+            entered_confirmation.set()
+            assert release_confirmation.wait(3)
+            return evidence
+
+    session = ServerSession()
+    route = RouteToken('capture-auto-stop', 1, 0, 'capture-scope')
+    arbiter = RdbgArbiter(session, route)
+
+    def capture(port):
+        pending = port.start_evaluation('long-running')
+        while True:
+            try:
+                return Settlement(port.wait_evaluation_event(pending, timeout_s=0.01))
+            except CommandTimeout:
+                continue
+
+    ticket = arbiter.submit(route, capture)
+    arbiter.dispatch(ticket)
+    assert entered_wait.wait(3)
+    assert arbiter.request_stop(ticket).name == 'REQUESTED'
+    release_wait.set()
+    assert entered_confirmation.wait(3)
+    try:
+        assert ticket.status().pending_capability is session.pending
+        assert arbiter.active_ticket is ticket
+        with pytest.raises(ArbiterBusy):
+            arbiter.submit(route, lambda port: Settlement('unsafe'))
+    finally:
+        release_confirmation.set()
+    with pytest.raises(arbiter_module.TargetTerminated):
+        ticket.wait_settled(3)
+    attempt = ticket.stop_teardown
+    assert attempt is not None
+    assert isinstance(attempt.wait(3), ServerTerminationConfirmed)
+    assert [name for name, _ in session.calls] == ['eval', 'wait', 'terminate', 'confirm']
+    assert len({thread for _, thread in session.calls}) == 1
+    arbiter.close(timeout=3)
+
+
+def test_stop_does_not_terminate_server_after_matching_main_stop_wins_race():
+    from onec_runtime.rdbg.models import DebugTarget, ModuleLocation, StopEvent
+
+    target = TargetId(uuid4(), 'DefAlias', uuid4())
+    stop = StopEvent(
+        target, ModuleLocation('ExtensionModule', '', uuid4(), uuid4(), 1, 'Test'),
+        'breakpoint',
+    )
+    entered_wait = Event()
+    release_wait = Event()
+
+    class ServerSession:
+        def __init__(self):
+            self.target = DebugTarget(target, 'Server', 'running')
+            self.terminations = 0
+
+        def continue_(self, *, on_transport_dispatch):
+            on_transport_dispatch()
+
+        def wait_for_any_stop(self, *, timeout_s, expected_target, on_transport_dispatch):
+            on_transport_dispatch()
+            entered_wait.set()
+            assert release_wait.wait(3)
+            return stop
+
+        def terminate_bound_server_session(self):
+            self.terminations += 1
+            return True
+
+    session = ServerSession()
+    route = RouteToken('main-result-wins-stop', 1, 0, 'main')
+    arbiter = RdbgArbiter(session, route)
+
+    def main(port):
+        port.continue_()
+        return Settlement(port.wait_for_any_stop(timeout_s=0.01))
+
+    ticket = arbiter.submit(route, main)
+    arbiter.dispatch(ticket)
+    assert entered_wait.wait(3)
+    assert arbiter.request_stop(ticket).name == 'REQUESTED'
+    release_wait.set()
+    assert ticket.wait_settled(3) is stop
+    assert ticket.stop_teardown is None
+    assert session.terminations == 0
+    arbiter.close(timeout=3)
+
+
+@pytest.mark.parametrize('selected_kind', ['foreign_target', 'file_mode'])
+def test_auto_stop_requires_exact_owned_server_target(selected_kind):
+    from onec_runtime.rdbg.models import DebugTarget
+
+    from onec_runtime.execution.termination import ServerTerminationConfirmed
+
+    session, route, arbiter, ticket, target, evidence = _unknown_server_stop(
+        absence_results=[None],
+    )
+    session.target = (
+        DebugTarget(TargetId(uuid4(), 'DefAlias', target.seance_id), 'Server', 'stopped')
+        if selected_kind == 'foreign_target'
+        else DebugTarget(target, 'ServerEmulation', 'stopped')
+    )
+
+    assert arbiter.request_stop(ticket).name == 'REQUESTED'
+    assert ticket.stop_teardown is None
+    assert ticket.wait_unknown(0)
+    assert arbiter.active_ticket is ticket
+    assert [call[0] for call in session.calls] == ['continue']
+    with pytest.raises(ValueError, match='exact selected server target'):
+        arbiter.teardown_fenced_server_target(ticket, route, grace_s=0.01)
+    with pytest.raises(ArbiterBusy):
+        arbiter.close(timeout=0)
+    arbiter.retire_terminated_target(
+        ticket, route, ServerTerminationConfirmed(target, evidence),
+    )
+    arbiter.close(timeout=3)
+
+
 def test_server_stop_teardown_uses_same_worker_and_exact_proof():
     session, route, arbiter, ticket, target, evidence = _unknown_server_stop(
         absence_results=[None],
@@ -2235,7 +2477,8 @@ def test_server_stop_teardown_uses_same_worker_and_exact_proof():
     with pytest.raises(CancelledBeforeEffect):
         queued.wait_settled(3)
 
-    attempt = arbiter.teardown_fenced_server_target(ticket, route, grace_s=0.1)
+    attempt = ticket.stop_teardown
+    assert attempt is not None
     result = attempt.wait(3)
 
     from onec_runtime.execution.termination import ServerTerminationConfirmed
@@ -2259,7 +2502,8 @@ def test_server_stop_after_main_to_capture_handoff_uses_current_route():
     )
     assert arbiter.current_route == capture_route
     assert arbiter.request_stop(ticket).name == 'REQUESTED'
-    attempt = arbiter.teardown_fenced_server_target(ticket, capture_route, grace_s=0.1)
+    attempt = ticket.stop_teardown
+    assert attempt is not None
 
     result = attempt.wait(3)
     assert isinstance(result, ServerTerminationConfirmed)
@@ -2280,7 +2524,8 @@ def test_server_stop_rejects_foreign_absence_without_repeating_termination():
         absence_results=[foreign, None],
     )
     assert arbiter.request_stop(ticket).name == 'REQUESTED'
-    first = arbiter.teardown_fenced_server_target(ticket, route, grace_s=0.01)
+    first = ticket.stop_teardown
+    assert first is not None
     result = first.wait(3)
     assert isinstance(result, TerminationUnknown)
     assert result.error_type == 'EvidenceMismatch'
@@ -2289,6 +2534,7 @@ def test_server_stop_rejects_foreign_absence_without_repeating_termination():
     assert arbiter.active_ticket is ticket
 
     second = arbiter.teardown_fenced_server_target(ticket, route, grace_s=0.01)
+    assert ticket.stop_teardown is second
     confirmed = second.wait(3)
     assert isinstance(confirmed, ServerTerminationConfirmed)
     assert confirmed.absence is evidence
@@ -2305,7 +2551,8 @@ def test_server_stop_unknown_keeps_owner_and_retries_only_absence_probe():
         absence_results=[CommandTimeout('registry interval'), None],
     )
     assert arbiter.request_stop(ticket).name == 'REQUESTED'
-    first = arbiter.teardown_fenced_server_target(ticket, route, grace_s=0.01)
+    first = ticket.stop_teardown
+    assert first is not None
     unknown = first.wait(3)
     assert isinstance(unknown, TerminationUnknown)
     assert unknown.expected_target == target
@@ -2337,7 +2584,8 @@ def test_server_stop_teardown_waiter_timeout_retains_worker_and_route_fence():
     stale = RouteToken(route.incarnation, route.epoch + 1, 0, route.context_id)
     with pytest.raises(StaleRoute):
         arbiter.teardown_fenced_server_target(ticket, stale, grace_s=0.01)
-    attempt = arbiter.teardown_fenced_server_target(ticket, route, grace_s=0.01)
+    attempt = ticket.stop_teardown
+    assert attempt is not None
     assert session.confirmation_entered.wait(3)
     try:
         with pytest.raises(TimeoutError):
@@ -2407,7 +2655,8 @@ def test_real_rdbg_server_teardown_and_absence_share_arbiter_worker():
     arbiter.dispatch(ticket)
     assert ticket.wait_unknown(3)
     assert arbiter.request_stop(ticket).name == 'REQUESTED'
-    attempt = arbiter.teardown_fenced_server_target(ticket, route, grace_s=0.1)
+    attempt = ticket.stop_teardown
+    assert attempt is not None
     result = attempt.wait(3)
 
     assert isinstance(result, ServerTerminationConfirmed)

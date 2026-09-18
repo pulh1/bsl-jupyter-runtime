@@ -174,6 +174,7 @@ class ExecutionTicket:
         self._stop_requested = False
         self._stop_blocked_after_effect = False
         self._server_termination_attempted = False
+        self._stop_teardown: ServerTeardownAttempt | None = None
         self._stop_target: TargetId | None = None
         self._effect_target: TargetId | None = None
         self._value: Any = None
@@ -188,6 +189,13 @@ class ExecutionTicket:
 
         with self._owner._mailbox:
             return self._post_settlement_cleanup
+
+    @property
+    def stop_teardown(self) -> ServerTeardownAttempt | None:
+        """Worker-owned Stop proof, if exact server-target evidence allowed it."""
+
+        with self._owner._mailbox:
+            return self._stop_teardown
 
     def status(self) -> TicketStatus:
         with self._owner._mailbox:
@@ -512,9 +520,10 @@ class RdbgArbiter:
 
     The port exposes evaluation and MAIN command operations with ownership evidence.
     No background polling is started: active plans read events on this worker.
-    Unknown plans keep the slot until a reconciliation/teardown plan supplies a
-    confirmed settlement. This primitive cannot itself infer protocol evidence
-    or terminate remote execution; those are executor responsibilities.
+    Unknown plans keep the slot until a reconciliation or exact target absence
+    proof settles them. A user Stop schedules server termination on this same
+    worker only after the active plan relinquishes it; unmatched target evidence
+    keeps the old owner fenced.
     """
 
     def __init__(self, session: EvaluationSession, route: RouteToken):
@@ -604,7 +613,7 @@ class RdbgArbiter:
             return cleanup
 
     def request_stop(self, ticket: ExecutionTicket) -> StopRequestOutcome:
-        """Fence user dispatch; a later stop plan must establish remote termination.
+        """Fence dispatch and schedule exact server teardown if still unknown.
 
         A queued ticket has no remote effects and can be cancelled locally.
         An active ticket keeps ownership until its plan settles or reconciles.
@@ -624,7 +633,51 @@ class RdbgArbiter:
                 while self._queue:
                     self._settle(self._queue.popleft(), error=CancelledBeforeEffect())
                 self._mailbox.notify_all()
+            self._schedule_auto_server_stop_locked(ticket)
             return StopRequestOutcome.REQUESTED
+
+    def _schedule_auto_server_stop_locked(self, ticket: ExecutionTicket) -> None:
+        """Run Stop only after the active plan relinquishes the one RDBG worker."""
+
+        if (
+            not ticket._stop_requested
+            or ticket._phase != 'unknown'
+            or self._active is not ticket
+            or self._reconciliation is not None
+            or self._server_teardown is not None
+        ):
+            return
+        expected = self._exact_server_stop_target_locked(ticket)
+        if expected is None:
+            # File targets require their exact process owner; an uncertain
+            # server target must remain fenced instead of killing a guess.
+            return
+        attempt = ServerTeardownAttempt(
+            self, ticket, expected, 30.0,
+            request_termination=not ticket._server_termination_attempted,
+        )
+        ticket._server_termination_attempted = True
+        ticket._stop_teardown = attempt
+        self._server_teardown = attempt
+        self._mailbox.notify_all()
+
+    def _exact_server_stop_target_locked(
+        self, ticket: ExecutionTicket,
+    ) -> TargetId | None:
+        expected = (
+            ticket._pending.target_id if ticket._pending is not None else
+            ticket._stop_target or ticket._effect_target
+        )
+        selected = self._session.target
+        if (
+            expected is None
+            or expected.seance_id is None
+            or selected is None
+            or selected.target_id != expected
+            or selected.target_type != 'Server'
+        ):
+            return None
+        return expected
 
     def reconcile(self, ticket: ExecutionTicket, plan: Plan) -> None:
         """Schedule evidence collection or confirmed teardown, never blind retry."""
@@ -659,15 +712,15 @@ class RdbgArbiter:
                     or not ticket._stop_requested or self._reconciliation is not None
                     or self._server_teardown is not None):
                 raise ArbiterBusy('Server teardown requires the fenced unknown owner')
-            expected = (ticket._pending.target_id if ticket._pending is not None else
-                        ticket._stop_target or ticket._effect_target)
+            expected = self._exact_server_stop_target_locked(ticket)
             if expected is None:
-                raise ValueError('Server teardown requires an exact affected target')
+                raise ValueError('Server teardown requires the exact selected server target')
             attempt = ServerTeardownAttempt(
                 self, ticket, expected, float(grace_s),
                 request_termination=not ticket._server_termination_attempted,
             )
             ticket._server_termination_attempted = True
+            ticket._stop_teardown = attempt
             self._server_teardown = attempt
             self._mailbox.notify_all()
             return attempt
@@ -820,6 +873,7 @@ class RdbgArbiter:
                             or isinstance(error, OutcomeUnknown)):
                         ticket._phase = 'unknown'
                         ticket._error = error
+                        self._schedule_auto_server_stop_locked(ticket)
                         self._mailbox.notify_all()
                     else:
                         cleanup_plan = ticket._post_settlement_cleanup_plan
