@@ -165,6 +165,8 @@ def test_successor_commit_waits_for_confirmed_next_stop() -> None:
         ContinuationAttemptSpec("late-commit", 1, "request", ()),
         (BUSINESS,),
     )
+    with pytest.raises(ProtocolError, match="idle CAPTURE"):
+        api.configure_continuation_capture_points(())
     results: list[object] = []
     errors: list[BaseException] = []
 
