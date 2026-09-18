@@ -10,7 +10,7 @@ from __future__ import annotations
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from math import isfinite
 from threading import Thread, local
-from typing import Callable, Iterator, Protocol
+from typing import Callable, Iterator, Mapping, Protocol
 from uuid import UUID
 
 import pandas as pd
@@ -23,6 +23,9 @@ from onec_runtime.execution.arbiter import ExecutionTicket, RdbgArbiter
 from onec_runtime.execution.contracts import PreparedCell
 from onec_runtime.execution.capture.public_inspection import (
     CaptureInspection, CaptureInspectionBridge,
+)
+from onec_runtime.execution.capture.session_inspection_adapter import (
+    SessionCaptureInspectionAdapter,
 )
 from onec_runtime.execution.controller.controller import ExecutionController
 from onec_runtime.execution.pipeline import CellExecutionPipeline
@@ -122,6 +125,9 @@ class PublicExecutionFacade:
         )
         self._capture_inspection = CaptureInspectionBridge(
             controller, wait_handoff=self._wait_handoff,
+        )
+        self._session_capture_inspection = SessionCaptureInspectionAdapter(
+            controller, self._capture_inspection, wait_handoff=self._wait_handoff,
         )
         self._worker_breakpoint_service: WorkerBreakpointService | None = None
 
@@ -315,6 +321,26 @@ class PublicExecutionFacade:
         """Return stack, frame, and context handles for the current stop."""
 
         return self._capture_inspection.current()
+
+    def capture_stack(
+        self, *, cursor: int, limit: int, timeout_s: float | None = None,
+    ) -> Mapping[str, object]:
+        """Page safe native stack metadata for RuntimeSession's capture fence."""
+
+        return self._session_capture_inspection.capture_stack(
+            cursor=cursor, limit=limit, timeout_s=timeout_s,
+        )
+
+    def capture_frame(
+        self, *, level: int, cursor: int, limit: int,
+        name: str | None = None, timeout_s: float | None = None,
+    ) -> Mapping[str, object]:
+        """Page safe frame metadata for RuntimeSession's capture fence."""
+
+        return self._session_capture_inspection.capture_frame(
+            level=level, cursor=cursor, limit=limit,
+            name=name, timeout_s=timeout_s,
+        )
 
     def current_capture(self) -> CaptureView:
         """Return the established CaptureView contract over controller evidence."""

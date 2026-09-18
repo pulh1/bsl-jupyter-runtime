@@ -13,7 +13,7 @@ import pytest
 
 from onec_runtime.capture_evaluation import CapturePhase
 from onec_runtime.config import RuntimeConfig
-from onec_runtime.errors import NoActiveCaptureError
+from onec_runtime.errors import NoActiveCaptureError, ProtocolError
 from onec_runtime.execution.post_bootstrap import compose_fresh_post_bootstrap_execution
 from onec_runtime.runtime_api import RuntimeReplyKind
 from onec_runtime.session import RuntimeSession, RuntimeSessionConfig
@@ -55,6 +55,15 @@ def test_runtime_session_routes_main_capture_resume_and_heartbeat_through_one_ow
             self.eval_waiting = Event()
             self.release_eval = Event()
             self._last_expression = ""
+            self.hold_variable_read = False
+            self.variable_waiting = Event()
+            self.release_variable = Event()
+
+        def local_variables(self, stack_level=0, **kwargs):
+            if self.hold_variable_read and stack_level == 0:
+                self.variable_waiting.set()
+                assert self.release_variable.wait(5), "CAPTURE variable read was not released"
+            return super().local_variables(stack_level, **kwargs)
 
         def start_evaluation(self, expression: str, **kwargs: object):
             self._last_expression = expression
@@ -160,6 +169,44 @@ def test_runtime_session_routes_main_capture_resume_and_heartbeat_through_one_ow
         assert captured.capture_ticket == armed.ticket_id
         assert armed.expected_controller_operation_id == captured.operation_id
         assert armed.expected_stop_sequence == captured.stop_sequence
+        capture_fence = SimpleNamespace(
+            capture_intent_id=intent.capture_intent_id,
+            operation_id=intent.operation_id,
+            capture_generation=intent.capture_generation,
+            source_revision=intent.source_revision,
+            source_sha256=intent.source_sha256,
+            stop_sequence=captured.stop_sequence,
+        )
+        stack_page = runtime.capture_stack(capture_fence, cursor=0, limit=10)
+        assert stack_page["total"] >= 2
+        frame_page = runtime.capture_frame(
+            capture_fence, level=0, cursor=0, limit=10,
+        )
+        assert frame_page["frame"]["level"] == 0
+        session.hold_variable_read = True
+        variable_reply: list[object] = []
+        variable_errors: list[BaseException] = []
+
+        def read_named_variable() -> None:
+            try:
+                variable_reply.append(runtime.capture_frame(
+                    capture_fence, level=0, cursor=0, limit=1, name="Amount",
+                ))
+            except BaseException as error:
+                variable_errors.append(error)
+
+        variable_caller = Thread(target=read_named_variable, name="variable-caller")
+        variable_caller.start()
+        assert session.variable_waiting.wait(5)
+        assert runtime._operation_lock.acquire(blocking=False), (
+            "Session admission lock was retained during an owned variable read"
+        )
+        runtime._operation_lock.release()
+        session.release_variable.set()
+        variable_caller.join(timeout=5)
+        assert not variable_caller.is_alive()
+        assert variable_errors == []
+        assert variable_reply[0]["variables"][0]["name"] == "Amount"
         capture_view = runtime.current_capture()
         assert capture_view.status().phase is CapturePhase.PAUSED
 
@@ -179,6 +226,8 @@ def test_runtime_session_routes_main_capture_resume_and_heartbeat_through_one_ow
         completed, resume_caller = _notebook_call(runtime.resume_capture)
         assert completed.kind is RuntimeReplyKind.MAIN_COMPLETED
         assert capture_view.status().phase is CapturePhase.STALE
+        with pytest.raises(ProtocolError, match="capture frame is stale"):
+            runtime.capture_stack(capture_fence, cursor=0, limit=1)
         with pytest.raises(NoActiveCaptureError):
             runtime.current_capture()
         runtime._heartbeat_tick()
@@ -195,6 +244,7 @@ def test_runtime_session_routes_main_capture_resume_and_heartbeat_through_one_ow
         assert any(name == "heartbeat" for name, _ in calls)
     finally:
         session.release_eval.set()
+        session.release_variable.set()
         if capture_caller.ident is not None:
             capture_caller.join(timeout=5)
         runtime._heartbeat_stop.set()

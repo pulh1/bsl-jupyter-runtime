@@ -2006,6 +2006,13 @@ class RuntimeSession:
     def capture_frame(self, capture: object, *, level: int, cursor: int, limit: int, name: str | None = None, timeout_s: float | None = None) -> Mapping[str, object]:
         with self._operation_lock:
             self._require_capture_fence(capture)
+            bind = getattr(self.runtime_api, "execution_caller_handoff", None)
+            if callable(bind):
+                with bind(self._release_operation_lock_for_capture_wait):
+                    return self.runtime_api.capture_frame(
+                        level=level, cursor=cursor, limit=limit, name=name,
+                        timeout_s=timeout_s,
+                    )
             return self.runtime_api.capture_frame(
                 level=level, cursor=cursor, limit=limit, name=name,
                 timeout_s=timeout_s,
