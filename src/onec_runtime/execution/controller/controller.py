@@ -14,7 +14,9 @@ from typing import TYPE_CHECKING, Callable
 from uuid import uuid4
 from weakref import WeakKeyDictionary
 
-from onec_runtime.capture import build_live_capture_root_transfer_call
+from onec_runtime.capture import (
+    build_live_capture_root_transfer_call, build_live_current_capture_call,
+)
 from onec_runtime.capture_evaluation import (
     CaptureEvaluationKind, CaptureFailureDiagnostic,
 )
@@ -43,7 +45,7 @@ from onec_runtime.execution.capture.materialization import (
 )
 from onec_runtime.execution.capture.messages import CaptureMessageCollector
 from onec_runtime.execution.capture.operation_executor import (
-    CaptureCellOperation,
+    CaptureCellOperation, CaptureOperationRepairRequired,
     CaptureCellOperationExecutor,
 )
 from onec_runtime.execution.capture.policy import CaptureCellPolicy, CapturePreparedPayload
@@ -57,6 +59,10 @@ from onec_runtime.execution.breakpoint_routes import RouteBreakpointWorkspace
 from onec_runtime.execution.contracts import (
     Accepted, Current, PreparationContext, PreparedCell, Rejected,
     StalePreparation, StalePreparedDispatch, SubmissionReceipt, Unavailable,
+)
+from onec_runtime.execution.completion_fields import CompletionFieldsPlan
+from onec_runtime.execution.evaluation import (
+    EvaluationSuspended, wait_for_pending_result,
 )
 from onec_runtime.execution.main import MainExecutor, MainOperation, MainPhase
 from onec_runtime.execution.main.completion import MainRemoteCompletion, read_main_completion
@@ -1802,6 +1808,145 @@ class ExecutionController:
             ticket = self._arbiter.submit(route, plan)
             self._preparation_revision += 1
             self._arbiter.dispatch(ticket)
+            return ticket
+
+    def submit_completion_helper(
+        self, completion_plan: CompletionFieldsPlan,
+    ) -> ExecutionTicket:
+        """Read a private field-name schema on the exact stopped route.
+
+        The namespace and Worker snapshots are rechecked on the arbiter
+        worker before breakpoint shielding or evaluation. A caller wait may
+        expire without changing this ticket's remote ownership.
+        """
+
+        if not isinstance(completion_plan, CompletionFieldsPlan):
+            raise TypeError("completion helper plan is required")
+        with self._lock:
+            if self._continuation_admission is not None or self._resume_in_flight():
+                raise ProtocolError("CAPTURE continuation prevents completion")
+            selected = self._value_route_snapshot_locked()
+            if selected is None:
+                raise ProtocolError("Completion requires a confirmed stopped route")
+            route = (
+                selected.route if isinstance(selected, MainIdleTargetFence)
+                else self._capture_route
+            )
+            assert route is not None
+            ledger: CaptureEvaluationLedger | None = None
+            receipt_id: str | None = None
+            if isinstance(selected, CaptureScope):
+                ledger = self._capture_evaluation_ledger
+                if (
+                    not selected.published
+                    or selected.kernel_stack_level is None
+                    or selected.inspection_target_id != selected.identity.target_id
+                    or self.main_operation is None
+                    or self.main_operation.pending_stop is not selected.stop
+                    or ledger is None
+                    or ledger.identity != selected.identity
+                ):
+                    raise ProtocolError("Completion CAPTURE fence is unavailable")
+                receipt_id = f"completion-{uuid4().hex}"
+
+            def worker_plan(port: SessionPort) -> Settlement | ReadyForPolicy:
+                completion_plan.validate_current()
+                with self._lock:
+                    current = self._value_route_snapshot_locked(allow_pending=True)
+                    if (
+                        self._continuation_admission is not None
+                        or self._resume_in_flight()
+                        or self._arbiter.current_route != route
+                        or (
+                            current != selected
+                            if isinstance(selected, MainIdleTargetFence)
+                            else current is not selected
+                        )
+                    ):
+                        raise ProtocolError("Completion stopped-route fence changed")
+                    if isinstance(selected, CaptureScope) and (
+                        not selected.published
+                        or selected.kernel_stack_level is None
+                        or selected.inspection_target_id != selected.identity.target_id
+                        or self.main_operation is None
+                        or self.main_operation.pending_stop is not selected.stop
+                        or self._capture_evaluation_ledger is not ledger
+                    ):
+                        raise ProtocolError("Completion CAPTURE fence changed")
+
+                self._shield_capture_workspace(port)
+                if isinstance(selected, MainIdleTargetFence):
+                    expression = completion_plan.expression
+                    stack_level = 0
+                    target = selected.target
+                else:
+                    expression = build_live_current_capture_call(
+                        completion_plan.instruction
+                        + "\nРезультатИнструкции = Результат;"
+                    )
+                    stack_level = selected.kernel_stack_level
+                    target = selected.identity.target_id
+                assert stack_level is not None
+                try:
+                    pending = port.start_evaluation(
+                        expression,
+                        max_text_size=completion_plan.max_text_size,
+                        stack_level=stack_level,
+                        timeout_s=30.0,
+                    )
+                    if pending.target_id != target:
+                        raise OutcomeUnknown(
+                            "Completion evaluation belongs to another target"
+                        )
+                    result = wait_for_pending_result(port, pending)
+                except (OutcomeUnknown, EvaluationSuspended):
+                    raise
+                except BaseException as error:
+                    raise CaptureOperationRepairRequired("workspace_restore") from error
+                try:
+                    self._restore_capture_workspace(port)
+                except BaseException as error:
+                    raise CaptureOperationRepairRequired("workspace_restore") from error
+                fields = completion_plan.accept_result(result)
+                return (
+                    ReadyForPolicy(fields)
+                    if ledger is not None else Settlement(fields)
+                )
+
+            def publish(fields: object) -> object:
+                assert ledger is not None and receipt_id is not None
+                ledger.complete(receipt_id)
+                return fields
+
+            if ledger is not None:
+                assert receipt_id is not None
+                ledger.begin(receipt_id, CaptureEvaluationKind.MATERIALIZATION_HELPER)
+            try:
+                ticket = self._arbiter.submit(
+                    route, worker_plan,
+                    finalizer=publish if ledger is not None else None,
+                )
+            except BaseException:
+                if ledger is not None:
+                    assert receipt_id is not None
+                    ledger.discard_unstarted(receipt_id)
+                raise
+            self._preparation_revision += 1
+            try:
+                self._arbiter.dispatch(ticket)
+            except BaseException:
+                if ticket.cancel_queued() and ledger is not None:
+                    assert receipt_id is not None
+                    ledger.discard_unstarted(receipt_id)
+                raise
+            if ledger is not None:
+                assert receipt_id is not None
+                Thread(
+                    target=_observe_capture_ticket,
+                    args=(ticket, ledger, receipt_id),
+                    name="onec-capture-completion-observer",
+                    daemon=True,
+                ).start()
             return ticket
 
     def submit_capture_materialization(

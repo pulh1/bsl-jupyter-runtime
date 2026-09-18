@@ -27,12 +27,18 @@ from onec_runtime.execution.capture.public_inspection import (
 from onec_runtime.execution.capture.session_inspection_adapter import (
     SessionCaptureInspectionAdapter,
 )
+from onec_runtime.execution.capture.writeback import (
+    CaptureExportFailed, CaptureModifyFailed,
+)
+from onec_runtime.execution.completion_fields import CompletionFieldsService
 from onec_runtime.execution.controller.controller import ExecutionController
 from onec_runtime.execution.pipeline import CellExecutionPipeline
 from onec_runtime.execution.session_value_adapter import SessionValueMaterializationAdapter
 from onec_runtime.execution.source_identity import NotebookSourceIdentityFactory
 from onec_runtime.execution.value_reference import validate_public_direct_handle
 from onec_runtime.execution.worker_breakpoint_service import WorkerBreakpointService
+from onec_runtime.execution.worker_activation import WorkerMaterializationSnapshot
+from onec_runtime.prototype_runtime import PartialWritebackError
 from onec_runtime.runtime_contracts import OperationExecutionProvenance
 from onec_runtime.rdbg.models import ModuleLocation
 from onec_runtime.table_materialization import ReferencePolicy
@@ -82,6 +88,9 @@ class PublicExecutionFacade:
         status_reader: Callable[[], object],
         source_identity: NotebookSourceIdentityFactory | None = None,
         namespace_reader: Callable[[], object] | None = None,
+        worker_catalog_snapshot: (
+            Callable[[], WorkerMaterializationSnapshot] | None
+        ) = None,
         value_router: ValueTransferPort | None = None,
         value_router_factory: (
             Callable[
@@ -98,6 +107,10 @@ class PublicExecutionFacade:
             raise TypeError("provenance reader must be callable")
         if namespace_reader is not None and not callable(namespace_reader):
             raise TypeError("namespace reader must be callable")
+        if worker_catalog_snapshot is not None and not callable(worker_catalog_snapshot):
+            raise TypeError("completion Worker catalog reader must be callable")
+        if worker_catalog_snapshot is not None and namespace_reader is None:
+            raise TypeError("completion fields require a namespace reader")
         if source_identity is not None and not isinstance(
             source_identity, NotebookSourceIdentityFactory
         ):
@@ -113,6 +126,15 @@ class PublicExecutionFacade:
         self._source_identity = source_identity
         self._status_reader = status_reader
         self._namespace_reader = namespace_reader
+        self._completion_fields = (
+            CompletionFieldsService(
+                controller,
+                namespace_snapshot=namespace_reader,
+                worker_catalog_snapshot=worker_catalog_snapshot,
+                wait_handoff=self._wait_handoff,
+            )
+            if worker_catalog_snapshot is not None else None
+        )
         self._provenance_reader = provenance_reader
         self._caller_handoff = local()
         self._value_router = (
@@ -233,8 +255,9 @@ class PublicExecutionFacade:
         """Continue the current CAPTURE stop without losing the owning ticket.
 
         Dirty roots and successor points are admitted in the same controller
-        ticket before writeback and Continue. A previously committed successor
-        admission binds its attempt ID and next-stop correlation ticket.
+        ticket before writeback and Continue. A successor admission binds its
+        attempt ID and next-stop correlation ticket; the caller commits it
+        only after the confirmed resume outcome.
         ``timeout_s`` limits this caller's wait, never remote BSL execution.
         """
 
@@ -246,11 +269,18 @@ class PublicExecutionFacade:
         if continuation_attempt_id is not None:
             submission["continuation_attempt_id"] = continuation_attempt_id
         ticket = self._controller.submit_resume(**submission)
-        return self._wait_for_reply(
-            ticket, timeout_s=timeout_s,
-            on_completion=on_completion,
-            on_detached_completion=on_detached_completion,
-        )
+        try:
+            return self._wait_for_reply(
+                ticket, timeout_s=timeout_s,
+                on_completion=_public_resume_completion(on_completion),
+                on_detached_completion=(
+                    _public_resume_completion(on_detached_completion)
+                ),
+            )
+        except (CaptureExportFailed, CaptureModifyFailed):
+            # These results are confirmed root failures. Keep their raw RDBG
+            # models private while preserving the MCP continuation contract.
+            raise _public_resume_error() from None
 
     def resume_debug_stop(self, *, timeout_s: float | None = None) -> object:
         """Continue a user breakpoint in its existing MAIN operation."""
@@ -271,6 +301,18 @@ class PublicExecutionFacade:
         if reader is None:
             raise ProtocolError("runtime namespace reader is not configured")
         return reader()
+
+    def completion_fields(
+        self, handle: str, *, table_row: bool = False, timeout_s: float = 1.0,
+    ) -> tuple[str, ...]:
+        """Read bounded field names through the current controller route."""
+
+        service = self._completion_fields
+        if service is None:
+            raise ProtocolError("completion fields route is not configured")
+        return service.completion_fields(
+            handle, table_row=table_row, timeout_s=timeout_s,
+        )
 
     def materialize_value(
         self, handle: str, options: MaterializationOptions | None = None,
@@ -564,6 +606,24 @@ def _publish_detached(
         callback(None, error)
     else:
         callback(reply, None)
+
+
+def _public_resume_error() -> PartialWritebackError:
+    return PartialWritebackError("CAPTURE root writeback was rejected")
+
+
+def _public_resume_completion(
+    callback: Callable[[object | None, BaseException | None], None] | None,
+) -> Callable[[object | None, BaseException | None], None] | None:
+    if callback is None:
+        return None
+
+    def publish(reply: object | None, error: BaseException | None) -> None:
+        if isinstance(error, (CaptureExportFailed, CaptureModifyFailed)):
+            error = _public_resume_error()
+        callback(reply, error)
+
+    return publish
 
 
 def _validate_wait_timeout(timeout_s: float | None) -> None:
