@@ -1743,7 +1743,7 @@ class AgentWorkspaceService:
                 operation_id,
                 stage="capture_setup_after_activation",
             )
-        if result.user_main_dispatched is not True:
+        if result.user_main_dispatched is False:
             try:
                 runtime.backend.discard_prepared_main_for_capture(prepared_main)
             except BaseException:

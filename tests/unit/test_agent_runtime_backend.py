@@ -43,6 +43,7 @@ from onec_runtime.errors import (
     ProtocolError,
 )
 from onec_runtime.prototype_runtime import OperationState
+from onec_runtime.execution.public_facade import PreparedMainExecutionAttempt
 from onec_runtime.runtime_api import (
     _PreparedMainExecutionAttempt,
     RuntimeNamespaceSnapshot,
@@ -704,6 +705,45 @@ def test_prepared_capture_main_bsl_error_publishes_only_generic_summary(
         result.execution,
         source_sha256=source_hash,
     )
+
+
+def test_public_prepared_main_keeps_unresolved_dispatch_evidence() -> None:
+    source = "Результат = 1;"
+    source_hash = hashlib.sha256(source.encode()).hexdigest()
+    unit = SourceUnitRef(
+        SourceUnitKind.NOTEBOOK_CELL, "cell-public-main", 1, source_hash,
+    )
+
+    class PreparedSession:
+        prepared = object()
+
+        def prepare_main_for_capture(self, exact_source, *, source_unit):
+            assert exact_source == source and source_unit == unit
+            return self.prepared
+
+        def activate_prepared_main_for_capture(self, prepared):
+            assert prepared is self.prepared
+            return prepared
+
+        def execute_prepared_main_for_capture(self, prepared):
+            assert prepared is self.prepared
+            return PreparedMainExecutionAttempt(
+                None, KeyboardInterrupt(), object(), lambda _ticket: None,
+            )
+
+    backend = OnecRuntimeBackend(
+        "runtime-public-main", PreparedSession()  # type: ignore[arg-type]
+    )
+    prepared = backend.activate_prepared_main_for_capture(
+        backend.prepare_main_for_capture(source, source_unit=unit)
+    )
+    result = backend.run_prepared_main_until_capture(
+        prepared,
+        intent=CaptureIntent("capture-public", "op-public", 1, source_hash, 1, ()),
+    )
+
+    assert result.user_main_dispatched is None
+    assert result.execution.terminal_state is AgentOperationState.UNKNOWN
 
 
 def test_failed_reply_without_valid_diagnostic_never_publishes_reply_error(

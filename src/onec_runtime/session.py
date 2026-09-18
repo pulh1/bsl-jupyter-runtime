@@ -1513,6 +1513,8 @@ class RuntimeSession:
         with self._operation_lock:
             if self._closed:
                 raise ProtocolError("ZUP demo runtime session is closed")
+            if isinstance(self.runtime_api, PublicExecutionFacade):
+                return self.runtime_api.prepare_bsl(source, source_unit=source_unit)
             return self.runtime_api.prepare_main_for_capture(
                 source,
                 source_unit=source_unit,
@@ -1522,6 +1524,10 @@ class RuntimeSession:
         with self._operation_lock:
             if self._closed:
                 raise ProtocolError("ZUP demo runtime session is closed")
+            if isinstance(self.runtime_api, PublicExecutionFacade):
+                # Worker publication belongs to the accepted arbiter ticket.
+                # Preparation activation is now a local handoff only.
+                return prepared
             return self.runtime_api.activate_prepared_main_for_capture(prepared)
 
     def prepared_main_execution_provenance(
@@ -1531,6 +1537,8 @@ class RuntimeSession:
         with self._operation_lock:
             if self._closed:
                 raise ProtocolError("ZUP demo runtime session is closed")
+            if isinstance(self.runtime_api, PublicExecutionFacade):
+                return self.runtime_api.prepared_bsl_execution_provenance(prepared)
             return self.runtime_api.prepared_main_execution_provenance(
                 prepared
             )
@@ -1539,12 +1547,22 @@ class RuntimeSession:
         with self._operation_lock:
             if self._closed:
                 raise ProtocolError("ZUP demo runtime session is closed")
+            if isinstance(self.runtime_api, PublicExecutionFacade):
+                with self.runtime_api.execution_caller_handoff(
+                    self._release_operation_lock_for_capture_wait
+                ):
+                    return self.runtime_api.attempt_prepared_main_for_capture(
+                        prepared
+                    )
             return self.runtime_api._attempt_prepared_main_for_capture(prepared)
 
     def discard_prepared_main_for_capture(self, prepared: object) -> None:
         with self._operation_lock:
             if self._closed:
                 raise ProtocolError("ZUP demo runtime session is closed")
+            if isinstance(self.runtime_api, PublicExecutionFacade):
+                self.runtime_api.discard_prepared_bsl(prepared)
+                return
             self.runtime_api.discard_prepared_main_for_capture(prepared)
 
     def prepare_capture_hypothesis(

@@ -44,6 +44,7 @@ from onec_runtime.bsl.lexer import BslLexError
 from onec_runtime.bsl.parser_target import BslParseError
 from onec_runtime.errors import BslExecutionError, ProtocolError
 from onec_runtime.prototype_runtime import OperationState, PartialWritebackError
+from onec_runtime.execution.public_facade import PreparedMainExecutionAttempt
 from onec_runtime.runtime_api import (
     _PreparedMainExecutionAttempt,
     RuntimeNamespaceSnapshot,
@@ -753,11 +754,17 @@ class OnecRuntimeBackend:
             return CaptureRunOutcome(
                 BackendExecution(AgentOperationState.UNKNOWN, (), False, "unknown")
             )
-        if type(attempt) is not _PreparedMainExecutionAttempt:
+        if type(attempt) not in (
+            _PreparedMainExecutionAttempt, PreparedMainExecutionAttempt,
+        ):
             return CaptureRunOutcome(
                 BackendExecution(AgentOperationState.UNKNOWN, (), False, "unknown")
             )
-        user_main_dispatched = attempt.user_main_dispatched is True
+        user_main_dispatched = attempt.user_main_dispatched
+        if user_main_dispatched is not None and type(user_main_dispatched) is not bool:
+            return CaptureRunOutcome(
+                BackendExecution(AgentOperationState.UNKNOWN, (), False, "unknown")
+            )
         try:
             reply = attempt.reply()
         except BslExecutionError as error:

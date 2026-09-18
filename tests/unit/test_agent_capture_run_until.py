@@ -339,6 +339,35 @@ def test_capture_service_disarms_every_terminal_no_stop_outcome_without_continui
     assert backend.calls == ["resolve", "arm", "run_prepared_main", "disarm"]
 
 
+def test_capture_service_keeps_armed_intent_while_main_dispatch_is_unresolved(
+    tmp_path: Path,
+) -> None:
+    class PendingBackend(_CaptureBackend):
+        def run_prepared_main_until_capture(
+            self, prepared: object, *, intent: CaptureIntent
+        ) -> CaptureRunOutcome:
+            assert prepared is self.prepared
+            self.calls.append("run_prepared_main")
+            return CaptureRunOutcome(
+                BackendExecution(AgentOperationState.UNKNOWN, (), False, "unknown"),
+                user_main_dispatched=None,
+            )
+
+    backend = PendingBackend()
+    result = CaptureService(tmp_path).run_until(
+        backend,
+        operation_id="op-pending",
+        prepared_main=backend.prepared,
+        source_revision=2,
+        source_sha256="a" * 64,
+        points=(_point(),),
+    )
+
+    assert result.user_main_dispatched is None
+    assert result.execution.terminal_state is AgentOperationState.UNKNOWN
+    assert backend.calls == ["resolve", "arm", "run_prepared_main"]
+
+
 def test_capture_service_reports_an_unexpected_debug_stop_with_recovery(tmp_path: Path) -> None:
     backend = _CaptureBackend(terminal=True)
     backend.terminal_state = AgentOperationState.UNKNOWN
@@ -872,6 +901,58 @@ class _CaptureFactory:
     def start(self, *, mode: CapabilityMode) -> _ServiceCaptureBackend:
         assert mode is CapabilityMode.EXPERIMENT
         return self.backend
+
+
+def test_agent_service_retains_runtime_for_unresolved_main_dispatch(
+    tmp_path: Path,
+) -> None:
+    source = "Результат = 1;"
+    source_sha256 = sha256(source.encode()).hexdigest()
+    cell = nbformat.v4.new_code_cell(source=source, id="cell-pending")
+    cell.metadata["onec_runtime"] = {
+        "revision": 1,
+        "language": "bsl",
+        "mode": "main",
+        "source_sha256": source_sha256,
+    }
+    nbformat.write(nbformat.v4.new_notebook(cells=[cell]), tmp_path / "demo.ipynb")
+
+    class PendingBackend(_ServiceCaptureBackend):
+        def run_prepared_main_until_capture(
+            self, prepared: object, *, intent: CaptureIntent
+        ) -> CaptureRunOutcome:
+            assert prepared is self.prepared
+            self.calls.append("run_prepared_main")
+            return CaptureRunOutcome(
+                BackendExecution(AgentOperationState.UNKNOWN, (), False, "unknown"),
+                user_main_dispatched=None,
+            )
+
+    backend = PendingBackend()
+    service = AgentWorkspaceService(
+        tmp_path, _CaptureFactory(backend), maximum_mode=CapabilityMode.EXPERIMENT,
+    )
+    try:
+        _ready(service)
+        assert service.call("code.list", {"container": "demo.ipynb"}).ok
+        response = service.call("capture.run_until", {
+            "cell_id": "cell-pending",
+            "revision": 1,
+            "source_sha256": source_sha256,
+            "request_id": "capture-pending",
+            "points": [{
+                "name": "before", "project": "zup", "module": "Payroll",
+                "procedure": "Run", "line": 17,
+            }],
+            "wait_s": 2.0,
+        })
+        assert response.ok
+        assert response.value.state is AgentOperationState.UNKNOWN
+        assert "discard_main" not in backend.calls
+        assert "disarm" not in backend.calls
+        assert service.call("workspace.status", {}).ok
+    finally:
+        service.close()
 
 
 def test_service_run_until_returns_the_correlated_durable_operation_view(tmp_path: Path) -> None:
