@@ -238,6 +238,7 @@ class WorkerUniverseActivationAdapter:
         )
         self._snapshot_lock = RLock()
         self._published = WorkerActivationSnapshot(0, (), None, None)
+        self._notebook_descriptor: WorkerModuleArtifact | None = None
         self._prebuild_owner = object()
 
     def snapshot(self) -> WorkerActivationSnapshot:
@@ -267,6 +268,89 @@ class WorkerUniverseActivationAdapter:
     @property
     def worker_exports(self) -> tuple[WorkerExport, ...]:
         return self.snapshot().worker_exports
+
+    def publish_modules(
+        self, artifacts: tuple[WorkerModuleArtifact, ...], *, port: SessionPort,
+    ) -> WorkerGenerationHandle:
+        """Promote a complete module graph through this adapter's bound port.
+
+        This narrow port supports only a workspace without logical Worker
+        breakpoints. A breakpoint-bearing reload needs per-call policy and
+        report publication from the shared breakpoint workspace owner.
+        """
+
+        if port is None:
+            raise TypeError("An admitted arbiter port is required to publish Worker")
+        if (
+            type(artifacts) is not tuple
+            or not artifacts
+            or any(type(artifact) is not WorkerModuleArtifact for artifact in artifacts)
+        ):
+            raise TypeError("Worker module artifacts are required")
+        names = tuple(artifact.logical_name.casefold() for artifact in artifacts)
+        if len(names) != len(set(names)) or "worker" in names:
+            raise ProtocolError("Worker module artifact names are invalid")
+        if self._breakpoints_present():
+            raise ProtocolError("Worker breakpoint reload requires a policy/report port")
+        if getattr(self._bound, "port", None) is not None:
+            raise ProtocolError("Worker activation is already bound to an RDBG port")
+        published = self.snapshot()
+        if self._host.active_handle is not published.active_handle:
+            raise ProtocolError("Worker active generation changed before publication")
+        notebook = self._notebook_descriptor
+        candidate = self._host.prepare(
+            artifacts + (() if notebook is None else (notebook,)),
+        )
+        self._bound.port = port
+        try:
+            handle = self._target.promote(candidate)
+        except (
+            OutcomeUnknown, WorkerPromotionOutcomeUnknown,
+            BreakpointWorkspaceOutcomeUnknown,
+        ) as error:
+            raise WorkerActivationUnknown(
+                _GenerationLease(
+                    self._host, self._target, candidate=candidate,
+                    worker_breakpoints_present=self._breakpoints_present,
+                    breakpoint_workspace=self._breakpoint_workspace,
+                ),
+                "Worker module publication outcome is unknown",
+            ) from error
+        finally:
+            self._bound.port = None
+        previous = published.active_handle
+        if previous is not None:
+            try:
+                self._target.release(previous)
+            except BaseException as error:
+                raise WorkerActivationUnknown(
+                    _GenerationLease(
+                        self._host, self._target, handle=handle,
+                        worker_breakpoints_present=self._breakpoints_present,
+                        breakpoint_workspace=self._breakpoint_workspace,
+                    ),
+                    "Worker module ownership could not be finalized",
+                ) from error
+        with self._snapshot_lock:
+            self._base_artifacts = artifacts
+            self._published = WorkerActivationSnapshot(
+                published.revision + 1, candidate.export_catalog,
+                published.active_methods, handle,
+            )
+        return handle
+
+    def release_generation(
+        self, handle: WorkerGenerationHandle, *, port: SessionPort,
+    ) -> None:
+        """Release an explicit generation handle inside an admitted ticket."""
+
+        if port is None:
+            raise TypeError("An admitted arbiter port is required to release Worker")
+        if not isinstance(handle, WorkerGenerationHandle):
+            raise TypeError("Worker generation handle is required")
+        if self._breakpoints_present():
+            raise ProtocolError("Worker breakpoint release requires a policy/report port")
+        self._target.release(handle)
 
     def pin_active(self, *, port: SessionPort) -> _GenerationLease | None:
         """Pin the confirmed active root for an ordinary MAIN/CAPTURE cell."""
@@ -421,6 +505,7 @@ class WorkerUniverseActivationAdapter:
                 "Worker activation ownership could not be finalized",
             ) from error
         with self._snapshot_lock:
+            self._notebook_descriptor = descriptor
             self._published = WorkerActivationSnapshot(
                 published.revision + 1, intent.candidate_catalog, method_set, handle,
             )
