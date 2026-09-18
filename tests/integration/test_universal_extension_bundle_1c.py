@@ -380,7 +380,7 @@ def _build_table_bound_instrumented_bundle(
         source_root=source,
         output_root=root / "bundle",
         platform_bin=platform,
-        artifact_version="0.1.7",
+        artifact_version="0.1.8",
         protocol_version="4",
     )
 
@@ -393,7 +393,7 @@ def _install_cfe(config: RuntimeConfig, cfe: Path, root: Path) -> None:
 @pytest.mark.live_1c
 @pytest.mark.parametrize(
     ("move_serializer_guard_after_read", "expected"),
-    ((False, "bounded|bounded"), (True, "serializer_probe|bounded")),
+    ((False, "bounded|exact|bounded"), (True, "serializer_probe|exact|bounded")),
     ids=("bounded", "guard_after_read_is_detected"),
 )
 def test_compact_table_bound_is_executed_before_value_table_and_query_sentinel_cells(
@@ -448,19 +448,52 @@ def test_compact_table_bound_is_executed_before_value_table_and_query_sentinel_c
 |    \"\"safe\"\" КАК Значение
 |ОБЪЕДИНИТЬ ВСЕ
 |ВЫБРАТЬ
+|    \"\"safe\"\" КАК Значение";
+ПроверкаТочногоЛимита = "";
+Попытка
+    ТочныйРезультат = RuntimeTableTransferServer.СериализоватьКомпактнуюТаблицу(
+        Запрос.Выполнить(), "presentation", Новый Соответствие, Новый Массив, 3, 1000000);
+    ПроверкаТочногоЛимита = ?(ТочныйРезультат.Доступ, "exact", "denied");
+Исключение
+    ПроверкаТочногоЛимита = "failed";
+КонецПопытки;
+
+Запрос.Текст = "ВЫБРАТЬ
+|    1 КАК НомерСтроки,
 |    \"\"safe\"\" КАК Значение
 |ОБЪЕДИНИТЬ ВСЕ
 |ВЫБРАТЬ
-|    \"\"__table_bound_sentinel__\"\" КАК Значение";
+|    2 КАК НомерСтроки,
+|    \"\"safe\"\" КАК Значение
+|ОБЪЕДИНИТЬ ВСЕ
+|ВЫБРАТЬ
+|    3 КАК НомерСтроки,
+|    \"\"safe\"\" КАК Значение
+|ОБЪЕДИНИТЬ ВСЕ
+|ВЫБРАТЬ
+|    4 КАК НомерСтроки,
+|    \"\"__table_bound_sentinel__\"\" КАК Значение
+|УПОРЯДОЧИТЬ ПО НомерСтроки";
 ПроверкаЗапроса = "";
 Попытка
     МатериализацияЗапроса = RuntimeTableTransferServer.СериализоватьКомпактнуюТаблицу(
         Запрос.Выполнить(), "presentation", Новый Соответствие, Новый Массив, 3, 1000000);
-    ПроверкаЗапроса = ?(МатериализацияЗапроса.Доступ, "bounded", "denied");
+    ПроверкаЗапроса = ?(МатериализацияЗапроса.Доступ, "unexpected_success", "denied");
 Исключение
-    ПроверкаЗапроса = "failed";
+    ОписаниеОшибки = ИнформацияОбОшибке().Описание;
+    Если ОписаниеОшибки = "Превышен лимит строк компактной таблицы" Тогда
+        ПроверкаЗапроса = "bounded";
+    ИначеЕсли ОписаниеОшибки = "out_of_page_query_cell_read" Тогда
+        ПроверкаЗапроса = "query_probe";
+    ИначеЕсли ОписаниеОшибки = "out_of_page_classifier_cell_read" Тогда
+        ПроверкаЗапроса = "classifier_probe";
+    ИначеЕсли ОписаниеОшибки = "out_of_page_serializer_cell_read" Тогда
+        ПроверкаЗапроса = "serializer_probe";
+    Иначе
+        ПроверкаЗапроса = "failed";
+    КонецЕсли;
 КонецПопытки;
-Результат = ПроверкаТаблицыЗначений + "|" + ПроверкаЗапроса;''')
+Результат = ПроверкаТаблицыЗначений + "|" + ПроверкаТочногоЛимита + "|" + ПроверкаЗапроса;''')
     finally:
         session.close()
 
@@ -480,7 +513,7 @@ def test_unbounded_to_df_keeps_all_rows_after_schema_probe(
         source_root=_REPOSITORY / "onec" / "OnecInteractiveRuntime",
         output_root=tmp_path / "bundle",
         platform_bin=platform,
-        artifact_version="0.1.7",
+        artifact_version="0.1.8",
         protocol_version="4",
     )
     config = _config(tmp_path / "target", platform)
@@ -516,7 +549,7 @@ def test_bounded_to_df_initializes_value_transfer_module(
         source_root=_REPOSITORY / "onec" / "OnecInteractiveRuntime",
         output_root=tmp_path / "bundle",
         platform_bin=platform,
-        artifact_version="0.1.7",
+        artifact_version="0.1.8",
         protocol_version="4",
     )
     config = _config(tmp_path / "target", platform)

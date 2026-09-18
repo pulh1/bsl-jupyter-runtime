@@ -2,11 +2,11 @@
   "schema_version": 1,
   "product_id": "onec-interactive-runtime",
   "extension_name": "OnecInteractiveRuntime",
-  "artifact_version": "0.1.7",
+  "artifact_version": "0.1.8",
   "protocol_version": "4",
   "cfe_filename": "OnecInteractiveRuntime.cfe",
-  "cfe_size": 27115,
-  "cfe_sha256": "76f573692b1dccf0feaa7638b93f28953f056d866c38409d2d58064e64598ad4",
+  "cfe_size": 27057,
+  "cfe_sha256": "4067088c4d1b5630c5b1b80c688fae60eff43ece62d586feac245ca54fbd4837",
   "fingerprints": {
     "identity": {
       "product_id": "onec-interactive-runtime",
@@ -23,7 +23,7 @@
       "vendor": "onec-interactive-runtime"
     },
     "artifact": {
-      "artifact_version": "0.1.7",
+      "artifact_version": "0.1.8",
       "protocol_version": "4",
       "language_bound_by_name": false,
       "metadata": [
@@ -69,14 +69,14 @@
         }
       ],
       "source_sha256": {
-        "CommonModules/RuntimeKernelServer/Ext/Module.bsl": "3c5660758340832b60e2c3e31b4f1294f505ea2fc9af16ddc0e84f2eb05128ca",
-        "CommonModules/RuntimeTableTransferServer/Ext/Module.bsl": "e49ad674ee0d191658f2fa0fca8af9b9637e424447df617489f2dc1a7d6bef11",
+        "CommonModules/RuntimeKernelServer/Ext/Module.bsl": "54ccc7668ea08b258656250197f7a97e11faee0ebc04affe617be51a041edeb5",
+        "CommonModules/RuntimeTableTransferServer/Ext/Module.bsl": "9df10fbcf05fe67383e3265dd05efb1e033e44306e3e9ef467d5a9587ba1e229",
         "CommonModules/RuntimeValueTransferServer/Ext/Module.bsl": "290ee511278514f0a6537ef932b0bac3364b74c7b366737df40483e93da644e0",
-        "Ext/ManagedApplicationModule.bsl": "c9e76ccb1c6b4f45b58871063d1039f2bb60a50cb3966fd31b2bef15834a155b"
+        "Ext/ManagedApplicationModule.bsl": "6a60fc4bb5eb876bf2906cbe2bdf746aff754f407920e12266c0e8ebbf45a589"
       }
     },
     "identity_sha256": "726065a5d3c6f5472e24a83fc0c474fd5f13c42eace441b90c7eba1b404df496",
-    "artifact_sha256": "ccd586d37608b4644a529f7118fed6573ce590d5d83a73a96c6536594be308e0"
+    "artifact_sha256": "0cf478b9e237b56da75fecca17c2b4cd2c72658a4cbb9a5d3cbf335e5264b3a2"
   },
   "breakpoints": {
     "managed": {

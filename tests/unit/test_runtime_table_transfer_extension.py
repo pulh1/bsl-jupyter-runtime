@@ -73,8 +73,8 @@ def test_query_result_schema_uses_declared_columns_without_materializing_rows() 
     assert ".Выгрузить(" not in columns
 
 
-def test_query_result_normalization_stops_at_n_plus_one_before_row_allocation() -> None:
-    """Break caught: a query preview must never unload or allocate its N+1 row."""
+def test_query_result_normalization_rejects_n_plus_one_before_cell_read() -> None:
+    """Break caught: a query result must not return a truncated successful page."""
     source = SERVICE_MODULE.read_text(encoding="utf-8-sig")
     helper = source.split(
         "Функция ПодготовитьТабличноеЗначение", 1
@@ -90,12 +90,14 @@ def test_query_result_normalization_stops_at_n_plus_one_before_row_allocation() 
 
     next_row = helper.index("Пока ВыборкаДанных.Следующий() Цикл")
     row_guard = helper.index("Результат.Количество() >= МаксимумСтрок")
-    stop = helper.index("Прервать;", row_guard)
+    overflow = helper.index(
+        'ВызватьИсключение "Превышен лимит строк компактной таблицы";', row_guard
+    )
     allocate = helper.index("Результат.Добавить()")
     copy = helper.index(
         "ВыборкаДанных[КолонкаРезультата.Имя]", allocate
     )
-    assert next_row < row_guard < stop < allocate < copy
+    assert next_row < row_guard < overflow < allocate < copy
 
 
 def test_value_table_stays_zero_copy_and_other_table_like_values_fail_closed() -> None:

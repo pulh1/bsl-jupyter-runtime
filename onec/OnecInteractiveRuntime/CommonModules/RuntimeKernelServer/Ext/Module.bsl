@@ -105,7 +105,7 @@
 
 Процедура Запустить() Экспорт
 	ИдентификаторПродуктаRuntime = "onec-interactive-runtime";
-	ВерсияАртефактаRuntime = "0.1.7";
+	ВерсияАртефактаRuntime = "0.1.8";
 	ВерсияПротоколаRuntime = "4";
 	Контекст = Новый Структура; // @runtime-server-extension-entry-breakpoint
 	ТекущаяИнструкция = "";
