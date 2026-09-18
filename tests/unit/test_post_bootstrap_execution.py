@@ -144,10 +144,11 @@ def test_fresh_composition_rejects_source_identity_reuse_while_main_is_suspended
 def test_post_bootstrap_facade_materializes_on_initial_main_idle_route() -> None:
     payload = b'{"version":1,"root":{"t":"number","v":"12.50"}}'
     encoded = b64encode(payload).decode("ascii")
-    session = ValueSession([
+    response = [
         f"R|7|3|{len(payload)}|{sha256(payload).hexdigest()}|{len(encoded)}",
         encoded, "Истина",
-    ])
+    ]
+    session = ValueSession(response + response)
     worker = lambda: WorkerActivationSnapshot(0, (), None, None)
     namespace = RuntimeNamespaceOwner(7, 3, worker_snapshot=worker)
     composed = compose_post_bootstrap_execution(
@@ -163,7 +164,14 @@ def test_post_bootstrap_facade_materializes_on_initial_main_idle_route() -> None
         assert composed.facade.materialize_value(
             "Контекст.Сумма", MaterializationOptions(max_bytes=4096),
         ) == Decimal("12.50")
-        assert len([call for call in session.calls if call[0] == "start"]) == 3
+        kind, projected = composed.facade.project_value_payload(
+            "Контекст.Сумма", kind="slice", offset=0, limit=1,
+            columns=(), names=(), max_depth=2, max_items=1,
+            max_rows=1, max_bytes=4096,
+        )
+        assert kind == "value"
+        assert projected == payload
+        assert len([call for call in session.calls if call[0] == "start"]) == 6
     finally:
         composed.facade.close()
 

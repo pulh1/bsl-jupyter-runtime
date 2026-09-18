@@ -10,7 +10,7 @@ from __future__ import annotations
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from math import isfinite
 from threading import Thread, local
-from typing import Callable, Iterator, Mapping, Protocol
+from typing import Callable, Iterator, Mapping, Protocol, cast
 from uuid import UUID
 
 import pandas as pd
@@ -30,12 +30,16 @@ from onec_runtime.execution.capture.session_inspection_adapter import (
 from onec_runtime.execution.capture.writeback import (
     CaptureExportFailed, CaptureModifyFailed,
 )
+from onec_runtime.execution.capture.ticket_materialization import WorkerTransferCatalog
 from onec_runtime.execution.completion_fields import CompletionFieldsService
 from onec_runtime.execution.controller.controller import ExecutionController
 from onec_runtime.execution.pipeline import CellExecutionPipeline
 from onec_runtime.execution.session_value_adapter import SessionValueMaterializationAdapter
 from onec_runtime.execution.source_identity import NotebookSourceIdentityFactory
 from onec_runtime.execution.value_reference import validate_public_direct_handle
+from onec_runtime.execution.value_projection_service import (
+    ProjectionTicketPort, ValueProjectionService,
+)
 from onec_runtime.execution.worker_breakpoint_service import WorkerBreakpointService
 from onec_runtime.execution.worker_activation import WorkerMaterializationSnapshot
 from onec_runtime.prototype_runtime import PartialWritebackError
@@ -86,6 +90,8 @@ class PublicExecutionFacade:
         *,
         source_unit_factory: Callable[[str], SourceUnitRef],
         status_reader: Callable[[], object],
+        runtime_generation: int | None = None,
+        context_generation: int | None = None,
         source_identity: NotebookSourceIdentityFactory | None = None,
         namespace_reader: Callable[[], object] | None = None,
         worker_catalog_snapshot: (
@@ -112,6 +118,8 @@ class PublicExecutionFacade:
             raise TypeError("completion Worker catalog reader must be callable")
         if worker_catalog_snapshot is not None and namespace_reader is None:
             raise TypeError("completion fields require a namespace reader")
+        if (runtime_generation is None) != (context_generation is None):
+            raise TypeError("value projection requires both generation fences")
         if resolve_capture_sources is not None and not callable(resolve_capture_sources):
             raise TypeError("CAPTURE source resolver must be callable")
         if source_identity is not None and not isinstance(
@@ -144,6 +152,25 @@ class PublicExecutionFacade:
             value_router_factory(self._wait_handoff)
             if value_router_factory is not None else value_router
         )
+        self._value_projection: ValueProjectionService | None = None
+        if runtime_generation is not None:
+            if self._value_router is None or worker_catalog_snapshot is None:
+                raise TypeError("value projection requires a route and Worker catalog")
+
+            def projection_catalog() -> WorkerTransferCatalog:
+                snapshot = worker_catalog_snapshot()
+                if not isinstance(snapshot, WorkerMaterializationSnapshot):
+                    raise TypeError("Worker materialization snapshot is invalid")
+                return WorkerTransferCatalog(
+                    snapshot.revision, snapshot.registrations,
+                )
+
+            self._value_projection = ValueProjectionService(
+                cast(ProjectionTicketPort, self._value_router),
+                runtime_generation=runtime_generation,
+                context_generation=context_generation,
+                worker_catalog_snapshot=projection_catalog,
+            )
         self._session_value_adapter = (
             SessionValueMaterializationAdapter(self._value_router)
             if self._value_router is not None else None
@@ -348,6 +375,62 @@ class PublicExecutionFacade:
         """Validate a direct public Context handle without reading target data."""
 
         return validate_public_direct_handle(handle)
+
+    def _require_value_projection(self) -> ValueProjectionService:
+        service = self._value_projection
+        if service is None:
+            raise ProtocolError("value projection route is not configured")
+        return service
+
+    def materialization_kind(
+        self, handle: str, *, timeout_s: float | None = None,
+    ) -> str:
+        """Read a value's serializer kind with one bounded route ticket."""
+
+        return self._require_value_projection().materialization_kind(
+            handle, timeout_s=timeout_s,
+        )
+
+    def materialize_value_payload(self, handle: str, **options: object) -> bytes:
+        """Return an integrity-checked typed payload for a direct handle."""
+
+        return self._require_value_projection().materialize_value_payload(
+            handle, **options,
+        )
+
+    def materialize_table_payload(self, handle: str, **options: object) -> bytes:
+        """Return an integrity-checked compact table payload."""
+
+        return self._require_value_projection().materialize_table_payload(
+            handle, **options,
+        )
+
+    def project_value_payload(
+        self, handle: str, **selection_and_options: object,
+    ) -> tuple[str, bytes]:
+        """Return one bounded selection's kind and verified payload."""
+
+        return self._require_value_projection().project_value_payload(
+            handle, **selection_and_options,
+        )
+
+    def project_to_df(
+        self, handle: str, selection: dict[str, object], **options: object,
+    ) -> pd.DataFrame:
+        """Decode a bounded table selection through the current route."""
+
+        return self._require_value_projection().project_to_df(
+            handle, selection, **options,
+        )
+
+    def project_value(
+        self, handle: str, selection: dict[str, object], **options: object,
+    ) -> object:
+        """Decode a bounded value selection through the current route."""
+
+        return self._require_value_projection().project_value(
+            handle, selection, **options,
+        )
 
     def to_df(
         self,

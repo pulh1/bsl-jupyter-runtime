@@ -131,6 +131,8 @@ def compose_post_bootstrap_execution(
             source_unit_factory=source_identity,
             source_identity=source_identity,
             status_reader=status.status,
+            runtime_generation=runtime_generation,
+            context_generation=context_generation,
             namespace_reader=status.namespace_snapshot,
             worker_catalog_snapshot=worker_materialization_snapshot,
             resolve_capture_sources=resolve_capture_sources,
