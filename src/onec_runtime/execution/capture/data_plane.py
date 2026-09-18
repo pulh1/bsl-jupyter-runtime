@@ -22,13 +22,18 @@ from onec_runtime.execution.capture.scope import (
 )
 from onec_runtime.execution.capture.materialization import CaptureMaterializationPlan
 from onec_runtime.execution.capture.stack import CaptureStackInventoryAdapter
+from onec_runtime.execution.local_wait import (
+    LocalWaitStatus, validate_local_wait_timeout, wait_initiator_locally,
+)
 from onec_runtime.rdbg.models import FrameVariable, StackFrame
 
 
 class _CaptureTicket(Protocol):
-    def wait_initiator(self) -> object: ...
+    def wait_initiator(self, timeout: float | None = None) -> object: ...
 
     def detach_waiter(self) -> None: ...
+
+    def status(self) -> LocalWaitStatus: ...
 
 
 class CaptureTicketController(Protocol):
@@ -143,13 +148,16 @@ class CaptureTicketDataPlane:
             raise ProtocolError("CAPTURE variable result is invalid")
         return result
 
-    def materialize_private_payload(self, plan: CaptureMaterializationPlan) -> bytes:
+    def materialize_private_payload(
+        self, plan: CaptureMaterializationPlan, *, timeout_s: float | None = None,
+    ) -> bytes:
         """Run an already qualified transfer plan; return private encoded bytes."""
 
+        local_wait = validate_local_wait_timeout(timeout_s)
         self._require_current()
         result = self._wait(self._controller.submit_capture_materialization(
             plan, _before_first_effect=self._before_materialization,
-        ))
+        ), timeout_s=local_wait)
         self._require_current()
         if type(result) is not bytes:
             raise ProtocolError("CAPTURE materialization payload is invalid")
@@ -164,14 +172,10 @@ class CaptureTicketDataPlane:
         if result is not None:
             raise ProtocolError("CAPTURE cleanup result is invalid")
 
-    def _wait(self, ticket: _CaptureTicket) -> object:
-        try:
-            with self._wait_handoff():
-                return ticket.wait_initiator()
-        except KeyboardInterrupt:
-            # The arbiter still owns the remote operation and its outcome.
-            ticket.detach_waiter()
-            raise
+    def _wait(self, ticket: _CaptureTicket, *, timeout_s: float | None = None) -> object:
+        return wait_initiator_locally(
+            ticket, timeout_s=timeout_s, wait_handoff=self._wait_handoff,
+        )
 
     def _validate_fence(self, fence: object) -> None:
         if fence != self._fence:

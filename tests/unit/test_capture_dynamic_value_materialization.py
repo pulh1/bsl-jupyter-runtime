@@ -1,10 +1,12 @@
 """Dynamic value and bounded table projection through one CAPTURE ticket."""
 
 import json
+from threading import Event
 
 import pytest
 
 from onec_runtime.errors import BslExecutionError, ProtocolError
+from onec_runtime.execution.arbiter import RdbgArbiter, RouteToken, Settlement
 from onec_runtime.execution.capture.ticket_materialization import WorkerTransferCatalog
 from onec_runtime.execution.dynamic_value_materialization import (
     CaptureDynamicValueMaterialization,
@@ -15,6 +17,7 @@ from onec_runtime.value_materialization import MaterializationOptions
 from test_capture_stack_inventory_adapter import ready_scope
 from test_capture_ticket_data_plane import Ticket, TicketController
 from test_compact_table import compact_payload
+from test_main_idle_materialization import Session
 
 
 def _service(controller, scope, catalog):
@@ -113,3 +116,46 @@ def test_worker_catalog_change_rejects_before_capture_dispatch() -> None:
     with pytest.raises(ProtocolError, match="Worker catalog changed"):
         _service(controller, scope, catalog).materialize("Контекст.Сумма")
     assert controller.capture_scope is scope
+
+
+def test_capture_materialize_timeout_detaches_only_local_waiter() -> None:
+    scope = ready_scope()
+    route = RouteToken("runtime", 1, 0, "capture")
+    arbiter = RdbgArbiter(Session([]), route)
+    release = Event()
+    entered = Event()
+    payload = b'{"version":1,"root":{"t":"number","v":"9"}}'
+
+    class Controller(TicketController):
+        def submit_capture_materialization(self, plan, *, _before_first_effect=None):
+            def operation(_port):
+                if _before_first_effect is not None:
+                    _before_first_effect()
+                entered.set()
+                release.wait(3)
+                return Settlement(payload)
+
+            ticket = arbiter.submit(route, operation)
+            self.materialization_ticket = ticket
+            arbiter.dispatch(ticket)
+            return ticket
+
+    controller = Controller(scope)
+    service = _service(controller, scope, [WorkerTransferCatalog(1, ())])
+    try:
+        with pytest.raises(TimeoutError, match="Local waiter interval"):
+            service.materialize("Контекст.Сумма", timeout_s=0.02)
+        assert entered.is_set()
+        ticket = controller.materialization_ticket
+        assert ticket.status().waiter_detached is True
+        assert ticket.status().settled is False
+        assert controller.capture_scope is scope
+
+        release.set()
+        assert ticket.wait_settled(1) == payload
+        assert ticket.status().settled is True
+        assert service.materialize("Контекст.Сумма", timeout_s=1) == 9
+        assert controller.capture_scope is scope
+    finally:
+        release.set()
+        arbiter.close(timeout=3)

@@ -17,6 +17,7 @@ from onec_runtime.execution.capture.ticket_materialization import (
 from onec_runtime.execution.dynamic_value_materialization import (
     CaptureDynamicValueMaterialization,
 )
+from onec_runtime.execution.local_wait import validate_local_wait_timeout
 from onec_runtime.execution.main.idle_materialization import (
     MainIdleMaterializationService, MainIdleTargetFence,
 )
@@ -110,16 +111,20 @@ class ValueMaterializationRouter:
         options: MaterializationOptions | None = None,
         *,
         table_policy: ReferencePolicy | None = None,
+        timeout_s: float | None = None,
     ) -> object:
-        """Dynamically materialize a value or table on the confirmed route."""
+        """Materialize on the confirmed route with an optional local wait limit."""
 
+        local_wait = validate_local_wait_timeout(timeout_s)
         route = self._controller.value_route_snapshot()
         if isinstance(route, CaptureScope):
             return self._capture_dynamic(route).materialize(
-                handle, options, table_policy=table_policy,
+                handle, options, table_policy=table_policy, timeout_s=local_wait,
             )
         if isinstance(route, MainIdleTargetFence):
-            return self._main.materialize(handle, options, table_policy=table_policy)
+            return self._main.materialize(
+                handle, options, table_policy=table_policy, timeout_s=local_wait,
+            )
         raise ProtocolError("No confirmed stopped value route is available")
 
     def head_to_df(

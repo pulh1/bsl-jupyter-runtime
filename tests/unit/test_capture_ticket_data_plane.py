@@ -146,6 +146,20 @@ def test_interrupted_private_read_detaches_waiter_without_dropping_scope():
     assert controller.capture_scope is scope
 
 
+def test_invalid_materialization_wait_is_rejected_before_ticket_submission():
+    from onec_runtime.execution.capture.data_plane import CaptureTicketDataPlane
+
+    scope = ready_scope()
+    controller = TicketController(scope)
+    data = CaptureTicketDataPlane(controller, scope)
+
+    with pytest.raises(ValueError, match="timeout_s"):
+        data.materialize_private_payload(
+            transfer_plan("__onec_value_" + "b" * 32), timeout_s=0,
+        )
+    assert controller.requested == []
+
+
 def test_private_result_type_is_checked_before_it_can_reach_public_binding():
     from onec_runtime.execution.capture.data_plane import CaptureTicketDataPlane
 

@@ -3,6 +3,8 @@
 import json
 from decimal import Decimal
 
+import pytest
+
 from onec_runtime.execution.arbiter import RdbgArbiter, RouteToken
 from onec_runtime.execution.main.idle_materialization import MainIdleTargetFence
 from onec_runtime.execution.worker_activation import WorkerMaterializationSnapshot
@@ -149,5 +151,57 @@ def test_value_router_builds_bounded_head_on_the_capture_ticket() -> None:
         )
         assert frame["Name"].tolist() == ["Alice", "Bob"]
         assert "Для ИндексПроекции = 0 По Мин(Контекст.Таблица.Количество() - 1, 1)" in controller.plan.instruction
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_dynamic_materialize_forwards_local_wait_budget_on_both_routes() -> None:
+    from onec_runtime.execution.value_materialization_router import ValueMaterializationRouter
+
+    scope = ready_scope()
+    route = RouteToken("runtime", 1, 0, "main")
+    fence = MainIdleTargetFence(route, TARGET)
+    arbiter = RdbgArbiter(Session([]), route)
+
+    class Controller:
+        capture_scope = scope
+        selected = scope
+
+        def value_route_snapshot(self):
+            return self.selected
+
+        def main_idle_fence(self):
+            return fence
+
+        def main_idle_fence_in_ticket(self):
+            return fence
+
+    class Service:
+        def __init__(self):
+            self.calls = []
+
+        def materialize(self, handle, options=None, *, table_policy=None, timeout_s=None):
+            self.calls.append((handle, timeout_s))
+            return "value"
+
+    controller = Controller()
+    router = ValueMaterializationRouter(
+        controller, arbiter,
+        runtime_generation=7, context_generation=4,
+        worker_catalog_snapshot=lambda: WorkerMaterializationSnapshot(0, ()),
+    )
+    capture_service = Service()
+    main_service = Service()
+    router._capture_dynamic = lambda _scope: capture_service
+    router._main = main_service
+    try:
+        with pytest.raises(ValueError, match="timeout_s"):
+            router.materialize("Контекст.X", timeout_s=0)
+        assert capture_service.calls == []
+        assert router.materialize("Контекст.X", timeout_s=0.25) == "value"
+        controller.selected = fence
+        assert router.materialize("Контекст.X", timeout_s=0.5) == "value"
+        assert capture_service.calls == [("Контекст.X", 0.25)]
+        assert main_service.calls == [("Контекст.X", 0.5)]
     finally:
         arbiter.close(timeout=3)

@@ -1,0 +1,215 @@
+"""The public Session value signatures must retain their supported semantics."""
+
+import pytest
+from contextlib import nullcontext
+from math import inf, nan
+from threading import RLock
+from types import SimpleNamespace
+
+from onec_runtime.performance_profile import PhaseRecorder
+from onec_runtime.table_materialization import ReferencePolicy
+from onec_runtime.value_materialization import MaterializationOptions
+
+
+class RecordingRouter:
+    def __init__(self) -> None:
+        self.calls: list[tuple[object, ...]] = []
+
+    def materialize(self, handle, options=None, *, table_policy=None, timeout_s=None):
+        self.calls.append(("materialize", handle, options, table_policy))
+        return {"value": 7}
+
+    def to_df(self, handle, policy=None, *, max_rows, max_bytes):
+        self.calls.append(("to_df", handle, policy, max_rows, max_bytes))
+        return "frame"
+
+
+def test_materialize_preserves_public_reference_and_value_limits() -> None:
+    from onec_runtime.execution.session_value_adapter import SessionValueMaterializationAdapter
+
+    router = RecordingRouter()
+    adapter = SessionValueMaterializationAdapter(router)
+
+    result = adapter.materialize(
+        "Контекст.Значение",
+        refs="both",
+        ref_columns={"Ссылка": "uuid"},
+        uuid_suffix="_ид",
+        max_depth=5,
+        max_items=40,
+        max_bytes=8192,
+    )
+
+    assert result == {"value": 7}
+    assert router.calls == [(
+        "materialize",
+        "Контекст.Значение",
+        MaterializationOptions(refs="both", max_depth=5, max_items=40, max_bytes=8192),
+        ReferencePolicy(refs="both", ref_columns={"Ссылка": "uuid"}, uuid_suffix="_ид"),
+    )]
+
+
+def test_to_df_applies_explicit_row_and_byte_budgets() -> None:
+    from onec_runtime.execution.session_value_adapter import SessionValueMaterializationAdapter
+
+    router = RecordingRouter()
+    adapter = SessionValueMaterializationAdapter(router)
+
+    assert adapter.to_df(
+        "Контекст.Таблица",
+        refs="uuid",
+        ref_columns={"Сотрудник": "both"},
+        uuid_suffix="_uuid",
+    ) == "frame"
+    assert router.calls == [(
+        "to_df",
+        "Контекст.Таблица",
+        ReferencePolicy(refs="uuid", ref_columns={"Сотрудник": "both"}, uuid_suffix="_uuid"),
+        100_000,
+        64 * 1024 * 1024,
+    )]
+
+
+def test_materialize_value_keeps_proxy_alias_signature() -> None:
+    from onec_runtime.execution.session_value_adapter import SessionValueMaterializationAdapter
+
+    router = RecordingRouter()
+    adapter = SessionValueMaterializationAdapter(router)
+
+    assert adapter.materialize_value("Контекст.X", max_items=3) == {"value": 7}
+    assert router.calls == [(
+        "materialize",
+        "Контекст.X",
+        MaterializationOptions(max_items=3),
+        ReferencePolicy(refs="presentation", ref_columns=None, uuid_suffix="__uuid"),
+    )]
+
+
+def test_timeout_is_forwarded_to_routed_materialization() -> None:
+    from onec_runtime.execution.session_value_adapter import SessionValueMaterializationAdapter
+
+    class TimeoutRouter(RecordingRouter):
+        def materialize(self, handle, options=None, *, table_policy=None, timeout_s=None):
+            self.calls.append(("timeout", timeout_s))
+            return 7
+
+    router = TimeoutRouter()
+    adapter = SessionValueMaterializationAdapter(router)
+
+    assert adapter.materialize("Контекст.Значение", timeout_s=0.25) == 7
+    assert router.calls == [("timeout", 0.25)]
+
+
+@pytest.mark.parametrize("timeout_s", [0, -1, True, inf, nan, "2"])
+def test_invalid_local_wait_timeout_fails_before_router(timeout_s) -> None:
+    from onec_runtime.execution.session_value_adapter import SessionValueMaterializationAdapter
+
+    router = RecordingRouter()
+    adapter = SessionValueMaterializationAdapter(router)
+
+    with pytest.raises(ValueError, match="timeout_s"):
+        adapter.materialize("Контекст.Значение", timeout_s=timeout_s)
+    assert router.calls == []
+
+
+@pytest.mark.parametrize("options", [
+    {"refs": "opaque"},
+    {"ref_columns": {"Ссылка": "opaque"}},
+    {"ref_columns": {"": "uuid"}},
+    {"uuid_suffix": ""},
+])
+def test_invalid_reference_options_fail_before_table_transfer(options) -> None:
+    from onec_runtime.execution.session_value_adapter import SessionValueMaterializationAdapter
+
+    router = RecordingRouter()
+    adapter = SessionValueMaterializationAdapter(router)
+
+    with pytest.raises((TypeError, ValueError)):
+        adapter.to_df("Контекст.Таблица", **options)
+    assert router.calls == []
+
+
+@pytest.mark.parametrize("method, expected_route", [
+    ("to_df", "to_df"),
+    ("materialize", "materialize"),
+])
+def test_current_session_default_chunk_size_is_advisory(method, expected_route) -> None:
+    """RuntimeSession injects 2400; routed transfers accept this hint."""
+
+    from onec_runtime.execution.session_value_adapter import SessionValueMaterializationAdapter
+    from onec_runtime.session import RuntimeSession
+
+    router = RecordingRouter()
+    session = SimpleNamespace(
+        _operation_lock=RLock(),
+        config=SimpleNamespace(chunk_size=2400),
+        runtime_api=SessionValueMaterializationAdapter(router),
+        validate_value_reference=lambda handle: handle,
+        _capture_materialization_caller_handoff=nullcontext,
+    )
+
+    getattr(RuntimeSession, method)(session, "Контекст.Таблица")
+    assert len(router.calls) == 1
+    assert router.calls[0][0] == expected_route
+
+
+@pytest.mark.parametrize("method", ["to_df", "materialize"])
+@pytest.mark.parametrize("chunk_size", [0, -1, True, 1.5, "128"])
+def test_chunk_hint_must_be_positive_integer(method, chunk_size) -> None:
+    from onec_runtime.execution.session_value_adapter import SessionValueMaterializationAdapter
+
+    router = RecordingRouter()
+    adapter = SessionValueMaterializationAdapter(router)
+
+    with pytest.raises(ValueError, match="chunk_size"):
+        getattr(adapter, method)("Контекст.Таблица", chunk_size=chunk_size)
+    assert router.calls == []
+
+
+@pytest.mark.parametrize("method", ["to_df", "materialize"])
+def test_invalid_profiler_fails_before_routed_transfer(method) -> None:
+    from onec_runtime.execution.session_value_adapter import SessionValueMaterializationAdapter
+
+    router = RecordingRouter()
+    adapter = SessionValueMaterializationAdapter(router)
+
+    with pytest.raises(TypeError, match="profiler"):
+        getattr(adapter, method)("Контекст.Значение", profiler=object())
+    assert router.calls == []
+
+
+@pytest.mark.parametrize("method, phase", [
+    ("to_df", "table.routed_transfer"),
+    ("materialize", "materialization.routed_transfer"),
+])
+def test_profiler_records_routed_transfer_phase(method, phase) -> None:
+    from onec_runtime.execution.session_value_adapter import SessionValueMaterializationAdapter
+
+    router = RecordingRouter()
+    adapter = SessionValueMaterializationAdapter(router)
+    profiler = PhaseRecorder()
+
+    getattr(adapter, method)("Контекст.Значение", profiler=profiler)
+
+    assert len(router.calls) == 1
+    assert [event.phase for event in profiler.events] == [phase]
+    assert profiler.events[0].error_present is False
+
+
+def test_profiler_records_routed_failure_without_private_payload() -> None:
+    from onec_runtime.execution.session_value_adapter import SessionValueMaterializationAdapter
+
+    class FailingRouter(RecordingRouter):
+        def materialize(self, handle, options=None, *, table_policy=None, timeout_s=None):
+            raise RuntimeError("remote transfer failed")
+
+    profiler = PhaseRecorder()
+    adapter = SessionValueMaterializationAdapter(FailingRouter())
+
+    with pytest.raises(RuntimeError, match="remote transfer failed"):
+        adapter.materialize("Контекст.Секрет", profiler=profiler)
+
+    assert [event.phase for event in profiler.events] == ["materialization.routed_transfer"]
+    assert profiler.events[0].error_present is True
+    assert profiler.events[0].input_bytes == 0
+    assert profiler.events[0].output_bytes == 0

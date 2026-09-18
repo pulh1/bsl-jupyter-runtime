@@ -109,6 +109,46 @@ def test_direct_value_materialization_runs_all_remote_steps_in_one_arbiter_ticke
         arbiter.close(timeout=3)
 
 
+def test_main_idle_materialize_timeout_detaches_only_local_waiter() -> None:
+    payload = b'{"version":1,"root":{"t":"number","v":"12"}}'
+    encoded = b64encode(payload).decode("ascii")
+    session = Session([
+        f"R|7|3|{len(payload)}|{sha256(payload).hexdigest()}|{len(encoded)}",
+        encoded,
+        "Истина",
+    ])
+    arbiter = RdbgArbiter(session, ROUTE)
+    release = Event()
+    blocker_started = Event()
+    blocker = arbiter.submit(
+        ROUTE,
+        lambda _port: (blocker_started.set(), release.wait(3), Settlement(None))[2],
+    )
+    arbiter.dispatch(blocker)
+    service = MainIdleMaterializationService(
+        arbiter,
+        main_idle_fence=lambda: MainIdleTargetFence(ROUTE, TARGET),
+        runtime_generation=7, context_generation=3,
+    )
+    try:
+        assert blocker_started.wait(1)
+        with pytest.raises(TimeoutError, match="Local waiter interval"):
+            service.materialize("Контекст.Сумма", timeout_s=0.02)
+
+        pending = arbiter._queue[0]
+        assert pending.status().waiter_detached is True
+        assert pending.status().settled is False
+        assert session.calls == []
+
+        release.set()
+        assert pending.wait_settled(1) == payload
+        assert pending.status().settled is True
+    finally:
+        release.set()
+        blocker.wait_settled(1)
+        arbiter.close(timeout=3)
+
+
 def test_materialization_rejects_target_changed_before_ticket_admission() -> None:
     session = Session([])
     arbiter = RdbgArbiter(session, ROUTE)

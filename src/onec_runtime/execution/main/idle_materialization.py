@@ -19,6 +19,9 @@ from onec_runtime.execution.arbiter import (
     Settlement,
 )
 from onec_runtime.execution.evaluation import wait_for_pending_result
+from onec_runtime.execution.local_wait import (
+    validate_local_wait_timeout, wait_initiator_locally,
+)
 from onec_runtime.execution.worker_activation import WorkerMaterializationSnapshot
 from onec_runtime.execution.value_transfer_plan import (
     build_bounded_projection_instruction,
@@ -167,9 +170,11 @@ class MainIdleMaterializationService:
         options: MaterializationOptions | None = None,
         *,
         table_policy: ReferencePolicy | None = None,
+        timeout_s: float | None = None,
     ) -> object:
-        """Materialize a bounded value or table on the confirmed MAIN route."""
+        """Materialize on MAIN with an optional initiating-wait limit."""
 
+        local_wait = validate_local_wait_timeout(timeout_s)
         selected = options or MaterializationOptions()
         if not isinstance(selected, MaterializationOptions):
             raise TypeError("value materialization options are invalid")
@@ -199,6 +204,7 @@ class MainIdleMaterializationService:
             ),
             CaptureEvaluationKind.MATERIALIZATION_HELPER,
             catalog,
+            timeout_s=local_wait,
         )
         if classify_materialization_payload(payload) == "table":
             return decode_compact_table_payload(
@@ -293,6 +299,8 @@ class MainIdleMaterializationService:
         plan: CaptureTransferPlan,
         kind: CaptureEvaluationKind,
         catalog: WorkerMaterializationSnapshot,
+        *,
+        timeout_s: float | None = None,
     ) -> bytes:
         if kind is not CaptureEvaluationKind.MATERIALIZATION_HELPER:
             raise ProtocolError("MAIN materialization kind is invalid")
@@ -304,12 +312,9 @@ class MainIdleMaterializationService:
         )
         holder["ticket"] = ticket
         self._arbiter.dispatch(ticket)
-        try:
-            with self._wait_handoff():
-                result = ticket.wait_initiator()
-        except KeyboardInterrupt:
-            ticket.detach_waiter()
-            raise
+        result = wait_initiator_locally(
+            ticket, timeout_s=timeout_s, wait_handoff=self._wait_handoff,
+        )
         if type(result) is not bytes:
             raise ProtocolError("MAIN materialization payload is invalid")
         return result

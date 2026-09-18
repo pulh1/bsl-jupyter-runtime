@@ -17,6 +17,7 @@ from onec_runtime.execution.capture.data_plane import (
 )
 from onec_runtime.execution.capture.scope import CaptureScope
 from onec_runtime.execution.capture.ticket_materialization import WorkerTransferCatalog
+from onec_runtime.execution.local_wait import validate_local_wait_timeout
 from onec_runtime.execution.value_transfer_plan import (
     build_bounded_projection_instruction,
     build_dynamic_materialization_instruction,
@@ -66,9 +67,11 @@ class CaptureDynamicValueMaterialization:
         options: MaterializationOptions | None = None,
         *,
         table_policy: ReferencePolicy | None = None,
+        timeout_s: float | None = None,
     ) -> object:
-        """Materialize one admitted value, selecting table or value from payload."""
+        """Materialize with an optional limit on the initiating ticket wait."""
 
+        local_wait = validate_local_wait_timeout(timeout_s)
         selected = options or MaterializationOptions()
         if not isinstance(selected, MaterializationOptions):
             raise TypeError("value materialization options are invalid")
@@ -88,13 +91,16 @@ class CaptureDynamicValueMaterialization:
             context_generation=self._context_generation,
             worker_type_registrations=catalog.registrations,
         )
-        payload = transfer.materialize_private_payload(build_projection_transfer_plan(
-            instruction,
-            context_key=key,
-            max_bytes=selected.max_bytes,
-            runtime_generation=self._runtime_generation,
-            context_generation=self._context_generation,
-        ))
+        payload = transfer.materialize_private_payload(
+            build_projection_transfer_plan(
+                instruction,
+                context_key=key,
+                max_bytes=selected.max_bytes,
+                runtime_generation=self._runtime_generation,
+                context_generation=self._context_generation,
+            ),
+            timeout_s=local_wait,
+        )
         route = classify_materialization_payload(payload)
         if route == "table":
             policy = table_policy or ReferencePolicy(selected.refs)
