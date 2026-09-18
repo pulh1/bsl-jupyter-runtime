@@ -294,6 +294,29 @@ class MainIdleMaterializationService:
             raise ProtocolError("bounded table projection returned a value payload")
         return decode_compact_table_payload(payload, selected_policy)
 
+    def transfer_private_plan(
+        self,
+        plan: CaptureTransferPlan,
+        *,
+        catalog: WorkerMaterializationSnapshot,
+        timeout_s: float | None = None,
+    ) -> bytes:
+        """Run a qualified projection plan on this exact MAIN-idle target.
+
+        The same ticket checks target and Worker generation immediately before
+        its first RDBG request, then owns payload admission and cleanup. A
+        caller wait limit detaches only that caller, retaining the ticket.
+        """
+
+        if not isinstance(plan, CaptureTransferPlan):
+            raise TypeError("MAIN projection transfer plan is invalid")
+        if not isinstance(catalog, WorkerMaterializationSnapshot):
+            raise TypeError("MAIN projection Worker catalog is invalid")
+        return self._execute_transfer(
+            plan, CaptureEvaluationKind.MATERIALIZATION_HELPER, catalog,
+            timeout_s=validate_local_wait_timeout(timeout_s),
+        )
+
     def _execute_transfer(
         self,
         plan: CaptureTransferPlan,

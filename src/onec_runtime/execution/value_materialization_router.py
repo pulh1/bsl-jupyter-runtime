@@ -5,11 +5,14 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from typing import Protocol
+from uuid import uuid4
 
 import pandas as pd
 
+from onec_runtime.capture_evaluation import CaptureTransferPlan
 from onec_runtime.errors import ProtocolError
 from onec_runtime.execution.arbiter import RdbgArbiter
+from onec_runtime.execution.capture.data_plane import CaptureTicketDataPlane
 from onec_runtime.execution.capture.scope import CaptureScope
 from onec_runtime.execution.capture.ticket_materialization import (
     WorkerTransferCatalog, bind_capture_ticket_materialization,
@@ -22,8 +25,17 @@ from onec_runtime.execution.main.idle_materialization import (
     MainIdleMaterializationService, MainIdleTargetFence,
 )
 from onec_runtime.execution.worker_activation import WorkerMaterializationSnapshot
+from onec_runtime.execution.value_reference import validate_public_direct_handle
+from onec_runtime.execution.value_transfer_plan import (
+    build_projection_transfer_plan, classify_materialization_payload,
+)
+from onec_runtime.experiment import bsl_string_literal
 from onec_runtime.table_materialization import ReferencePolicy
-from onec_runtime.value_materialization import MaterializationOptions
+from onec_runtime.value_materialization import MaterializationOptions, decode_value_payload
+
+
+_KIND_PAYLOAD_BYTES = 2048
+_KIND_OPTIONS = MaterializationOptions(max_depth=1, max_items=1, max_bytes=_KIND_PAYLOAD_BYTES)
 
 
 class ValueRouteController(Protocol):
@@ -148,6 +160,74 @@ class ValueMaterializationRouter:
             )
         raise ProtocolError("No confirmed stopped value route is available")
 
+    def transfer(
+        self, plan: CaptureTransferPlan, *, catalog: WorkerTransferCatalog,
+        timeout_s: float | None,
+    ) -> bytes:
+        """Execute a private projection plan through the current route ticket.
+
+        The route owner decodes the admission envelope, keeps unknown outcomes
+        pending, and performs private-key cleanup. A changed Worker catalog or
+        stopped route is rejected before a remote side effect.
+        """
+
+        if not isinstance(plan, CaptureTransferPlan):
+            raise TypeError("projection transfer plan is invalid")
+        if not isinstance(catalog, WorkerTransferCatalog):
+            raise TypeError("projection Worker catalog is invalid")
+        wait = validate_local_wait_timeout(timeout_s)
+        self._require_catalog(catalog)
+        route = self._controller.value_route_snapshot()
+        if isinstance(route, CaptureScope):
+            def require_same_catalog() -> None:
+                self._require_catalog(catalog)
+
+            data = CaptureTicketDataPlane(
+                self._controller, route,
+                wait_handoff=self._wait_handoff,
+                before_materialization=require_same_catalog,
+            )
+            return data.materialize_private_payload(plan, timeout_s=wait)
+        if isinstance(route, MainIdleTargetFence):
+            return self._main.transfer_private_plan(
+                plan,
+                catalog=WorkerMaterializationSnapshot(
+                    catalog.revision, catalog.registrations,
+                ),
+                timeout_s=wait,
+            )
+        raise ProtocolError("No confirmed stopped value route is available")
+
+    def inspect_kind(
+        self, handle: str, *, catalog: WorkerTransferCatalog,
+        timeout_s: float | None,
+    ) -> str:
+        """Read a bounded serializer kind without exposing debugger text."""
+
+        safe_handle = validate_public_direct_handle(handle)
+        if not isinstance(catalog, WorkerTransferCatalog):
+            raise TypeError("projection Worker catalog is invalid")
+        self._require_catalog(catalog)
+        key = f"__onec_projection_{uuid4().hex}"
+        instruction = _kind_instruction(
+            safe_handle, context_key=key,
+            catalog=catalog,
+            runtime_generation=self._runtime_generation,
+            context_generation=self._context_generation,
+        )
+        plan = build_projection_transfer_plan(
+            instruction, context_key=key, max_bytes=_KIND_PAYLOAD_BYTES,
+            runtime_generation=self._runtime_generation,
+            context_generation=self._context_generation,
+        )
+        payload = self.transfer(plan, catalog=catalog, timeout_s=timeout_s)
+        if classify_materialization_payload(payload) != "value":
+            raise ProtocolError("materialization kind payload is invalid")
+        kind = decode_value_payload(payload, _KIND_OPTIONS)
+        if kind not in {"value", "table"}:
+            raise ProtocolError("materialization kind is invalid")
+        return kind
+
     def _select(self):
         route = self._controller.value_route_snapshot()
         if isinstance(route, CaptureScope):
@@ -172,6 +252,10 @@ class ValueMaterializationRouter:
         snapshot = self._worker_snapshot()
         return WorkerTransferCatalog(snapshot.revision, snapshot.registrations)
 
+    def _require_catalog(self, expected: WorkerTransferCatalog) -> None:
+        if self._transfer_catalog() != expected:
+            raise ProtocolError("Worker catalog changed before value projection")
+
     def _capture_dynamic(self, scope: CaptureScope) -> CaptureDynamicValueMaterialization:
         return CaptureDynamicValueMaterialization(
             self._controller,
@@ -181,3 +265,49 @@ class ValueMaterializationRouter:
             worker_catalog_snapshot=self._transfer_catalog,
             wait_handoff=self._wait_handoff,
         )
+
+
+def _kind_instruction(
+    handle: str, *, context_key: str, catalog: WorkerTransferCatalog,
+    runtime_generation: int, context_generation: int,
+) -> str:
+    """Serialize only ``value`` or ``table`` after Worker privacy admission."""
+
+    lines = ["Попытка", "ТипыОбъектовWorker = Новый Массив;"]
+    for index, registration in enumerate(catalog.registrations):
+        lines.extend((
+            f"ВременныйОбъектWorker{index} = ВнешниеОбработки.Создать("
+            f"{bsl_string_literal(registration)}, Ложь);",
+            f"ТипыОбъектовWorker.Добавить(ТипЗнч(ВременныйОбъектWorker{index}));",
+        ))
+    lines.extend((
+        "Если Не RuntimeValueTransferServer.ДопуститьЗначение("
+        f"{handle}, ТипыОбъектовWorker) Тогда",
+        '    Результат = "D|worker_generation_value";',
+        "Иначе",
+        "    ВидМатериализации = RuntimeValueTransferServer."
+        f"ПолучитьВидМатериализации({handle});",
+        '    Если ВидМатериализации = "table" Или ВидМатериализации = "value" Тогда',
+        "        Материализация = RuntimeValueTransferServer."
+        "СериализоватьЗначение(ВидМатериализации, "
+        f'"presentation", 1, 1, {_KIND_PAYLOAD_BYTES}, ТипыОбъектовWorker);',
+        "        Если Не Материализация.Доступ Тогда",
+        '            Результат = "D|worker_generation_value";',
+        "        Иначе",
+        f"            Контекст.Вставить({bsl_string_literal(context_key)}, Материализация.Base64);",
+        '            Результат = "R|" + '
+        f'Формат({runtime_generation}, "ЧГ=0; ЧДЦ=0") + "|" + '
+        f'Формат({context_generation}, "ЧГ=0; ЧДЦ=0") + "|" + '
+        'Формат(Материализация.Размер, "ЧГ=0; ЧДЦ=0") + "|" + '
+        'Материализация.Хеш + "|" + '
+        'Формат(СтрДлина(Материализация.Base64), "ЧГ=0; ЧДЦ=0");',
+        "        КонецЕсли;",
+        "    Иначе",
+        '        Результат = "E|value_admission_failed";',
+        "    КонецЕсли;",
+        "КонецЕсли;",
+        "Исключение",
+        '    Результат = "E|value_admission_failed";',
+        "КонецПопытки;",
+    ))
+    return "\n".join(lines)
