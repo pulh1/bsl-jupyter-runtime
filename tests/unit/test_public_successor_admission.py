@@ -11,12 +11,14 @@ from types import SimpleNamespace
 import pytest
 
 from onec_runtime.config import RuntimeConfig
+from onec_runtime.capture_evaluation import CapturePhase
 from onec_runtime.errors import ProtocolError
-from onec_runtime.execution.capture.writeback import CaptureExportFailed
 from onec_runtime.execution.post_bootstrap import compose_fresh_post_bootstrap_execution
 from onec_runtime.rdbg.models import EvaluationResult
 from onec_runtime.runtime_api import RuntimeReplyKind
 from onec_runtime.session import RuntimeSession, RuntimeSessionConfig
+from onec_runtime_mcp.agent.runtime_backend import OnecRuntimeBackend
+from onec_runtime_mcp.agent.runtime_session import AgentRuntimeSession
 
 from test_execution_controller_routes import BUSINESS, KERNEL, CompleteSession
 
@@ -109,14 +111,14 @@ def test_session_successor_ticket_correlates_second_stop_of_same_main(
             operation_id="request-failed", capture_generation=2,
             source_revision=1, source_sha256="source-hash",
         )
-        failed_admission = runtime.prepare_capture_successor(
+        backend = OnecRuntimeBackend("synthetic", AgentRuntimeSession(runtime))
+        failed_admission = backend.prepare_capture_successor(
             failed_intent, attempt=failed_attempt,
         )
-        with pytest.raises(CaptureExportFailed):
-            runtime.resume_capture(
-                dirty_roots=("Amount",),
-                continuation_attempt_id="continue-failed",
-            )
+        failed_outcome = backend.continue_capture(
+            dirty_roots=("Amount",), attempt_id="continue-failed",
+        )
+        assert failed_outcome.execution.runtime_state == "partial_writeback_failure"
         failed_evidence = runtime.continuation_attempt_evidence("continue-failed")
         assert failed_evidence.root_statuses == (("Amount", "failed"),)
         assert failed_evidence.continue_state == "unattempted"
@@ -124,6 +126,7 @@ def test_session_successor_ticket_correlates_second_stop_of_same_main(
         assert runtime._active_capture_ticket.ticket_id == first_arming.ticket_id
         assert composed.breakpoint_workspace.confirmed_snapshot.captures == (BUSINESS,)
         assert runtime.continuation_attempt_evidence("continue-failed") == failed_evidence
+        assert runtime.current_capture().status().phase is CapturePhase.PAUSED
         assert runtime.execute_bsl("Результат = 2;").kind is RuntimeReplyKind.CAPTURE_CELL
 
         attempt = SimpleNamespace(
