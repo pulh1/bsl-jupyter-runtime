@@ -869,6 +869,11 @@ class RdbgArbiter:
             if expected is None or evidence.expected_target != expected:
                 raise ValueError('Termination evidence belongs to another target')
             if isinstance(evidence, ServerTerminationConfirmed):
+                if (
+                    self._file_target_lease is not None
+                    or self._exact_server_stop_target_locked(ticket) != expected
+                ):
+                    raise ValueError('Server termination proof requires the current bound server backend and exact selected target')
                 absence = evidence.absence
                 if (
                     not isinstance(absence, BoundServerTargetAbsence)
@@ -883,10 +888,11 @@ class RdbgArbiter:
             if isinstance(evidence, FileTerminationConfirmed):
                 lease = self._file_target_lease
                 if (
-                    lease is not None
-                    and (lease.expected_target != expected or evidence.pid != lease.pid)
+                    lease is None
+                    or not self._exact_file_stop_target_locked(ticket, lease)
+                    or evidence.pid != lease.pid
                 ):
-                    raise ValueError('file exit evidence belongs to another process')
+                    raise ValueError('File termination proof requires the exact selected file process lease')
 
             self._closed = True
             while self._queue:

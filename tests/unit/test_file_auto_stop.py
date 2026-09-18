@@ -48,7 +48,7 @@ class _FileSession:
 
 
 def _unknown_file_ticket(*, exit_on_close: bool = True):
-    target = TargetId(uuid4(), "file-test")
+    target = TargetId(uuid4(), "file-test", uuid4())
     process = _OwnedDebuggee(exit_on_close=exit_on_close)
     session = _FileSession(target)
     route = RouteToken("file-stop", 1, 0, "main")
@@ -214,3 +214,55 @@ def test_file_stop_rejects_lease_for_another_stopped_target() -> None:
         )
 
     assert process.close_calls == []
+
+
+def test_file_exit_proof_requires_exact_leased_process() -> None:
+    from onec_runtime.execution.termination import ServerTerminationConfirmed
+    from onec_runtime.rdbg.session import BoundServerTargetAbsence
+
+    _session, route, arbiter, ticket, target, process = _unknown_file_ticket()
+    server_proof = ServerTerminationConfirmed(
+        target,
+        BoundServerTargetAbsence(TargetId(uuid4(), target.infobase_alias), target, 1.0, 1),
+    )
+    try:
+        with pytest.raises(ValueError, match='server.*backend|selected server target'):
+            arbiter.retire_terminated_target(ticket, route, server_proof)
+        with pytest.raises(ValueError, match='file.*process|file.*lease'):
+            arbiter.retire_terminated_target(
+                ticket, route, FileTerminationConfirmed(target, process.pid + 1, -15),
+            )
+        assert arbiter.active_ticket is ticket
+        assert ticket.wait_unknown(0)
+    finally:
+        if arbiter.active_ticket is ticket:
+            arbiter.retire_terminated_target(
+                ticket, route, FileTerminationConfirmed(target, process.pid, -15),
+            )
+        arbiter.close(timeout=3)
+
+
+def test_file_owner_rejects_server_proof_after_selected_target_kind_changes() -> None:
+    from onec_runtime.execution.termination import ServerTerminationConfirmed
+    from onec_runtime.rdbg.session import BoundServerTargetAbsence
+
+    session, route, arbiter, ticket, target, process = _unknown_file_ticket()
+    selected = session.target
+    session.target = DebugTarget(target, 'Server', 'stopped')
+    proof = ServerTerminationConfirmed(
+        target,
+        BoundServerTargetAbsence(
+            TargetId(uuid4(), target.infobase_alias, target.seance_id), target, 1.0, 1,
+        ),
+    )
+    try:
+        with pytest.raises(ValueError, match='server.*backend|file.*backend'):
+            arbiter.retire_terminated_target(ticket, route, proof)
+        assert arbiter.active_ticket is ticket
+    finally:
+        session.target = selected
+        if arbiter.active_ticket is ticket:
+            arbiter.retire_terminated_target(
+                ticket, route, FileTerminationConfirmed(target, process.pid, -15),
+            )
+        arbiter.close(timeout=3)

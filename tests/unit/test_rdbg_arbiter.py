@@ -6,6 +6,7 @@ from uuid import uuid4
 import pytest
 
 import onec_runtime.execution.arbiter as arbiter_module
+from arbiter_test_cleanup import confirm_test_server_terminated
 from onec_runtime.errors import CommandTimeout, EvaluationDispatchUnknown
 from onec_runtime.rdbg.models import FrameVariable, LocalVariablesResult, PendingEvaluation, TargetId, EvaluationResult
 
@@ -29,7 +30,7 @@ class Session:
     def start_evaluation(self, expression, *, on_transport_dispatch, **kwargs):
         if not expression:
             raise ValueError('empty expression')
-        self.pending = PendingEvaluation(TargetId(uuid4(), 'test'), uuid4(), self)
+        self.pending = PendingEvaluation(TargetId(uuid4(), 'test', uuid4()), uuid4(), self)
         self.expression = expression
         on_transport_dispatch()
         self.record(expression, expression == 'blocked')
@@ -108,11 +109,10 @@ class StoppedEvaluationSession(Session):
 
 def close_stopped_eval_test_arbiter(arbiter, route, ticket, session):
     """Use explicit test target proof only when a RED failure leaves ownership unknown."""
-    from onec_runtime.execution.termination import FileTerminationConfirmed
-
     if ticket.wait_unknown(3):
-        proof = FileTerminationConfirmed(session.pending.target_id, 1234, -15)
-        arbiter.retire_terminated_target(ticket, route, proof)
+        confirm_test_server_terminated(
+            arbiter, ticket, route, session, session.pending.target_id,
+        )
         with pytest.raises(arbiter_module.TargetTerminated):
             ticket.wait_settled(3)
     arbiter.close(timeout=3)
@@ -346,9 +346,8 @@ def test_ambiguous_post_settlement_cleanup_owns_arbiter_after_parent_reply(runti
     assert cleanup is not None and cleanup.wait_unknown(3)
     assert arbiter.active_ticket is cleanup
     assert arbiter.try_heartbeat() is None
-    from onec_runtime.execution.termination import FileTerminationConfirmed
-    arbiter.retire_terminated_target(
-        cleanup, route, FileTerminationConfirmed(session.pending.target_id, 1234, -15)
+    confirm_test_server_terminated(
+        arbiter, cleanup, route, session, session.pending.target_id,
     )
 
 
@@ -609,10 +608,8 @@ def test_local_variables_stop_before_first_transport_entry_sends_nothing(runtime
 
 
 def test_local_variables_timeout_after_dispatch_keeps_arbiter_owner():
-    from onec_runtime.execution.termination import FileTerminationConfirmed
-
     session = Session()
-    target = TargetId(uuid4(), 'capture')
+    target = TargetId(uuid4(), 'capture', uuid4())
     session.target = SimpleNamespace(target_id=target)
     route = RouteToken('locals-timeout', 1, 0, 'capture-scope')
     arbiter = RdbgArbiter(session, route)
@@ -634,8 +631,7 @@ def test_local_variables_timeout_after_dispatch_keeps_arbiter_owner():
         later.wait(0)
     assert [name for name, _ in session.calls] == ['locals-request']
 
-    proof = FileTerminationConfirmed(target, 1234, -15)
-    arbiter.retire_terminated_target(ticket, route, proof)
+    proof = confirm_test_server_terminated(arbiter, ticket, route, session, target)
     with pytest.raises(arbiter_module.TargetTerminated) as raised:
         ticket.wait_settled(3)
     assert raised.value.evidence is proof
@@ -647,10 +643,8 @@ def test_local_variables_timeout_after_dispatch_keeps_arbiter_owner():
 
 
 def test_heartbeat_timeout_after_transport_entry_keeps_owner_until_target_proof():
-    from onec_runtime.execution.termination import FileTerminationConfirmed
-
     session = Session()
-    target = TargetId(uuid4(), 'heartbeat')
+    target = TargetId(uuid4(), 'heartbeat', uuid4())
     session.target = SimpleNamespace(target_id=target)
     route = RouteToken('heartbeat-timeout', 1, 0, 'capture-scope')
     arbiter = RdbgArbiter(session, route)
@@ -671,8 +665,7 @@ def test_heartbeat_timeout_after_transport_entry_keeps_owner_until_target_proof(
         later.wait(0)
     assert [name for name, _ in session.calls] == ['test-server']
 
-    proof = FileTerminationConfirmed(target, 1234, -15)
-    arbiter.retire_terminated_target(ticket, route, proof)
+    confirm_test_server_terminated(arbiter, ticket, route, session, target)
     with pytest.raises(arbiter_module.TargetTerminated):
         ticket.wait_settled(3)
     with pytest.raises(CancelledBeforeEffect):
@@ -681,11 +674,11 @@ def test_heartbeat_timeout_after_transport_entry_keeps_owner_until_target_proof(
 
 
 def test_stop_between_heartbeat_requests_blocks_later_transport_entry():
-    from onec_runtime.execution.termination import FileTerminationConfirmed
+    from onec_runtime.rdbg.models import DebugTarget
 
     session = Session()
-    target = TargetId(uuid4(), 'heartbeat')
-    session.target = SimpleNamespace(target_id=target)
+    target = TargetId(uuid4(), 'heartbeat', uuid4())
+    session.target = DebugTarget(target, 'CLIENT', 'stopped')
     route = RouteToken('heartbeat-stop', 1, 0, 'capture-scope')
     arbiter = RdbgArbiter(session, route)
     first_request_done = Event()
@@ -712,8 +705,7 @@ def test_stop_between_heartbeat_requests_blocks_later_transport_entry():
     assert [name for name, _ in session.calls] == ['test-server']
     assert arbiter.active_ticket is ticket
 
-    proof = FileTerminationConfirmed(target, 1234, -15)
-    arbiter.retire_terminated_target(ticket, route, proof)
+    confirm_test_server_terminated(arbiter, ticket, route, session, target)
     with pytest.raises(arbiter_module.TargetTerminated):
         ticket.wait_settled(3)
     arbiter.close(timeout=3)
@@ -723,6 +715,7 @@ def test_termination_retirement_requires_exact_route_target_and_confirmed_eviden
     from onec_runtime.execution.termination import (
         FileTerminationConfirmed, FileTerminationUnknown, ServerTerminationConfirmed,
     )
+    from onec_runtime.rdbg.models import DebugTarget
     from onec_runtime.rdbg.session import BoundServerTargetAbsence
 
     session = Session()
@@ -758,6 +751,7 @@ def test_termination_retirement_requires_exact_route_target_and_confirmed_eviden
     assert ticket.status().pending_capability is pending
     assert ticket.wait_unknown(0)
 
+    session.target = DebugTarget(pending.target_id, 'Server', 'stopped')
     wrong_client = TargetId(uuid4(), 'another-infobase')
     mismatched_absence = BoundServerTargetAbsence(wrong_client, pending.target_id, 1.0, 2)
     with pytest.raises(ValueError, match='server'):
@@ -766,7 +760,8 @@ def test_termination_retirement_requires_exact_route_target_and_confirmed_eviden
         )
 
     absence = BoundServerTargetAbsence(
-        TargetId(uuid4(), pending.target_id.infobase_alias), pending.target_id, 1.0, 2,
+        TargetId(uuid4(), pending.target_id.infobase_alias, pending.target_id.seance_id),
+        pending.target_id, 1.0, 2,
     )
     proof = ServerTerminationConfirmed(pending.target_id, absence)
     arbiter.retire_terminated_target(ticket, route, proof)
@@ -1259,7 +1254,7 @@ def test_failed_reconciliation_cannot_release_unknown_owner_without_new_io(runti
 def test_policy_finalizer_waits_for_reconciled_eval_and_workspace_restore(runtime):
     session, route, arbiter = runtime
     observed = []
-    session.target = SimpleNamespace(target_id=TargetId(uuid4(), 'test'))
+    session.target = SimpleNamespace(target_id=TargetId(uuid4(), 'test', uuid4()))
 
     def initial(port):
         port.start_evaluation('ambiguous')
@@ -1290,19 +1285,15 @@ def test_policy_finalizer_waits_for_reconciled_eval_and_workspace_restore(runtim
         assert ticket.status().settled
     finally:
         if ticket.status().phase == 'unknown':
-            from onec_runtime.execution.termination import FileTerminationConfirmed
-            arbiter.retire_terminated_target(
-                ticket, route,
-                FileTerminationConfirmed(
-                    (ticket.status().pending_capability or session.target).target_id,
-                    1234, -15,
-                ),
+            confirm_test_server_terminated(
+                arbiter, ticket, route, session,
+                (ticket.status().pending_capability or session.target).target_id,
             )
 
 
 def test_policy_ticket_reconcile_plain_settlement_cannot_publish_raw_outcome(runtime):
     session, route, arbiter = runtime
-    session.target = SimpleNamespace(target_id=TargetId(uuid4(), 'test'))
+    session.target = SimpleNamespace(target_id=TargetId(uuid4(), 'test', uuid4()))
     published = []
 
     def initial(port):
@@ -1326,19 +1317,15 @@ def test_policy_ticket_reconcile_plain_settlement_cannot_publish_raw_outcome(run
         assert published == ['confirmed']
     finally:
         if ticket.status().phase == 'unknown':
-            from onec_runtime.execution.termination import FileTerminationConfirmed
-            arbiter.retire_terminated_target(
-                ticket, route,
-                FileTerminationConfirmed(
-                    (ticket.status().pending_capability or session.target).target_id,
-                    1234, -15,
-                ),
+            confirm_test_server_terminated(
+                arbiter, ticket, route, session,
+                (ticket.status().pending_capability or session.target).target_id,
             )
 
 
 def test_policy_finalizer_failure_is_not_retried_by_reconciliation(runtime):
     session, route, arbiter = runtime
-    session.target = SimpleNamespace(target_id=TargetId(uuid4(), 'test'))
+    session.target = SimpleNamespace(target_id=TargetId(uuid4(), 'test', uuid4()))
     calls = []
 
     def finish(raw):
@@ -1366,13 +1353,9 @@ def test_policy_finalizer_failure_is_not_retried_by_reconciliation(runtime):
         assert arbiter.active_ticket is ticket
     finally:
         if ticket.status().phase == 'unknown':
-            from onec_runtime.execution.termination import FileTerminationConfirmed
-            arbiter.retire_terminated_target(
-                ticket, route,
-                FileTerminationConfirmed(
-                    (ticket.status().pending_capability or session.target).target_id,
-                    1234, -15,
-                ),
+            confirm_test_server_terminated(
+                arbiter, ticket, route, session,
+                (ticket.status().pending_capability or session.target).target_id,
             )
 
 
@@ -1596,12 +1579,11 @@ def test_real_rdbg_heartbeat_runs_all_requests_on_arbiter_worker():
 
 
 def test_stop_between_eval_ping_and_autoattach_fences_hidden_rdbg_effect():
-    from onec_runtime.execution.termination import FileTerminationConfirmed
     from onec_runtime.rdbg.models import DebugTarget, ModuleLocation
     from onec_runtime.rdbg.session import RdbgSession, SessionState
     from onec_runtime.rdbg.xml_codec import BASE_NS, RDBG_NS
 
-    target = TargetId(uuid4(), 'DefAlias')
+    target = TargetId(uuid4(), 'DefAlias', uuid4())
     discovered_id = uuid4()
     ping_entered = Event()
     release_ping = Event()
@@ -1646,20 +1628,18 @@ def test_stop_between_eval_ping_and_autoattach_fences_hidden_rdbg_effect():
     finally:
         release_ping.set()
         if ticket.wait_unknown(3):
-            proof = FileTerminationConfirmed(target, 1234, -15)
-            arbiter.retire_terminated_target(ticket, route, proof)
+            confirm_test_server_terminated(arbiter, ticket, route, session, target)
             with pytest.raises(arbiter_module.TargetTerminated):
                 ticket.wait_settled(3)
         arbiter.close(timeout=3)
 
 
 def test_stop_after_ping_reconciles_result_despite_fenced_autoattach():
-    from onec_runtime.execution.termination import FileTerminationConfirmed
     from onec_runtime.rdbg.models import DebugTarget, ModuleLocation
     from onec_runtime.rdbg.session import RdbgSession, SessionState
     from onec_runtime.rdbg.xml_codec import BASE_NS, CALC_NS, RDBG_NS
 
-    target = TargetId(uuid4(), 'DefAlias')
+    target = TargetId(uuid4(), 'DefAlias', uuid4())
     discovered_id = uuid4()
     ping_entered = Event()
     release_ping = Event()
@@ -1717,9 +1697,7 @@ def test_stop_after_ping_reconciles_result_despite_fenced_autoattach():
     finally:
         release_ping.set()
         if ticket.wait_unknown(3):
-            arbiter.retire_terminated_target(
-                ticket, route, FileTerminationConfirmed(target, 1234, -15),
-            )
+            confirm_test_server_terminated(arbiter, ticket, route, session, target)
             with pytest.raises(arbiter_module.TargetTerminated):
                 ticket.wait_settled(3)
         arbiter.close(timeout=3)
@@ -2223,6 +2201,54 @@ def _unknown_server_stop(*, absence_results, block_confirmation=None,
     return session, capture_route if handoff_to_capture else route, arbiter, ticket, target, evidence
 
 
+def test_server_owner_rejects_file_exit_proof_without_file_process_lease():
+    from onec_runtime.execution.termination import (
+        FileTerminationConfirmed, ServerTerminationConfirmed,
+    )
+
+    _session, route, arbiter, ticket, target, absence = _unknown_server_stop(
+        absence_results=[None],
+    )
+    try:
+        with pytest.raises(ValueError, match='file.*backend|file.*lease'):
+            arbiter.retire_terminated_target(
+                ticket, route, FileTerminationConfirmed(target, 1234, -15),
+            )
+        assert arbiter.active_ticket is ticket
+        assert ticket.wait_unknown(0)
+    finally:
+        if arbiter.active_ticket is ticket:
+            arbiter.retire_terminated_target(
+                ticket, route, ServerTerminationConfirmed(target, absence),
+            )
+        arbiter.close(timeout=3)
+
+
+def test_server_exit_proof_requires_current_bound_server_target():
+    from onec_runtime.execution.termination import ServerTerminationConfirmed
+    from onec_runtime.rdbg.models import DebugTarget
+
+    session, route, arbiter, ticket, target, absence = _unknown_server_stop(
+        absence_results=[None],
+    )
+    selected = session.target
+    session.target = DebugTarget(target, 'ServerEmulation', 'stopped')
+    try:
+        with pytest.raises(ValueError, match='server.*backend|selected server target'):
+            arbiter.retire_terminated_target(
+                ticket, route, ServerTerminationConfirmed(target, absence),
+            )
+        assert arbiter.active_ticket is ticket
+        assert ticket.wait_unknown(0)
+    finally:
+        session.target = selected
+        if arbiter.active_ticket is ticket:
+            arbiter.retire_terminated_target(
+                ticket, route, ServerTerminationConfirmed(target, absence),
+            )
+        arbiter.close(timeout=3)
+
+
 def test_stop_automatically_terminates_fenced_server_target_on_same_worker():
     from onec_runtime.execution.termination import ServerTerminationConfirmed
 
@@ -2459,6 +2485,7 @@ def test_auto_stop_requires_exact_owned_server_target(selected_kind):
         arbiter.teardown_fenced_server_target(ticket, route, grace_s=0.01)
     with pytest.raises(ArbiterBusy):
         arbiter.close(timeout=0)
+    session.target = DebugTarget(target, 'Server', 'stopped')
     arbiter.retire_terminated_target(
         ticket, route, ServerTerminationConfirmed(target, evidence),
     )
