@@ -13,6 +13,7 @@ from onec_runtime.errors import ProtocolError
 from onec_runtime.session import RuntimeSession, RuntimeSessionConfig
 from onec_runtime_jupyter.extension import (
     NotebookDisplayConfig,
+    detach_runtime_namespace,
     install_runtime,
     load_ipython_extension,
 )
@@ -41,6 +42,7 @@ class InteractiveRuntimeSession:
         self._guardian = guardian
         self._closed = False
         self._close_lock = RLock()
+        self._installed_shell: object | None = None
         self._shutdown_shell: InteractiveShell | None = None
 
     @classmethod
@@ -103,6 +105,8 @@ class InteractiveRuntimeSession:
         with self._close_lock:
             if self._closed:
                 return
+            if self._installed_shell is not None:
+                detach_runtime_namespace(self._installed_shell, self.runtime)
             # Failed core cleanup remains retryable, including at Python exit.
             shutdown_close = (
                 getattr(self.runtime, "close_for_kernel_shutdown", None)
@@ -120,6 +124,7 @@ class InteractiveRuntimeSession:
             if self._guardian is not None:
                 self._guardian.stop()
             self._closed = True
+            self._installed_shell = None
             atexit.unregister(self._close_at_shutdown)
             if self._shutdown_shell is not None:
                 if getattr(self._shutdown_shell, _OWNED_SESSION_ATTR, None) is self:
@@ -130,6 +135,7 @@ class InteractiveRuntimeSession:
     def _register_shutdown(self, shell: InteractiveShell) -> None:
         # Keep the active owner alive even when its notebook variable is lost.
         # Directly wrapped/injected runtimes stay external.
+        self._installed_shell = shell
         atexit.register(self._close_at_shutdown)
         if isinstance(shell, InteractiveShell):
             self._shutdown_shell = shell

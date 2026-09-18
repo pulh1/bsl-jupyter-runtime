@@ -415,6 +415,46 @@ def test_explicit_close_unregisters_shutdown_cleanup(monkeypatch):
     assert runtime.closes == 1
 
 
+def test_owned_close_invalidates_saved_bsl_values_before_core_cleanup(monkeypatch):
+    class ValueRuntime(RuntimeResource):
+        def __init__(self) -> None:
+            super().__init__()
+            self.during_close = lambda: None
+            self.materializations = 0
+
+        def namespace_snapshot(self):
+            return RuntimeNamespaceSnapshot(3, 7, ("Данные",))
+
+        def to_df(self, _handle, **_kwargs):
+            self.materializations += 1
+            return object()
+
+        def close(self):
+            self.during_close()
+            super().close()
+
+    shell, runtime = InteractiveShell(), ValueRuntime()
+    owner = start_owned(monkeypatch, shell, runtime)
+    saved_bsl = shell.user_ns["bsl"]
+    saved_proxy = shell.user_ns["Данные"]
+
+    def assert_detached() -> None:
+        with pytest.raises(ProtocolError, match="stale"):
+            saved_proxy.to_df()
+        with pytest.raises(ProtocolError, match="stale"):
+            saved_bsl.Данные
+        assert runtime.materializations == 0
+
+    runtime.during_close = assert_detached
+    try:
+        owner.close()
+        assert_detached()
+    finally:
+        if not owner._closed:
+            runtime.during_close = lambda: None
+            owner.close()
+
+
 def test_shell_shutdown_uses_runtime_shutdown_cleanup_before_ordinary_close(monkeypatch):
     class ShutdownResource(RuntimeResource):
         def __init__(self) -> None:

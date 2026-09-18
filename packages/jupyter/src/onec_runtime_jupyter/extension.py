@@ -621,6 +621,16 @@ def install_runtime(
         logging.getLogger(__name__).warning('BSL project bridge unavailable')
 
 
+def detach_runtime_namespace(shell: object, runtime: object) -> None:
+    """Invalidate proxies owned by ``runtime`` before its core cleanup starts."""
+    user_ns = getattr(shell, "user_ns", None)
+    if not isinstance(user_ns, dict):
+        return
+    bridge = user_ns.get(_NAMESPACE_BRIDGE_NAME)
+    if isinstance(bridge, _BslNamespaceBridge) and bridge._runtime_ref() is runtime:
+        bridge.detach(user_ns)
+
+
 def synchronize_bsl_namespace(shell: object) -> None:
     user_ns = getattr(shell, "user_ns", None)
     if not isinstance(user_ns, dict):

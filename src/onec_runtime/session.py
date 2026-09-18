@@ -1388,10 +1388,11 @@ class RuntimeSession:
 
     @contextmanager
     def _capture_materialization_caller_handoff(self) -> Iterator[None]:
-        """Let the coordinator wait without retaining the Session operation lock."""
-        with self.runtime_api.capture_session_caller_handoff(
-            self._release_operation_lock_for_capture_wait
-        ):
+        """Let the execution owner wait without retaining the Session lock."""
+        bind = getattr(self.runtime_api, "execution_caller_handoff", None)
+        if not callable(bind):
+            bind = self.runtime_api.capture_session_caller_handoff
+        with bind(self._release_operation_lock_for_capture_wait):
             yield
 
     def configure_capture_source(
@@ -1855,9 +1856,15 @@ class RuntimeSession:
             try:
                 bind = getattr(
                     self.runtime_api,
-                    "capture_session_caller_handoff",
+                    "execution_caller_handoff",
                     None,
                 )
+                if not callable(bind):
+                    bind = getattr(
+                        self.runtime_api,
+                        "capture_session_caller_handoff",
+                        None,
+                    )
                 arguments = {
                     "dirty_roots": dirty_roots,
                     "continuation_attempt_id": continuation_attempt_id,
