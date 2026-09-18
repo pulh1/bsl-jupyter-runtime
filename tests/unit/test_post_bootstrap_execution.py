@@ -109,6 +109,8 @@ def test_fresh_composition_rejects_source_identity_reuse_while_main_is_suspended
         capture_locations=(BUSINESS,),
         notebook_builder=lambda *_args, **_kwargs: None,
     )
+    assert composed.worker_module_service.arbiter is composed.execution.core.arbiter
+    assert composed.execution.facade.last_worker_breakpoint_reload_report() is None
     first_source = "Результат = 1;"
     changed_source = "Результат = 2;"
     first_unit = SourceUnitRef(

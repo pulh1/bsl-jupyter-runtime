@@ -31,11 +31,17 @@ from onec_runtime.execution.worker_activation import (
     WorkerUniverseActivationAdapter,
 )
 from onec_runtime.execution.worker_breakpoint_service import WorkerBreakpointService
+from onec_runtime.execution.worker_module_lifecycle import (
+    WorkerModuleArtifactPreparer, WorkerModuleLifecycleService,
+)
 from onec_runtime.rdbg.models import DebugTarget, ModuleLocation, TargetId
 from onec_runtime.runtime_contracts import OperationExecutionProvenance
 from onec_runtime.server_worker import NotebookWorkerArtifactBuilder
 from onec_runtime.worker_breakpoints import WorkerBreakpointCoordinator
-from onec_runtime.worker_universe import WorkerUniverseRegistry
+from onec_runtime.worker_universe import (
+    WorkerModuleArtifactBuilder, WorkerModuleArtifactCache,
+    WorkerUniverseRegistry,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +66,7 @@ class FreshPostBootstrapExecution:
     worker_breakpoints: WorkerBreakpointCoordinator
     worker_breakpoint_service: WorkerBreakpointService
     worker_activation: WorkerActivationPort
+    worker_module_service: WorkerModuleLifecycleService
 
 
 def compose_post_bootstrap_execution(
@@ -164,6 +171,7 @@ def compose_fresh_post_bootstrap_execution(
     capture_locations: tuple[ModuleLocation, ...],
     notebook_builder: NotebookWorkerArtifactBuilder,
     target_profile: str = "notebook-worker",
+    worker_module_builder: WorkerModuleArtifactBuilder | None = None,
     resolve_capture_sources: CaptureSourceResolver | None = None,
 ) -> FreshPostBootstrapExecution:
     """Create all new execution owners after bootstrap stopped one exact target.
@@ -261,12 +269,32 @@ def compose_fresh_post_bootstrap_execution(
             wait_handoff=composed.facade._wait_handoff,
         )
         composed.facade.bind_worker_breakpoint_service(worker_breakpoint_service)
+        module_builder = worker_module_builder or WorkerModuleArtifactBuilder(
+            notebook_builder,
+            cache=WorkerModuleArtifactCache(),
+            packer_version="worker-epf-v1",
+            target_profile=target_profile,
+        )
+        worker_module_service = WorkerModuleLifecycleService(
+            composed.core.arbiter, bound,
+            prepare_artifacts=WorkerModuleArtifactPreparer(
+                composed.core.parser_target, module_builder,
+            ),
+            route_provider=composed.core.controller.worker_mutation_route,
+            require_mutation_boundary=require_worker_mutation_boundary,
+            worker_breakpoints_present=lambda: bool(
+                worker_breakpoints.list_statuses()
+            ),
+            wait_handoff=composed.facade._wait_handoff,
+        )
+        composed.facade.bind_worker_module_lifecycle(worker_module_service)
     except BaseException:
         composed.facade.close()
         raise
     return FreshPostBootstrapExecution(
         composed, namespace, worker_universe, workspace, routes,
         worker_breakpoints, worker_breakpoint_service, bound,
+        worker_module_service,
     )
 
 

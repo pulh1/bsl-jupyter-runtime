@@ -16,6 +16,8 @@ from uuid import UUID
 import pandas as pd
 
 from onec_runtime.bsl.source_maps import SourceUnitRef, source_sha256
+from onec_runtime.bsl.module_catalog import CommonModuleCatalogSnapshot
+from onec_runtime.bsl.module_universe import WorkerModuleUnit
 from onec_runtime.capture_evaluation import CapturePhase
 from onec_runtime.capture_inspection import CaptureView
 from onec_runtime.errors import NoActiveCaptureError, ProtocolError
@@ -41,13 +43,19 @@ from onec_runtime.execution.value_projection_service import (
     ProjectionTicketPort, ValueProjectionService,
 )
 from onec_runtime.execution.worker_breakpoint_service import WorkerBreakpointService
+from onec_runtime.execution.worker_module_lifecycle import WorkerModuleLifecycleService
 from onec_runtime.execution.worker_activation import WorkerMaterializationSnapshot
 from onec_runtime.prototype_runtime import PartialWritebackError
+from onec_runtime.performance_profile import PhaseRecorder
 from onec_runtime.runtime_contracts import OperationExecutionProvenance
 from onec_runtime.rdbg.models import ModuleLocation
 from onec_runtime.table_materialization import ReferencePolicy
 from onec_runtime.value_materialization import MaterializationOptions
-from onec_runtime.worker_breakpoints import WorkerBreakpointStatus
+from onec_runtime.worker_breakpoints import (
+    WorkerBreakpointReloadPolicy, WorkerBreakpointReloadReport,
+    WorkerBreakpointStatus,
+)
+from onec_runtime.worker_universe import WorkerGenerationHandle
 
 
 class ValueTransferPort(Protocol):
@@ -183,6 +191,7 @@ class PublicExecutionFacade:
             controller, self._capture_inspection, wait_handoff=self._wait_handoff,
         )
         self._worker_breakpoint_service: WorkerBreakpointService | None = None
+        self._worker_module_service: WorkerModuleLifecycleService | None = None
 
     def bind_worker_breakpoint_service(self, service: WorkerBreakpointService) -> None:
         """Bind one shared breakpoint owner during fresh runtime composition."""
@@ -194,6 +203,19 @@ class PublicExecutionFacade:
         if self._worker_breakpoint_service is not None:
             raise ProtocolError("Worker breakpoint service is already bound")
         self._worker_breakpoint_service = service
+
+    def bind_worker_module_lifecycle(
+        self, service: WorkerModuleLifecycleService,
+    ) -> None:
+        """Bind the persistent Worker owner to this facade's sole arbiter."""
+
+        if not isinstance(service, WorkerModuleLifecycleService):
+            raise TypeError("Worker module lifecycle service is required")
+        if service.arbiter is not self._arbiter:
+            raise ProtocolError("Worker modules require this runtime's RDBG owner")
+        if self._worker_module_service is not None:
+            raise ProtocolError("Worker module lifecycle is already bound")
+        self._worker_module_service = service
 
     @contextmanager
     def execution_caller_handoff(
@@ -615,6 +637,50 @@ class PublicExecutionFacade:
         """Read the confirmed logical Worker breakpoint catalog locally."""
 
         return self._require_worker_breakpoint_service().list_worker_breakpoints()
+
+    def load_worker_modules(
+        self,
+        units: tuple[WorkerModuleUnit, ...],
+        *,
+        common_modules: CommonModuleCatalogSnapshot,
+        breakpoint_policy: WorkerBreakpointReloadPolicy = (
+            WorkerBreakpointReloadPolicy.STRICT
+        ),
+        profiler: PhaseRecorder | None = None,
+    ) -> WorkerGenerationHandle:
+        """Publish a complete Worker graph through one stopped-route ticket."""
+
+        return self._require_worker_module_service().load_worker_modules(
+            units, common_modules=common_modules,
+            breakpoint_policy=breakpoint_policy, profiler=profiler,
+        )
+
+    def confirmed_worker_module_units(
+        self, handle: WorkerGenerationHandle,
+    ) -> tuple[WorkerModuleUnit, ...]:
+        """Read source units for a confirmed active Worker generation."""
+
+        return self._require_worker_module_service().confirmed_worker_module_units(
+            handle,
+        )
+
+    def release_worker_generation(self, handle: WorkerGenerationHandle) -> None:
+        """Release an explicitly API-owned generation at a stopped boundary."""
+
+        self._require_worker_module_service().release_worker_generation(handle)
+
+    def last_worker_breakpoint_reload_report(
+        self,
+    ) -> WorkerBreakpointReloadReport | None:
+        """Read the confirmed report of the last module reload."""
+
+        return self._require_worker_module_service().last_worker_breakpoint_reload_report()
+
+    def _require_worker_module_service(self) -> WorkerModuleLifecycleService:
+        service = self._worker_module_service
+        if service is None:
+            raise ProtocolError("Worker module lifecycle is not configured")
+        return service
 
     def _require_worker_breakpoint_service(self) -> WorkerBreakpointService:
         service = self._worker_breakpoint_service
