@@ -578,6 +578,7 @@ class RdbgArbiter:
         self._server_teardown: ServerTeardownAttempt | None = None
         self._file_teardown: FileTeardownAttempt | None = None
         self._cleanup_debt: ExecutionTicket | None = None
+        self._closing = False
         self._closed = False
         self._worker = Thread(target=self._run, name='rdbg-arbiter', daemon=True)
         self._worker.start()
@@ -601,7 +602,7 @@ class RdbgArbiter:
     def submit(self, route: RouteToken, plan: Plan, *,
                finalizer: Callable[[Any], Any] | None = None) -> ExecutionTicket:
         with self._mailbox:
-            if self._closed:
+            if self._closed or self._closing:
                 raise RuntimeError('Arbiter is closed')
             if self._active is not None and self._active._stop_requested:
                 raise ArbiterBusy('Stop is requested for the active operation')
@@ -615,7 +616,7 @@ class RdbgArbiter:
         """Queue one best-effort heartbeat only while the RDBG owner is idle."""
 
         with self._mailbox:
-            if (self._closed or self._active is not None or self._queue
+            if (self._closed or self._closing or self._active is not None or self._queue
                     or self._reconciliation is not None or self._server_teardown is not None):
                 return None
             ticket = ExecutionTicket(
@@ -906,14 +907,63 @@ class RdbgArbiter:
             self._mailbox.notify_all()
 
     def close(self, timeout: float | None = None) -> None:
-        """Close local ownership only when no remote operation may remain live."""
+        """Drain confirmed dependent cleanup before relinquishing RDBG ownership.
+
+        A cleanup ticket is the only active operation whose confirmed parent
+        reply may already have returned to the caller. Never cancel its queued
+        deletion or orphan its running remote capability. Unknown outcomes and
+        confirmed cleanup debts retain the owner for explicit reconciliation.
+        ``timeout`` bounds only the local worker join after ownership retires.
+        """
         with self._mailbox:
-            if self._active is not None:
-                raise ArbiterBusy('Reconcile or confirm target teardown before closing')
-            self._closed = True
-            while self._queue:
-                self._settle(self._queue.popleft(), error=CancelledBeforeEffect())
-            self._mailbox.notify_all()
+            if self._closing or get_ident() == self._worker.ident:
+                raise ArbiterBusy('Arbiter close is already in progress')
+            self._closing = True
+            try:
+                while not self._closed:
+                    active = self._active
+                    if active is not None:
+                        if active._post_settlement_parent is None:
+                            raise ArbiterBusy(
+                                'Reconcile or confirm target teardown before closing'
+                            )
+                        if active._phase == 'unknown':
+                            raise ArbiterBusy('Dependent cleanup outcome unknown')
+                        self._mailbox.wait_for(
+                            lambda: self._active is not active
+                            or active._phase == 'unknown'
+                        )
+                        continue
+                    if self._cleanup_debt is not None:
+                        raise ArbiterBusy('Confirmed cleanup debt requires retry')
+                    if any(
+                        ticket._post_settlement_parent is not None
+                        for ticket in self._queue
+                    ):
+                        while (
+                            self._queue
+                            and self._queue[0]._post_settlement_parent is None
+                        ):
+                            self._settle(
+                                self._queue.popleft(), error=CancelledBeforeEffect()
+                            )
+                        cleanup = self._queue[0]
+                        self._mailbox.notify_all()
+                        self._mailbox.wait_for(
+                            lambda: self._active is not None
+                            or not self._queue
+                            or self._queue[0] is not cleanup
+                        )
+                        continue
+                    self._closed = True
+                    while self._queue:
+                        self._settle(
+                            self._queue.popleft(), error=CancelledBeforeEffect()
+                        )
+                    self._mailbox.notify_all()
+            finally:
+                self._closing = False
+                self._mailbox.notify_all()
         self._worker.join(timeout)
         if self._worker.is_alive():
             raise TimeoutError('Arbiter worker did not exit')

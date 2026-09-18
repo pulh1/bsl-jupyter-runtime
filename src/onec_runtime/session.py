@@ -766,7 +766,11 @@ class RuntimeSession:
             self._operation_lock.release()
         if heartbeat_ticket is not None:
             try:
-                heartbeat_ticket.wait_settled()
+                # A transport-ambiguous keepalive retains the arbiter owner;
+                # it cannot settle until an explicit reconciliation or target
+                # teardown. The request itself has a bounded transport wait.
+                if not heartbeat_ticket.wait_unknown():
+                    heartbeat_ticket.wait_settled(timeout=0)
             except RdbgDebugUiNotRegistered:
                 lost_debug_ui = True
             except Exception:
@@ -2530,7 +2534,10 @@ class RuntimeSession:
             return
         self._heartbeat_stop.set()
         if current_thread() is not self._heartbeat_thread:
-            self._heartbeat_thread.join(timeout=2.0)
+            # Stop admission first, then let a bounded keepalive request retire
+            # before asking the arbiter to close. A fixed local join interval
+            # can otherwise leave an active heartbeat ticket at close.
+            self._heartbeat_thread.join()
         if (
             shutdown
             and isinstance(self.runtime_api, PublicExecutionFacade)

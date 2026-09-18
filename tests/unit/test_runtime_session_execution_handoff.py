@@ -5,6 +5,7 @@ from pathlib import Path
 from threading import Event, Thread
 from types import SimpleNamespace
 
+from onec_runtime.execution.arbiter import ArbiterBusy
 from onec_runtime.session import RuntimeSession
 
 from tests.unit.test_extension_session import session_config
@@ -89,9 +90,12 @@ def test_runtime_heartbeat_ticket_wait_releases_public_operation_lock(
     direct_calls: list[str] = []
 
     class Ticket:
-        def wait_settled(self, timeout=None):
+        def wait_unknown(self, timeout=None):
             entered.set()
             assert release.wait(3), "heartbeat ticket was not released"
+            return False
+
+        def wait_settled(self, timeout=None):
             return {"rtt_ms": 1.0}
 
     class ArbiterApi:
@@ -130,6 +134,102 @@ def test_runtime_heartbeat_ticket_wait_releases_public_operation_lock(
         runtime._heartbeat_stop.set()
         runtime._heartbeat_thread.join(2)
     assert heartbeat_errors == []
+
+
+def test_unknown_heartbeat_ticket_does_not_wait_for_impossible_settlement(
+    tmp_path: Path,
+) -> None:
+    unknown_observed, settlement_waited = Event(), Event()
+
+    class Ticket:
+        def wait_unknown(self, timeout=None):
+            unknown_observed.set()
+            return True
+
+        def wait_settled(self, timeout=None):
+            settlement_waited.set()
+            raise AssertionError("unknown heartbeat cannot settle without reconciliation")
+
+    class ArbiterApi:
+        def try_heartbeat_ticket(self):
+            return Ticket()
+
+    runtime = RuntimeSession(
+        session_config(tmp_path), SimpleNamespace(ensure_running=lambda: None),
+        SimpleNamespace(), SimpleNamespace(target=None),
+        ArbiterApi(), SimpleNamespace(), heartbeat_interval_s=60.0,
+    )
+    try:
+        runtime._heartbeat_tick()
+        assert unknown_observed.is_set()
+        assert not settlement_waited.is_set()
+    finally:
+        runtime._heartbeat_stop.set()
+        runtime._heartbeat_thread.join(2)
+
+
+def test_close_waits_for_bounded_heartbeat_transport_before_closing_owner(
+    tmp_path: Path,
+) -> None:
+    heartbeat_entered, release_heartbeat = Event(), Event()
+    heartbeat_done, close_done = Event(), Event()
+    close_errors: list[BaseException] = []
+
+    class Ticket:
+        def wait_unknown(self, timeout=None):
+            heartbeat_entered.set()
+            assert release_heartbeat.wait(4)
+            heartbeat_done.set()
+            return False
+
+        def wait_settled(self, timeout=None):
+            if not heartbeat_done.is_set():
+                heartbeat_entered.set()
+                assert release_heartbeat.wait(4)
+                heartbeat_done.set()
+            return {"rtt_ms": 1.0}
+
+    class ArbiterApi:
+        def __init__(self) -> None:
+            self.scheduled = False
+
+        def try_heartbeat_ticket(self):
+            if self.scheduled:
+                return None
+            self.scheduled = True
+            return Ticket()
+
+        def close(self) -> None:
+            if not heartbeat_done.is_set():
+                raise ArbiterBusy("heartbeat still owns RDBG")
+
+    runtime = RuntimeSession(
+        session_config(tmp_path), SimpleNamespace(close=lambda: None),
+        SimpleNamespace(close=lambda: None), SimpleNamespace(target=None),
+        ArbiterApi(), SimpleNamespace(), heartbeat_interval_s=0.01,
+    )
+    assert heartbeat_entered.wait(1)
+
+    def close_owner() -> None:
+        try:
+            runtime.close()
+        except BaseException as error:
+            close_errors.append(error)
+        finally:
+            close_done.set()
+
+    closer = Thread(target=close_owner)
+    closer.start()
+    try:
+        assert not close_done.wait(2.1)
+    finally:
+        release_heartbeat.set()
+        closer.join(3)
+        if not runtime.is_closed:
+            runtime.close()
+    assert close_done.is_set()
+    assert close_errors == []
+    assert runtime.is_closed
 
 
 def test_generic_capture_resume_wait_allows_public_namespace_snapshot(

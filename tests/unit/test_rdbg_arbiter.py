@@ -226,6 +226,134 @@ def test_post_settlement_cleanup_runs_before_later_ticket_and_preserves_parent_r
     assert [name for name, _ in session.calls] == ['cleanup', 'event', 'later', 'event']
 
 
+def test_close_waits_for_running_post_settlement_cleanup(runtime):
+    _session, route, arbiter = runtime
+    cleanup_entered = Event()
+    release_cleanup = Event()
+    close_done = Event()
+    close_errors = []
+
+    def plan(port):
+        def cleanup(_cleanup_port):
+            cleanup_entered.set()
+            assert release_cleanup.wait(3)
+            return Settlement('released')
+
+        port.register_post_settlement_cleanup(cleanup)
+        return Settlement('reply')
+
+    parent = arbiter.submit(route, plan)
+    arbiter.dispatch(parent)
+    assert parent.wait_settled(3) == 'reply'
+    cleanup_ticket = parent.post_settlement_cleanup
+    assert cleanup_ticket is not None and cleanup_entered.wait(3)
+
+    def close_owner():
+        try:
+            arbiter.close(timeout=3)
+        except BaseException as error:
+            close_errors.append(error)
+        finally:
+            close_done.set()
+
+    closer = Thread(target=close_owner)
+    closer.start()
+    try:
+        assert not close_done.wait(0.05)
+    finally:
+        release_cleanup.set()
+        closer.join(3)
+    assert close_done.is_set()
+    assert close_errors == []
+    assert cleanup_ticket.wait_settled(0) == 'released'
+
+
+def test_close_drains_queued_post_settlement_cleanup(runtime, monkeypatch):
+    _session, route, arbiter = runtime
+    parent_finished = Event()
+    release_worker = Event()
+    cleanup_ran = Event()
+    close_done = Event()
+    close_errors = []
+    parent_holder = {}
+    original_port = arbiter_module.SessionPort
+
+    class PausingPort(original_port):
+        def __setattr__(self, name, value):
+            if (
+                name == '_live' and value is False
+                and getattr(self, '_ticket', None) is parent_holder.get('ticket')
+            ):
+                parent_finished.set()
+                assert release_worker.wait(3)
+            super().__setattr__(name, value)
+
+    monkeypatch.setattr(arbiter_module, 'SessionPort', PausingPort)
+
+    def plan(port):
+        def cleanup(_cleanup_port):
+            cleanup_ran.set()
+            return Settlement('released')
+
+        port.register_post_settlement_cleanup(cleanup)
+        return Settlement('reply')
+
+    parent = arbiter.submit(route, plan)
+    parent_holder['ticket'] = parent
+    arbiter.dispatch(parent)
+    assert parent.wait_settled(3) == 'reply'
+    cleanup_ticket = parent.post_settlement_cleanup
+    assert cleanup_ticket is not None and parent_finished.wait(3)
+    assert cleanup_ticket.status().phase == 'queued'
+
+    def close_owner():
+        try:
+            arbiter.close(timeout=3)
+        except BaseException as error:
+            close_errors.append(error)
+        finally:
+            close_done.set()
+
+    closer = Thread(target=close_owner)
+    closer.start()
+    try:
+        assert not close_done.wait(0.05)
+    finally:
+        release_worker.set()
+        closer.join(3)
+    assert close_done.is_set()
+    assert close_errors == []
+    assert cleanup_ran.is_set()
+    assert cleanup_ticket.wait_settled(0) == 'released'
+
+
+def test_close_retains_confirmed_post_settlement_cleanup_debt(runtime):
+    _session, route, arbiter = runtime
+    attempts = 0
+
+    def cleanup(_port):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ValueError('cleanup rejected')
+        return Settlement('released')
+
+    def plan(port):
+        port.register_post_settlement_cleanup(cleanup)
+        return Settlement('reply')
+
+    parent = arbiter.submit(route, plan)
+    arbiter.dispatch(parent)
+    assert parent.wait_settled(3) == 'reply'
+    first = parent.post_settlement_cleanup
+    assert first is not None
+    with pytest.raises(ValueError, match='cleanup rejected'):
+        first.wait_settled(3)
+    with pytest.raises(ArbiterBusy, match='cleanup'):
+        arbiter.close(timeout=3)
+    assert arbiter.retry_post_settlement_cleanup(parent).wait_settled(3) == 'released'
+
+
 def test_confirmed_post_settlement_cleanup_failure_is_observable_and_retryable(runtime):
     _session, route, arbiter = runtime
     attempts = []
@@ -346,6 +474,9 @@ def test_ambiguous_post_settlement_cleanup_owns_arbiter_after_parent_reply(runti
     assert cleanup is not None and cleanup.wait_unknown(3)
     assert arbiter.active_ticket is cleanup
     assert arbiter.try_heartbeat() is None
+    with pytest.raises(ArbiterBusy, match='cleanup outcome unknown'):
+        arbiter.close(timeout=0)
+    assert arbiter.active_ticket is cleanup
     confirm_test_server_terminated(
         arbiter, cleanup, route, session, session.pending.target_id,
     )
