@@ -141,6 +141,7 @@ class _ContinuationAdmission:
         self.closed = False
         self.continue_state = "unattempted"
         self.frozen_root_statuses: tuple[tuple[str, str], ...] | None = None
+        self.resume_ticket: ExecutionTicket | None = None
 
     def commit(self) -> None:
         with self._controller._lock:
@@ -149,8 +150,16 @@ class _ContinuationAdmission:
                 or not self.consumed
                 or self.continue_state != "acknowledged"
                 or self._controller._continuation_admission is not self
+                or self.resume_ticket is None
+                or not self.resume_ticket.status().settled
             ):
                 raise ProtocolError("Continuation has no confirmed result to commit")
+            try:
+                self.resume_ticket.wait_settled(0)
+            except BaseException:
+                raise ProtocolError(
+                    "Continuation has no confirmed result to commit"
+                ) from None
             self.frozen_root_statuses = (
                 self._controller.continuation_attempt_evidence(
                     self.spec.attempt_id,
@@ -1503,7 +1512,12 @@ class ExecutionController:
             else:
                 ticket = None
         if ticket is not None:
-            ticket.wait_settled()
+            while not ticket.status().settled:
+                if ticket.wait_unknown(timeout=1.0):
+                    raise ProtocolError(
+                        "CAPTURE breakpoint rollback outcome is unknown"
+                    )
+            ticket.wait_settled(0)
         with self._lock:
             if self._continuation_admission is not admission:
                 raise ProtocolError("Continuation admission changed during rollback")
@@ -1689,6 +1703,8 @@ class ExecutionController:
                         operation, admission.ticket,
                     )
                 ticket = self._arbiter.submit(route, plan, finalizer=operation.settler)
+                if admission is not None:
+                    admission.resume_ticket = ticket
             except BaseException:
                 active_ledger.discard_resuming()
                 raise

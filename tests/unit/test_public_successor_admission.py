@@ -6,6 +6,7 @@ part of this contract until the full public cutover.
 
 from dataclasses import replace
 from pathlib import Path
+from threading import Event, Thread
 from types import SimpleNamespace
 
 import pytest
@@ -15,6 +16,7 @@ from onec_runtime.capture_evaluation import CapturePhase
 from onec_runtime.errors import ProtocolError
 from onec_runtime.execution.post_bootstrap import compose_fresh_post_bootstrap_execution
 from onec_runtime.rdbg.models import EvaluationResult
+from onec_runtime.prototype_runtime import ContinuationAttemptSpec
 from onec_runtime.runtime_api import RuntimeReplyKind
 from onec_runtime.session import RuntimeSession, RuntimeSessionConfig
 from onec_runtime_mcp.agent.runtime_backend import OnecRuntimeBackend
@@ -46,6 +48,61 @@ class ExportFailsOnce(CompleteSession):
             pending, timeout_s=timeout_s,
             on_transport_dispatch=on_transport_dispatch,
         )
+
+
+def test_successor_commit_waits_for_confirmed_next_stop() -> None:
+    class HeldSecondStop(CompleteSession):
+        def __init__(self) -> None:
+            super().__init__(capture_count=2)
+            self.stop_calls = 0
+            self.waiting = Event()
+            self.release = Event()
+
+        def wait_for_any_stop(self, **kwargs):
+            self.stop_calls += 1
+            if self.stop_calls == 2:
+                self.waiting.set()
+                assert self.release.wait(5)
+            return super().wait_for_any_stop(**kwargs)
+
+    rdbg = HeldSecondStop()
+    api = compose_fresh_post_bootstrap_execution(
+        rdbg, KERNEL, runtime_generation=7,
+        stopped_target=rdbg.target, capture_locations=(BUSINESS,),
+        notebook_builder=lambda *_args, **_kwargs: None,
+    ).execution.facade
+    api.configure_capture_points((BUSINESS,))
+    api.prepare_capture_ticket()
+    assert api.execute_bsl("Результат = 1;").kind is RuntimeReplyKind.CAPTURED
+    admission = api.begin_continuation_admission(
+        ContinuationAttemptSpec("late-commit", 1, "request", ()),
+        (BUSINESS,),
+    )
+    results: list[object] = []
+    errors: list[BaseException] = []
+
+    def resume() -> None:
+        try:
+            results.append(api.resume_capture(continuation_attempt_id="late-commit"))
+        except BaseException as error:
+            errors.append(error)
+
+    caller = Thread(target=resume)
+    caller.start()
+    try:
+        assert rdbg.waiting.wait(5)
+        with pytest.raises(ProtocolError, match="confirmed result"):
+            admission.commit()
+        rdbg.release.set()
+        caller.join(timeout=5)
+        assert not caller.is_alive()
+        assert errors == []
+        assert results[0].kind is RuntimeReplyKind.CAPTURED
+        admission.commit()
+    finally:
+        rdbg.release.set()
+        caller.join(timeout=5)
+        api.close()
 
 
 def test_session_successor_ticket_correlates_second_stop_of_same_main(
