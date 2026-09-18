@@ -13,7 +13,9 @@ from onec_runtime.capture_evaluation import CapturePhase
 from onec_runtime.execution.capture.cell_evaluator import CaptureCellEvaluator
 from onec_runtime.execution.capture.executor import CaptureExecutor
 from onec_runtime.execution.main import MainExecutor, MainPhase
-from onec_runtime.rdbg.models import EvaluationResult, LocalVariablesResult, StopEvent
+from onec_runtime.rdbg.models import (
+    EvaluationResult, FrameVariable, LocalVariablesResult, StopEvent,
+)
 from onec_runtime.stop_routing import BreakpointRegistry
 from onec_runtime.table_value import evaluation_to_python
 
@@ -101,6 +103,53 @@ def test_capture_variable_page_uses_owned_ticket_and_safe_names() -> None:
         ).wait_settled(3)
         assert page.names == ("Amount",)
         assert page.total == 1
+        assert {thread for _, thread in session.calls} == {arbiter._worker}
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_capture_typed_variable_page_uses_current_capture_route_for_nonroot_frame() -> None:
+    from onec_runtime.execution.controller.controller import ExecutionController
+
+    class TypedPageSession(CompleteSession):
+        def local_variables(self, stack_level=0, *, timeout_s, on_transport_dispatch):
+            if stack_level != 1:
+                return super().local_variables(
+                    stack_level, timeout_s=timeout_s,
+                    on_transport_dispatch=on_transport_dispatch,
+                )
+            on_transport_dispatch()
+            self._record("locals")
+            return LocalVariablesResult(
+                UUID(int=123),
+                (FrameVariable("NestedAmount", "Число", "private 42", 2),),
+            )
+
+    session = TypedPageSession()
+    arbiter = RdbgArbiter(session, RouteToken("runtime-1", 1, 0, "main"))
+    controller = ExecutionController(
+        arbiter,
+        MainExecutor(poll_interval_s=0.1),
+        CaptureExecutor(None, KERNEL, decode_command_id=evaluation_to_python),
+        CaptureCellEvaluator(),
+        BreakpointRegistry(KERNEL, (BUSINESS,)),
+        runtime_generation=1,
+    )
+    try:
+        controller.submit_main("Результат = 1;").wait_settled(3)
+        page = controller.submit_capture_typed_variable_page(
+            stack_level=1, start=0, stop=1,
+        ).wait_settled(3)
+        assert len(page.variables) == 1
+        assert (
+            page.variables[0].name,
+            page.variables[0].type_name,
+            page.variables[0].collection_size,
+        ) == ("NestedAmount", "Число", 2)
+        assert page.total == 1
+        assert page.next_cursor is None
+        assert "private 42" not in repr(page)
+        assert arbiter.current_route == controller._capture_route
         assert {thread for _, thread in session.calls} == {arbiter._worker}
     finally:
         arbiter.close(timeout=3)

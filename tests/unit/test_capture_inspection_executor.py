@@ -180,6 +180,102 @@ def test_native_variable_page_exposes_only_bounded_names_and_cursor() -> None:
     arbiter.close(timeout=3)
 
 
+def test_typed_variable_page_bounds_metadata_for_nonroot_frame_without_presentation() -> None:
+    from onec_runtime.execution.capture.inspection import CaptureInspectionExecutor
+
+    variables = (
+        FrameVariable("Первый", "Строка", "private value A", 3),
+        FrameVariable("Второй", "ТаблицаЗначений", "private value B", 10_000),
+        FrameVariable("Третий", "Число", "private value C"),
+    )
+    session = Session([LocalVariablesResult(UUID(int=121), variables)])
+    route = RouteToken("runtime", 1, 0, "capture")
+    arbiter = RdbgArbiter(session, route)
+    try:
+        ticket = arbiter.submit(
+            route,
+            lambda port: Settlement(
+                CaptureInspectionExecutor(request_timeout_s=3).read_typed_variable_page(
+                    ready_scope(), stack_level=1, start=1, stop=3, port=port,
+                )
+            ),
+        )
+        arbiter.dispatch(ticket)
+        page = ticket.wait(3)
+        assert tuple(
+            (item.name, item.type_name, item.collection_size)
+            for item in page.variables
+        ) == (("Второй", "ТаблицаЗначений", 10_000), ("Третий", "Число", None))
+        assert page.total == 3
+        assert page.next_cursor is None
+        assert "private value" not in repr(page)
+        assert not hasattr(page.variables[0], "presentation")
+        assert session.calls[0][1] == (1, 3)
+    finally:
+        arbiter.close(timeout=3)
+
+
+@pytest.mark.parametrize(
+    "variable",
+    [
+        FrameVariable("Amount", "T" * 257, "secret"),
+        FrameVariable("Amount", "Число", "secret", -1),
+        FrameVariable("Amount", "Число", "secret", 10_001),
+        FrameVariable("Amount", "Число", "secret", True),
+    ],
+)
+def test_typed_variable_page_rejects_unbounded_metadata_without_leaking_values(
+    variable: FrameVariable,
+) -> None:
+    from onec_runtime.execution.capture.inspection import (
+        CaptureInspectionExecutor, CaptureInspectionUnavailable,
+    )
+
+    session = Session([LocalVariablesResult(UUID(int=122), (variable,))])
+    route = RouteToken("runtime", 1, 0, "capture")
+    arbiter = RdbgArbiter(session, route)
+    try:
+        ticket = arbiter.submit(
+            route,
+            lambda port: Settlement(
+                CaptureInspectionExecutor().read_typed_variable_page(
+                    ready_scope(), stack_level=1, start=0, stop=1, port=port,
+                )
+            ),
+        )
+        arbiter.dispatch(ticket)
+        with pytest.raises(CaptureInspectionUnavailable) as failure:
+            ticket.wait(3)
+        assert "secret" not in str(failure.value)
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_typed_variable_page_rejects_kernel_and_oversized_page_before_rdbg() -> None:
+    from onec_runtime.execution.capture.inspection import CaptureInspectionExecutor
+
+    session = Session([])
+    route = RouteToken("runtime", 1, 0, "capture")
+    arbiter = RdbgArbiter(session, route)
+    try:
+        for stack_level, stop, expected in ((2, 1, "kernel"), (1, 101, "100")):
+            ticket = arbiter.submit(
+                route,
+                lambda port, stack_level=stack_level, stop=stop: Settlement(
+                    CaptureInspectionExecutor().read_typed_variable_page(
+                        ready_scope(), stack_level=stack_level, start=0, stop=stop,
+                        port=port,
+                    )
+                ),
+            )
+            arbiter.dispatch(ticket)
+            with pytest.raises(ValueError, match=expected):
+                ticket.wait(3)
+        assert session.calls == []
+    finally:
+        arbiter.close(timeout=3)
+
+
 def test_native_variable_page_rejects_kernel_and_invalid_bounds_before_rdbg() -> None:
     from onec_runtime.execution.capture.inspection import CaptureInspectionExecutor
 

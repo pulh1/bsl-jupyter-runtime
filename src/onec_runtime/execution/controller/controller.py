@@ -1486,6 +1486,41 @@ class ExecutionController:
             self._arbiter.dispatch(ticket)
             return ticket
 
+    def submit_capture_typed_variable_page(
+        self, *, stack_level: int, start: int, stop: int,
+    ) -> ExecutionTicket:
+        """Read bounded typed metadata from a user frame in this CAPTURE stop."""
+
+        with self._lock:
+            if self._resume_in_flight():
+                raise ProtocolError("CAPTURE resume has already been admitted")
+            scope = self.capture_scope
+            operation = self.main_operation
+            route = self._capture_route
+            if (
+                scope is None
+                or scope.context_state is not CaptureContextState.READY
+                or operation is None
+                or operation.phase is not MainPhase.SUSPENDED_CAPTURE
+                or route is None
+            ):
+                raise ProtocolError("No ready CAPTURE stop is available")
+
+            def plan(port: SessionPort) -> Settlement:
+                page = self._capture_inspection_executor.read_typed_variable_page(
+                    scope,
+                    stack_level=stack_level,
+                    start=start,
+                    stop=stop,
+                    port=port,
+                )
+                return Settlement(page)
+
+            ticket = self._arbiter.submit(route, plan)
+            self._preparation_revision += 1
+            self._arbiter.dispatch(ticket)
+            return ticket
+
     def submit_capture_materialization(
         self, transfer_plan: CaptureMaterializationPlan,
         *, _before_first_effect: Callable[[], None] | None = None,

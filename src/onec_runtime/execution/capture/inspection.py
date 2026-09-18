@@ -8,6 +8,7 @@ from typing import Protocol
 
 from onec_runtime.capture_values import (
     MAX_PAGE_ITEMS,
+    MAX_TYPE_CHARS,
     SafePathSegment,
     ValuePathSegmentKind,
 )
@@ -46,6 +47,24 @@ class NativeVariablePage:
     """Only safe variable names, never RDBG value presentations."""
 
     names: tuple[str, ...]
+    total: int
+    next_cursor: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class TypedNativeVariable:
+    """Bounded frame metadata with no RDBG value presentation."""
+
+    name: str
+    type_name: str
+    collection_size: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class TypedNativeVariablePage:
+    """One bounded page of typed metadata from a user frame."""
+
+    variables: tuple[TypedNativeVariable, ...]
     total: int
     next_cursor: int | None
 
@@ -109,7 +128,52 @@ class CaptureInspectionExecutor:
         A confirmed RDBG error only settles this inspection request.
         """
 
-        self._require_frame(scope, stack_level, allow_kernel=False)
+        self._require_page_request(scope, stack_level, start, stop)
+        variables, names = self._read_inventory(scope, stack_level, port)
+        selected = names[start:stop]
+        return NativeVariablePage(
+            selected,
+            len(variables),
+            stop if selected and stop < len(variables) else None,
+        )
+
+    def read_typed_variable_page(
+        self,
+        scope: CaptureScope,
+        *,
+        stack_level: int,
+        start: int,
+        stop: int,
+        port: CaptureInspectionPort,
+    ) -> TypedNativeVariablePage:
+        """Read bounded name/type/size metadata; keep presentations private."""
+
+        self._require_page_request(scope, stack_level, start, stop)
+        variables, names = self._read_inventory(scope, stack_level, port)
+        selected: list[TypedNativeVariable] = []
+        for index in range(start, min(stop, len(variables))):
+            variable = variables[index]
+            type_name = variable.type_name
+            size = variable.collection_size
+            if (
+                not isinstance(type_name, str)
+                or not 0 < len(type_name) <= MAX_TYPE_CHARS
+                or size is not None
+                and (type(size) is not int or not 0 <= size <= MAX_NATIVE_VARIABLE_INVENTORY)
+            ):
+                raise CaptureInspectionUnavailable("CAPTURE frame inventory is unavailable")
+            selected.append(TypedNativeVariable(names[index], type_name, size))
+        return TypedNativeVariablePage(
+            tuple(selected),
+            len(variables),
+            stop if selected and stop < len(variables) else None,
+        )
+
+    @staticmethod
+    def _require_page_request(
+        scope: CaptureScope, stack_level: int, start: int, stop: int,
+    ) -> None:
+        CaptureInspectionExecutor._require_frame(scope, stack_level, allow_kernel=False)
         if (
             type(start) is not int
             or type(stop) is not int
@@ -119,6 +183,10 @@ class CaptureInspectionExecutor:
             raise ValueError("CAPTURE variable pages require nonnegative bounds")
         if stop - start > MAX_PAGE_ITEMS:
             raise ValueError("CAPTURE variable pages require at most 100 names")
+
+    def _read_inventory(
+        self, scope: CaptureScope, stack_level: int, port: CaptureInspectionPort,
+    ) -> tuple[tuple[FrameVariable, ...], tuple[str, ...]]:
         response = port.local_variables(
             stack_level=stack_level, timeout_s=self._request_timeout_s
         )
@@ -143,12 +211,7 @@ class CaptureInspectionExecutor:
             ) from error
         if len({name.casefold() for name in names}) != len(names):
             raise CaptureInspectionUnavailable("CAPTURE frame inventory is unavailable")
-        selected = names[start:stop]
-        return NativeVariablePage(
-            selected,
-            len(names),
-            stop if selected and stop < len(names) else None,
-        )
+        return variables, names
 
     def evaluate_helper(
         self,
