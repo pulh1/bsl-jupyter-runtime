@@ -77,4 +77,4 @@ The remaining continuation and Worker extractions are structural follow-up after
 - [x] Run `python -m pytest tests/unit -q` once after focused checks and run VS Code unit tests/compile if its files changed. Final offline suite: 4828 passed, 57 skipped; no VS Code files changed.
 - [x] Run the complete `01-overview.ipynb` and CAPTURE error/repair/materialization scenario on a disposable 1C infobase. Run separate file-mode live Stop/replacement gates for long-running MAIN and CAPTURE, recording exact target-exit evidence. Server-mode live qualification remains unavailable without a server infobase.
 - [x] Review all `AGENTS.md` for removed legacy references and current execution ownership, run `git diff --check`, verify generated notebooks have empty outputs/execution counts and inspect staged files for local evidence.
-- [ ] Commit and push the verified branch. State explicitly any live gate that remains unverified.
+- [x] Commit and push the verified branch. State explicitly any live gate that remains unverified. Main/file-mode live gates passed; server-mode live qualification requires a server infobase.
