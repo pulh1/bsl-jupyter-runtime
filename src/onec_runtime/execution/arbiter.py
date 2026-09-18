@@ -98,6 +98,13 @@ class ReadyForPolicy:
     next_route: RouteToken | None = None
 
 
+@dataclass(frozen=True)
+class ConfirmedFailure:
+    """Terminal cell error after all mandatory remote work has completed."""
+
+    error: BaseException
+
+
 class OutcomeUnknown(RuntimeError):
     """Remote effects may still be live; retain ownership and pending evidence."""
 
@@ -447,7 +454,7 @@ class SessionPort:
             self._ticket._entered = False
 
 
-Plan = Callable[[SessionPort], Settlement | ReadyForPolicy]
+Plan = Callable[[SessionPort], Settlement | ReadyForPolicy | ConfirmedFailure]
 
 
 class ServerTeardownAttempt:
@@ -706,7 +713,12 @@ class RdbgArbiter:
             port = SessionPort(self, ticket)
             try:
                 outcome = plan(port)
-                if ticket._finalizer is None:
+                if isinstance(outcome, ConfirmedFailure):
+                    if not isinstance(outcome.error, BaseException):
+                        raise TypeError('Confirmed failure requires an exception')
+                    if ticket._finalizer_started:
+                        raise OutcomeUnknown('Policy finalizer already started; its effects cannot be replaced')
+                elif ticket._finalizer is None:
                     if not isinstance(outcome, Settlement):
                         raise TypeError('Raw plan must return a confirmed Settlement')
                 elif ticket._finalizer_started:
@@ -717,7 +729,7 @@ class RdbgArbiter:
                     raise StopPendingTeardown('A stopped plan cannot settle after blocking remote work')
                 if ticket._pending is not None or ticket._stop_target is not None or ticket._entered:
                     raise OutcomeUnknown('Settlement cannot discard an unretired capability')
-                if outcome.next_route is not None:
+                if not isinstance(outcome, ConfirmedFailure) and outcome.next_route is not None:
                     with self._mailbox:
                         current = self._route
                         next_route = outcome.next_route
@@ -748,9 +760,12 @@ class RdbgArbiter:
                         self._active = None
             else:
                 with self._mailbox:
-                    if outcome.next_route is not None:
-                        self._route = outcome.next_route
-                    self._settle(ticket, value=outcome.value)
+                    if isinstance(outcome, ConfirmedFailure):
+                        self._settle(ticket, error=outcome.error)
+                    else:
+                        if outcome.next_route is not None:
+                            self._route = outcome.next_route
+                        self._settle(ticket, value=outcome.value)
                     self._active = None
             finally:
                 port._live = False

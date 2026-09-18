@@ -8,14 +8,16 @@ belong to the enclosing CAPTURE policy and resource owners.
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import Protocol
 
-from onec_runtime.execution.arbiter import OutcomeUnknown, Settlement
+from onec_runtime.execution.arbiter import ConfirmedFailure, OutcomeUnknown, Settlement
 from onec_runtime.execution.capture.cell_evaluator import CaptureCellEvaluator
 from onec_runtime.execution.capture.scope import (
     CaptureContextState,
     CaptureFrameIdentity,
     CaptureScope,
+    CaptureStopIdentity,
 )
 from onec_runtime.execution.evaluation import EvaluationPort, EvaluationSuspended
 from onec_runtime.rdbg.models import EvaluationResult, ModuleLocation
@@ -64,6 +66,21 @@ class TemporaryKeyCleanupOutcomeUnknown(OutcomeUnknown):
         super().__init__("temporary key cleanup outcome is unknown")
 
 
+@dataclass(slots=True, repr=False)
+class CaptureCellOperation:
+    """One cell's confirmed result and repair progress, separate from its stop."""
+
+    scope_identity: CaptureStopIdentity
+    evaluation_started: bool = field(default=False, init=False)
+    confirmed_result: EvaluationResult | None = field(default=None, init=False, repr=False)
+    workspace_restored: bool = field(default=False, init=False)
+    policy_started: bool = field(default=False, init=False)
+    policy_value: object = field(default=None, init=False, repr=False)
+    policy_error: BaseException | None = field(default=None, init=False, repr=False)
+    cleanup_started: bool = field(default=False, init=False)
+    cleanup_complete: bool = field(default=False, init=False)
+
+
 class CaptureCellOperationExecutor:
     """Run a cell without keeping the worker port or pending eval as state."""
 
@@ -80,7 +97,8 @@ class CaptureCellOperationExecutor:
         restore_workspace: Callable[[CaptureCellWorkerPort], None],
         cleanup: Callable[[CaptureCellWorkerPort], None],
         result_policy: Callable[[EvaluationResult], object],
-    ) -> Settlement:
+        operation: CaptureCellOperation | None = None,
+    ) -> Settlement | ConfirmedFailure:
         """Settle only after result, workspace restoration, and cleanup.
 
         A pending/unknown eval or debugger stop exits before dependent RDBG
@@ -101,7 +119,12 @@ class CaptureCellOperationExecutor:
         ):
             raise RuntimeError("CAPTURE scope is not ready for user evaluation")
 
+        record = operation or CaptureCellOperation(scope.identity)
+        self._require_matching_operation(record, scope)
+        if record.evaluation_started:
+            raise RuntimeError("CAPTURE cell evaluation was already attempted")
         shield_workspace(port)
+        record.evaluation_started = True
         try:
             result = self._evaluator.evaluate(scope, lowered_source, port=port)
         except (OutcomeUnknown, EvaluationSuspended):
@@ -110,40 +133,105 @@ class CaptureCellOperationExecutor:
             # Even a confirmed pre-dispatch rejection leaves the acknowledged
             # breakpoint shield installed. Repair it before the next cell.
             raise CaptureOperationRepairRequired("workspace_restore") from error
-        try:
-            restore_workspace(port)
-        except BaseException as error:
-            raise CaptureOperationRepairRequired("workspace_restore") from error
-        policy_error: BaseException | None = None
-        value: object = None
-        try:
-            value = result_policy(result)
-        except BaseException as error:
-            policy_error = error
-        try:
-            cleanup(port)
-        except TemporaryKeyCleanupOutcomeUnknown as error:
+        record.confirmed_result = result
+        return self._finish_confirmed_result(
+            record, scope, port=port, restore_workspace=restore_workspace,
+            cleanup=cleanup, result_policy=result_policy,
+        )
+
+    def repair_confirmed_result(
+        self,
+        operation: CaptureCellOperation,
+        scope: CaptureScope,
+        *,
+        port: CaptureCellWorkerPort,
+        restore_workspace: Callable[[CaptureCellWorkerPort], None],
+        cleanup: Callable[[CaptureCellWorkerPort], None],
+        result_policy: Callable[[EvaluationResult], object],
+    ) -> Settlement | ConfirmedFailure:
+        """Finish a saved result; never send its user eval expression again."""
+
+        self._require_matching_operation(operation, scope)
+        if operation.confirmed_result is None:
+            raise RuntimeError("CAPTURE cell has no confirmed result to repair")
+        return self._finish_confirmed_result(
+            operation, scope, port=port, restore_workspace=restore_workspace,
+            cleanup=cleanup, result_policy=result_policy,
+        )
+
+    @staticmethod
+    def _require_matching_operation(
+        operation: CaptureCellOperation, scope: CaptureScope,
+    ) -> None:
+        if not isinstance(operation, CaptureCellOperation):
+            raise TypeError("CAPTURE cell operation record is invalid")
+        if operation.scope_identity != scope.identity:
+            raise RuntimeError("CAPTURE cell operation belongs to another stop")
+        if (
+            scope.context_state is not CaptureContextState.READY
+            or scope.frame_identity is not CaptureFrameIdentity.CONFIRMED
+        ):
+            raise RuntimeError("CAPTURE scope is not ready for cell repair")
+
+    @staticmethod
+    def _finish_confirmed_result(
+        operation: CaptureCellOperation,
+        scope: CaptureScope,
+        *,
+        port: CaptureCellWorkerPort,
+        restore_workspace: Callable[[CaptureCellWorkerPort], None],
+        cleanup: Callable[[CaptureCellWorkerPort], None],
+        result_policy: Callable[[EvaluationResult], object],
+    ) -> Settlement | ConfirmedFailure:
+        result = operation.confirmed_result
+        if result is None:
+            raise RuntimeError("CAPTURE cell result is not confirmed")
+        if not operation.workspace_restored:
             try:
-                scope.note_temporary_cleanup_unknown(error.key)
-            except (KeyError, ValueError) as tracking_error:
-                raise CaptureOperationRepairRequired(
-                    "cleanup", policy_error=policy_error
-                ) from tracking_error
-            error.policy_error = policy_error
-            raise
-        except ConfirmedTemporaryKeyCleanupFailure as error:
+                restore_workspace(port)
+            except BaseException as error:
+                raise CaptureOperationRepairRequired("workspace_restore") from error
+            operation.workspace_restored = True
+
+        if not operation.policy_started:
+            operation.policy_started = True
             try:
-                scope.note_temporary_cleanup_failure(error.key)
-            except (KeyError, ValueError) as tracking_error:
-                raise CaptureOperationRepairRequired(
-                    "cleanup", policy_error=policy_error
-                ) from tracking_error
-            error.policy_error = policy_error
-            raise
-        except BaseException as error:
+                operation.policy_value = result_policy(result)
+            except BaseException as error:
+                operation.policy_error = error
+
+        if operation.cleanup_started and not operation.cleanup_complete:
             raise CaptureOperationRepairRequired(
-                "cleanup", policy_error=policy_error
-            ) from error
-        if policy_error is not None:
-            raise policy_error
-        return Settlement(value)
+                "cleanup", policy_error=operation.policy_error
+            )
+        if not operation.cleanup_started:
+            operation.cleanup_started = True
+            try:
+                cleanup(port)
+            except TemporaryKeyCleanupOutcomeUnknown as error:
+                try:
+                    scope.note_temporary_cleanup_unknown(error.key)
+                except (KeyError, ValueError) as tracking_error:
+                    raise CaptureOperationRepairRequired(
+                        "cleanup", policy_error=operation.policy_error
+                    ) from tracking_error
+                error.policy_error = operation.policy_error
+                raise
+            except ConfirmedTemporaryKeyCleanupFailure as error:
+                try:
+                    scope.note_temporary_cleanup_failure(error.key)
+                except (KeyError, ValueError) as tracking_error:
+                    raise CaptureOperationRepairRequired(
+                        "cleanup", policy_error=operation.policy_error
+                    ) from tracking_error
+                error.policy_error = operation.policy_error
+                raise
+            except BaseException as error:
+                raise CaptureOperationRepairRequired(
+                    "cleanup", policy_error=operation.policy_error
+                ) from error
+            operation.cleanup_complete = True
+
+        if operation.policy_error is not None:
+            return ConfirmedFailure(operation.policy_error)
+        return Settlement(operation.policy_value)

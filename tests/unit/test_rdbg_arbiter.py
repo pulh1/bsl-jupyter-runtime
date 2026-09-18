@@ -11,7 +11,7 @@ from onec_runtime.rdbg.models import FrameVariable, LocalVariablesResult, Pendin
 
 
 from onec_runtime.execution.arbiter import (
-    RdbgArbiter, RouteToken, Settlement, OutcomeUnknown, StaleRoute,
+    ConfirmedFailure, RdbgArbiter, RouteToken, Settlement, OutcomeUnknown, StaleRoute,
     CancelledBeforeEffect, WaiterDetached, ArbiterBusy,
 )
 
@@ -277,7 +277,10 @@ def test_continue_evaluation_refuses_foreign_stop_before_dispatch():
         close_stopped_eval_test_arbiter(arbiter, route, ticket, session)
 
 
-def test_settlement_cannot_discard_pending_evaluation_stop():
+@pytest.mark.parametrize(
+    'outcome', [Settlement('premature'), ConfirmedFailure(ValueError('premature'))],
+)
+def test_settlement_cannot_discard_pending_evaluation_stop(outcome):
     session = StoppedEvaluationSession()
     route = RouteToken('eval-suspended-stop', 1, 0, 'capture-scope')
     arbiter = RdbgArbiter(session, route)
@@ -286,7 +289,7 @@ def test_settlement_cannot_discard_pending_evaluation_stop():
         pending = port.start_evaluation('pending')
         stop = port.wait_evaluation_event(pending, timeout_s=1)
         assert stop is session.stop
-        return Settlement('premature')
+        return outcome
 
     ticket = arbiter.submit(route, plan)
     arbiter.dispatch(ticket)
@@ -1183,6 +1186,10 @@ def test_policy_finalizer_failure_is_not_retried_by_reconciliation(runtime):
         assert ticket.wait_unknown(3)
         assert calls == ['level0']
         arbiter.reconcile(ticket, lambda _port: arbiter_module.ReadyForPolicy('level0'))
+        assert ticket.wait_unknown(3)
+        assert calls == ['level0']
+        assert arbiter.active_ticket is ticket
+        arbiter.reconcile(ticket, lambda _port: ConfirmedFailure(ValueError('skip policy')))
         assert ticket.wait_unknown(3)
         assert calls == ['level0']
         assert arbiter.active_ticket is ticket

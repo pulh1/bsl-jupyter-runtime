@@ -11,11 +11,13 @@ from dataclasses import dataclass, field
 from enum import Enum
 from threading import RLock
 from typing import Callable
+from weakref import WeakKeyDictionary
 
 from onec_runtime.bsl.parser_target import PythonParserTarget
 from onec_runtime.errors import BslExecutionError, ProtocolError
 from onec_runtime.execution.arbiter import (
     CancelledBeforeEffect,
+    ConfirmedFailure,
     ExecutionTicket,
     RdbgArbiter,
     ReadyForPolicy,
@@ -32,7 +34,10 @@ from onec_runtime.execution.capture.materialization import (
     CaptureMaterializationExecutor,
     CaptureMaterializationPlan,
 )
-from onec_runtime.execution.capture.operation_executor import CaptureCellOperationExecutor
+from onec_runtime.execution.capture.operation_executor import (
+    CaptureCellOperation,
+    CaptureCellOperationExecutor,
+)
 from onec_runtime.execution.capture.policy import CaptureCellPolicy, CapturePreparedPayload
 from onec_runtime.execution.capture.scope import (
     CaptureContextState, CaptureFrameIdentity, CaptureScope,
@@ -74,6 +79,14 @@ class _PreparationRecord:
     revision: int
     snapshot: RoutePreparationSnapshot
     owner: MainOperation | CaptureScope | None
+
+
+@dataclass(frozen=True, slots=True)
+class _CaptureCellRepair:
+    operation: CaptureCellOperation
+    scope: CaptureScope
+    result_policy: Callable[[EvaluationResult], object]
+    policy_bound: bool
 
 
 class _RawSettlementServices:
@@ -128,6 +141,9 @@ class ExecutionController:
         self._main_stop_ticket: ExecutionTicket | None = None
         self._preparation_revision = 0
         self._preparations: dict[object, _PreparationRecord] = {}
+        self._capture_cell_operations: WeakKeyDictionary[
+            ExecutionTicket, _CaptureCellRepair
+        ] = WeakKeyDictionary()
 
     def await_preparation_context(self) -> PreparationContext | Unavailable:
         """Select one stable statement route without reserving RDBG for lowering.
@@ -440,8 +456,9 @@ class ExecutionController:
             ):
                 raise ProtocolError("No ready CAPTURE stop is available")
             selected_policy = result_policy or (lambda result: result)
+            cell_operation = CaptureCellOperation(scope.identity)
 
-            def plan(port: SessionPort) -> Settlement | ReadyForPolicy:
+            def plan(port: SessionPort) -> Settlement | ReadyForPolicy | ConfirmedFailure:
                 if _before_first_effect is not None:
                     _before_first_effect()
                 scope.admit_cell_dirty_roots(dirty_roots)
@@ -457,7 +474,10 @@ class ExecutionController:
                     ),
                     cleanup=lambda worker: None,
                     result_policy=selected_policy,
+                    operation=cell_operation,
                 )
+                if isinstance(outcome, ConfirmedFailure):
+                    return outcome
                 if _finalizer is None:
                     return outcome
                 return ReadyForPolicy(
@@ -467,9 +487,58 @@ class ExecutionController:
             ticket = self._arbiter.submit(route, plan, finalizer=_finalizer)
             if _receipt is not None:
                 _receipt.adopt(ticket)
+            self._capture_cell_operations[ticket] = _CaptureCellRepair(
+                cell_operation, scope, selected_policy, _finalizer is not None
+            )
             self._preparation_revision += 1
             self._arbiter.dispatch(ticket)
             return ticket
+
+    def repair_capture_cell_after_restore(self, ticket: ExecutionTicket) -> None:
+        """Resume one ticket whose confirmed eval lost its workspace restore.
+
+        The same operation record supplies the original result. A post-dispatch
+        ambiguous restore remains blocked by the arbiter port until its remote
+        outcome is established; this method cannot repeat that command blindly.
+        """
+
+        with self._lock:
+            repair = self._capture_cell_operations.get(ticket)
+            scope = self.capture_scope
+            if (
+                repair is None
+                or scope is not repair.scope
+                or scope is None
+                or scope.context_state is not CaptureContextState.READY
+                or scope.frame_identity is not CaptureFrameIdentity.CONFIRMED
+                or ticket is not self._arbiter.active_ticket
+                or ticket.status().phase != "unknown"
+                or repair.operation.confirmed_result is None
+                or repair.operation.workspace_restored
+                or self._capture_route != self._arbiter.current_route
+            ):
+                raise ProtocolError("No confirmed CAPTURE restore can be repaired")
+
+            def plan(port: SessionPort) -> Settlement | ReadyForPolicy | ConfirmedFailure:
+                outcome = self._capture_cell_executor.repair_confirmed_result(
+                    repair.operation,
+                    repair.scope,
+                    port=port,
+                    restore_workspace=lambda worker: worker.set_breakpoints(
+                        self._registry.full_locations
+                    ),
+                    cleanup=lambda worker: None,
+                    result_policy=repair.result_policy,
+                )
+                if isinstance(outcome, ConfirmedFailure):
+                    return outcome
+                if repair.policy_bound:
+                    return ReadyForPolicy(
+                        outcome.value, next_route=outcome.next_route
+                    )
+                return outcome
+
+            self._arbiter.reconcile(ticket, plan)
 
     def submit_resume(self) -> ExecutionTicket:
         """Write dirty roots, close CAPTURE, and resume the same MAIN command."""

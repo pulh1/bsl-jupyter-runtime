@@ -115,6 +115,63 @@ def test_controller_runs_main_capture_cell_resume_and_completion_with_one_owner(
         arbiter.close(timeout=3)
 
 
+def test_controller_repairs_confirmed_capture_restore_without_repeating_cell() -> None:
+    from onec_runtime.execution.controller.controller import ExecutionController
+
+    class RestoreRejectedOnce(CompleteSession):
+        def __init__(self) -> None:
+            super().__init__()
+            self.restore_rejected = False
+            self.user_evals = 0
+
+        def start_evaluation(self, expression, **kwargs):
+            if expression.startswith("RuntimeKernelServer.ВыполнитьКодВКонтекстеОтладки("):
+                self.user_evals += 1
+            return super().start_evaluation(expression, **kwargs)
+
+        def set_breakpoints(self, locations, *, on_transport_dispatch):
+            if (
+                tuple(locations) == (KERNEL, BUSINESS)
+                and self.expression.startswith("RuntimeKernelServer.ВыполнитьКодВКонтекстеОтладки(")
+                and not self.restore_rejected
+            ):
+                self.restore_rejected = True
+                raise ValueError("restore rejected before transport")
+            return super().set_breakpoints(
+                locations, on_transport_dispatch=on_transport_dispatch
+            )
+
+    session = RestoreRejectedOnce()
+    arbiter = RdbgArbiter(session, RouteToken("runtime-1", 1, 0, "main"))
+    controller = ExecutionController(
+        arbiter,
+        MainExecutor(poll_interval_s=0.1),
+        CaptureExecutor(None, KERNEL, decode_command_id=evaluation_to_python),
+        CaptureCellEvaluator(),
+        BreakpointRegistry(KERNEL, (BUSINESS,)),
+        runtime_generation=1,
+    )
+    try:
+        controller.submit_main("Результат = 1;").wait_settled(3)
+        scope = controller.capture_scope
+        ticket = controller.submit_capture_cell("Результат = 2;")
+        assert ticket.wait_unknown(3)
+        assert session.user_evals == 1
+        assert controller.capture_scope is scope
+
+        controller.repair_capture_cell_after_restore(ticket)
+        assert ticket.wait_settled(3).error_occurred is False
+        assert session.user_evals == 1
+        assert controller.capture_scope is scope
+        assert scope.published
+        assert controller.submit_capture_cell("Результат = 3;").wait_settled(3).error_occurred is False
+        assert session.user_evals == 2
+        assert controller.capture_scope is scope
+    finally:
+        if arbiter.active_ticket is None:
+            arbiter.close(timeout=3)
+
+
 def test_second_capture_stop_has_new_scope_but_same_main_operation() -> None:
     from onec_runtime.execution.controller.controller import (
         ExecutionController,

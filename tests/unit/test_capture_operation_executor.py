@@ -247,6 +247,135 @@ def test_confirmed_restore_rejection_keeps_operation_owned_until_repair() -> Non
     arbiter.close(timeout=3)
 
 
+def test_restore_repair_uses_confirmed_result_without_second_eval() -> None:
+    result = EvaluationResult(UUID(int=4), "Число", "17", False)
+    session = Session([result])
+    original_set = session.set_breakpoints
+    rejected = False
+
+    def set_breakpoints(locations, *, on_transport_dispatch):
+        nonlocal rejected
+        if locations == FULL and not rejected:
+            rejected = True
+            raise ValueError("restore rejected before transport")
+        original_set(locations, on_transport_dispatch=on_transport_dispatch)
+
+    session.set_breakpoints = set_breakpoints
+    route = RouteToken("runtime", 1, 0, "capture")
+    arbiter = RdbgArbiter(session, route)
+    scope = ready_scope()
+    executor = operation_module.CaptureCellOperationExecutor(
+        CaptureCellEvaluator(wait_interval_s=0.01)
+    )
+    operation = operation_module.CaptureCellOperation(scope.identity)
+    policy_calls = []
+    cleanup_calls = []
+
+    def restore(port):
+        port.set_breakpoints(FULL)
+
+    def policy(confirmed):
+        policy_calls.append(confirmed)
+        return confirmed.presentation
+
+    def cleanup(_port):
+        cleanup_calls.append("done")
+
+    try:
+        ticket = arbiter.submit(
+            route,
+            lambda port: executor.execute(
+                scope, "Результат = 17;", operation=operation, port=port,
+                shield_workspace=lambda worker: worker.set_breakpoints(SHIELDED),
+                restore_workspace=restore, cleanup=cleanup, result_policy=policy,
+            ),
+        )
+        arbiter.dispatch(ticket)
+        assert ticket.wait_unknown(3)
+        assert operation.confirmed_result is result
+        assert [kind for kind, _, _ in session.calls].count("start") == 1
+        assert policy_calls == []
+        assert cleanup_calls == []
+
+        arbiter.reconcile(
+            ticket,
+            lambda port: executor.repair_confirmed_result(
+                operation, scope, port=port, restore_workspace=restore,
+                cleanup=cleanup, result_policy=policy,
+            ),
+        )
+        assert ticket.wait_settled(3) == "17"
+        assert [kind for kind, _, _ in session.calls].count("start") == 1
+        assert policy_calls == [result]
+        assert cleanup_calls == ["done"]
+        assert scope.frame_identity is CaptureFrameIdentity.CONFIRMED
+    finally:
+        if arbiter.active_ticket is None:
+            arbiter.close(timeout=3)
+
+
+def test_restore_repair_settles_confirmed_bsl_error_and_releases_next_cell() -> None:
+    result = EvaluationResult(UUID(int=4), "Ошибка", "", True, "planned BSL error")
+    session = Session([result])
+    original_set = session.set_breakpoints
+    rejected = False
+
+    def set_breakpoints(locations, *, on_transport_dispatch):
+        nonlocal rejected
+        if locations == FULL and not rejected:
+            rejected = True
+            raise ValueError("restore rejected before transport")
+        original_set(locations, on_transport_dispatch=on_transport_dispatch)
+
+    session.set_breakpoints = set_breakpoints
+    route = RouteToken("runtime", 1, 0, "capture")
+    arbiter = RdbgArbiter(session, route)
+    scope = ready_scope()
+    executor = operation_module.CaptureCellOperationExecutor(
+        CaptureCellEvaluator(wait_interval_s=0.01)
+    )
+    operation = operation_module.CaptureCellOperation(scope.identity)
+
+    def restore(port):
+        port.set_breakpoints(FULL)
+
+    def policy(confirmed):
+        if confirmed.error_occurred:
+            raise BslExecutionError(confirmed.error_text)
+        return confirmed.presentation
+
+    try:
+        ticket = arbiter.submit(
+            route,
+            lambda port: executor.execute(
+                scope, "ВызватьОшибку;", operation=operation, port=port,
+                shield_workspace=lambda worker: worker.set_breakpoints(SHIELDED),
+                restore_workspace=restore, cleanup=lambda worker: None,
+                result_policy=policy,
+            ),
+        )
+        arbiter.dispatch(ticket)
+        assert ticket.wait_unknown(3)
+        later = arbiter.submit(route, lambda port: Settlement("next cell"))
+        arbiter.dispatch(later)
+
+        arbiter.reconcile(
+            ticket,
+            lambda port: executor.repair_confirmed_result(
+                operation, scope, port=port, restore_workspace=restore,
+                cleanup=lambda worker: None, result_policy=policy,
+            ),
+        )
+        with pytest.raises(BslExecutionError, match="planned BSL error"):
+            ticket.wait_settled(3)
+        assert later.wait_settled(3) == "next cell"
+        assert [kind for kind, _, _ in session.calls].count("start") == 1
+        assert scope.frame_identity is CaptureFrameIdentity.CONFIRMED
+    finally:
+        if arbiter.active_ticket is None:
+            arbiter.close(timeout=3)
+
+
 def test_mandatory_cleanup_failure_keeps_operation_owned_until_repair() -> None:
     result = EvaluationResult(UUID(int=4), "Число", "1", False)
     session = Session([result])

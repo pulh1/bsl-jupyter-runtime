@@ -192,6 +192,78 @@ def test_capture_policy_settles_confirmed_bsl_error_after_restore_when_waiter_de
         arbiter.close(timeout=3)
 
 
+def test_capture_bsl_error_survives_confirmed_restore_repair_on_same_ticket() -> None:
+    class RestoreRejectedOnce(CompleteSession):
+        def __init__(self) -> None:
+            super().__init__()
+            self.restore_rejected = False
+            self.user_evals = 0
+
+        def start_evaluation(self, expression, **kwargs):
+            if expression.startswith("RuntimeKernelServer.ВыполнитьКодВКонтекстеОтладки("):
+                self.user_evals += 1
+            return super().start_evaluation(expression, **kwargs)
+
+        def wait_evaluation_event(self, pending, *, timeout_s, on_transport_dispatch):
+            if self.expression.startswith("RuntimeKernelServer.ВыполнитьКодВКонтекстеОтладки("):
+                on_transport_dispatch()
+                self._record("wait_eval")
+                self.pending = None
+                return EvaluationResult(
+                    pending.result_id, "Ошибка", "", True, "planned BSL error"
+                )
+            return super().wait_evaluation_event(
+                pending, timeout_s=timeout_s, on_transport_dispatch=on_transport_dispatch,
+            )
+
+        def set_breakpoints(self, locations, *, on_transport_dispatch):
+            if (
+                tuple(locations) == (KERNEL, BUSINESS)
+                and self.expression.startswith("RuntimeKernelServer.ВыполнитьКодВКонтекстеОтладки(")
+                and not self.restore_rejected
+            ):
+                self.restore_rejected = True
+                raise ValueError("restore rejected before transport")
+            return super().set_breakpoints(
+                locations, on_transport_dispatch=on_transport_dispatch
+            )
+
+    owner = object()
+    session = RestoreRejectedOnce()
+    replies = []
+
+    class Services:
+        def settle_capture(self, outcome, _payload):
+            replies.append(outcome)
+            return "bsl-error-reply"
+
+    controller, arbiter, _session, parser = _runtime(
+        lambda: RoutePreparationSnapshot(owner, 1, (), ()),
+        session=session, settlement_services=Services(),
+    )
+    try:
+        controller.submit_main("Результат = 1;").wait_settled(3)
+        scope = controller.capture_scope
+        context, prepared = _prepared(controller, parser, "Результат = 2;")
+        ticket = controller.submit_cell(
+            context, prepared, context.capabilities.for_pipeline().guards,
+            SubmissionReceipt(),
+        ).ticket
+        assert ticket.wait_unknown(3)
+        assert session.user_evals == 1
+        assert replies == []
+
+        controller.repair_capture_cell_after_restore(ticket)
+        assert ticket.wait_settled(3) == "bsl-error-reply"
+        assert len(replies) == 1 and replies[0].error_occurred
+        assert session.user_evals == 1
+        assert controller.capture_scope is scope
+        assert scope.published
+    finally:
+        if arbiter.active_ticket is None:
+            arbiter.close(timeout=3)
+
+
 def test_capture_policy_reconciles_pending_eval_then_restores_workspace_once() -> None:
     class AmbiguousCaptureSession(CompleteSession):
         def __init__(self):
