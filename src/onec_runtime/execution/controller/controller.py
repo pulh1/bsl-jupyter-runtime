@@ -652,6 +652,9 @@ class ExecutionController:
         self._capture_cell_operations: WeakKeyDictionary[
             ExecutionTicket, _CaptureCellRepair
         ] = WeakKeyDictionary()
+        self._main_dispatch_operations: WeakKeyDictionary[
+            ExecutionTicket, MainOperation | None
+        ] = WeakKeyDictionary()
 
     def await_preparation_context(self) -> PreparationContext | Unavailable:
         """Select one stable statement route without reserving RDBG for lowering.
@@ -1008,6 +1011,8 @@ class ExecutionController:
                                 prior_capture_sequence=self._stop_sequence,
                             )
                         self.main_operation = operation
+                        assert ticket is not None
+                        self._main_dispatch_operations[ticket] = operation
                         self.capture_scope = None
                         self._capture_route = None
                         self._resume_ticket = None
@@ -1082,6 +1087,7 @@ class ExecutionController:
         ticket = self._arbiter.submit(route, plan, finalizer=finalizer)
         if is_main:
             self._worker_activation_main_ticket = ticket
+            self._main_dispatch_operations[ticket] = None
         receipt.adopt(ticket)
         self._preparation_revision += 1
         self._arbiter.dispatch(ticket)
@@ -1089,6 +1095,42 @@ class ExecutionController:
 
     def request_stop(self, ticket: ExecutionTicket) -> object:
         return self._arbiter.request_stop(ticket)
+
+    def require_main_prepared_cell(
+        self, context: PreparationContext, prepared: PreparedCell,
+    ) -> None:
+        """Reject a non-MAIN or substituted preparation before admission."""
+
+        with self._lock:
+            record = self._preparations.get(context.preparation_nonce)
+            if (
+                record is None
+                or record.context is not context
+                or not isinstance(context.policy, MainCellPolicy)
+                or not isinstance(prepared.payload, MainPreparedPayload)
+                or prepared.route_token is not context.route_token
+                or prepared.preparation_nonce is not context.preparation_nonce
+            ):
+                raise ProtocolError("Prepared cell does not belong to MAIN")
+
+    def main_dispatch_evidence(self, ticket: ExecutionTicket) -> bool | None:
+        """Report exact user MAIN Continue entry for one admitted ticket.
+
+        ``None`` means this ticket can still enter Continue; Worker activation
+        or command-field writes alone never prove user BSL dispatch. A settled
+        Worker-only ticket and confirmed pre-Continue failures return false.
+        """
+
+        with self._lock:
+            if ticket not in self._main_dispatch_operations:
+                raise ProtocolError("MAIN dispatch ticket is not owned by this controller")
+            operation = self._main_dispatch_operations[ticket]
+            if operation is not None:
+                if operation.command_dispatch_attempted:
+                    return True
+                if operation.phase is MainPhase.FAILED_BEFORE_DISPATCH:
+                    return False
+            return False if ticket.status().settled else None
 
     def _main_worker_activation_pending(self) -> bool:
         ticket = self._worker_activation_main_ticket
@@ -1208,6 +1250,7 @@ class ExecutionController:
                         capture_ticket=planned_capture_ticket,
                     )
                 ticket = self._arbiter.submit(route, plan, finalizer=operation.settler)
+                self._main_dispatch_operations[ticket] = operation
                 self._planned_capture_ticket = None
                 self._main_stop_ticket = ticket
                 if _receipt is not None:
@@ -1216,6 +1259,8 @@ class ExecutionController:
                 self._arbiter.dispatch(ticket)
             except BaseException:
                 if _receipt is None or _receipt.ticket is None:
+                    if ticket is not None:
+                        self._main_dispatch_operations.pop(ticket, None)
                     self._planned_capture_ticket = planned_capture_ticket
                     if settlement is not None and _prepared_payload is not None:
                         settlement.discard_main(operation)

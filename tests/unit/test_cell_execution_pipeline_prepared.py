@@ -250,6 +250,7 @@ def test_prepared_interrupt_stops_only_adopted_ticket_and_releases_wait_lock() -
 def test_prepared_submission_keeps_exact_ticket_when_caller_exits(failure: str) -> None:
     submitted: list[object] = []
     stopped: list[object] = []
+    adopted: list[object] = []
 
     class Parser:
         def prepare(self, source, source_unit):
@@ -290,10 +291,11 @@ def test_prepared_submission_keeps_exact_ticket_when_caller_exits(failure: str) 
     candidate = pipeline.prepare("hello", _unit("hello"))
     if failure == "interrupt_after_adoption":
         with pytest.raises(KeyboardInterrupt):
-            pipeline.execute_prepared(candidate)
+            pipeline.execute_prepared(candidate, on_admitted_ticket=adopted.append)
         assert stopped == [ticket]
     else:
         with pytest.raises(StalePreparedDispatch, match="after remote effect"):
-            pipeline.execute_prepared(candidate)
+            pipeline.execute_prepared(candidate, on_admitted_ticket=adopted.append)
         assert stopped == []
     assert len(submitted) == 1
+    assert adopted == [ticket]

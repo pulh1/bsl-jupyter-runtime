@@ -14,6 +14,7 @@ from onec_runtime.execution.contracts import (
 )
 from onec_runtime.execution import public_facade as facade_module
 from onec_runtime.execution.pipeline import CellExecutionPipeline
+from onec_runtime.execution.pipeline import PreparedCellHandle
 from onec_runtime.execution.reply_presenter import RuntimeReplyPresenter
 from onec_runtime.execution.source_identity import NotebookSourceIdentityFactory
 from onec_runtime.prototype_runtime import OperationState
@@ -218,3 +219,83 @@ def test_worker_module_entrypoint_keeps_lazy_catalog_source_as_a_public_input(
     assert SessionCommonModuleCatalog in get_args(
         get_type_hints(facade_module.PublicExecutionFacade.load_worker_modules)["common_modules"]
     )
+
+
+def test_discard_prepared_cell_consumes_only_local_handle_without_admission() -> None:
+    facade, _, _, events = _ready_facade()
+    handle = facade.prepare_bsl("Результат = 3;")
+
+    facade.discard_prepared_bsl(handle)
+
+    with pytest.raises(RuntimeError, match="already consumed"):
+        facade.execute_prepared_bsl(handle)
+    assert not any(isinstance(event, tuple) and event[0] == "submit" for event in events)
+
+
+def test_prepared_main_attempt_keeps_exact_ticket_and_live_dispatch_evidence() -> None:
+    source = "Результат = 3;"
+    ticket = object()
+    evidence: list[bool | None] = [None]
+    observed_tickets: list[object] = []
+
+    class Pipeline:
+        def prepare(self, source, source_unit, *, wait_handoff, on_prepared):
+            cell = PreparedCell("route", "nonce", source)
+            on_prepared(cell)
+            return PreparedCellHandle(
+                object(), PreparationContext("route", "nonce", object(), ()),
+                cell, "guards",
+            )
+
+        def execute_prepared(
+            self, candidate, *, wait_handoff, on_admitted, on_admitted_ticket,
+            validate_claimed,
+        ):
+            on_admitted_ticket(ticket)
+            raise KeyboardInterrupt
+
+    class Controller:
+        capture_scope = None
+
+        def require_main_prepared_cell(self, context, prepared):
+            pass
+
+        def main_dispatch_evidence(self, received):
+            observed_tickets.append(received)
+            return evidence[0]
+
+    facade = facade_module.PublicExecutionFacade(
+        Pipeline(), Controller(), _Arbiter(),
+        source_unit_factory=_unit, status_reader=_status,
+    )
+    handle = facade.prepare_bsl(source)
+    attempt = facade.attempt_prepared_main_for_capture(handle)
+
+    assert attempt.user_main_dispatched is None
+    evidence[0] = True
+    assert attempt.user_main_dispatched is True
+    assert observed_tickets == [ticket, ticket]
+    with pytest.raises(KeyboardInterrupt):
+        attempt.reply()
+    with pytest.raises(RuntimeError, match="already consumed"):
+        facade.execute_prepared_bsl(handle)
+
+
+def test_prepared_main_attempt_rejects_another_route_before_admission() -> None:
+    facade, _, controller, events = _ready_facade()
+
+    def reject_non_main(context, prepared):
+        raise ProtocolError("prepared cell does not belong to MAIN")
+
+    controller.require_main_prepared_cell = reject_non_main  # type: ignore[attr-defined]
+    controller.main_dispatch_evidence = lambda ticket: True  # type: ignore[attr-defined]
+    handle = facade.prepare_bsl("Результат = 3;")
+
+    attempt = facade.attempt_prepared_main_for_capture(handle)
+
+    assert attempt.user_main_dispatched is False
+    with pytest.raises(ProtocolError, match="does not belong to MAIN"):
+        attempt.reply()
+    assert not any(isinstance(event, tuple) and event[0] == "submit" for event in events)
+    with pytest.raises(RuntimeError, match="already consumed"):
+        facade.execute_prepared_bsl(handle)

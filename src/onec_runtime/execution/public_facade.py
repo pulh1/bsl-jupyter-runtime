@@ -25,7 +25,7 @@ from onec_runtime.capture_inspection import CaptureView
 from onec_runtime.errors import NoActiveCaptureError, ProtocolError
 from onec_runtime.execution.arbiter import ExecutionTicket, RdbgArbiter
 from onec_runtime.execution.contracts import (
-    PreparedCell, SourceDiagnostic, Unavailable,
+    PreparationContext, PreparedCell, SourceDiagnostic, Unavailable,
 )
 from onec_runtime.execution.capture.public_inspection import (
     CaptureInspection, CaptureInspectionBridge, CaptureSourceResolver,
@@ -145,6 +145,46 @@ class PreparedBslCell:
             if self._provenance is None:
                 self._provenance = reader(self._prepared)
             return self._provenance
+
+
+class PreparedMainExecutionAttempt:
+    """One prepared MAIN request with live evidence for its exact ticket.
+
+    ``user_main_dispatched`` remains unknown while an accepted ticket can
+    still enter Continue. Reading it never submits another runtime command.
+    """
+
+    __slots__ = ("_result", "_error", "_ticket", "_read_dispatch")
+
+    def __init__(
+        self,
+        result: object | None,
+        error: BaseException | None,
+        ticket: ExecutionTicket | None,
+        read_dispatch: Callable[[ExecutionTicket], bool | None],
+    ) -> None:
+        self._result = result
+        self._error = error
+        self._ticket = ticket
+        self._read_dispatch = read_dispatch
+
+    @property
+    def user_main_dispatched(self) -> bool | None:
+        """True after Continue entry, false if ruled out, otherwise unknown."""
+
+        if self._ticket is None:
+            return False
+        evidence = self._read_dispatch(self._ticket)
+        if evidence is not None and type(evidence) is not bool:
+            raise TypeError("MAIN dispatch evidence is invalid")
+        return evidence
+
+    def reply(self) -> object:
+        """Return the settled public reply or re-raise the initiating error."""
+
+        if self._error is not None:
+            raise self._error
+        return self._result
 
 
 class PublicExecutionFacade:
@@ -401,6 +441,62 @@ class PublicExecutionFacade:
     ) -> object:
         """Consume one exact preparation through the controller's admission."""
 
+        return self._execute_prepared_bsl(
+            prepared, on_execution_provenance=on_execution_provenance,
+            on_admitted_ticket=None, validate_claimed=None,
+        )
+
+    def discard_prepared_bsl(self, prepared: PreparedBslCell) -> None:
+        """Consume an unused local preparation without admitting a ticket."""
+
+        if not isinstance(prepared, PreparedBslCell):
+            raise TypeError("A prepared BSL cell is required")
+        prepared._claim(self._prepared_owner)
+
+    def attempt_prepared_main_for_capture(
+        self, prepared: PreparedBslCell,
+        *,
+        on_execution_provenance: (
+            Callable[[OperationExecutionProvenance], None] | None
+        ) = None,
+    ) -> PreparedMainExecutionAttempt:
+        """Capture an exact MAIN ticket and its evolving Continue evidence.
+
+        The outcome may be known while dispatch evidence remains pending after
+        a detached caller. Consumers must treat ``None`` as unresolved.
+        """
+
+        adopted: list[ExecutionTicket] = []
+        try:
+            reply = self._execute_prepared_bsl(
+                prepared,
+                on_execution_provenance=on_execution_provenance,
+                on_admitted_ticket=adopted.append,
+                validate_claimed=self._controller.require_main_prepared_cell,
+            )
+        except BaseException as error:
+            return PreparedMainExecutionAttempt(
+                None, error, adopted[0] if adopted else None,
+                self._controller.main_dispatch_evidence,
+            )
+        return PreparedMainExecutionAttempt(
+            reply, None, adopted[0] if adopted else None,
+            self._controller.main_dispatch_evidence,
+        )
+
+    def _execute_prepared_bsl(
+        self,
+        prepared: PreparedBslCell,
+        *,
+        on_execution_provenance: (
+            Callable[[OperationExecutionProvenance], None] | None
+        ),
+        on_admitted_ticket: Callable[[ExecutionTicket], None] | None,
+        validate_claimed: (
+            Callable[[PreparationContext, PreparedCell], None] | None
+        ),
+    ) -> object:
+
         if not isinstance(prepared, PreparedBslCell):
             raise TypeError("A prepared BSL cell is required")
         if on_execution_provenance is not None and not callable(on_execution_provenance):
@@ -426,6 +522,8 @@ class PublicExecutionFacade:
             candidate,
             wait_handoff=self._wait_handoff,
             on_admitted=(publish_admitted if evidence is not None else None),
+            on_admitted_ticket=on_admitted_ticket,
+            validate_claimed=validate_claimed,
         )
 
     def _resolve_source_unit(

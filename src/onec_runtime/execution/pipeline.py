@@ -11,6 +11,7 @@ from onec_runtime.execution.contracts import (
     CommonCellParser,
     Current,
     ExecutionControllerPort,
+    ExecutionTicket,
     PreparationContext,
     PreparationSnapshotReader,
     PreparationSnapshots,
@@ -121,11 +122,18 @@ class CellExecutionPipeline:
         *,
         wait_handoff: Callable[[], AbstractContextManager[None]] | None = None,
         on_admitted: Callable[[PreparedCell], None] | None = None,
+        on_admitted_ticket: Callable[[ExecutionTicket], None] | None = None,
+        validate_claimed: (
+            Callable[[PreparationContext, PreparedCell], None] | None
+        ) = None,
     ) -> object:
         """Consume one candidate and admit it only against its original guards.
 
         Staleness is reported to the caller for a fresh explicit preparation;
         this method never repeats an adopted or possibly dispatched operation.
+        ``on_admitted_ticket`` sees the exact receipt-owned ticket even if the
+        synchronous submit raises after adoption.
+        ``validate_claimed`` is a route-specific guard before any admission.
         """
 
         if not isinstance(candidate, PreparedCellHandle):
@@ -134,6 +142,8 @@ class CellExecutionPipeline:
         release_wait = wait_handoff or nullcontext
         receipt = SubmissionReceipt()
         try:
+            if validate_claimed is not None:
+                validate_claimed(context, prepared)
             validity = self._controller.validate_preparation(context, guards)
             if isinstance(validity, StalePreparation):
                 raise StalePreparedCell(validity.reason)
@@ -141,7 +151,13 @@ class CellExecutionPipeline:
                 return self._replies.unavailable_reply(validity)
             if not isinstance(validity, Current):
                 raise TypeError("Invalid preparation validation result")
-            admission = self._controller.submit_cell(context, prepared, guards, receipt)
+            try:
+                admission = self._controller.submit_cell(
+                    context, prepared, guards, receipt,
+                )
+            finally:
+                if receipt.ticket is not None and on_admitted_ticket is not None:
+                    on_admitted_ticket(receipt.ticket)
             if isinstance(admission, Rejected):
                 if receipt.ticket is not None:
                     raise RuntimeError("Rejected admission adopted a ticket")
