@@ -1477,20 +1477,49 @@ class ExecutionController:
             ):
                 raise ProtocolError("No ready CAPTURE stop is available")
 
-            def plan(port: SessionPort) -> Settlement:
+            ledger = self._capture_evaluation_ledger
+            if ledger is None or ledger.identity != scope.identity:
+                raise ProtocolError("CAPTURE evaluation ledger is unavailable")
+            receipt_id = f"materialization-{uuid4().hex}"
+
+            def plan(port: SessionPort) -> ReadyForPolicy:
                 if _before_first_effect is not None:
                     _before_first_effect()
-                return self._capture_materialization_executor.execute(
+                result = self._capture_materialization_executor.execute(
                     scope,
                     transfer_plan,
                     port=port,
                     shield_workspace=self._shield_capture_workspace,
                     restore_workspace=self._restore_capture_workspace,
                 )
+                return ReadyForPolicy(result.value, next_route=result.next_route)
 
-            ticket = self._arbiter.submit(route, plan)
+            def publish(payload: object) -> object:
+                # Bytes stay private; the public CAPTURE ledger records only
+                # that this helper completed after its remote capabilities
+                # and mandatory cleanup were retired.
+                ledger.complete(receipt_id)
+                return payload
+
+            ledger.begin(receipt_id, CaptureEvaluationKind.MATERIALIZATION_HELPER)
+            try:
+                ticket = self._arbiter.submit(route, plan, finalizer=publish)
+            except BaseException:
+                ledger.discard_unstarted(receipt_id)
+                raise
             self._preparation_revision += 1
-            self._arbiter.dispatch(ticket)
+            try:
+                self._arbiter.dispatch(ticket)
+            except BaseException:
+                if ticket.cancel_queued():
+                    ledger.discard_unstarted(receipt_id)
+                raise
+            Thread(
+                target=_observe_capture_ticket,
+                args=(ticket, ledger, receipt_id),
+                name="onec-capture-outcome-observer",
+                daemon=True,
+            ).start()
             return ticket
 
     def submit_capture_cleanup_retry(self, key: str) -> ExecutionTicket:

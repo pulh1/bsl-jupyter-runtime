@@ -5,7 +5,10 @@ from threading import current_thread
 
 import pytest
 
-from onec_runtime.capture_evaluation import AdmissionEnvelopeV1
+from onec_runtime.capture_evaluation import (
+    AdmissionEnvelopeV1, CaptureEvaluationKind, CaptureEvaluationState,
+    CapturePhase,
+)
 from onec_runtime.errors import BslExecutionError
 from onec_runtime.execution.arbiter import RdbgArbiter, RouteToken
 from onec_runtime.execution.capture.cell_evaluator import CaptureCellEvaluator
@@ -143,6 +146,11 @@ def test_capture_error_retry_inspect_materialize_resume_same_main_and_scope() ->
         key = "__onec_compact_table_" + "a" * 32
         payload = controller.submit_capture_materialization(transfer_plan(key)).wait(3)
         assert payload == b"a"
+        ledger = controller.capture_evaluation_ledger()
+        assert ledger.status().phase is CapturePhase.PAUSED
+        transferred = ledger.wait(1)
+        assert transferred.evaluation_kind is CaptureEvaluationKind.MATERIALIZATION_HELPER
+        assert transferred.state is CaptureEvaluationState.COMPLETED
         assert scope.temporary_cleanup_debts == ()
         assert controller.capture_scope is scope
 
@@ -190,6 +198,11 @@ def test_failed_materialization_cleanup_is_repairable_in_same_capture_stop() -> 
         key = "__onec_compact_table_" + "a" * 32
         with pytest.raises(ConfirmedTemporaryKeyCleanupFailure):
             controller.submit_capture_materialization(transfer_plan(key)).wait(3)
+        ledger = controller.capture_evaluation_ledger()
+        assert ledger.status().phase is CapturePhase.PAUSED
+        transfer = ledger.wait(1)
+        assert transfer.evaluation_kind is CaptureEvaluationKind.MATERIALIZATION_HELPER
+        assert transfer.state is CaptureEvaluationState.FAILED
         assert controller.capture_scope is scope
         assert scope.context_state is CaptureContextState.READY
         assert scope.temporary_cleanup_debts[0].can_retry_delete
