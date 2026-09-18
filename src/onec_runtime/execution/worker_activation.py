@@ -24,7 +24,7 @@ from onec_runtime.execution.preparation import WorkerCandidateIntent
 from onec_runtime.execution.worker import WorkerActivationUnknown
 from onec_runtime.execution.worker_breakpoint_workspace import WorkerBreakpointWorkspace
 from onec_runtime.server_worker import (
-    NotebookWorkerArtifactBuilder,
+    NotebookWorkerArtifactBuilder, WorkerArtifact, WorkerSourceProvenance,
     validate_production_worker_artifact,
 )
 from onec_runtime.worker_universe import (
@@ -64,6 +64,75 @@ class WorkerMaterializationSnapshot:
             not isinstance(item, str) or not item for item in self.registrations
         ):
             raise ValueError("Worker materialization registrations are invalid")
+
+
+class PrebuiltWorkerIntent:
+    """One-use local Worker artifact for a later admitted activation.
+
+    The EPF and its source map are built before capture setup, so provenance
+    can be journaled before target mutation. Only the owning adapter may
+    consume the artifact; the controller still admits the activation ticket.
+    """
+
+    __slots__ = (
+        "_owner", "_intent", "_method_set", "_artifact", "_revision",
+        "_consumed", "_lock",
+    )
+
+    def __init__(
+        self,
+        owner: object,
+        intent: WorkerCandidateIntent,
+        method_set: NotebookMethodSet,
+        artifact: WorkerArtifact,
+        revision: int,
+    ) -> None:
+        object.__setattr__(self, "_owner", owner)
+        object.__setattr__(self, "_intent", intent)
+        object.__setattr__(self, "_method_set", method_set)
+        object.__setattr__(self, "_artifact", artifact)
+        object.__setattr__(self, "_revision", revision)
+        object.__setattr__(self, "_consumed", False)
+        object.__setattr__(self, "_lock", RLock())
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("prebuilt Worker intents are immutable")
+
+    def __repr__(self) -> str:
+        return "<redacted prebuilt Worker intent>"
+
+    def __deepcopy__(self, memo: dict[int, object]) -> str:
+        del memo
+        return "<redacted prebuilt Worker intent>"
+
+    @property
+    def method_set_candidate(self) -> NotebookMethodSet:
+        """Retain the existing route settlement's visible-source contract."""
+
+        return self._intent.method_set_candidate
+
+    @property
+    def intent(self) -> WorkerCandidateIntent:
+        return self._intent
+
+    @property
+    def source_provenance(self) -> WorkerSourceProvenance:
+        provenance = self._artifact.source_provenance
+        if not isinstance(provenance, WorkerSourceProvenance):
+            raise ProtocolError("Prebuilt Worker provenance is incomplete")
+        return provenance
+
+    def consume(
+        self, owner: object,
+    ) -> tuple[WorkerCandidateIntent, NotebookMethodSet, WorkerArtifact, int]:
+        with self._lock:
+            if self._owner is not owner:
+                raise ProtocolError("Prebuilt Worker belongs to another runtime")
+            if self._consumed:
+                raise ProtocolError("Prebuilt Worker intent was already consumed")
+            object.__setattr__(self, "_consumed", True)
+            return self._intent, self._method_set, self._artifact, self._revision
 
 
 class _GenerationLease:
@@ -169,6 +238,7 @@ class WorkerUniverseActivationAdapter:
         )
         self._snapshot_lock = RLock()
         self._published = WorkerActivationSnapshot(0, (), None, None)
+        self._prebuild_owner = object()
 
     def snapshot(self) -> WorkerActivationSnapshot:
         """Return one immutable version; never combine separate live getters."""
@@ -217,24 +287,34 @@ class WorkerUniverseActivationAdapter:
             breakpoint_workspace=self._breakpoint_workspace,
         )
 
-    def activate(
-        self, intent: WorkerCandidateIntent, *, port: SessionPort,
-    ) -> _GenerationLease:
+    def prebuild_for_capture(
+        self, intent: WorkerCandidateIntent,
+    ) -> PrebuiltWorkerIntent:
+        """Build locally without a debugger port or Worker publication."""
+
         if not isinstance(intent, WorkerCandidateIntent):
             raise TypeError("Worker candidate intent is required")
-        if port is None or (
-            self._breakpoint_workspace is not None
-            and not callable(getattr(port, "set_breakpoints", None))
-        ):
-            raise TypeError("An admitted arbiter port is required to activate Worker")
         published = self.snapshot()
         if intent.previous_methods is not published.active_methods:
             raise ProtocolError("Prepared Worker methods are stale")
-        if self._breakpoints_present() and self._breakpoint_workspace is None:
-            raise ProtocolError("Worker breakpoint publication requires a workspace transaction")
-        if getattr(self._bound, "port", None) is not None:
-            raise ProtocolError("Worker activation is already bound to an RDBG port")
+        method_set, artifact = self._build_artifact(intent)
+        if validate_production_worker_artifact(artifact) != method_set.exports:
+            raise ProtocolError("Prepared Worker artifact catalog changed")
+        current = self.snapshot()
+        if (
+            current.revision != published.revision
+            or current.active_methods is not published.active_methods
+        ):
+            raise ProtocolError("Worker generation changed during local prebuild")
+        prepared = PrebuiltWorkerIntent(
+            self._prebuild_owner, intent, method_set, artifact, published.revision,
+        )
+        prepared.source_provenance
+        return prepared
 
+    def _build_artifact(
+        self, intent: WorkerCandidateIntent,
+    ) -> tuple[NotebookMethodSet, WorkerArtifact]:
         method_set = intent.method_set_candidate
         bound_source, bound_globals = bind_notebook_method_globals(
             method_set.mapped_source,
@@ -247,6 +327,36 @@ class WorkerUniverseActivationAdapter:
             method_set.exports,
             visible_source_context=method_set.visible_source_context,
         )
+        return method_set, artifact
+
+    def activate(
+        self, intent: WorkerCandidateIntent | PrebuiltWorkerIntent, *, port: SessionPort,
+    ) -> _GenerationLease:
+        if not isinstance(intent, (WorkerCandidateIntent, PrebuiltWorkerIntent)):
+            raise TypeError("Worker candidate intent is required")
+        if port is None or (
+            self._breakpoint_workspace is not None
+            and not callable(getattr(port, "set_breakpoints", None))
+        ):
+            raise TypeError("An admitted arbiter port is required to activate Worker")
+        prebuilt = (
+            intent.consume(self._prebuild_owner)
+            if isinstance(intent, PrebuiltWorkerIntent) else None
+        )
+        if prebuilt is not None:
+            intent, method_set, artifact, prepared_revision = prebuilt
+        published = self.snapshot()
+        if intent.previous_methods is not published.active_methods:
+            raise ProtocolError("Prepared Worker methods are stale")
+        if prebuilt is not None and prepared_revision != published.revision:
+            raise ProtocolError("Prebuilt Worker generation is stale")
+        if self._breakpoints_present() and self._breakpoint_workspace is None:
+            raise ProtocolError("Worker breakpoint publication requires a workspace transaction")
+        if getattr(self._bound, "port", None) is not None:
+            raise ProtocolError("Worker activation is already bound to an RDBG port")
+
+        if prebuilt is None:
+            method_set, artifact = self._build_artifact(intent)
         if validate_production_worker_artifact(artifact) != method_set.exports:
             raise ProtocolError("Prepared Worker artifact catalog changed")
         descriptor = worker_module_artifact_from_notebook(
