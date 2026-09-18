@@ -211,6 +211,54 @@ def test_stale_prepared_dispatch_reprepares_after_adoption_without_stopping_tick
     assert stopped == []
 
 
+def test_stale_named_failure_from_accepted_ticket_does_not_repeat_remote_dispatch() -> None:
+    dispatches = []
+
+    class Parser:
+        def prepare(self, source, source_unit):
+            return CommonCell(source_unit, source, {}, "same-source")
+
+    class Policy:
+        def prepare(self, common, snapshots, context):
+            return PreparedCell(context.route_token, context.preparation_nonce, common.parsed_units)
+
+    class Snapshots:
+        def read_for(self, capabilities):
+            return PreparationSnapshots({}, {}, "guard")
+
+    class Ticket:
+        def __init__(self, dispatch_number):
+            self.dispatch_number = dispatch_number
+
+        def wait_initiator(self):
+            if self.dispatch_number == 1:
+                raise StalePreparedDispatch("policy settlement failed after remote effect")
+            return "duplicated-remote-effect"
+
+    class Controller:
+        def await_preparation_context(self):
+            return PreparationContext("route", object(), Policy(), ())
+
+        def submit_cell(self, context, prepared, guards, receipt):
+            dispatches.append(prepared.preparation_nonce)
+            ticket = Ticket(len(dispatches))
+            receipt.adopt(ticket)
+            return Accepted(ticket)
+
+    class Replies:
+        def diagnostic_reply(self, diagnostic):
+            raise AssertionError("unexpected source diagnostic")
+
+        def unavailable_reply(self, unavailable):
+            raise AssertionError("unexpected unavailable route")
+
+    pipeline = CellExecutionPipeline(Parser(), Controller(), Snapshots(), Replies())
+
+    with pytest.raises(StalePreparedDispatch, match="policy settlement failed"):
+        pipeline.execute("source", unit("source"))
+    assert len(dispatches) == 1
+
+
 def test_policy_diagnostic_is_published_only_after_guard_validation() -> None:
     class Parser:
         def prepare(self, source, source_unit):

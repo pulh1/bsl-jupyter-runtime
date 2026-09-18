@@ -1,9 +1,9 @@
 """Single-worker RDBG ownership primitive; not yet wired to the runtime.
 
 Submission is deliberately two phase: publish the ticket, then dispatch it.
-Plans own protocol sequencing, polling and mandatory cleanup. They must return
-Settlement only after remote ownership can safely be released. Neither a local
-wait timeout nor an exception after session entry establishes that fact.
+Plans own protocol sequencing, polling and mandatory cleanup. Raw plans return
+Settlement; policy-bound plans return ReadyForPolicy only after cleanup. Neither
+a local wait timeout nor an exception after session entry establishes release.
 """
 from __future__ import annotations
 
@@ -85,6 +85,19 @@ class Settlement:
     next_route: RouteToken | None = None
 
 
+@dataclass(frozen=True)
+class ReadyForPolicy:
+    """Confirmed raw result after all mandatory remote cleanup has completed.
+
+    Only a ticket with a finalizer may return this from its initial or
+    reconciliation plan. Evidence-only reconciliation must leave that ticket
+    unknown until a later plan can supply the raw outcome safely.
+    """
+
+    raw_outcome: Any
+    next_route: RouteToken | None = None
+
+
 class OutcomeUnknown(RuntimeError):
     """Remote effects may still be live; retain ownership and pending evidence."""
 
@@ -136,11 +149,14 @@ class TicketStatus:
 
 
 class ExecutionTicket:
-    def __init__(self, owner: RdbgArbiter, route: RouteToken, plan: Plan):
+    def __init__(self, owner: RdbgArbiter, route: RouteToken, plan: Plan,
+                 finalizer: Callable[[Any], Any] | None = None):
         self.id = uuid4().hex
         self._owner = owner
         self._route = route
         self._plan = plan
+        self._finalizer = finalizer
+        self._finalizer_started = False
         self._phase = 'queued'
         self._ready = False
         self._detached = False
@@ -431,7 +447,7 @@ class SessionPort:
             self._ticket._entered = False
 
 
-Plan = Callable[[SessionPort], Settlement]
+Plan = Callable[[SessionPort], Settlement | ReadyForPolicy]
 
 
 class ServerTeardownAttempt:
@@ -494,7 +510,8 @@ class RdbgArbiter:
         with self._mailbox:
             return self._active is not None or bool(self._queue)
 
-    def submit(self, route: RouteToken, plan: Plan) -> ExecutionTicket:
+    def submit(self, route: RouteToken, plan: Plan, *,
+               finalizer: Callable[[Any], Any] | None = None) -> ExecutionTicket:
         with self._mailbox:
             if self._closed:
                 raise RuntimeError('Arbiter is closed')
@@ -502,7 +519,7 @@ class RdbgArbiter:
                 raise ArbiterBusy('Stop is requested for the active operation')
             if route != self._route:
                 raise StaleRoute()
-            ticket = ExecutionTicket(self, route, plan)
+            ticket = ExecutionTicket(self, route, plan, finalizer)
             self._queue.append(ticket)
             return ticket
 
@@ -546,6 +563,9 @@ class RdbgArbiter:
                     or self._reconciliation is not None or self._server_teardown is not None):
                 raise ArbiterBusy('Reconciliation requires the unknown owner')
             self._reconciliation = plan
+            # Do not let wait_unknown() observe the previous unknown phase as
+            # the outcome of this newly scheduled reconciliation attempt.
+            ticket._phase = 'reconciling'
             self._mailbox.notify_all()
 
     def teardown_fenced_server_target(
@@ -686,8 +706,13 @@ class RdbgArbiter:
             port = SessionPort(self, ticket)
             try:
                 outcome = plan(port)
-                if not isinstance(outcome, Settlement):
-                    raise TypeError('Plan must return a confirmed Settlement')
+                if ticket._finalizer is None:
+                    if not isinstance(outcome, Settlement):
+                        raise TypeError('Raw plan must return a confirmed Settlement')
+                elif ticket._finalizer_started:
+                    raise OutcomeUnknown('Policy finalizer already started; its effects cannot be repeated')
+                elif not isinstance(outcome, ReadyForPolicy):
+                    raise OutcomeUnknown('Policy ticket requires a confirmed raw outcome after cleanup')
                 if ticket._stop_blocked_after_effect and not reconciling:
                     raise StopPendingTeardown('A stopped plan cannot settle after blocking remote work')
                 if ticket._pending is not None or ticket._stop_target is not None or ticket._entered:
@@ -702,9 +727,19 @@ class RdbgArbiter:
                                           and next_route.revision > current.revision)
                         if next_route.incarnation != current.incarnation or not (newer_epoch or newer_revision):
                             raise StaleRoute('Settlement cannot reverse or repeat the current route')
+                if isinstance(outcome, ReadyForPolicy):
+                    # The callback may publish namespace/Worker state. It runs
+                    # outside the mailbox and cannot be retried after entry.
+                    ticket._finalizer_started = True
+                    assert ticket._finalizer is not None
+                    outcome = Settlement(
+                        ticket._finalizer(outcome.raw_outcome), outcome.next_route
+                    )
             except BaseException as error:
                 with self._mailbox:
-                    if reconciling or ticket._entered or ticket._pending is not None or ticket._stop_target is not None or isinstance(error, OutcomeUnknown):
+                    if (reconciling or ticket._entered or ticket._pending is not None
+                            or ticket._stop_target is not None or ticket._finalizer_started
+                            or isinstance(error, OutcomeUnknown)):
                         ticket._phase = 'unknown'
                         ticket._error = error
                         self._mailbox.notify_all()

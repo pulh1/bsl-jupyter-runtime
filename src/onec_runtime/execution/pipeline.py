@@ -54,7 +54,14 @@ class CellExecutionPipeline:
                 raise TypeError("Invalid preparation validation result")
             receipt = SubmissionReceipt()
             try:
-                admission = self._controller.submit_cell(context, prepared, snapshots.guards, receipt)
+                try:
+                    admission = self._controller.submit_cell(
+                        context, prepared, snapshots.guards, receipt
+                    )
+                except StalePreparedDispatch:
+                    # Only admission may report proven pre-effect staleness.
+                    # A ticket waiter can raise the same type after remote work.
+                    continue
                 if isinstance(admission, Rejected):
                     if receipt.ticket is not None:
                         raise RuntimeError("Rejected admission adopted a ticket")
@@ -68,8 +75,6 @@ class CellExecutionPipeline:
                 if admission.ticket is not receipt.ticket:
                     raise RuntimeError("Accepted ticket was not adopted by submission receipt")
                 return admission.ticket.wait_initiator()
-            except StalePreparedDispatch:
-                continue
             except KeyboardInterrupt:
                 if receipt.ticket is not None:
                     self._controller.request_stop(receipt.ticket)

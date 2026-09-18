@@ -52,6 +52,10 @@ class Session:
             uuid4(), (FrameVariable(f'level{stack_level}', 'Number', '1'),)
         )
 
+    def set_breakpoints(self, locations, *, on_transport_dispatch):
+        on_transport_dispatch()
+        self.record('set_breakpoints')
+
     def heartbeat(self, *, on_transport_dispatch):
         for command in ('test-server', 'ping', 'targets'):
             on_transport_dispatch()
@@ -1076,6 +1080,122 @@ def test_failed_reconciliation_cannot_release_unknown_owner_without_new_io(runti
     assert arbiter.active_ticket is ticket
     arbiter.reconcile(ticket, lambda port: Settlement('confirmed'))
     assert ticket.wait(3) == 'confirmed'
+
+
+def test_policy_finalizer_waits_for_reconciled_eval_and_workspace_restore(runtime):
+    session, route, arbiter = runtime
+    observed = []
+    session.target = SimpleNamespace(target_id=TargetId(uuid4(), 'test'))
+
+    def initial(port):
+        port.start_evaluation('ambiguous')
+        return Settlement('unreachable')
+
+    def finish(raw):
+        observed.append((raw, get_ident(), tuple(name for name, _ in session.calls)))
+        return f'published:{raw}'
+
+    ticket = arbiter.submit(route, initial, finalizer=finish)
+    arbiter.dispatch(ticket)
+    try:
+        assert ticket.wait_unknown(3)
+        pending = ticket.status().pending_capability
+        assert pending is session.pending
+        ticket.detach_waiter()
+        with pytest.raises(WaiterDetached):
+            ticket.wait_initiator(3)
+
+        def reconcile(port):
+            result = port.wait_evaluation_event(pending, timeout_s=1)
+            port.set_breakpoints(())  # mandatory workspace restore before publication
+            return arbiter_module.ReadyForPolicy(result.presentation)
+
+        arbiter.reconcile(ticket, reconcile)
+        assert ticket.wait_settled(3) == 'published:ambiguous'
+        assert observed == [('ambiguous', session.calls[0][1], ('ambiguous', 'event', 'set_breakpoints'))]
+        assert ticket.status().settled
+    finally:
+        if ticket.status().phase == 'unknown':
+            from onec_runtime.execution.termination import FileTerminationConfirmed
+            arbiter.retire_terminated_target(
+                ticket, route,
+                FileTerminationConfirmed(
+                    (ticket.status().pending_capability or session.target).target_id,
+                    1234, -15,
+                ),
+            )
+
+
+def test_policy_ticket_reconcile_plain_settlement_cannot_publish_raw_outcome(runtime):
+    session, route, arbiter = runtime
+    session.target = SimpleNamespace(target_id=TargetId(uuid4(), 'test'))
+    published = []
+
+    def initial(port):
+        port.start_evaluation('ambiguous')
+        return Settlement('unreachable')
+
+    ticket = arbiter.submit(route, initial, finalizer=lambda raw: published.append(raw) or 'policy')
+    arbiter.dispatch(ticket)
+    try:
+        assert ticket.wait_unknown(3)
+        pending = ticket.status().pending_capability
+        arbiter.reconcile(ticket, lambda port: Settlement(
+            port.wait_evaluation_event(pending, timeout_s=1).presentation
+        ))
+        assert ticket.wait_unknown(3)
+        assert not ticket.status().settled
+        assert arbiter.active_ticket is ticket
+        assert published == []
+        arbiter.reconcile(ticket, lambda _port: arbiter_module.ReadyForPolicy('confirmed'))
+        assert ticket.wait_settled(3) == 'policy'
+        assert published == ['confirmed']
+    finally:
+        if ticket.status().phase == 'unknown':
+            from onec_runtime.execution.termination import FileTerminationConfirmed
+            arbiter.retire_terminated_target(
+                ticket, route,
+                FileTerminationConfirmed(
+                    (ticket.status().pending_capability or session.target).target_id,
+                    1234, -15,
+                ),
+            )
+
+
+def test_policy_finalizer_failure_is_not_retried_by_reconciliation(runtime):
+    session, route, arbiter = runtime
+    session.target = SimpleNamespace(target_id=TargetId(uuid4(), 'test'))
+    calls = []
+
+    def finish(raw):
+        calls.append(raw)
+        raise RuntimeError('publication partially failed')
+
+    ticket = arbiter.submit(
+        route,
+        lambda port: arbiter_module.ReadyForPolicy(
+            port.local_variables(stack_level=0, timeout_s=1).variables[0].name
+        ),
+        finalizer=finish,
+    )
+    arbiter.dispatch(ticket)
+    try:
+        assert ticket.wait_unknown(3)
+        assert calls == ['level0']
+        arbiter.reconcile(ticket, lambda _port: arbiter_module.ReadyForPolicy('level0'))
+        assert ticket.wait_unknown(3)
+        assert calls == ['level0']
+        assert arbiter.active_ticket is ticket
+    finally:
+        if ticket.status().phase == 'unknown':
+            from onec_runtime.execution.termination import FileTerminationConfirmed
+            arbiter.retire_terminated_target(
+                ticket, route,
+                FileTerminationConfirmed(
+                    (ticket.status().pending_capability or session.target).target_id,
+                    1234, -15,
+                ),
+            )
 
 
 def test_session_port_cannot_escape_worker_plan(runtime):

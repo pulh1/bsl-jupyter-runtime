@@ -18,6 +18,7 @@ from onec_runtime.execution.arbiter import (
     CancelledBeforeEffect,
     ExecutionTicket,
     RdbgArbiter,
+    ReadyForPolicy,
     RouteToken,
     SessionPort,
     Settlement,
@@ -75,6 +76,16 @@ class _PreparationRecord:
     owner: MainOperation | CaptureScope | None
 
 
+class _RawSettlementServices:
+    """Keep component callers' raw outcomes until runtime services are bound."""
+
+    def settle_main(self, outcome: object, _payload: MainPreparedPayload) -> object:
+        return outcome
+
+    def settle_capture(self, outcome: object, _payload: CapturePreparedPayload) -> object:
+        return outcome
+
+
 class ExecutionController:
     """Choose the current route; executors own protocol command sequences."""
 
@@ -89,6 +100,7 @@ class ExecutionController:
         runtime_generation: int,
         parser_target: PythonParserTarget | None = None,
         snapshot_provider: Callable[[], RoutePreparationSnapshot] | None = None,
+        settlement_services: object | None = None,
     ) -> None:
         if type(runtime_generation) is not int or runtime_generation <= 0:
             raise ValueError("runtime_generation must be positive")
@@ -103,6 +115,9 @@ class ExecutionController:
         self._generation = runtime_generation
         self._parser_target = parser_target
         self._snapshot_provider = snapshot_provider
+        self._settlement_services = (
+            settlement_services if settlement_services is not None else _RawSettlementServices()
+        )
         self._lock = RLock()
         self._command_sequence = 0
         self._stop_sequence = 0
@@ -284,6 +299,11 @@ class ExecutionController:
                 return Rejected(StalePreparation("CAPTURE dirty roots do not match lowering"))
             source = statement.lowering.source
 
+            def finalizer(raw_outcome: object) -> object:
+                return context.policy.settle(
+                    raw_outcome, prepared, self._settlement_services
+                )
+
             def preflight() -> None:
                 fresh = provider()
                 with self._lock:
@@ -302,12 +322,14 @@ class ExecutionController:
             try:
                 if isinstance(context.policy, MainCellPolicy):
                     ticket = self.submit_main(
-                        source, _receipt=receipt, _before_first_effect=preflight
+                        source, _receipt=receipt, _before_first_effect=preflight,
+                        _finalizer=finalizer,
                     )
                 else:
                     ticket = self.submit_capture_cell(
                         source, dirty_roots=payload.dirty_roots,
                         _receipt=receipt, _before_first_effect=preflight,
+                        _finalizer=finalizer,
                     )
             except StaleRoute:
                 return Rejected(StalePreparation("arbiter route changed"))
@@ -321,6 +343,7 @@ class ExecutionController:
         self, instruction: str, *,
         _receipt: SubmissionReceipt | None = None,
         _before_first_effect: Callable[[], None] | None = None,
+        _finalizer: Callable[[object], object] | None = None,
     ) -> ExecutionTicket:
         """Admit one MAIN command and return its first-stop ticket."""
 
@@ -337,7 +360,7 @@ class ExecutionController:
             self._capture_route = None
             self._resume_ticket = None
 
-            def plan(port: SessionPort) -> Settlement:
+            def plan(port: SessionPort) -> Settlement | ReadyForPolicy:
                 if _before_first_effect is not None:
                     try:
                         _before_first_effect()
@@ -354,11 +377,16 @@ class ExecutionController:
                     before_continue=lambda: None,
                     port=port,
                 )
-                return self._route_stop(port, operation, stop)
+                outcome = self._route_stop(port, operation, stop)
+                if _finalizer is None:
+                    return outcome
+                return ReadyForPolicy(
+                    outcome.value, next_route=outcome.next_route
+                )
 
             ticket: ExecutionTicket | None = None
             try:
-                ticket = self._arbiter.submit(route, plan)
+                ticket = self._arbiter.submit(route, plan, finalizer=_finalizer)
                 self._main_stop_ticket = ticket
                 if _receipt is not None:
                     _receipt.adopt(ticket)
@@ -393,6 +421,7 @@ class ExecutionController:
         result_policy: Callable[[EvaluationResult], object] | None = None,
         _receipt: SubmissionReceipt | None = None,
         _before_first_effect: Callable[[], None] | None = None,
+        _finalizer: Callable[[object], object] | None = None,
     ) -> ExecutionTicket:
         """Run one cell inside the current stop; policy interprets its result."""
 
@@ -412,11 +441,11 @@ class ExecutionController:
                 raise ProtocolError("No ready CAPTURE stop is available")
             selected_policy = result_policy or (lambda result: result)
 
-            def plan(port: SessionPort) -> Settlement:
+            def plan(port: SessionPort) -> Settlement | ReadyForPolicy:
                 if _before_first_effect is not None:
                     _before_first_effect()
                 scope.admit_cell_dirty_roots(dirty_roots)
-                return self._capture_cell_executor.execute(
+                outcome = self._capture_cell_executor.execute(
                     scope,
                     lowered_source,
                     port=port,
@@ -429,8 +458,13 @@ class ExecutionController:
                     cleanup=lambda worker: None,
                     result_policy=selected_policy,
                 )
+                if _finalizer is None:
+                    return outcome
+                return ReadyForPolicy(
+                    outcome.value, next_route=outcome.next_route
+                )
 
-            ticket = self._arbiter.submit(route, plan)
+            ticket = self._arbiter.submit(route, plan, finalizer=_finalizer)
             if _receipt is not None:
                 _receipt.adopt(ticket)
             self._preparation_revision += 1
