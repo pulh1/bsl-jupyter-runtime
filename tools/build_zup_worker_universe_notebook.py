@@ -21,7 +21,7 @@ from integration.zup_worker_universe_notebook import (  # noqa: E402
 def _validated_notebook_source() -> str:
     expected = serialize_notebook(build_notebook())
     if (
-        "onec-worker-universe-zup-acceptance-v2" not in expected
+        "onec-worker-universe-zup-acceptance-v3" not in expected
         or "catalog_setup_ms" not in expected
         or "catalog_extension" not in expected
         or "active_generation_unchanged" not in expected

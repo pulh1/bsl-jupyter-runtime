@@ -207,9 +207,15 @@ def test_kernel_shutdown_terminates_server_before_worker_cleanup(tmp_path: Path)
 
     session.close_for_kernel_shutdown()
 
-    assert events == ["server-terminate", "client-close", "debugger-detach", "transport-close"]
+    assert events == [
+        "api-close", "server-terminate", "client-close", "debugger-detach",
+        "transport-close",
+    ]
     session.close()
-    assert events == ["server-terminate", "client-close", "debugger-detach", "transport-close"]
+    assert events == [
+        "api-close", "server-terminate", "client-close", "debugger-detach",
+        "transport-close",
+    ]
 
 
 @pytest.mark.parametrize("startup", [False, True])
@@ -305,11 +311,11 @@ def test_kernel_shutdown_retries_native_termination_before_closing_client(tmp_pa
 
     with pytest.raises(ProtocolError, match="cleanup failed"):
         session.close_for_kernel_shutdown()
-    assert events == ["server-terminate"]
+    assert events == ["api-close", "server-terminate"]
 
     session.close_for_kernel_shutdown()
     assert events == [
-        "server-terminate", "server-terminate", "client-close",
+        "api-close", "server-terminate", "server-terminate", "client-close",
         "debugger-detach", "transport-close",
     ]
 
@@ -440,6 +446,7 @@ def test_heartbeat_lost_debug_ui_releases_owned_runtime(tmp_path: Path) -> None:
         SimpleNamespace(
             close=lambda: events.append("api-close"),
             owns_debug_ui_stream=lambda: False,
+            try_heartbeat_ticket=lost_heartbeat,
         ),
         ArtifactWriter(tmp_path / "evidence", "test"),
         heartbeat_interval_s=0.01,
@@ -478,6 +485,7 @@ def test_heartbeat_closes_when_owned_client_has_exited(tmp_path: Path) -> None:
         SimpleNamespace(
             close=lambda: events.append("api-close"),
             owns_debug_ui_stream=lambda: False,
+            try_heartbeat_ticket=lambda: events.append("heartbeat") or None,
         ),
         ArtifactWriter(tmp_path / "evidence", "test"),
         heartbeat_interval_s=0.01,

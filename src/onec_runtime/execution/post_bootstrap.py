@@ -158,6 +158,7 @@ def compose_post_bootstrap_execution(
                 context_generation=context_generation,
                 worker_catalog_snapshot=worker_materialization_snapshot,
                 wait_handoff=handoff,
+                request_stop=core.controller.request_stop,
             ),
         )
     except BaseException:
@@ -243,6 +244,12 @@ def compose_fresh_post_bootstrap_execution(
     settlement = RouteSettlementService(namespace)
     status: dict[str, ExecutionStatusProjection] = {}
 
+    def retained_source_units() -> tuple[SourceUnitRef, ...]:
+        return (
+            *settlement.retained_source_units(),
+            *worker_universe.retained_source_units(),
+        )
+
     def reply_status():
         try:
             return status["projection"].status()
@@ -261,7 +268,7 @@ def compose_fresh_post_bootstrap_execution(
         worker_materialization_snapshot=worker_materialization_snapshot,
         settlement_services=settlement,
         reply_presenter=RuntimeReplyPresenter(reply_status),
-        retained_source_units=settlement.retained_source_units,
+        retained_source_units=retained_source_units,
         breakpoint_routes=routes,
         resolve_capture_sources=resolve_capture_sources,
         file_target_lease=file_target_lease,
@@ -286,6 +293,7 @@ def compose_fresh_post_bootstrap_execution(
             workspace,
             require_mutation_boundary=require_worker_mutation_boundary,
             wait_handoff=composed.facade._wait_handoff,
+            request_stop=composed.core.controller.request_stop,
         )
         composed.facade.bind_worker_breakpoint_service(worker_breakpoint_service)
         module_builder = worker_module_builder or WorkerModuleArtifactBuilder(
@@ -305,6 +313,7 @@ def compose_fresh_post_bootstrap_execution(
                 worker_breakpoints.list_statuses()
             ),
             wait_handoff=composed.facade._wait_handoff,
+            request_stop=composed.core.controller.request_stop,
         )
         composed.facade.bind_worker_module_lifecycle(worker_module_service)
     except BaseException:

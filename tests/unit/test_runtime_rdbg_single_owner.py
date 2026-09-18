@@ -15,7 +15,7 @@ from onec_runtime.capture_evaluation import CapturePhase
 from onec_runtime.config import RuntimeConfig
 from onec_runtime.errors import NoActiveCaptureError, ProtocolError
 from onec_runtime.execution.post_bootstrap import compose_fresh_post_bootstrap_execution
-from onec_runtime.runtime_api import RuntimeReplyKind
+from onec_runtime.runtime_models import RuntimeReplyKind
 from onec_runtime.session import RuntimeSession, RuntimeSessionConfig
 
 from test_execution_controller_routes import BUSINESS, KERNEL, CompleteSession

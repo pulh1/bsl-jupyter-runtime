@@ -62,7 +62,7 @@ from onec_runtime.extension_bundle import EXTENSION_NAME, packaged_extension_bun
 from onec_runtime.kernel import SYNTHETIC_CAPTURE_A_MARKER
 from onec_runtime.session import RuntimeSession, RuntimeSessionConfig
 from onec_runtime.table_value import evaluation_to_python
-from onec_runtime.runtime_api import RuntimeReply, RuntimeReplyKind
+from onec_runtime.runtime_models import RuntimeReply, RuntimeReplyKind
 from onec_runtime.toolchain import create_empty_infobase, run_tool_command
 from onec_runtime.worker_breakpoints import WorkerMappedFrame
 from onec_runtime.worker_epf import prepare_worker_module_source

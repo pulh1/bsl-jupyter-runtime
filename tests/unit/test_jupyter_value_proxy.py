@@ -14,8 +14,8 @@ from onec_runtime_jupyter.extension import (
     install_runtime,
     synchronize_bsl_namespace,
 )
-from onec_runtime.prototype_runtime import OperationState
-from onec_runtime.runtime_api import RuntimeNamespaceSnapshot, RuntimeStatus
+from onec_runtime.runtime_models import OperationState
+from onec_runtime.runtime_models import RuntimeNamespaceSnapshot, RuntimeStatus
 
 
 class FakeShell:

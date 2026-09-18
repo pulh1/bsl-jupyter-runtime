@@ -140,7 +140,7 @@ class CellExecutionPipeline:
             raise TypeError("A sealed prepared cell is required")
         context, prepared, guards = candidate._claim(self._preparation_owner)
         release_wait = wait_handoff or nullcontext
-        receipt = SubmissionReceipt()
+        receipt = SubmissionReceipt(on_admitted_ticket)
         try:
             if validate_claimed is not None:
                 validate_claimed(context, prepared)
@@ -151,13 +151,9 @@ class CellExecutionPipeline:
                 return self._replies.unavailable_reply(validity)
             if not isinstance(validity, Current):
                 raise TypeError("Invalid preparation validation result")
-            try:
-                admission = self._controller.submit_cell(
-                    context, prepared, guards, receipt,
-                )
-            finally:
-                if receipt.ticket is not None and on_admitted_ticket is not None:
-                    on_admitted_ticket(receipt.ticket)
+            admission = self._controller.submit_cell(
+                context, prepared, guards, receipt,
+            )
             if isinstance(admission, Rejected):
                 if receipt.ticket is not None:
                     raise RuntimeError("Rejected admission adopted a ticket")
@@ -187,6 +183,7 @@ class CellExecutionPipeline:
         wait_handoff: Callable[[], AbstractContextManager[None]] | None = None,
         on_prepared: Callable[[PreparedCell], None] | None = None,
         on_admitted: Callable[[PreparedCell], None] | None = None,
+        on_admitted_ticket: Callable[[ExecutionTicket], None] | None = None,
     ) -> object:
         """Execute a cell, releasing a caller lock only at blocking waits.
 
@@ -217,7 +214,7 @@ class CellExecutionPipeline:
                 raise TypeError("Invalid preparation validation result")
             if on_prepared is not None:
                 on_prepared(prepared)
-            receipt = SubmissionReceipt()
+            receipt = SubmissionReceipt(on_admitted_ticket)
             try:
                 try:
                     admission = self._controller.submit_cell(

@@ -9,6 +9,7 @@ import onec_runtime.rdbg.session as session_module
 from onec_runtime.errors import (
     CommandTimeout,
     EvaluationDispatchUnknown,
+    LocalVariablesResultTimeout,
     ProtocolError,
     TargetLost,
     UnexpectedStop,
@@ -723,6 +724,17 @@ def test_local_variables_bounds_the_http_request_by_its_deadline() -> None:
     assert 0 < transport.request_timeout <= 0.25
 
 
+def test_local_variables_missing_result_is_a_read_timeout() -> None:
+    transport = FakeTransport()
+    session = ready_session(transport)
+
+    with pytest.raises(LocalVariablesResultTimeout):
+        session.local_variables(timeout_s=0.01)
+
+    assert transport.calls[0] == 'evalLocalVariables'
+    assert session.state is SessionState.READY
+
+
 def test_local_variables_callback_rejection_prevents_transport_and_pending_state() -> None:
     transport = FakeTransport()
     session = ready_session(transport)
@@ -818,6 +830,30 @@ def test_evaluation_stop_is_returned_before_matching_result(
     session.continue_evaluation(pending, stop)
     assert session.wait_evaluation_event(pending, timeout_s=1) is result
     assert transport.calls.count("step") == 1
+
+
+def test_pending_evaluation_preserves_foreign_stop_before_matching_result() -> None:
+    transport = FakeTransport()
+    session = ready_session(transport)
+    pending = session.start_evaluation("1", stack_level=0)
+    foreign = DebugTarget(
+        TargetId(UUID("33333333-3333-3333-3333-333333333333"), "DefAlias"),
+        "ManagedClient",
+        "stopped",
+    )
+    session.attached_targets[foreign.target_id.id] = foreign
+    foreign_stop = StopEvent(foreign.target_id, LOCATION, "breakpoint")
+    result = EvaluationResult(pending.result_id, "Число", "1", False)
+    session._event_queue.extend((foreign_stop, result))
+
+    assert session.wait_evaluation_event(pending, timeout_s=1) is result
+    assert session.target.target_id == pending.target_id
+    session.state = SessionState.ATTACHED
+    assert session.wait_for_any_stop(
+        expected_target=foreign.target_id, timeout_s=1,
+    ) is foreign_stop
+    assert session.target is foreign
+    assert transport.calls == ["evalExpr"]
 
 
 def test_continue_evaluation_callback_rejection_keeps_exact_pending_stop() -> None:

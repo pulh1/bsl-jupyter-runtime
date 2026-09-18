@@ -27,6 +27,42 @@ def unit(source: str) -> SourceUnitRef:
     )
 
 
+def test_ticket_callback_runs_inside_receipt_adoption() -> None:
+    events: list[str] = []
+
+    class Parser:
+        def prepare(self, source, source_unit):
+            return CommonCell(source_unit, source, {}, source_sha256(source))
+
+    class Policy:
+        def prepare(self, common, snapshots, context):
+            return PreparedCell(context.route_token, context.preparation_nonce, common)
+
+    class Snapshots:
+        def read_for(self, capabilities):
+            return PreparationSnapshots({}, {}, "guard")
+
+    class Ticket:
+        def wait_initiator(self):
+            return "done"
+
+    class Controller:
+        def await_preparation_context(self):
+            return PreparationContext("route", "nonce", Policy(), ())
+
+        def submit_cell(self, context, prepared, guards, receipt):
+            ticket = Ticket()
+            receipt.adopt(ticket)
+            assert events == ["adopted"]
+            return Accepted(ticket)
+
+    pipeline = CellExecutionPipeline(Parser(), Controller(), Snapshots(), object())
+    assert pipeline.execute(
+        "Результат = 1;", unit("Результат = 1;"),
+        on_admitted_ticket=lambda _ticket: events.append("adopted"),
+    ) == "done"
+
+
 def test_controller_selected_third_policy_runs_without_pipeline_route_changes() -> None:
     class Parser:
         def prepare(self, source: str, source_unit: SourceUnitRef) -> CommonCell:

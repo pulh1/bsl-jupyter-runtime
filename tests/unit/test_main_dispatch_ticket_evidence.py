@@ -5,9 +5,11 @@ from __future__ import annotations
 from threading import Event
 
 import pytest
+from arbiter_test_cleanup import confirm_test_server_terminated
 
-from onec_runtime.errors import ProtocolError
+from onec_runtime.errors import ProtocolError, RdbgTransportTimeout
 from onec_runtime.execution.contracts import Accepted, SubmissionReceipt
+from onec_runtime.execution.main import MainPhase
 from onec_runtime.execution.snapshot_binding import RoutePreparationSnapshot
 from onec_runtime.rdbg.models import ModifyResult
 
@@ -72,6 +74,44 @@ def test_confirmed_main_write_failure_proves_continue_was_never_entered() -> Non
             ticket.wait_settled(3)
         assert controller.main_dispatch_evidence(ticket) is False
     finally:
+        arbiter.close(timeout=3)
+
+
+@pytest.mark.parametrize("ambiguous_field", ["ТекущаяИнструкция", "ИдентификаторКоманды"])
+def test_ambiguous_main_command_write_keeps_operation_live(
+    ambiguous_field: str,
+) -> None:
+    class AmbiguousWrite(CompleteSession):
+        def modify(self, variable, value_expression, *, on_transport_dispatch):
+            if variable == ambiguous_field:
+                on_transport_dispatch()
+                raise RdbgTransportTimeout("command write outcome is unknown")
+            return super().modify(
+                variable, value_expression, on_transport_dispatch=on_transport_dispatch,
+            )
+
+    owner = object()
+    controller, arbiter, session, _parser = _runtime(
+        lambda: RoutePreparationSnapshot(owner, 1, (), ()),
+        session=AmbiguousWrite(),
+    )
+    ticket = None
+    try:
+        ticket = controller.submit_main("Результат = 1;")
+        assert ticket.wait_unknown(3)
+        operation = controller.main_operation
+        assert operation is not None
+        assert operation.phase is MainPhase.UNKNOWN
+        assert not operation.terminal
+        assert operation.command_dispatch_attempted is False
+        with pytest.raises(ProtocolError, match="MAIN command is still active"):
+            controller.submit_main("Результат = 2;")
+    finally:
+        if ticket is not None and ticket.status().phase == "unknown":
+            confirm_test_server_terminated(
+                arbiter, ticket, arbiter.current_route, session,
+                session.target.target_id,
+            )
         arbiter.close(timeout=3)
 
 

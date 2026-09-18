@@ -41,6 +41,17 @@ class MainOperation:
         if self.terminal:
             raise RuntimeError("MAIN operation is already terminal")
 
+    def command_write_requested(self) -> None:
+        """Retain an unresolved command-field write without claiming Continue."""
+        self._require_live()
+        self.phase = MainPhase.UNKNOWN
+
+    def command_write_acknowledged(self) -> None:
+        """A confirmed field result restores pre-Continue admission."""
+        self._require_live()
+        if not self.command_dispatch_attempted:
+            self.phase = MainPhase.ADMITTED
+
     def continue_requested(self) -> None:
         self._require_live()
         # Until acknowledgement, the previous frame may already have gone.
@@ -82,7 +93,7 @@ class MainOperation:
         self.phase = MainPhase.COMPLETED
 
     def fail_before_dispatch(self) -> None:
-        """Reject local admission only before command writes/Continue attempts."""
+        """Terminate only after local failure or confirmed writes before Continue."""
         if self.phase is not MainPhase.ADMITTED:
             raise RuntimeError("MAIN dispatch has already been attempted")
         self.phase = MainPhase.FAILED_BEFORE_DISPATCH

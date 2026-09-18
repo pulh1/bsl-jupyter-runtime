@@ -16,8 +16,8 @@ from onec_runtime.capture_evaluation import CapturePhase
 from onec_runtime.errors import ProtocolError
 from onec_runtime.execution.post_bootstrap import compose_fresh_post_bootstrap_execution
 from onec_runtime.rdbg.models import EvaluationResult
-from onec_runtime.prototype_runtime import ContinuationAttemptSpec
-from onec_runtime.runtime_api import RuntimeReplyKind
+from onec_runtime.execution.continuation_models import ContinuationAttemptSpec
+from onec_runtime.runtime_models import RuntimeReplyKind
 from onec_runtime.session import RuntimeSession, RuntimeSessionConfig
 from onec_runtime_mcp.agent.runtime_backend import OnecRuntimeBackend
 from onec_runtime_mcp.agent.runtime_session import AgentRuntimeSession

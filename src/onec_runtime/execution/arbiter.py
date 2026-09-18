@@ -1,4 +1,4 @@
-"""Single-worker RDBG ownership primitive; not yet wired to the runtime.
+"""Single-worker RDBG ownership primitive for the public runtime.
 
 Submission is deliberately two phase: publish the ticket, then dispatch it.
 Plans own protocol sequencing, polling and mandatory cleanup. Raw plans return
@@ -12,10 +12,15 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from math import isfinite
 from threading import Condition, Thread, get_ident
+from time import monotonic
 from typing import Any, Callable, Protocol
 from uuid import uuid4
 
-from onec_runtime.errors import CommandTimeout, EvaluationDispatchUnknown, StopWaitIntervalElapsed
+from onec_runtime.errors import (
+    CommandTimeout, EvaluationDispatchUnknown, LocalVariablesResultTimeout,
+    StopWaitIntervalElapsed,
+)
+from onec_runtime.execution.contracts import SubmissionReceipt
 from onec_runtime.execution.termination import (
     FileTargetProcessLease, FileTerminationConfirmed, FileTerminationUnknown,
     ServerTerminationConfirmed, TerminationUnknown, terminate_file_target,
@@ -234,8 +239,9 @@ class ExecutionTicket:
 
     def _wait(self, timeout: float | None, *, respect_detach: bool) -> Any:
         with self._owner._mailbox:
-            if not self._owner._mailbox.wait_for(
-                lambda: self._phase == 'settled' or (respect_detach and self._detached), timeout
+            if not self._wait_until(
+                lambda: self._phase == 'settled' or (respect_detach and self._detached),
+                timeout,
             ):
                 raise TimeoutError('Local waiter interval elapsed; operation remains owned')
             if respect_detach and self._detached:
@@ -246,8 +252,21 @@ class ExecutionTicket:
 
     def wait_unknown(self, timeout: float | None = None) -> bool:
         with self._owner._mailbox:
-            self._owner._mailbox.wait_for(lambda: self._phase in ('unknown', 'settled'), timeout)
+            self._wait_until(lambda: self._phase in ('unknown', 'settled'), timeout)
             return self._phase == 'unknown'
+
+    def _wait_until(self, ready: Callable[[], bool], timeout: float | None) -> bool:
+        """Reenter Python during local waits so Windows kernel interrupts run."""
+
+        deadline = None if timeout is None else monotonic() + timeout
+        while not ready():
+            remaining = None if deadline is None else deadline - monotonic()
+            if remaining is not None and remaining <= 0:
+                return False
+            self._owner._mailbox.wait(
+                0.1 if remaining is None else min(0.1, remaining)
+            )
+        return True
 
 
 class SessionPort:
@@ -334,12 +353,18 @@ class SessionPort:
             self._ticket._entered = False
 
     def local_variables(self, stack_level: int = 0, *, timeout_s: float = 30.0) -> LocalVariablesResult:
-        """Read a stopped frame while retaining ownership of ambiguous dispatch."""
+        """Read a stopped frame; an absent result has no remote write effect."""
         self._require_idle()
-        result = self._owner._session.local_variables(
-            stack_level=stack_level, timeout_s=timeout_s,
-            on_transport_dispatch=self._transport_entered,
-        )
+        try:
+            result = self._owner._session.local_variables(
+                stack_level=stack_level, timeout_s=timeout_s,
+                on_transport_dispatch=self._transport_entered,
+            )
+        except LocalVariablesResultTimeout:
+            with self._owner._mailbox:
+                if not self._ticket._stop_requested:
+                    self._ticket._entered = False
+            raise
         with self._owner._mailbox:
             self._ticket._entered = False
         return result
@@ -641,7 +666,8 @@ class RdbgArbiter:
             return True
 
     def submit(self, route: RouteToken, plan: Plan, *,
-               finalizer: Callable[[Any], Any] | None = None) -> ExecutionTicket:
+               finalizer: Callable[[Any], Any] | None = None,
+               receipt: SubmissionReceipt | None = None) -> ExecutionTicket:
         with self._mailbox:
             if self._closed or self._closing:
                 raise RuntimeError('Arbiter is closed')
@@ -650,7 +676,18 @@ class RdbgArbiter:
             if route != self._route:
                 raise StaleRoute()
             ticket = ExecutionTicket(self, route, plan, finalizer)
-            self._queue.append(ticket)
+            try:
+                self._queue.append(ticket)
+                if receipt is not None:
+                    receipt.adopt(ticket)
+            except BaseException:
+                # The worker cannot enter an unready ticket. If receipt
+                # publication is interrupted, retire it before releasing the
+                # mailbox so neither caller nor worker loses its owner.
+                if ticket in self._queue:
+                    self._queue.remove(ticket)
+                self._settle(ticket, error=CancelledBeforeEffect())
+                raise
             return ticket
 
     def try_heartbeat(self) -> ExecutionTicket | None:

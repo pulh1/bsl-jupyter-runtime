@@ -43,16 +43,20 @@ from onec_runtime.execution.capture.scope import (
     CaptureFrameIdentity,
     CaptureScope,
 )
+from onec_runtime.execution.local_wait import LocalWaitStatus, wait_initiator_locally
 from onec_runtime.rdbg.models import FrameVariable
 
 
 class _CaptureTicket(Protocol):
-    def wait_initiator(self) -> object: ...
+    def wait_initiator(self, timeout: float | None = None) -> object: ...
     def detach_waiter(self) -> None: ...
+    def status(self) -> LocalWaitStatus: ...
 
 
 class CaptureVariablePageController(Protocol):
     capture_scope: CaptureScope | None
+
+    def request_stop(self, ticket: _CaptureTicket) -> object: ...
 
     def submit_capture_typed_variable_page(
         self, *, stack_level: int, start: int, stop: int,
@@ -169,12 +173,10 @@ class CaptureTicketValueProjection:
         raise CaptureShapeUnsupportedError("CAPTURE value expansion is not attached")
 
     def _wait(self, ticket: _CaptureTicket) -> object:
-        try:
-            with self._wait_handoff():
-                return ticket.wait_initiator()
-        except KeyboardInterrupt:
-            ticket.detach_waiter()
-            raise
+        return wait_initiator_locally(
+            ticket, timeout_s=None, wait_handoff=self._wait_handoff,
+            request_stop=lambda: self._controller.request_stop(ticket),
+        )
 
     def _validate_current(self) -> None:
         scope = self._scope

@@ -347,6 +347,10 @@ class CommandTimeout(RuntimeProbeError):
     """A command did not complete by its monotonic deadline."""
 
 
+class LocalVariablesResultTimeout(CommandTimeout):
+    """A read-only local-variable request returned no matching result in time."""
+
+
 class StopWaitIntervalElapsed(CommandTimeout):
     """A stop polling interval ended normally without a matching stop event."""
 

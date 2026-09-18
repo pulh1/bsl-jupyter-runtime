@@ -4,7 +4,7 @@ import pytest
 
 from onec_runtime.bsl import LoweringMode, SemanticNotebookLowerer
 from onec_runtime.bsl.parser_target import PythonParserTarget
-from onec_runtime.prototype_runtime import PrototypeRuntimeController
+from onec_runtime.execution.message_collector import with_message_collector
 
 
 @pytest.fixture(scope="module")
@@ -21,11 +21,11 @@ def test_message_wrapper_parses_and_preserves_the_cell_result(
         mode=LoweringMode.CAPTURE,
         message_collector_key="__onec_cell_messages_7_3",
     )
-    wrapped = PrototypeRuntimeController._with_message_collector(
-        lowered.source,
+    wrapped = with_message_collector(
+        lowered.mapped_source,
         lowered.messages_intercepted,
         "__onec_cell_messages_7_3",
-    )
+    ).text
 
     parser_target.parse(wrapped, "БлокНоутбука")
     assert "Наконец" not in wrapped

@@ -24,7 +24,7 @@ from onec_runtime.extension_bundle import (
 from onec_runtime.extension_state import ExtensionStateStore, VerifiedExtensionState
 from onec_runtime.performance_profile import PhaseRecorder
 from onec_runtime.processes import FileModeProcesses, OwnedProcess
-from onec_runtime.runtime_api import RuntimeReplyKind
+from onec_runtime.runtime_models import RuntimeReplyKind
 from onec_runtime.session import ExtensionMode, RuntimeSession, RuntimeSessionConfig
 from onec_runtime.toolchain import (
     apply_product_extension,

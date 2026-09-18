@@ -60,16 +60,15 @@ from onec_runtime.errors import (
     BslExecutionError,
     ProtocolError,
     StaleWorkerGeneration,
-    WorkerPromotionOutcomeUnknown,
 )
 from onec_runtime.performance_profile import PhaseRecorder
-from onec_runtime.prototype_runtime import CaptureCellResult, OperationState
-from onec_runtime.runtime_api import (
+from onec_runtime.runtime_models import (
+    OperationState,
     RuntimeNamespaceSnapshot,
     RuntimeReply,
     RuntimeReplyKind,
 )
-from onec_runtime.worker_universe import _worker_promotion_failure_phase
+from onec_runtime.worker_universe import WorkerGenerationHandle
 
 
 def _code_cells(notebook: nbformat.NotebookNode) -> list[nbformat.NotebookNode]:
@@ -146,7 +145,7 @@ def test_notebook_covers_main_capture_diagnostics_lifecycle_and_performance() ->
     assert "iterations=ITERATIONS" in cells["main-load"].source
     assert "warmup_iterations=WARMUP_ITERATIONS" in cells["main-load"].source
     assert "2_500" in cells["performance-results"].source
-    assert "onec-worker-universe-zup-acceptance-v2" in cells["performance-results"].source
+    assert "onec-worker-universe-zup-acceptance-v3" in cells["performance-results"].source
     assert "catalog_setup_ms" in cells["performance-results"].source
     assert "catalog_extension" in cells["performance-results"].source
     assert "active_generation_unchanged" in cells["performance-results"].source
@@ -174,15 +173,12 @@ def test_real_capture_worker_reload_is_visible_only_to_the_next_operation() -> N
 
     class FakeRuntimeApi:
         def __init__(self) -> None:
-            self.operation_worker_generation: object | None = None
             self.worker_generation_handle: object | None = original_generation
             self.resume_results = [7101, 7102]
-            self.resume_pins: list[object | None] = []
 
         def resume_capture(self) -> RuntimeReply:
-            self.resume_pins.append(self.operation_worker_generation)
             result = self.resume_results.pop(0)
-            self.operation_worker_generation = None
+            session.state = OperationState.COMPLETED
             return RuntimeReply(
                 RuntimeReplyKind.MAIN_COMPLETED,
                 result,
@@ -193,15 +189,22 @@ def test_real_capture_worker_reload_is_visible_only_to_the_next_operation() -> N
     class FakeSession:
         def __init__(self) -> None:
             self.runtime_api = FakeRuntimeApi()
+            self.state = OperationState.IDLE
             self.sources: list[str] = []
-            self.observed_pins: list[object | None] = []
+
+        def status(self) -> object:
+            return SimpleNamespace(
+                state=self.state,
+                worker_generation=self.runtime_api.worker_generation_handle,
+            )
+
+        def resume_capture(self) -> RuntimeReply:
+            return self.runtime_api.resume_capture()
 
         def execute_bsl(self, source: str) -> RuntimeReply:
             self.sources.append(source)
             if "СинтетическийCapture" in source:
-                self.runtime_api.operation_worker_generation = (
-                    self.runtime_api.worker_generation_handle
-                )
+                self.state = OperationState.CAPTURED
                 return RuntimeReply(
                     RuntimeReplyKind.CAPTURED,
                     len(self.sources),
@@ -209,9 +212,6 @@ def test_real_capture_worker_reload_is_visible_only_to_the_next_operation() -> N
                     location=capture_location,  # type: ignore[arg-type]
                 )
             if source == worker_source:
-                self.observed_pins.append(
-                    self.runtime_api.operation_worker_generation
-                )
                 self.runtime_api.worker_generation_handle = promoted_generation
                 return RuntimeReply(
                     RuntimeReplyKind.WORKER_LOADED,
@@ -220,9 +220,6 @@ def test_real_capture_worker_reload_is_visible_only_to_the_next_operation() -> N
                     result=promoted_generation,
                 )
             if source == probe_source:
-                self.observed_pins.append(
-                    self.runtime_api.operation_worker_generation
-                )
                 return RuntimeReply(
                     RuntimeReplyKind.CAPTURE_CELL,
                     len(self.sources),
@@ -242,12 +239,7 @@ def test_real_capture_worker_reload_is_visible_only_to_the_next_operation() -> N
         phase=71,
     )
 
-    assert session.observed_pins == [original_generation, promoted_generation]
-    assert session.runtime_api.resume_pins == [
-        original_generation,
-        promoted_generation,
-    ]
-    assert session.runtime_api.operation_worker_generation is None
+    assert session.status().state is OperationState.COMPLETED
     assert session.runtime_api.worker_generation_handle is promoted_generation
     assert session.sources[1:] == [
         worker_source,
@@ -258,254 +250,46 @@ def test_real_capture_worker_reload_is_visible_only_to_the_next_operation() -> N
     assert "СинтетическийCapture" in session.sources[2]
 
 
-@pytest.mark.parametrize(
-    ("fault", "message"),
-    (
-        pytest.param(None, None, id="accepts-retired-original-owner"),
-        pytest.param(
-            "intermediate-live",
-            "confirmed manifest identity",
-            id="rejects-intermediate-generation-left-live",
-        ),
-        pytest.param(
-            "original-pin-lost",
-            "original generation pin",
-            id="rejects-original-pin-lost-early",
-        ),
-        pytest.param(
-            "original-operation-pin-replaced",
-            "original operation pin",
-            id="rejects-original-operation-pin-replaced-for-same-generation",
-        ),
-        pytest.param(
-            "original-after-terminal",
-            "terminal confirmed manifest identity",
-            id="rejects-original-generation-after-terminal",
-        ),
-        pytest.param(
-            "original-explicit-owner",
-            "original explicit ownership",
-            id="rejects-explicit-original-owner-after-replacement",
-        ),
-        pytest.param(
-            "original-explicit-owner-after-g18",
-            "original explicit ownership",
-            id="rejects-explicit-original-owner-after-first-replacement",
-        ),
-    ),
-)
-def test_real_captured_two_promotion_lifecycle_enforces_retirement_contract(
+def test_capture_measurement_uses_public_suspension_and_terminal_status(
     monkeypatch: pytest.MonkeyPatch,
-    fault: str | None,
-    message: str | None,
 ) -> None:
-    exercise = getattr(
-        zup_acceptance,
-        "_exercise_captured_two_promotion_lifecycle",
-        None,
+    location = object()
+    monkeypatch.setattr(
+        zup_acceptance, "_synthetic_capture_location", lambda _path: location
     )
-    assert exercise is not None
-    g17 = SimpleNamespace(generation=17, manifest_sha256="g17")
-    g18 = SimpleNamespace(generation=18, manifest_sha256="g18")
-    g19 = SimpleNamespace(generation=19, manifest_sha256="g19")
-    original_operation_pin = SimpleNamespace(handle=g17)
-    g18_units = (object(),)
-    g19_units = (object(),)
-
-    class FakeHost:
-        def __init__(self) -> None:
-            self.active_handle: object | None = g17
-            self._generations = {
-                17: SimpleNamespace(
-                    handle=g17,
-                    active=True,
-                    explicitly_retained=True,
-                    operation_pins=1,
-                )
-            }
-
-        def _confirmed_live_inventory(self) -> object:
-            live = tuple(
-                record
-                for record in self._generations.values()
-                if (
-                    record.active
-                    or record.explicitly_retained
-                    or record.operation_pins > 0
-                )
-            )
-            return SimpleNamespace(
-                manifest_sha256s=frozenset(
-                    record.handle.manifest_sha256 for record in live
-                )
-            )
-
-        def _retained_debug_views(self) -> tuple[object, ...]:
-            return tuple(
-                SimpleNamespace(handle=record.handle)
-                for record in self._generations.values()
-                if (
-                    record.active
-                    or record.explicitly_retained
-                    or record.operation_pins > 0
-                )
-            )
-
-    class FakeRuntimeApi:
-        def __init__(self) -> None:
-            self._operation_generation_pin: object | None = original_operation_pin
-            self._worker_universe = FakeHost()
-            self.prepared_sources: list[str] = []
-            self.hypothesis_pins: list[object | None] = []
-
-        @property
-        def operation_worker_generation(self) -> object | None:
-            pin = self._operation_generation_pin
-            return None if pin is None else pin.handle
-
-        def prepare_capture_hypothesis(self, source: str) -> object:
-            self.prepared_sources.append(source)
-            return object()
-
-        def execute_prepared_capture_hypothesis(
-            self,
-            prepared: object,
-        ) -> RuntimeReply:
-            assert prepared is not None
-            self.hypothesis_pins.append(self._operation_generation_pin)
-            return RuntimeReply(
-                RuntimeReplyKind.CAPTURE_CELL,
-                len(self.hypothesis_pins),
-                OperationState.CAPTURED,
-                result=1719,
-            )
-
-        def resume_capture(self) -> RuntimeReply:
-            assert self.operation_worker_generation is g17
-            self._operation_generation_pin = None
-            if fault != "original-after-terminal":
-                self._worker_universe._generations.pop(17)
-            return RuntimeReply(
-                RuntimeReplyKind.MAIN_COMPLETED,
-                1,
-                OperationState.COMPLETED,
-                result="1717|1717",
-            )
 
     class FakeSession:
         def __init__(self) -> None:
-            self.runtime_api = FakeRuntimeApi()
-            self.release_calls: list[object] = []
-            self.main_calls = 0
+            self.config = SimpleNamespace(runtime=SimpleNamespace(runtime_dir=Path(".")))
+            self.state = OperationState.IDLE
+            self.points = ()
 
-        def load_worker_modules(self, units: tuple[object, ...]) -> object:
-            assert units is g19_units
-            host = self.runtime_api._worker_universe
-            previous = host._generations[18]
-            previous.active = False
-            previous.explicitly_retained = fault == "intermediate-live"
-            previous.operation_pins = 0
-            if not previous.explicitly_retained:
-                del host._generations[18]
-            original = host._generations[17]
-            original.active = False
-            original.explicitly_retained = fault == "original-explicit-owner"
-            host._generations[19] = SimpleNamespace(
-                handle=g19,
-                active=True,
-                explicitly_retained=True,
-                operation_pins=0,
-            )
-            host.active_handle = g19
-            if fault == "original-pin-lost":
-                self.runtime_api._operation_generation_pin = SimpleNamespace(
-                    handle=g19
-                )
-            elif fault == "original-operation-pin-replaced":
-                self.runtime_api._operation_generation_pin = SimpleNamespace(
-                    handle=g17
-                )
-            return g19
+        def configure_capture_points(self, points):
+            self.points = points
 
-        def release_worker_generation(self, handle: object) -> None:
-            self.release_calls.append(handle)
-            assert handle is g17
-            raise StaleWorkerGeneration("superseded generation cannot be released")
-
-        def execute_bsl(self, source: str) -> RuntimeReply:
-            assert source == (
-                "Результат = КадровыйУчет.__OnecTask10CrossCall();"
-            )
-            self.main_calls += 1
+        def execute_bsl(self, source):
+            assert "СинтетическийCapture" in source
+            self.state = OperationState.CAPTURED
             return RuntimeReply(
-                RuntimeReplyKind.MAIN_COMPLETED,
-                self.main_calls,
-                OperationState.COMPLETED,
-                result=1719,
+                RuntimeReplyKind.CAPTURED, 1, self.state, location=location
+            )
+
+        def status(self):
+            return SimpleNamespace(state=self.state)
+
+        def resume_capture(self):
+            assert self.state is OperationState.CAPTURED
+            self.state = OperationState.COMPLETED
+            return RuntimeReply(
+                RuntimeReplyKind.MAIN_COMPLETED, 1, self.state,
+                result="1719|1719",
             )
 
     session = FakeSession()
-
-    def observe_incremental(
-        actual: object,
-        units: tuple[object, ...],
-    ) -> tuple[object, IncrementalAccounting]:
-        assert actual is session
-        assert units is g18_units
-        host = session.runtime_api._worker_universe
-        original = host._generations[17]
-        original.active = False
-        original.explicitly_retained = fault == "original-explicit-owner-after-g18"
-        host._generations[18] = SimpleNamespace(
-            handle=g18,
-            active=True,
-            explicitly_retained=True,
-            operation_pins=0,
-        )
-        host.active_handle = g18
-        return g18, IncrementalAccounting.clean_update()
-
-    monkeypatch.setattr(
-        zup_acceptance,
-        "_observe_incremental_promotion",
-        observe_incremental,
-    )
-
-    if message is not None:
-        with pytest.raises(ProtocolError, match=message):
-            exercise(
-                session,
-                g17=g17,
-                g18_units=g18_units,
-                g19_units=g19_units,
-            )
-        assert session.release_calls == []
-        return
-
-    observed_g18, observed_g19, accounting = exercise(
-        session,
-        g17=g17,
-        g18_units=g18_units,
-        g19_units=g19_units,
-    )
-
-    assert observed_g18 is g18
-    assert observed_g19 is g19
-    assert accounting == IncrementalAccounting.clean_update()
-    assert session.release_calls == []
-    assert session.runtime_api.prepared_sources == [
-        "РезультатИнструкции = КадровыйУчет.__OnecTask10CrossCall();"
-    ] * 2
-    assert len(session.runtime_api.hypothesis_pins) == 2
-    assert all(
-        pin is original_operation_pin
-        for pin in session.runtime_api.hypothesis_pins
-    )
-    assert session.runtime_api.operation_worker_generation is None
-    assert session.runtime_api._operation_generation_pin is None
-    assert session.runtime_api._worker_universe.active_handle is g19
-    assert set(session.runtime_api._worker_universe._generations) == {19}
-    assert session.main_calls == 1
+    with zup_acceptance._controlled_capture_reload_context(session):
+        assert session.points == (location,)
+        assert session.status().state is OperationState.CAPTURED
+    assert session.status().state is OperationState.COMPLETED
 
 
 def test_all_bsl_cells_are_accepted_by_the_generated_product_parser() -> None:
@@ -618,7 +402,7 @@ def test_notebook_facade_exact_preflight_runs_real_acceptance_and_uses_real_clea
     source_root.mkdir()
     run_dir = tmp_path / "run"
     evidence = {
-        "schema": "onec-worker-universe-zup-acceptance-v2",
+        "schema": "onec-worker-universe-zup-acceptance-v3",
         "status": "PASS",
         "sla_claimed": True,
         "catalog_setup_ms": 41.0,
@@ -872,6 +656,124 @@ def _pass_gates() -> dict[str, str]:
     }
 
 
+def test_runtime_checkpoint_uses_public_idle_and_worker_status(monkeypatch) -> None:
+    checkpoint = {"runtime_git_commit": "a" * 40}
+    monkeypatch.setattr(
+        zup_acceptance, "active_parser_acceptance_checkpoint",
+        lambda: checkpoint,
+    )
+
+    class Session:
+        state = OperationState.IDLE
+        worker_generation = None
+
+        def status(self):
+            return SimpleNamespace(
+                state=self.state, worker_generation=self.worker_generation,
+            )
+
+    session = Session()
+    assert zup_acceptance.require_fresh_parser_runtime(
+        session, checkpoint,
+    )["fresh_empty_session_cache"] is True
+    session.worker_generation = object()
+    with pytest.raises(ProtocolError, match="not fresh"):
+        zup_acceptance.require_fresh_parser_runtime(session, checkpoint)
+
+
+def test_incremental_promotion_uses_public_generation_and_phase_evidence() -> None:
+    before = WorkerGenerationHandle(1, 1, 17, "a" * 64)
+    after = WorkerGenerationHandle(1, 1, 18, "b" * 64)
+    units = (
+        SimpleNamespace(logical_name="КадровыйУчет"),
+        SimpleNamespace(logical_name="КадровыйУчетРасширенный"),
+    )
+
+    class Session:
+        worker_generation = before
+
+        def __init__(self) -> None:
+            self.runtime_api = SimpleNamespace(
+                confirmed_worker_module_units=lambda handle: units if handle is after else (),
+            )
+
+        def status(self):
+            return SimpleNamespace(worker_generation=self.worker_generation)
+
+        def load_worker_modules(self, received, *, profiler):
+            assert received is units
+            for phase in zup_acceptance._INCREMENTAL_COUNTERS:
+                profiler.measure(
+                    phase, lambda: None,
+                    item_count=(lambda _result: 1) if phase == "artifact_staging" else None,
+                )
+            self.worker_generation = after
+            return after
+
+    handle, accounting = zup_acceptance._observe_incremental_promotion(
+        Session(), units,
+    )
+    assert handle is after
+    assert accounting.unchanged_parse == 0
+    assert accounting.changed_parse == 1
+    assert accounting.changed_artifact_staging == 1
+
+
+def test_capture_promotion_checks_public_canaries_and_terminal_generation() -> None:
+    g17 = WorkerGenerationHandle(1, 1, 17, "a" * 64)
+    g18 = WorkerGenerationHandle(1, 1, 18, "b" * 64)
+    g19 = WorkerGenerationHandle(1, 1, 19, "c" * 64)
+    units = (
+        SimpleNamespace(logical_name="КадровыйУчет"),
+        SimpleNamespace(logical_name="КадровыйУчетРасширенный"),
+    )
+
+    class Session:
+        worker_generation = g17
+        loads = 0
+        capture_cells = 0
+
+        def __init__(self) -> None:
+            self.runtime_api = SimpleNamespace(
+                confirmed_worker_module_units=lambda handle: units if handle is g18 else (),
+            )
+
+        def status(self):
+            return SimpleNamespace(worker_generation=self.worker_generation)
+
+        def load_worker_modules(self, received, *, profiler=None):
+            assert received is units
+            self.loads += 1
+            if profiler is not None:
+                for phase in zup_acceptance._INCREMENTAL_COUNTERS:
+                    profiler.measure(
+                        phase, lambda: None,
+                        item_count=(lambda _result: 1) if phase == "artifact_staging" else None,
+                    )
+            self.worker_generation = (g18, g19)[self.loads - 1]
+            return self.worker_generation
+
+        def execute_bsl(self, source):
+            assert "__OnecTask10CrossCall" in source
+            if self.capture_cells < 2:
+                self.capture_cells += 1
+                return RuntimeReply(RuntimeReplyKind.CAPTURE_CELL, 1, OperationState.CAPTURED, 1719)
+            return RuntimeReply(RuntimeReplyKind.MAIN_COMPLETED, 2, OperationState.COMPLETED, 1719)
+
+        def resume_capture(self):
+            return RuntimeReply(
+                RuntimeReplyKind.MAIN_COMPLETED, 1, OperationState.COMPLETED,
+                "1717|1717",
+            )
+
+    session = Session()
+    observed_g18, observed_g19, _ = zup_acceptance._exercise_captured_two_promotion_lifecycle(
+        session, g17=g17, g18_units=units, g19_units=units,
+    )
+    assert (observed_g18, observed_g19) == (g18, g19)
+    assert session.capture_cells == 2
+
+
 def _observed_incremental() -> IncrementalAccounting:
     return IncrementalAccounting(
         unchanged_parse=0,
@@ -888,8 +790,6 @@ def _observed_incremental() -> IncrementalAccounting:
         changed_admission=1,
         changed_packaging=1,
         changed_artifact_staging=1,
-        fresh_objects_created=2,
-        fresh_objects_wired=2,
     )
 
 
@@ -985,7 +885,7 @@ def test_compact_evidence_keeps_catalog_setup_outside_reload_samples() -> None:
         gates=_pass_gates(),
     )
 
-    assert evidence["schema"] == "onec-worker-universe-zup-acceptance-v2"
+    assert evidence["schema"] == "onec-worker-universe-zup-acceptance-v3"
     assert evidence["catalog_setup_ms"] == 41.0
     assert len(
         evidence["modes"]["main"]["phase_samples_ms"]["catalog_validation"]
@@ -1106,6 +1006,14 @@ def test_compact_evidence_rejects_v1_without_inferring_catalog_setup() -> None:
     )
     evidence["schema"] = "onec-worker-universe-zup-acceptance-v1"
     evidence.pop("catalog_setup_ms")
+
+    with pytest.raises(ProtocolError, match="compact evidence is invalid"):
+        verify_compact_evidence(evidence)
+
+
+def test_compact_evidence_rejects_previous_rollback_schema() -> None:
+    evidence = _valid_compact_evidence()
+    evidence["schema"] = "onec-worker-universe-zup-acceptance-v2"
 
     with pytest.raises(ProtocolError, match="compact evidence is invalid"):
         verify_compact_evidence(evidence)
@@ -1602,37 +1510,6 @@ def test_runtime_diagnostic_contract_requires_exact_callee_caller_frame_order() 
         )
 
 
-def test_known_wire_failure_unit_uses_an_existing_admitted_dependency() -> None:
-    builder = getattr(zup_acceptance, "_known_wire_failure_unit", None)
-    assert builder is not None
-    source = "Функция Existing()\n    Возврат 1;\nКонецФункции"
-    unit_ref = SourceUnitRef(
-        SourceUnitKind.MODULE,
-        "КадровыйУчет",
-        17,
-        zup_acceptance.source_sha256(source),
-    )
-    unit = zup_acceptance.WorkerModuleUnit(
-        "КадровыйУчет",
-        "module",
-        17,
-        zup_acceptance.mapped_visible_source(source, unit_ref),
-    )
-    failed = builder((unit,), SimpleNamespace(sha256="d" * 64))
-
-    assert failed.logical_name == "КадровыйУчет"
-    assert failed.revision == 99
-    assert "__OnecTask10KnownWireFailure" in failed.mapped_source.text
-    assert "КадровыйУчетРасширенный.__OnecTask10SameName()" in (
-        failed.mapped_source.text
-    )
-    assert "Task10MissingDependency" not in failed.mapped_source.text
-    PythonParserTarget.from_generated().parse(
-        failed.mapped_source.text,
-        "Модуль",
-    )
-
-
 def test_worker_proxy_privacy_uses_bare_names_and_exact_context_handles() -> None:
     verifier = getattr(zup_acceptance, "_require_worker_proxy_privacy", None)
     assert verifier is not None
@@ -1657,206 +1534,6 @@ def test_worker_proxy_privacy_uses_bare_names_and_exact_context_handles() -> Non
         "e1cRuntimeКонтекст.RuntimeWorkerActiveGeneration.Modules.КадровыйУчет",
     ]
     assert all("e1cRuntimeКонтекст.e1cRuntimeКонтекст" not in handle for handle in session.handles)
-
-
-def test_unknown_compile_failure_has_no_phase_but_injected_wire_failure_is_known() -> None:
-    injector = getattr(zup_acceptance, "_inject_known_wire_failure", None)
-    verifier = getattr(zup_acceptance, "_verify_known_wire_failure", None)
-    assert injector is not None
-    assert verifier is not None
-    unknown = BslExecutionError("worker candidate compile failed before execution")
-    assert _worker_promotion_failure_phase(unknown) is None
-
-    source = (
-        'ЭтапПубликацииWorker = "create";\n'
-        "Попытка\n"
-        "    ОбъектыКандидатаWorker = Новый Соответствие;\n"
-        '    ЭтапПубликацииWorker = "wire";\n'
-        '    ИсточникЗависимостиWorker0 = ОбъектыКандидатаWorker.Получить("A");\n'
-        '    ЦельЗависимостиWorker0 = ОбъектыКандидатаWorker.Получить("B");\n'
-        "    ИсточникЗависимостиWorker0.DependencyB = ЦельЗависимостиWorker0;\n"
-        "Исключение\n"
-        '    ВызватьИсключение "onec-worker-root-prepare-stage=" '
-        "+ ЭтапПубликацииWorker;\n"
-        "КонецПопытки;"
-    )
-    injected = injector(source, binding_index=0, export_variable="DependencyB")
-
-    assert injected.index('ЭтапПубликацииWorker = "wire"') < injected.index(
-        "ИсточникЗависимостиWorker0 = Неопределено;"
-    )
-    assert injected.index("ИсточникЗависимостиWorker0 = Неопределено;") < (
-        injected.index(
-            "ИсточникЗависимостиWorker0.DependencyB = ЦельЗависимостиWorker0;"
-        )
-    )
-    PythonParserTarget.from_generated().parse(injected, "БлокНоутбука")
-    attribution = {
-        "phase": "wire",
-        "source_module": "КадровыйУчет",
-        "target_module": "КадровыйУчетРасширенный",
-        "target_kind": "overloaded",
-        "revision": 99,
-    }
-    verifier(
-        BslExecutionError("onec-worker-root-prepare-stage=wire\nplanned"),
-        attribution,
-    )
-    with pytest.raises(ProtocolError, match="outcome is unknown"):
-        verifier(WorkerPromotionOutcomeUnknown(20, "a" * 64), attribution)
-    with pytest.raises(ProtocolError, match="known wire failure"):
-        verifier(unknown, attribution)
-
-
-def test_known_wire_executor_injects_the_exact_pending_admitted_binding() -> None:
-    executor_type = getattr(zup_acceptance, "_KnownWireFailureExecutor", None)
-    assert executor_type is not None
-    captured: list[str] = []
-
-    def execute(source: str) -> object:
-        captured.append(source)
-        raise BslExecutionError(
-            "onec-worker-root-prepare-stage=wire\nplanned"
-        )
-
-    binding = SimpleNamespace(
-        source_module="КадровыйУчет",
-        target_module="КадровыйУчетРасширенный",
-        target_kind="overloaded",
-        export_variable="DependencyB",
-    )
-    manifest = SimpleNamespace(
-        wiring=(binding,),
-        modules=(
-            SimpleNamespace(logical_name="КадровыйУчет", revision=99),
-            SimpleNamespace(
-                logical_name="КадровыйУчетРасширенный",
-                revision=19,
-            ),
-        ),
-    )
-    target = SimpleNamespace(
-        _instruction_executor=execute,
-        _host=SimpleNamespace(_pending=SimpleNamespace(manifest=manifest)),
-    )
-    wrapper = executor_type(target)
-    source = (
-        'ЭтапПубликацииWorker = "create";\n'
-        "Попытка\n"
-        'ЭтапПубликацииWorker = "wire";\n'
-        "    ИсточникЗависимостиWorker0.DependencyB = "
-        "ЦельЗависимостиWorker0;\n"
-        "Исключение\n"
-        'ВызватьИсключение "onec-worker-root-prepare-stage=";\n'
-        "КонецПопытки;"
-    )
-
-    with pytest.raises(BslExecutionError, match="root-prepare-stage=wire") as caught:
-        wrapper(source)
-
-    assert len(captured) == 1
-    assert "ИсточникЗависимостиWorker0 = Неопределено;" in captured[0]
-    assert wrapper.observed_error is caught.value
-    assert wrapper.injections == 1
-    assert wrapper.attribution == {
-        "phase": "wire",
-        "source_module": "КадровыйУчет",
-        "target_module": "КадровыйУчетРасширенный",
-        "target_kind": "overloaded",
-        "revision": 99,
-    }
-
-
-def test_incremental_object_probe_is_read_only_and_proves_two_fresh_wired_modules() -> None:
-    source_builder = getattr(
-        zup_acceptance,
-        "_incremental_object_probe_source",
-        None,
-    )
-    verifier = getattr(zup_acceptance, "_verify_incremental_object_probe", None)
-    assert source_builder is not None
-    assert verifier is not None
-
-    primary_registration = "OnecRuntime_11111111_aaaaaaaaaaaaaaaa"
-    extended_registration = "OnecRuntime_22222222_bbbbbbbbbbbbbbbb"
-    source = source_builder(
-        extended_value=18,
-        primary_registration=primary_registration,
-        extended_registration=extended_registration,
-    )
-
-    assert "__OnecPinnedWorkerGeneration.Modules.Получить" in source
-    assert "e1cRuntimeКонтекст.RuntimeWorkerActiveGeneration.Modules.Получить" in source
-    assert "Тип(\"ВнешняяОбработкаОбъект\")" not in source
-    assert source.count("ВнешниеОбработки.Создать(") == 2
-    assert primary_registration in source
-    assert extended_registration in source
-    assert "__OnecTask10CrossCall() = 1718" in source
-    assert '"ONEC_ZUP_INCREMENTAL_OBJECT_PROBE_V1"' in source
-    assert "Новый Структура" not in source
-    assert "e1cRuntimeКонтекст.Вставить" not in source
-    assert "e1cRuntimeКонтекст.Удалить" not in source
-    PythonParserTarget.from_generated().parse(source, "БлокНоутбука")
-
-    observation = {
-        "primary_fresh": True,
-        "extended_fresh": True,
-        "objects_distinct": True,
-        "primary_type": True,
-        "extended_type": True,
-        "primary_access": True,
-        "extended_access": True,
-        "dependency_wired": True,
-    }
-    assert verifier(observation) == (2, 2)
-    assert verifier(
-        "ONEC_ZUP_INCREMENTAL_OBJECT_PROBE_V1|1|1|1|1|1|1|1|1"
-    ) == (2, 2)
-    with pytest.raises(ProtocolError, match="object probe"):
-        verifier({**observation, "dependency_wired": False})
-    with pytest.raises(ProtocolError, match="object probe"):
-        verifier({**observation, "extra": True})
-    for malformed in (
-        "ONEC_ZUP_INCREMENTAL_OBJECT_PROBE_V1|1|1|1|1|1|1|1",
-        "ONEC_ZUP_INCREMENTAL_OBJECT_PROBE_V1|1|1|1|1|1|1|1|1|",
-        "ONEC_ZUP_INCREMENTAL_OBJECT_PROBE_V1|1|1|1|1|1|1|1|true",
-        "OTHER|1|1|1|1|1|1|1|1",
-    ):
-        with pytest.raises(ProtocolError, match="object probe"):
-            verifier(malformed)
-
-
-def test_incremental_object_probe_uses_trusted_capture_execution_boundary() -> None:
-    """The reserved pin/active roots cannot pass through the user lowerer."""
-    execute_probe = getattr(
-        zup_acceptance,
-        "_execute_trusted_incremental_object_probe",
-        None,
-    )
-    assert execute_probe is not None
-    observation = {field: True for field in zup_acceptance._INCREMENTAL_OBJECT_PROBE_FIELDS}
-    calls: list[str] = []
-
-    class Controller:
-        def execute_system_capture(
-            self,
-            source: str,
-            *,
-            evaluation_kind: object,
-        ) -> CaptureCellResult:
-            del evaluation_kind
-            calls.append(source)
-            return CaptureCellResult(1, source, source, observation)
-
-    class Api:
-        _controller = Controller()
-
-        def prepare_capture_hypothesis(self, _source: str) -> object:
-            raise AssertionError("trusted acceptance probe entered the user lowerer")
-
-    source = "trusted-incremental-object-probe"
-    assert execute_probe(Api(), source) is observation
-    assert calls == [source]
 
 
 def test_capture_pair_result_uses_locale_stable_integer_formatting() -> None:
@@ -2033,7 +1710,7 @@ def test_session_catalog_read_audit_observes_first_load_snapshot(
     snapshot = catalog.resolve_candidates(
         ("КадровыйУчет", "КадровыйУчетРасширенный")
     )
-    session.runtime_api = SimpleNamespace(_worker_catalog_snapshot=snapshot)
+    session.runtime_api = SimpleNamespace()
     recorder = PhaseRecorder()
     recorder.record_duration(
         "catalog_validation",
@@ -2065,10 +1742,11 @@ class _MeasuredReloadSession:
         self.mode = "main"
         self.catalog = catalog
         self.first_full_warmup = first_full_warmup
-        self.runtime_api = SimpleNamespace(
-            operation_worker_generation=None,
-            _worker_catalog_snapshot=None,
-        )
+        self.runtime_api = SimpleNamespace()
+        self.state = OperationState.IDLE
+
+    def status(self) -> object:
+        return SimpleNamespace(state=self.state, worker_generation=None)
 
     def _require_common_module_catalog(self) -> object:
         assert self.catalog is not None
@@ -2088,7 +1766,6 @@ class _MeasuredReloadSession:
             snapshot = self.catalog.ensure_modules(
                 unit.logical_name for unit in units
             )
-            self.runtime_api._worker_catalog_snapshot = snapshot
         call_number = len(self.calls)
         for phase in PHASES:
             if phase == self.omitted_phase:
@@ -2157,19 +1834,27 @@ class _CatalogExtensionSession:
         self,
         catalog: _ObservedExtensionCatalog,
         active_units: tuple[object, ...],
+        *,
+        corrupt_rollback: bool = False,
     ) -> None:
         self.catalog = catalog
         self.load_attempts = 0
         self.runtime_dispatches = 0
         self.dispatched_units: list[tuple[object, ...]] = []
         self.releases: list[object] = []
-        active_handle = SimpleNamespace(generation=145)
+        self.active_handle = SimpleNamespace(generation=145)
+        self.confirmed_units = active_units
+        self.corrupt_rollback = corrupt_rollback
         self.runtime_api = SimpleNamespace(
-            _worker_module_artifacts={
-                _worker_unit_cache_key(unit): object() for unit in active_units
-            },
-            _worker_universe=SimpleNamespace(active_handle=active_handle),
+            confirmed_worker_module_units=self.confirmed_worker_module_units,
         )
+
+    def status(self) -> object:
+        return SimpleNamespace(worker_generation=self.active_handle)
+
+    def confirmed_worker_module_units(self, handle: object) -> tuple[object, ...]:
+        assert handle is self.active_handle
+        return self.confirmed_units
 
     def _require_common_module_catalog(self) -> _ObservedExtensionCatalog:
         return self.catalog
@@ -2187,7 +1872,7 @@ class _CatalogExtensionSession:
                 unit
                 for unit in units
                 if _worker_unit_cache_key(unit)
-                not in self.runtime_api._worker_module_artifacts
+                not in {_worker_unit_cache_key(item) for item in self.confirmed_units}
             ]
             for _unit in additions:
                 profiler.record_duration("semantic_parse", wall_ns=1)
@@ -2223,10 +1908,6 @@ class _CatalogExtensionSession:
                         wall_ns=1,
                         item_count=1 if phase == "epf_packaging" else 0,
                     )
-            updated_cache = dict(self.runtime_api._worker_module_artifacts)
-            for key in (_worker_unit_cache_key(unit) for unit in additions):
-                updated_cache[key] = object()
-            self.runtime_api._worker_module_artifacts = updated_cache
             for phase in zup_acceptance._STAGING_DRILL_DOWN_PHASES:
                 profiler.record_duration(
                     phase,
@@ -2248,18 +1929,24 @@ class _CatalogExtensionSession:
                 item_count=1,
             )
             profiler.record_duration("root_swap", wall_ns=1, item_count=1)
+            profiler.record_duration("worker_generation_publication", wall_ns=1)
             handle = SimpleNamespace(
-                generation=self.runtime_api._worker_universe.active_handle.generation
-                + 1
+                generation=self.active_handle.generation + 1
             )
-            self.runtime_api._worker_universe.active_handle = handle
+            self.active_handle = handle
+            self.confirmed_units = units
             return handle
 
-        return profiler.measure(
-            "end_to_end",
-            reload,
-            item_count=lambda _result: len(units),
-        )
+        try:
+            return profiler.measure(
+                "end_to_end",
+                reload,
+                item_count=lambda _result: len(units),
+            )
+        except ProtocolError:
+            if self.corrupt_rollback:
+                self.confirmed_units = ()
+            raise
 
     def release_worker_generation(self, handle: object) -> None:
         self.releases.append(handle)
@@ -2291,7 +1978,7 @@ def _catalog_extension_evidence() -> dict[str, object]:
             "runtime_dispatches": 0,
             "catalog_unchanged": True,
             "active_generation_unchanged": True,
-            "artifact_cache_delta": 0,
+            "confirmed_units_unchanged": True,
             "build": {
                 counter: (4 if counter == "semantic_parse" else 0)
                 for counter in zup_acceptance._INCREMENTAL_COUNTERS
@@ -2438,13 +2125,13 @@ def test_catalog_setup_is_observed_from_first_production_load(
     @contextmanager
     def captured(actual: _MeasuredReloadSession):
         assert actual is session
-        assert actual.runtime_api.operation_worker_generation is None
+        assert actual.status().state is OperationState.IDLE
         actual.mode = "capture"
-        actual.runtime_api.operation_worker_generation = object()
+        actual.state = OperationState.CAPTURED
         try:
             yield
         finally:
-            actual.runtime_api.operation_worker_generation = None
+            actual.state = OperationState.IDLE
             actual.mode = "main"
 
     monkeypatch.setattr(Path, "read_bytes", observed_read_bytes)
@@ -2468,7 +2155,7 @@ def test_catalog_setup_is_observed_from_first_production_load(
     assert session.call_modes == ["main"] * 64 + ["capture"] * 63
     assert all(len(samples[mode][phase]) == 60 for mode in samples for phase in PHASES)
     assert parser_calls == _parser_call_samples()
-    assert session.runtime_api.operation_worker_generation is None
+    assert session.status().state is OperationState.IDLE
 
 
 def test_catalog_extension_gate_retains_real_success_and_both_rollbacks(
@@ -2506,6 +2193,29 @@ def test_catalog_extension_gate_retains_real_success_and_both_rollbacks(
         ".xml",
         ".xml",
     ]
+
+
+def test_catalog_extension_gate_rejects_changed_confirmed_sources_on_rollback(
+    tmp_path: Path,
+) -> None:
+    mirror_root = tmp_path / "catalog-source"
+    common_modules = mirror_root / "CommonModules"
+    common_modules.mkdir(parents=True)
+    active_units = _measurement_base_units()
+    for unit in active_units:
+        (common_modules / f"{unit.logical_name}.xml").write_text(
+            _common_module_metadata(unit.logical_name), encoding="utf-8"
+        )
+    catalog = _ObservedExtensionCatalog(mirror_root)
+    catalog.ensure_modules(unit.logical_name for unit in active_units)
+    session = _CatalogExtensionSession(
+        catalog, active_units, corrupt_rollback=True
+    )
+
+    with pytest.raises(ProtocolError, match="rollback evidence"):
+        zup_acceptance._run_missing_module_extension_gate(
+            session, mirror_root, active_units
+        )
 
 
 def test_verified_live_builds_pass_from_observed_semantics_and_reload_samples(
@@ -2589,7 +2299,7 @@ def test_verified_live_builds_pass_from_observed_semantics_and_reload_samples(
     )
 
     assert calls == [(config, Path("approved-source"), tmp_path)]
-    assert outcome["schema"] == "onec-worker-universe-zup-acceptance-v2"
+    assert outcome["schema"] == "onec-worker-universe-zup-acceptance-v3"
     assert outcome["status"] == "PASS"
     assert outcome["sla_claimed"] is True
     assert outcome["catalog_setup_ms"] == 41.0
@@ -2605,8 +2315,6 @@ def test_verified_live_builds_pass_from_observed_semantics_and_reload_samples(
     assert outcome["incremental"]["unchanged"]["admission"] == 0
     assert outcome["incremental"]["unchanged"]["epf_packaging"] == 0
     assert outcome["incremental"]["unchanged"]["artifact_staging"] == 0
-    assert outcome["incremental"]["fresh_objects_created"] == 2
-    assert outcome["incremental"]["fresh_objects_wired"] == 2
     assert outcome["reference"] == {
         "platform_version": REFERENCE_PLATFORM_VERSION,
         "platform_sha256": REFERENCE_PLATFORM_SHA256,

@@ -24,7 +24,7 @@ from onec_runtime_mcp.agent.capture_contracts import CaptureFence
 from onec_runtime_mcp.agent.proxies import ProxyProvenance, ProxyRealm
 from onec_runtime_mcp.agent.service import AgentWorkspaceService
 from onec_runtime.errors import ProtocolError
-from onec_runtime.runtime_api import RuntimeNamespaceSnapshot
+from onec_runtime.runtime_models import RuntimeNamespaceSnapshot
 from onec_runtime.bsl import (
     DiagnosticStage,
     MappingConfidence,

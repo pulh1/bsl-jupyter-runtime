@@ -17,7 +17,9 @@ from onec_runtime.breakpoint_workspace import (
     BreakpointWorkspaceOutcomeUnknown,
 )
 from onec_runtime.errors import ProtocolError
+from onec_runtime.execution.contracts import SubmissionReceipt
 from onec_runtime.execution.arbiter import (
+    ExecutionTicket,
     OutcomeUnknown,
     RdbgArbiter,
     SessionPort,
@@ -48,6 +50,7 @@ class WorkerBreakpointService:
         *,
         require_mutation_boundary: Callable[[], None],
         wait_handoff: Callable[[], AbstractContextManager[None]] = nullcontext,
+        request_stop: Callable[[ExecutionTicket], object] | None = None,
     ) -> None:
         if not isinstance(arbiter, RdbgArbiter):
             raise TypeError("one RDBG arbiter is required")
@@ -59,11 +62,14 @@ class WorkerBreakpointService:
             raise TypeError("Worker breakpoint admission check is required")
         if not callable(wait_handoff):
             raise TypeError("Worker breakpoint ticket wait handoff is invalid")
+        if request_stop is not None and not callable(request_stop):
+            raise TypeError("Worker breakpoint Stop callback is invalid")
         self._arbiter = arbiter
         self._breakpoints = breakpoints
         self._workspace = workspace
         self._require_mutation_boundary = require_mutation_boundary
         self._wait_handoff = wait_handoff
+        self._request_stop = arbiter.request_stop if request_stop is None else request_stop
 
     @property
     def arbiter(self) -> RdbgArbiter:
@@ -153,11 +159,15 @@ class WorkerBreakpointService:
                 if return_status else None
             )
 
-        ticket = self._arbiter.submit(route, plan)
+        receipt = SubmissionReceipt()
         try:
+            ticket = self._arbiter.submit(route, plan, receipt=receipt)
             self._arbiter.dispatch(ticket)
         except BaseException:
-            ticket.cancel_queued()
+            owned = receipt.ticket
+            if isinstance(owned, ExecutionTicket):
+                if not owned.cancel_queued() and not owned.status().settled:
+                    self._request_stop(owned)
             raise
         try:
             with self._wait_handoff():
@@ -167,8 +177,11 @@ class WorkerBreakpointService:
                     )
                 return ticket.wait_settled()
         except KeyboardInterrupt:
-            # Caller interruption does not cancel an admitted workspace plan.
-            ticket.detach_waiter()
+            try:
+                if not ticket.status().settled:
+                    self._request_stop(ticket)
+            finally:
+                ticket.detach_waiter()
             raise
 
     def _quarantine(self, proposal: WorkerBreakpointPlan) -> None:

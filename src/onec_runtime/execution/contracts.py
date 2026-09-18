@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Callable, Protocol
 
 from onec_runtime.bsl.diagnostics import DiagnosticStage, VisibleSourceContext
 from onec_runtime.bsl.source_maps import MappedSource, SourceUnitRef
@@ -112,10 +112,13 @@ class SubmissionReceipt:
     receipt empty. Its single writer is the synchronous admission call.
     """
 
-    __slots__ = ("_ticket",)
+    __slots__ = ("_ticket", "_on_adopt")
 
-    def __init__(self) -> None:
+    def __init__(
+        self, on_adopt: Callable[[ExecutionTicket], None] | None = None,
+    ) -> None:
         self._ticket: ExecutionTicket | None = None
+        self._on_adopt = on_adopt
 
     @property
     def ticket(self) -> ExecutionTicket | None:
@@ -125,6 +128,8 @@ class SubmissionReceipt:
         if self._ticket is not None:
             raise RuntimeError("Submission receipt already owns a ticket")
         self._ticket = ticket
+        if self._on_adopt is not None:
+            self._on_adopt(ticket)
 
 
 class CommonCellParser(Protocol):

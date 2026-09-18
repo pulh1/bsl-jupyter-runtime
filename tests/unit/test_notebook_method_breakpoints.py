@@ -16,24 +16,24 @@ from onec_runtime.worker_breakpoints import (
     map_worker_stop,
     resolve_source_line,
 )
-from test_notebook_method_runtime import PAIR, UPDATE, runtime
+from worker_debug_fixtures import notebook_debug_views
+
+
+PAIR = 'Функция А()\nВозврат Б();\nКонецФункции\nФункция Б()\nВозврат 1;\nКонецФункции'
+UPDATE = 'Функция Б()\nВозврат 2;\nКонецФункции'
 
 
 def _upsert_views(tmp_path):
-    api, _, _ = runtime(tmp_path)
     original = SourceUnitRef(SourceUnitKind.NOTEBOOK_CELL, "pair", 1, source_sha256(PAIR))
     updated = SourceUnitRef(SourceUnitKind.NOTEBOOK_CELL, "helper", 2, source_sha256(UPDATE))
-    api.execute_bsl(PAIR, source_unit=original)
-    first_pin = api._worker_universe.pin_active()
-    first = api._worker_universe._operation_debug_view(first_pin)
-    api.execute_bsl(UPDATE, source_unit=updated)
-    second_pin = api._worker_universe.pin_active()
-    second = api._worker_universe._operation_debug_view(second_pin)
-    return api, first, second, original, updated
+    first, second = notebook_debug_views(
+        tmp_path, ((PAIR, original), (UPDATE, updated)),
+    )
+    return first, second, original, updated
 
 
 def test_merged_worker_has_one_physical_view_and_two_exact_source_identities(tmp_path):
-    _, first, second, original, updated = _upsert_views(tmp_path)
+    first, second, original, updated = _upsert_views(tmp_path)
     assert first.modules[0].source_unit == original
     assert len(second.modules) == 1
     module = second.modules[0]
@@ -52,7 +52,7 @@ def test_merged_worker_has_one_physical_view_and_two_exact_source_identities(tmp
 
 
 def test_strict_reload_preserves_retained_caller_and_binds_new_helper(tmp_path):
-    _, first, second, original, updated = _upsert_views(tmp_path)
+    first, second, original, updated = _upsert_views(tmp_path)
     coordinator = WorkerBreakpointCoordinator(session_id=UUID(int=381))
     coordinator.set_views((first,))
     caller = coordinator.prepare_add(original, "Worker", 2, enabled=True, column=None)
@@ -71,7 +71,7 @@ def test_strict_reload_preserves_retained_caller_and_binds_new_helper(tmp_path):
 
 
 def test_merged_worker_stack_keeps_each_frames_own_source(tmp_path):
-    _, _, view, original, updated = _upsert_views(tmp_path)
+    _, view, original, updated = _upsert_views(tmp_path)
     module = view.modules[0]
     helper = module.registration.module_location(5)
     caller = module.registration.module_location(2)
@@ -88,7 +88,7 @@ def test_merged_worker_stack_keeps_each_frames_own_source(tmp_path):
 
 
 def test_merged_debug_view_rejects_forged_or_incomplete_source_membership(tmp_path):
-    _, _, view, original, updated = _upsert_views(tmp_path)
+    _, view, original, updated = _upsert_views(tmp_path)
     module = view.modules[0]
     forged = replace(updated, source_sha256="f" * 64)
     with pytest.raises(ProtocolError, match="does not match"):
@@ -98,7 +98,7 @@ def test_merged_debug_view_rejects_forged_or_incomplete_source_membership(tmp_pa
 
 
 def test_strict_reload_rejects_breakpoint_in_replaced_helper_body(tmp_path):
-    _, first, second, original, _ = _upsert_views(tmp_path)
+    first, second, original, _ = _upsert_views(tmp_path)
     coordinator = WorkerBreakpointCoordinator(session_id=UUID(int=383))
     coordinator.set_views((first,))
     helper = coordinator.prepare_add(original, "Worker", 5, enabled=True, column=None)
@@ -112,7 +112,7 @@ def test_strict_reload_rejects_breakpoint_in_replaced_helper_body(tmp_path):
 def test_debug_admission_rejects_same_source_identity_with_conflicting_hash(tmp_path):
     from onec_runtime.bsl.source_maps import MappedSource, SourceMap
 
-    _, _, view, original, _ = _upsert_views(tmp_path)
+    _, view, original, _ = _upsert_views(tmp_path)
     module = view.modules[0]
     forged = replace(original, source_sha256="f" * 64)
     source_map = module.mapped_source.source_map

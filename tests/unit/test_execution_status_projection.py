@@ -13,7 +13,7 @@ from onec_runtime.execution.status_projection import (
     ControllerStatusFacts, ExecutionActivity, ExecutionStatusProjection,
 )
 from onec_runtime.execution.worker_activation import WorkerActivationSnapshot
-from onec_runtime.prototype_runtime import OperationState
+from onec_runtime.runtime_models import OperationState
 from onec_runtime.worker_universe import WorkerGenerationHandle
 
 

@@ -44,6 +44,8 @@ class CaptureTicketController(Protocol):
 
     capture_scope: CaptureScope | None
 
+    def request_stop(self, ticket: _CaptureTicket) -> object: ...
+
     def submit_capture_variable(
         self, name: str, *, stack_level: int = 0,
     ) -> _CaptureTicket: ...
@@ -204,6 +206,7 @@ class CaptureTicketDataPlane:
     def _wait(self, ticket: _CaptureTicket, *, timeout_s: float | None = None) -> object:
         return wait_initiator_locally(
             ticket, timeout_s=timeout_s, wait_handoff=self._wait_handoff,
+            request_stop=lambda: self._controller.request_stop(ticket),
         )
 
     def _validate_fence(self, fence: object) -> None:

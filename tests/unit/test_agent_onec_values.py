@@ -16,7 +16,7 @@ from onec_runtime_mcp.agent.proxies import (
     StaleProxy,
 )
 from onec_runtime.errors import ProtocolError
-from onec_runtime.runtime_api import RuntimeNamespaceSnapshot
+from onec_runtime.runtime_models import RuntimeNamespaceSnapshot
 
 
 @dataclass

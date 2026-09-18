@@ -19,6 +19,7 @@ from onec_runtime.execution.arbiter import (
     Settlement,
 )
 from onec_runtime.execution.evaluation import wait_for_pending_result
+from onec_runtime.execution.contracts import SubmissionReceipt
 from onec_runtime.execution.main.instruction_call import build_main_instruction_call
 from onec_runtime.execution.local_wait import (
     validate_local_wait_timeout, wait_initiator_locally,
@@ -88,6 +89,7 @@ class MainIdleMaterializationService:
             Callable[[], WorkerMaterializationSnapshot] | None
         ) = None,
         wait_handoff: Callable[[], AbstractContextManager[None]] = nullcontext,
+        request_stop: Callable[[ExecutionTicket], object] | None = None,
     ) -> None:
         if not isinstance(arbiter, RdbgArbiter):
             raise TypeError("MAIN materialization requires an RDBG arbiter")
@@ -99,6 +101,8 @@ class MainIdleMaterializationService:
             raise TypeError("Worker materialization snapshot reader must be callable")
         if not callable(wait_handoff):
             raise TypeError("MAIN materialization wait handoff must be callable")
+        if request_stop is not None and not callable(request_stop):
+            raise TypeError("MAIN materialization Stop callback is invalid")
         if type(runtime_generation) is not int or runtime_generation <= 0:
             raise ValueError("MAIN materialization runtime generation must be positive")
         if type(context_generation) is not int or context_generation <= 0:
@@ -114,6 +118,7 @@ class MainIdleMaterializationService:
         self._worker_type_registrations = worker_type_registrations
         self._worker_catalog_snapshot = worker_catalog_snapshot
         self._wait_handoff = wait_handoff
+        self._request_stop = arbiter.request_stop if request_stop is None else request_stop
         self._cleanup_lock = RLock()
         self._cleanup_debts: dict[str, ExecutionTicket] = {}
 
@@ -134,12 +139,10 @@ class MainIdleMaterializationService:
         if parent is None:
             raise ProtocolError("MAIN materialization cleanup is not retryable")
         ticket = self._arbiter.retry_post_settlement_cleanup(parent)
-        try:
-            with self._wait_handoff():
-                result = ticket.wait_initiator()
-        except KeyboardInterrupt:
-            ticket.detach_waiter()
-            raise
+        result = wait_initiator_locally(
+            ticket, timeout_s=None, wait_handoff=self._wait_handoff,
+            request_stop=lambda: self._request_stop(ticket),
+        )
         if result is not None:
             raise ProtocolError("MAIN materialization cleanup result is invalid")
 
@@ -330,14 +333,24 @@ class MainIdleMaterializationService:
             raise ProtocolError("MAIN materialization kind is invalid")
         fence = self._require_fence()
         holder: dict[str, ExecutionTicket] = {}
-        ticket = self._arbiter.submit(
-            fence.route,
-            lambda port: self._run_plan(plan, fence, catalog, port, holder["ticket"]),
-        )
-        holder["ticket"] = ticket
-        self._arbiter.dispatch(ticket)
+        receipt = SubmissionReceipt()
+        try:
+            ticket = self._arbiter.submit(
+                fence.route,
+                lambda port: self._run_plan(plan, fence, catalog, port, holder["ticket"]),
+                receipt=receipt,
+            )
+            holder["ticket"] = ticket
+            self._arbiter.dispatch(ticket)
+        except BaseException:
+            owned = receipt.ticket
+            if isinstance(owned, ExecutionTicket):
+                if not owned.cancel_queued() and not owned.status().settled:
+                    self._request_stop(owned)
+            raise
         result = wait_initiator_locally(
             ticket, timeout_s=timeout_s, wait_handoff=self._wait_handoff,
+            request_stop=lambda: self._request_stop(ticket),
         )
         if type(result) is not bytes:
             raise ProtocolError("MAIN materialization payload is invalid")

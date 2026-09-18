@@ -164,7 +164,10 @@ def test_cold_child_reaches_full_ast_staging_and_reload(
         closed = False
 
         def __init__(self) -> None:
-            self.runtime_api = SimpleNamespace(_worker_catalog_snapshot=None)
+            self.catalog = SimpleNamespace(ensure_initialized=lambda: catalog)
+
+        def _require_common_module_catalog(self) -> object:
+            return self.catalog
 
         def load_worker_modules(self, loaded_units, *, profiler: PhaseRecorder):
             for unit in loaded_units:
@@ -196,7 +199,6 @@ def test_cold_child_reaches_full_ast_staging_and_reload(
                         }.get(phase, 1),
                         item_count=items // calls,
                     )
-            self.runtime_api._worker_catalog_snapshot = catalog
             return object()
 
         def release_worker_generation(self, _handle: object) -> None:
@@ -307,19 +309,11 @@ def _fresh_session() -> SimpleNamespace:
         _path_index=None,
         _resolved={},
     )
-    cache = SimpleNamespace(_capsules={})
-    api = SimpleNamespace(
-        _worker_catalog_snapshot=None,
-        _worker_active_modules={},
-        _worker_module_artifacts={},
-        _worker_generation_handle=None,
-        _worker_module_builder=SimpleNamespace(_cache=cache),
-        _worker_universe=SimpleNamespace(_generations={}, _active_generation=None),
-        _worker_universe_target=SimpleNamespace(_registrations={}),
-    )
+    status = SimpleNamespace(worker_generation=None)
     return SimpleNamespace(
         _require_common_module_catalog=lambda: catalog,
-        runtime_api=api,
+        status=lambda: status,
+        _status=status,
     )
 
 
@@ -335,30 +329,7 @@ def _fresh_session() -> SimpleNamespace:
         lambda session: session._require_common_module_catalog()._resolved.update(
             {"known": None}
         ),
-        lambda session: setattr(
-            session.runtime_api, "_worker_catalog_snapshot", object()
-        ),
-        lambda session: session.runtime_api._worker_active_modules.update(
-            {"known": object()}
-        ),
-        lambda session: session.runtime_api._worker_module_artifacts.update(
-            {("known",): object()}
-        ),
-        lambda session: setattr(
-            session.runtime_api, "_worker_generation_handle", object()
-        ),
-        lambda session: session.runtime_api._worker_module_builder._cache._capsules.update(
-            {"known": object()}
-        ),
-        lambda session: session.runtime_api._worker_universe._generations.update(
-            {1: object()}
-        ),
-        lambda session: setattr(
-            session.runtime_api._worker_universe, "_active_generation", 1
-        ),
-        lambda session: session.runtime_api._worker_universe_target._registrations.update(
-            {"known": object()}
-        ),
+        lambda session: setattr(session._status, "worker_generation", object()),
     ),
 )
 def test_fresh_worker_guard_rejects_every_warm_state(mutate: object) -> None:
@@ -374,11 +345,6 @@ def test_fresh_worker_guard_returns_only_public_zero_counts() -> None:
         "catalog_initialized": False,
         "catalog_index_entries": 0,
         "catalog_resolved_entries": 0,
-        "active_models": 0,
-        "descriptor_artifacts": 0,
-        "binary_artifacts": 0,
-        "host_generations": 0,
-        "target_registrations": 0,
         "active_generation": False,
     }
 

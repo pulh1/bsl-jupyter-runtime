@@ -9,7 +9,6 @@ import pytest
 from onec_runtime.errors import ProtocolError
 from onec_runtime.session import RuntimeSession, RuntimeSessionConfig
 from test_extension_session import _Closeable, _IdleRdbg
-from test_runtime_api import _common_module_catalog, _semantic_snapshot_runtime
 
 
 @pytest.mark.parametrize('ancestor', [False, True])
@@ -52,8 +51,7 @@ def test_normal_config_root_remains_public_after_session_close(tmp_path, layout)
     if source:
         ((source / 'src' if layout == 'EDT' else source) / 'CommonModules').mkdir(parents=True)
     config = RuntimeSessionConfig(SimpleNamespace(is_server_infobase=False), tmp_path / 'evidence', source_root=source)
-    api = _semantic_snapshot_runtime(tmp_path, _common_module_catalog('ProbeServer'))
-    runtime = RuntimeSession(config, _Closeable(), _Closeable(), _IdleRdbg(), api, SimpleNamespace())
+    runtime = RuntimeSession(config, _Closeable(), _Closeable(), _IdleRdbg(), _Closeable(), SimpleNamespace())
     assert runtime.config is config
     assert runtime.config.source_root == source
     runtime.close()

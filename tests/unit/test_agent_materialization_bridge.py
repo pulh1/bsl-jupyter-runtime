@@ -17,7 +17,7 @@ from onec_runtime_mcp.agent.python_protocol import PythonWorkspaceLimits
 from onec_runtime_mcp.agent.python_workspace import PythonWorkspace
 from onec_runtime_mcp.agent.value_service import OnecMaterializationBridge
 from onec_runtime.errors import ProtocolError
-from onec_runtime.runtime_api import RuntimeNamespaceSnapshot
+from onec_runtime.runtime_models import RuntimeNamespaceSnapshot
 
 
 def table_payload(*, rows: int = 10_000) -> bytes:

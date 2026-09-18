@@ -32,7 +32,7 @@ from onec_runtime.capture_values import (
     ValuePage,
 )
 from onec_runtime.rdbg.session import RdbgSession
-from onec_runtime.runtime_api import PrototypeRuntimeApi
+from onec_runtime.execution.public_facade import PublicExecutionFacade
 from onec_runtime.session import RuntimeSession
 from onec_runtime_jupyter.capture_display import (
     CaptureSnapshotDisplay,
@@ -413,8 +413,8 @@ def test_rendering_saved_pages_twice_is_byte_identical_and_has_zero_io(
         return fail
 
     monkeypatch.setattr(
-        PrototypeRuntimeApi,
-        "_require_available",
+        PublicExecutionFacade,
+        "capture_inspection",
         contacted("runtime"),
     )
     monkeypatch.setattr(RuntimeSession, "status", contacted("runtime_session"))

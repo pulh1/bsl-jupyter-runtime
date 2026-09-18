@@ -82,7 +82,7 @@ class RuntimeNamespaceOwner:
     def namespace_snapshot(self) -> object:
         """Return only confirmed public names and this runtime's identity."""
 
-        from onec_runtime.runtime_api import RuntimeNamespaceSnapshot
+        from onec_runtime.runtime_models import RuntimeNamespaceSnapshot
 
         with self._lock:
             return RuntimeNamespaceSnapshot(

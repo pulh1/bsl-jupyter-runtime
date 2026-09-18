@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from inspect import signature
 
-from onec_runtime.runtime_api import PrototypeRuntimeApi
+from onec_runtime.execution.public_facade import PublicExecutionFacade
 from onec_runtime.session import RuntimeSession
 from onec_runtime.worker_breakpoints import WorkerBreakpointReloadPolicy
 
 
 def test_public_surface_is_logical_and_has_no_legacy_loader() -> None:
-    for runtime_type in (PrototypeRuntimeApi, RuntimeSession):
+    for runtime_type in (PublicExecutionFacade, RuntimeSession):
         assert not hasattr(runtime_type, "load_worker")
         assert not hasattr(runtime_type, "worker_version")
         assert not hasattr(runtime_type, "worker_calculate")
@@ -30,7 +30,7 @@ def test_public_surface_is_logical_and_has_no_legacy_loader() -> None:
             assert callable(getattr(runtime_type, name))
 
 
-def test_logical_breakpoint_signatures_match_on_api_and_session() -> None:
+def test_logical_breakpoint_call_signatures_match_on_facade_and_session() -> None:
     for name in (
         "remove_worker_breakpoint",
         "set_worker_breakpoint_enabled",
@@ -38,8 +38,8 @@ def test_logical_breakpoint_signatures_match_on_api_and_session() -> None:
         "list_worker_breakpoints",
         "resume_debug_stop",
     ):
-        assert signature(getattr(PrototypeRuntimeApi, name)) == signature(
-            getattr(RuntimeSession, name)
+        assert signature(getattr(PublicExecutionFacade, name)).parameters == (
+            signature(getattr(RuntimeSession, name)).parameters
         )
 
 

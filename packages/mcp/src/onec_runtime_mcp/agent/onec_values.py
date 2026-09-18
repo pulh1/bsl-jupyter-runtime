@@ -23,7 +23,7 @@ from onec_runtime_mcp.agent.proxies import (
 )
 from onec_runtime_mcp.agent.observation import ValueSelection
 from onec_runtime.errors import ProtocolError
-from onec_runtime.runtime_api import RuntimeNamespaceSnapshot
+from onec_runtime.runtime_models import RuntimeNamespaceSnapshot
 
 
 _BSL_IDENTIFIER = re.compile(r"[^\W\d]\w*", re.UNICODE)

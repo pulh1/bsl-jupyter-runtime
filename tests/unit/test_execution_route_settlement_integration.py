@@ -6,7 +6,7 @@ from onec_runtime.execution.contracts import Accepted, SubmissionReceipt
 from onec_runtime.execution.namespace import RuntimeNamespaceOwner
 from onec_runtime.execution.settlement import RouteSettlementService
 from onec_runtime.execution.worker_activation import WorkerActivationSnapshot
-from onec_runtime.runtime_api import RuntimeReplyKind
+from onec_runtime.runtime_models import RuntimeReplyKind
 from onec_runtime.rdbg.models import EvaluationResult
 from onec_runtime.errors import EvaluationDispatchUnknown
 

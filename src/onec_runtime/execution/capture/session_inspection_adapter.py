@@ -34,6 +34,8 @@ class _CaptureTicket(Protocol):
 class _CaptureScopeOwner(Protocol):
     capture_scope: CaptureScope | None
 
+    def request_stop(self, ticket: _CaptureTicket) -> object: ...
+
     def submit_capture_variable(
         self, name: str, *, stack_level: int = 0,
     ) -> _CaptureTicket: ...
@@ -225,6 +227,7 @@ class SessionCaptureInspectionAdapter:
             ticket,
             timeout_s=remaining,
             wait_handoff=self._wait_handoff,
+            request_stop=lambda: self._controller.request_stop(ticket),
         )
         # The ticket may settle after the stop was released. Recheck the
         # bridge's stop fence before returning any of its private result.
@@ -269,6 +272,7 @@ class SessionCaptureInspectionAdapter:
             raise
         result = wait_initiator_locally(
             ticket, timeout_s=remaining, wait_handoff=self._wait_handoff,
+            request_stop=lambda: self._controller.request_stop(ticket),
         )
         inspection.frame(frame.native_level)
         self._require_scope(scope)

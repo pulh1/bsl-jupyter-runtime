@@ -15,7 +15,7 @@ from onec_runtime_mcp.agent.contracts import BackendExecution, CapabilityMode, R
 from onec_runtime_mcp.agent.mcp_profiles import AGENT_TOOL_NAMES, EXPERT_TOOL_NAMES
 from onec_runtime_mcp.agent.service import AgentWorkspaceService
 from onec_runtime_mcp.agent.service_server import AgentControlServer
-from onec_runtime.runtime_api import RuntimeNamespaceSnapshot
+from onec_runtime.runtime_models import RuntimeNamespaceSnapshot
 
 
 class _OfflineBackend:

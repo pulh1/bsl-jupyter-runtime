@@ -4,6 +4,7 @@ from pathlib import Path
 from dataclasses import replace
 from threading import Event, Thread, current_thread
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 
@@ -13,11 +14,14 @@ from onec_runtime.execution.composition import build_execution_core
 from onec_runtime.execution.arbiter import ArbiterBusy
 from onec_runtime.execution.namespace import RuntimeNamespaceOwner
 from onec_runtime.execution.public_facade import PublicExecutionFacade
+from onec_runtime.execution.termination import ServerTerminationConfirmed
 from onec_runtime.execution.settlement import RouteSettlementService
 from onec_runtime.execution.status_projection import ExecutionStatusProjection
 from onec_runtime.execution.worker_activation import WorkerActivationSnapshot
-from onec_runtime.prototype_runtime import OperationState
-from onec_runtime.runtime_api import RuntimeReplyKind
+from onec_runtime.rdbg.models import TargetId
+from onec_runtime.rdbg.session import BoundServerTargetAbsence
+from onec_runtime.errors import ProtocolError
+from onec_runtime.runtime_models import OperationState, RuntimeReplyKind
 from onec_runtime.session import RuntimeSession, RuntimeSessionConfig
 
 from test_execution_controller_routes import BUSINESS, KERNEL, CompleteSession
@@ -212,3 +216,71 @@ def test_server_close_keeps_target_while_execution_arbiter_is_busy(
     finally:
         runtime._heartbeat_stop.set()
         runtime._heartbeat_thread.join(2)
+
+
+def test_server_close_retries_local_cleanup_after_public_facade_retires() -> None:
+    from tempfile import TemporaryDirectory
+
+    events: list[str] = []
+    target = TargetId(uuid4(), "runtime_test", uuid4())
+    proof = ServerTerminationConfirmed(
+        target, BoundServerTargetAbsence(target, target, 1.0, 1),
+    )
+
+    class Facade:
+        confirmed_target_termination = proof
+
+        def close(self) -> None:
+            events.append("facade")
+
+    class Processes:
+        attempts = 0
+
+        def close(self, *, graceful_client_timeout_s: float = 0.0) -> None:
+            events.append("process")
+            self.attempts += 1
+            if self.attempts == 1:
+                raise RuntimeError("transient process close")
+
+    def observe_absence(expected: TargetId) -> None:
+        assert expected == target
+        events.append("absence")
+
+    rdbg = SimpleNamespace(
+        _bound_client_target=target,
+        target=SimpleNamespace(target_id=target),
+        terminate_bound_server_session=lambda: events.append("terminate") or True,
+        wait_for_bound_server_targets_absent=observe_absence,
+        detach=lambda: events.append("detach"),
+    )
+    with TemporaryDirectory() as root:
+        config = _config(Path(root))
+        config = replace(
+            config,
+            runtime=replace(
+                config.runtime,
+                connection_string='Srvr="localhost";Ref="runtime_test";',
+            ),
+        )
+        runtime = RuntimeSession(
+            config, Processes(),
+            SimpleNamespace(close=lambda: events.append("transport")),
+            rdbg, Facade(), SimpleNamespace(), heartbeat_interval_s=60.0,
+        )
+        try:
+            with pytest.raises(ProtocolError, match="cleanup failed"):
+                runtime.close_for_kernel_shutdown()
+            assert events == ["facade", "terminate", "process"]
+            assert not runtime.is_closed
+            runtime.close_for_kernel_shutdown()
+            assert events == [
+                "facade", "terminate", "process", "process", "absence",
+                "detach", "transport",
+            ]
+            assert runtime.confirmed_target_termination is proof
+            assert runtime.is_closed
+            runtime.close_for_kernel_shutdown()
+            assert events.count("facade") == 1
+        finally:
+            runtime._heartbeat_stop.set()
+            runtime._heartbeat_thread.join(2)

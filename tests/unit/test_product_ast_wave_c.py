@@ -7,10 +7,11 @@ import pytest
 
 from onec_runtime.bsl import LoweringMode, SemanticNotebookLowerer, WorkerExport
 from onec_runtime.bsl.parser_target import PythonParserTarget
-from onec_runtime.errors import BslExecutionError, ProtocolError
+from onec_runtime.errors import ProtocolError
 from onec_runtime_jupyter.extension import MACHINE_MIME_TYPE, _display_reply
-from onec_runtime.prototype_runtime import MainCompletion, OperationHandle, OperationState
-from onec_runtime.runtime_api import PrototypeRuntimeApi, RuntimeReplyKind
+from onec_runtime.runtime_models import (
+    OperationState, RuntimeReply, RuntimeReplyKind,
+)
 import onec_runtime.server_worker as server_worker
 
 
@@ -112,10 +113,11 @@ def test_collector_key_must_match_the_bsl_identifier_lexer_rule() -> None:
 
 
 def test_capture_error_reply_preserves_lossless_messages_for_jupyter() -> None:
-    controller = _CaptureFailureController()
-    api = PrototypeRuntimeApi(controller)
-
-    reply = api.execute_bsl('Сообщить("before"); ВызватьИсключение "boom";')
+    reply = RuntimeReply(
+        RuntimeReplyKind.CAPTURE_CELL, 7, OperationState.CAPTURED,
+        error="BSL execution failed", succeeded=False,
+        messages=("first\nline", "", "last"),
+    )
     bundle = _display_reply(reply)._repr_mimebundle_()
 
     assert reply.kind is RuntimeReplyKind.CAPTURE_CELL
@@ -125,90 +127,3 @@ def test_capture_error_reply_preserves_lossless_messages_for_jupyter() -> None:
     assert reply.state is OperationState.CAPTURED
     assert bundle[MACHINE_MIME_TYPE]["messages"] == ["first\nline", "", "last"]
     assert "first\nline\n\nlast" not in bundle["text/plain"]
-
-
-class _WorkerController:
-    runtime_generation = 1
-    operation_id = 0
-    state = OperationState.COMPLETED
-
-    def __init__(self) -> None:
-        self.instructions: list[str] = []
-
-    def execute_system_main(self, source: str):  # type: ignore[no-untyped-def]
-        self.instructions.append(source)
-        raise AssertionError("invalid catalog must not execute worker instructions")
-
-
-class _CaptureFailureController:
-    runtime_generation = 1
-    operation_id = 7
-    state = OperationState.CAPTURED
-
-    def execute_capture(  # type: ignore[no-untyped-def]
-        self,
-        source: str,
-        *,
-        on_transport_dispatch=None,
-    ):
-        del source
-        if on_transport_dispatch is not None:
-            on_transport_dispatch()
-        raise BslExecutionError("boom", messages=("first\nline", "", "last"))
-
-    def execute_mapped_capture(  # type: ignore[no-untyped-def]
-        self,
-        _visible_source,
-        mapped_source,
-        **kwargs,
-    ):
-        return self.execute_capture(
-            mapped_source.text,
-            on_transport_dispatch=kwargs.get("on_transport_dispatch"),
-        )
-
-
-def _artifact(
-    tmp_path: Path,
-    version: str,
-    exports: tuple[WorkerExport, ...],
-) -> server_worker.WorkerArtifact:
-    path = tmp_path / f"Worker-{version}.epf"
-    path.write_bytes(version.encode("ascii"))
-    source = tmp_path / f"Worker-{version}.bsl"
-    source.write_text(
-        "\n".join(
-            f"Функция {export.method}() Экспорт\n"
-            "    Возврат Неопределено;\n"
-            "КонецФункции;"
-            for export in exports
-        ),
-        encoding="utf-8",
-    )
-    return server_worker.build_worker_artifact(
-        logical_name="Worker",
-        source_path=source,
-        artifact_path=path,
-        expected_version=version,
-        expected_value=13 if version == "v1" else 29,
-        exports=exports,
-    )
-
-
-class _CatalogWorkerController:
-    runtime_generation = 1
-    operation_id = 0
-    state = OperationState.COMPLETED
-
-    def __init__(self, results: tuple[object, ...]) -> None:
-        from collections import deque
-
-        self.results = deque(results)
-        self.instructions: list[str] = []
-        self.lowerer = SemanticNotebookLowerer(PythonParserTarget.from_generated())
-
-    def execute_system_main(self, source: str) -> MainCompletion:
-        self.instructions.append(source)
-        value = self.results.popleft()
-        operation = OperationHandle(len(self.instructions), source, source)
-        return MainCompletion(operation, value, "", True)

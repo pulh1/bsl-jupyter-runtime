@@ -507,7 +507,7 @@ def test_main_policy_and_message_key_survive_capture_until_resumed_completion(
     from onec_runtime.execution.reply_publication import (
         MainPublicationRecord, MainReplyPolicy,
     )
-    from onec_runtime.runtime_api import RuntimeReplyKind
+    from onec_runtime.runtime_models import RuntimeReplyKind
 
     class MessageSession(CompleteSession):
         def __init__(self) -> None:

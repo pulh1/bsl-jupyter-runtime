@@ -1,6 +1,6 @@
 """Installed-wheel browser/kernel acceptance; the default backend is NOT live 1C.
 
-Uses the public install_runtime path and a real RuntimeSession/RuntimeAPI with
+Uses the public install_runtime path and a real RuntimeSession with
 explicit test transport/packer fixtures. No server registry is injected. Source,
 protocol frames and credentials are never written to the evidence summaries.
 """
@@ -18,6 +18,8 @@ from tempfile import TemporaryDirectory
 from urllib.parse import unquote, urlsplit
 
 from playwright.sync_api import expect
+
+from lsp_public_fixture import reload_code
 
 
 def copy_source_fixture(source, owned_parent):
@@ -145,18 +147,6 @@ def definition(page, method, arguments='1', *, return_to_notebook=True):
         page.evaluate("async () => { await window.jupyterapp.commands.execute('docmanager:open', {path:'lsp.ipynb'}); }")
 
 
-def reload_code(method, revision, parameters='Первый', failure=None):
-    source = f'Функция {method}({parameters}) Экспорт\nВозврат 1;\nКонецФункции\n'
-    call = f'_lsp_runtime.load_worker_modules((_worker_module_source_unit("JupyterBslFixtureCalleeServer", {revision}, {source!r}),))'
-    if failure:
-        return (f'_lsp_previous = _lsp_runtime.runtime_api.worker_generation_handle\n_lsp_target.failure = {failure!r}\n'
-            f'try:\n    {call}\nexcept Exception:\n    pass\nelse:\n    raise AssertionError("Expected confirmation failure")\n'
-            + ('assert _lsp_runtime.runtime_api.worker_generation_handle is _lsp_previous\n' if failure != 'unknown' else '')
-            + '_lsp_target.failure = None')
-    return (f'_lsp_handle = {call}\nassert _lsp_runtime.runtime_api.worker_generation_handle is _lsp_handle\n'
-            '_lsp_runtime.release_worker_generation(_lsp_handle)')
-
-
 def exercise_browser_runtime(page, notebook_root, startup, sources, source_root, *, observed_frames, observed_contexts):
     from check_jupyter_bsl_lsp import SourceWriteOracle, fingerprints
     from onec_runtime_jupyter.lsp_contexts import normalize_source_root
@@ -204,7 +194,10 @@ def exercise_browser_runtime(page, notebook_root, startup, sources, source_root,
     expect(marker.first).to_be_visible(timeout=20000)
     print('PASS before startup: built-in/cross-cell completion, hover and mapped diagnostics', flush=True)
 
-    rootless = startup.replace(f'source_root=Path({str(source_root.resolve())!r})', 'source_root=None')
+    rootless = startup.replace(
+        f'_lsp_source_root = Path({str(source_root.resolve())!r})',
+        '_lsp_source_root = None',
+    )
     execute(page, rootless)
     expect(status).to_contain_text('virtual only', timeout=30000)
     completion(page, '%%bsl\nСообщ', 'Сообщить')
@@ -346,9 +339,7 @@ def exercise_browser_runtime(page, notebook_root, startup, sources, source_root,
 _remote_fixture = TemporaryDirectory(prefix='onec-remote-source-')
 _remote_root = Path(_remote_fixture.name)
 (_remote_root / 'CommonModules').mkdir()
-_remote_config = replace(_lsp_config, source_root=_remote_root)
-_remote_api = _semantic_snapshot_runtime(_lsp_work, _common_module_catalog('ProbeServer'))
-_remote_runtime = RuntimeSession(_remote_config, _Closeable(), _Closeable(), _IdleRdbg(), _remote_api, SimpleNamespace())
+_remote_runtime = make_lsp_session(_lsp_work, _remote_root, LspFailureTarget())
 _remote_fixture.cleanup()
 install_runtime(get_ipython(), _remote_runtime)
 ''')

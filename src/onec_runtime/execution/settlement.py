@@ -28,7 +28,7 @@ from onec_runtime.execution.reply_publication import (
 from onec_runtime.rdbg.models import StopEvent
 
 if TYPE_CHECKING:
-    from onec_runtime.runtime_api import CaptureCorrelationTicket, OperationState, RuntimeReply
+    from onec_runtime.runtime_models import CaptureCorrelationTicket, OperationState, RuntimeReply
 
 
 class NamespacePublicationPort(Protocol):
@@ -167,7 +167,7 @@ class RouteSettlementService:
         skip a stop number.
         """
 
-        from onec_runtime.runtime_api import CaptureCorrelationTicket
+        from onec_runtime.runtime_models import CaptureCorrelationTicket
 
         with self._lock:
             registration, next_sequence = self._published_capture_successor(operation)
@@ -342,7 +342,7 @@ class RouteSettlementService:
 
     @staticmethod
     def _worker_only_reply(outcome: object, has_intent: bool) -> RuntimeReply:
-        from onec_runtime.runtime_api import OperationState, RuntimeReply, RuntimeReplyKind
+        from onec_runtime.runtime_models import OperationState, RuntimeReply, RuntimeReplyKind
 
         if not has_intent or not isinstance(outcome, WorkerPublished):
             raise TypeError("Worker-only settlement requires WorkerPublished")

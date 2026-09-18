@@ -17,8 +17,8 @@ from onec_runtime.execution.pipeline import CellExecutionPipeline
 from onec_runtime.execution.pipeline import PreparedCellHandle
 from onec_runtime.execution.reply_presenter import RuntimeReplyPresenter
 from onec_runtime.execution.source_identity import NotebookSourceIdentityFactory
-from onec_runtime.prototype_runtime import OperationState
-from onec_runtime.runtime_api import RuntimeReplyKind, RuntimeStatus
+from onec_runtime.runtime_models import OperationState
+from onec_runtime.runtime_models import RuntimeReplyKind, RuntimeStatus
 from onec_runtime.runtime_contracts import OperationExecutionProvenance
 
 

@@ -5,8 +5,8 @@ from onec_runtime.bsl.lexer import BslLexError
 from onec_runtime.bsl.source_maps import SourceSpan, SourceUnitKind, SourceUnitRef, mapped_visible_source, source_sha256
 from onec_runtime.execution.contracts import CommonCell, SourceDiagnostic, Unavailable
 from onec_runtime.execution.pipeline import CellExecutionPipeline
-from onec_runtime.prototype_runtime import OperationState
-from onec_runtime.runtime_api import RuntimeReplyKind, RuntimeStatus
+from onec_runtime.runtime_models import OperationState
+from onec_runtime.runtime_models import RuntimeReplyKind, RuntimeStatus
 
 
 def _status() -> RuntimeStatus:

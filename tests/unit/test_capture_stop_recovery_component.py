@@ -1,7 +1,8 @@
 """One confirmed CAPTURE cell error does not end its stopped MAIN frame."""
 
+from dataclasses import replace
 from hashlib import sha256
-from threading import current_thread
+from threading import Event, current_thread
 
 import pytest
 
@@ -15,6 +16,7 @@ from onec_runtime.execution.capture.cell_evaluator import CaptureCellEvaluator
 from onec_runtime.execution.capture.executor import CaptureExecutor
 from onec_runtime.execution.capture.operation_executor import ConfirmedTemporaryKeyCleanupFailure
 from onec_runtime.execution.capture.scope import CaptureContextState, CaptureFrameIdentity
+import onec_runtime.execution.controller.controller as controller_module
 from onec_runtime.execution.controller.controller import (
     ExecutionController,
     MainYieldKind,
@@ -182,7 +184,9 @@ def test_capture_error_retry_inspect_materialize_resume_same_main_and_scope() ->
         arbiter.close(timeout=3)
 
 
-def test_failed_materialization_cleanup_is_repairable_in_same_capture_stop() -> None:
+def test_failed_materialization_cleanup_is_repairable_in_same_capture_stop(
+    monkeypatch,
+) -> None:
     session = RecoverySession(cleanup_fail_once=True)
     arbiter = RdbgArbiter(session, RouteToken("runtime-1", 1, 0, "main"))
     controller = ExecutionController(
@@ -193,13 +197,23 @@ def test_failed_materialization_cleanup_is_repairable_in_same_capture_stop() -> 
         BreakpointRegistry(KERNEL, (BUSINESS,)),
         runtime_generation=1,
     )
+    observer_release = Event()
     try:
         scope = controller.submit_main("Результат = 1;").wait(3).scope
+        original_observer = controller_module._observe_capture_ticket
+
+        def delayed_observer(ticket, ledger, receipt_id):
+            if receipt_id.startswith("materialization-"):
+                assert observer_release.wait(10)
+            original_observer(ticket, ledger, receipt_id)
+
+        monkeypatch.setattr(controller_module, "_observe_capture_ticket", delayed_observer)
         key = "__onec_compact_table_" + "a" * 32
         with pytest.raises(ConfirmedTemporaryKeyCleanupFailure):
             controller.submit_capture_materialization(transfer_plan(key)).wait(3)
         ledger = controller.capture_evaluation_ledger()
         assert ledger.status().phase is CapturePhase.PAUSED
+        observer_release.set()
         transfer = ledger.wait(1)
         assert transfer.evaluation_kind is CaptureEvaluationKind.MATERIALIZATION_HELPER
         assert transfer.state is CaptureEvaluationState.FAILED
@@ -217,4 +231,93 @@ def test_failed_materialization_cleanup_is_repairable_in_same_capture_stop() -> 
         assert sum("e1cRuntimeКонтекст.Удалить" in source and key in source for source in session.started) == 2
         assert len({thread for _, thread in session.calls}) == 1
     finally:
+        observer_release.set()
+        arbiter.close(timeout=3)
+
+
+def test_confirmed_materialization_policy_error_retires_ledger_before_waiter(
+    monkeypatch,
+) -> None:
+    session = RecoverySession()
+    arbiter = RdbgArbiter(session, RouteToken("runtime-1", 1, 0, "main"))
+    controller = ExecutionController(
+        arbiter,
+        MainExecutor(poll_interval_s=0.1),
+        CaptureExecutor(None, KERNEL, decode_command_id=evaluation_to_python),
+        CaptureCellEvaluator(),
+        BreakpointRegistry(KERNEL, (BUSINESS,)),
+        runtime_generation=1,
+    )
+    observer_release = Event()
+    try:
+        scope = controller.submit_main("Результат = 1;").wait(3).scope
+        original_observer = controller_module._observe_capture_ticket
+
+        def delayed_observer(ticket, ledger, receipt_id):
+            if receipt_id.startswith("materialization-"):
+                assert observer_release.wait(10)
+            original_observer(ticket, ledger, receipt_id)
+
+        monkeypatch.setattr(controller_module, "_observe_capture_ticket", delayed_observer)
+        key = "__onec_compact_table_" + "b" * 32
+
+        def reject_metadata(_value):
+            raise ValueError("metadata rejected")
+
+        plan = replace(transfer_plan(key), admit_metadata=reject_metadata)
+        with pytest.raises(ValueError, match="metadata rejected"):
+            controller.submit_capture_materialization(plan).wait(3)
+        ledger = controller.capture_evaluation_ledger()
+        assert ledger.status().phase is CapturePhase.PAUSED
+        assert ledger.wait(1).state is CaptureEvaluationState.FAILED
+        assert scope.temporary_cleanup_debts == ()
+        assert controller.submit_capture_cell(
+            "Результат = 2;", result_policy=_user_result
+        ).wait(3) == 2
+    finally:
+        observer_release.set()
+        arbiter.close(timeout=3)
+
+
+def test_capture_local_preflight_rejection_retires_ledger_before_waiter(
+    monkeypatch,
+) -> None:
+    session = RecoverySession()
+    arbiter = RdbgArbiter(session, RouteToken("runtime-1", 1, 0, "main"))
+    controller = ExecutionController(
+        arbiter,
+        MainExecutor(poll_interval_s=0.1),
+        CaptureExecutor(None, KERNEL, decode_command_id=evaluation_to_python),
+        CaptureCellEvaluator(),
+        BreakpointRegistry(KERNEL, (BUSINESS,)),
+        runtime_generation=1,
+    )
+    observer_release = Event()
+    try:
+        scope = controller.submit_main("Результат = 1;").wait(3).scope
+        original_observer = controller_module._observe_capture_ticket
+
+        def delayed_observer(ticket, ledger, receipt_id):
+            if receipt_id.startswith("capture-"):
+                assert observer_release.wait(10)
+            original_observer(ticket, ledger, receipt_id)
+
+        monkeypatch.setattr(controller_module, "_observe_capture_ticket", delayed_observer)
+
+        def reject_preflight():
+            raise ValueError("prepared snapshot expired")
+
+        with pytest.raises(ValueError, match="prepared snapshot expired"):
+            controller.submit_capture_cell(
+                "Результат = 2;", _before_first_effect=reject_preflight,
+            ).wait(3)
+        ledger = controller.capture_evaluation_ledger()
+        assert ledger.status().phase is CapturePhase.PAUSED
+        assert ledger.wait(1).state is CaptureEvaluationState.FAILED
+        assert controller.capture_scope is scope
+        assert controller.submit_capture_cell(
+            "Результат = 2;", result_policy=_user_result,
+        ).wait(3) == 2
+    finally:
+        observer_release.set()
         arbiter.close(timeout=3)

@@ -38,8 +38,8 @@ from onec_runtime.capture_values import (
     ValueRootKind,
     ValueShape,
 )
-from onec_runtime.prototype_runtime import OperationState
-from onec_runtime.runtime_api import (
+from onec_runtime.runtime_models import OperationState
+from onec_runtime.runtime_models import (
     RuntimeReply,
     RuntimeReplyKind,
     RuntimeStatus,
@@ -106,7 +106,7 @@ class FakeRuntime:
         return RuntimeStatus(OperationState.CAPTURED, 1, 7, None)
 
     def namespace_snapshot(self):  # type: ignore[no-untyped-def]
-        from onec_runtime.runtime_api import RuntimeNamespaceSnapshot
+        from onec_runtime.runtime_models import RuntimeNamespaceSnapshot
 
         return RuntimeNamespaceSnapshot(1, 1, ("ГДФЛ",))
 

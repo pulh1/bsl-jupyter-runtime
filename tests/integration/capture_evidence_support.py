@@ -31,7 +31,7 @@ from integration.evidence.capture_live_evidence import snapshot_unavailable_sha2
 from onec_runtime_mcp.agent.contracts import CapabilityMode, RuntimeDescriptor
 from onec_runtime_mcp.agent.service import AgentWorkspaceService
 from onec_runtime_mcp.agent.service_server import AgentControlServer
-from onec_runtime.runtime_api import RuntimeNamespaceSnapshot
+from onec_runtime.runtime_models import RuntimeNamespaceSnapshot
 from process_evidence_support import OwnedProcessTracker, ProcessIdentity
 
 

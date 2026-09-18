@@ -10,7 +10,7 @@ from onec_runtime.errors import (
 )
 from onec_runtime.execution.worker_activation import WorkerMaterializationSnapshot
 from onec_runtime.rdbg.models import EvaluationResult
-from onec_runtime.runtime_api import RuntimeNamespaceSnapshot
+from onec_runtime.runtime_models import RuntimeNamespaceSnapshot
 
 
 def schema(*names: str) -> str:

@@ -26,8 +26,9 @@ from onec_runtime.bsl.parser_target import PythonParserTarget
 from onec_runtime.bsl.source_maps import SourceUnitRef
 from onec_runtime.errors import ProtocolError, StaleWorkerGeneration
 from onec_runtime.execution.arbiter import (
-    OutcomeUnknown, RdbgArbiter, SessionPort, Settlement,
+    ExecutionTicket, OutcomeUnknown, RdbgArbiter, SessionPort, Settlement,
 )
+from onec_runtime.execution.contracts import SubmissionReceipt
 from onec_runtime.execution.worker_catalog_resolver import (
     ConfirmedWorkerModulePreparation, WorkerCatalogResolution,
     resolve_worker_module_catalog,
@@ -155,6 +156,7 @@ class WorkerModuleLifecycleService:
         require_mutation_boundary: Callable[[], None],
         worker_breakpoints_present: Callable[[], bool],
         wait_handoff: Callable[[], AbstractContextManager[None]] = nullcontext,
+        request_stop: Callable[[ExecutionTicket], object] | None = None,
     ) -> None:
         if not isinstance(arbiter, RdbgArbiter):
             raise TypeError("one RDBG arbiter is required")
@@ -163,6 +165,8 @@ class WorkerModuleLifecycleService:
             worker_breakpoints_present, wait_handoff,
         )):
             raise TypeError("Worker lifecycle collaborators must be callable")
+        if request_stop is not None and not callable(request_stop):
+            raise TypeError("Worker lifecycle Stop callback is invalid")
         if not callable(getattr(publisher, "publish_modules", None)) or not callable(
             getattr(publisher, "release_generation", None)
         ) or not callable(getattr(publisher, "snapshot", None)) or not callable(
@@ -176,6 +180,7 @@ class WorkerModuleLifecycleService:
         self._require_mutation_boundary = require_mutation_boundary
         self._worker_breakpoints_present = worker_breakpoints_present
         self._wait_handoff = wait_handoff
+        self._request_stop = arbiter.request_stop if request_stop is None else request_stop
         self._lock = RLock()
         self._confirmed: dict[str, ConfirmedWorkerModulePreparation] = {}
         self._catalog: CommonModuleCatalogSnapshot | None = None
@@ -399,11 +404,15 @@ class WorkerModuleLifecycleService:
             raise ProtocolError("Worker common-module catalog is not monotonic")
 
     def _submit_and_wait(self, token, plan):
-        ticket = self._arbiter.submit(token, plan)
+        receipt = SubmissionReceipt()
         try:
+            ticket = self._arbiter.submit(token, plan, receipt=receipt)
             self._arbiter.dispatch(ticket)
         except BaseException:
-            ticket.cancel_queued()
+            owned = receipt.ticket
+            if isinstance(owned, ExecutionTicket):
+                if not owned.cancel_queued() and not owned.status().settled:
+                    self._request_stop(owned)
             raise
         try:
             with self._wait_handoff():
@@ -411,7 +420,11 @@ class WorkerModuleLifecycleService:
                     raise OutcomeUnknown("Worker module lifecycle outcome is unknown")
                 return ticket.wait_settled(0)
         except KeyboardInterrupt:
-            ticket.detach_waiter()
+            try:
+                if not ticket.status().settled:
+                    self._request_stop(ticket)
+            finally:
+                ticket.detach_waiter()
             raise
 
 

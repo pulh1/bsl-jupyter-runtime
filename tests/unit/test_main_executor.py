@@ -28,8 +28,13 @@ class MainPort:
         self.calls: list[tuple[object, ...]] = []
         self.empty_intervals = empty_intervals
 
-    def modify(self, variable: str, value_expression: str) -> object:
+    def modify(
+        self, variable: str, value_expression: str, *,
+        on_transport_dispatch: Callable[[], None] | None = None,
+    ) -> object:
         self.calls.append(("modify", variable, value_expression))
+        if on_transport_dispatch is not None:
+            on_transport_dispatch()
         return SimpleNamespace(error_occurred=False, error_text="")
 
     def continue_(self, *, on_transport_dispatch: Callable[[], None] | None = None) -> None:
@@ -108,8 +113,14 @@ def test_long_lived_main_executor_uses_the_port_of_each_operation() -> None:
 
 def test_main_executor_does_not_continue_after_rejected_command_write() -> None:
     class RejectedPort(MainPort):
-        def modify(self, variable: str, value_expression: str) -> object:
-            super().modify(variable, value_expression)
+        def modify(
+            self, variable: str, value_expression: str, *,
+            on_transport_dispatch: Callable[[], None] | None = None,
+        ) -> object:
+            super().modify(
+                variable, value_expression,
+                on_transport_dispatch=on_transport_dispatch,
+            )
             return SimpleNamespace(error_occurred=True, error_text="rejected")
 
     port = RejectedPort()

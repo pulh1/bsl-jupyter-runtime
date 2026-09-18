@@ -1,8 +1,10 @@
 """Completion schema helpers use one fenced MAIN or CAPTURE arbiter ticket."""
 
 import pytest
+from threading import Event
 from uuid import UUID
 
+from onec_runtime.capture_evaluation import CaptureEvaluationState, CapturePhase
 from onec_runtime.errors import ProtocolError
 from onec_runtime.execution.arbiter import RdbgArbiter, RouteToken
 from onec_runtime.execution.capture.cell_evaluator import CaptureCellEvaluator
@@ -10,11 +12,12 @@ from onec_runtime.execution.capture.executor import CaptureExecutor
 from onec_runtime.execution.completion_fields import (
     CompletionFieldsPlan, CompletionFieldsService,
 )
+import onec_runtime.execution.controller.controller as controller_module
 from onec_runtime.execution.controller.controller import ExecutionController
 from onec_runtime.execution.main import MainExecutor
 from onec_runtime.execution.worker_activation import WorkerMaterializationSnapshot
 from onec_runtime.rdbg.models import EvaluationResult, TargetId
-from onec_runtime.runtime_api import RuntimeNamespaceSnapshot
+from onec_runtime.runtime_models import RuntimeNamespaceSnapshot
 from onec_runtime.stop_routing import BreakpointRegistry
 from onec_runtime.table_value import evaluation_to_python
 
@@ -165,6 +168,34 @@ def test_completion_rejects_private_schema_without_returning_raw_result() -> Non
         assert len(session.helper_expressions) == 1
         assert {thread for _, thread in session.calls} == {arbiter._worker}
     finally:
+        arbiter.close(timeout=3)
+
+
+def test_capture_completion_failure_retires_ledger_before_waiter(monkeypatch) -> None:
+    session, arbiter, controller = _bound("private target payload")
+    observer_release = Event()
+    try:
+        controller.submit_main("Результат = 1;").wait_settled(3)
+        original_observer = controller_module._observe_capture_ticket
+
+        def delayed_observer(ticket, ledger, receipt_id):
+            if receipt_id.startswith("completion-"):
+                assert observer_release.wait(10)
+            original_observer(ticket, ledger, receipt_id)
+
+        monkeypatch.setattr(controller_module, "_observe_capture_ticket", delayed_observer)
+        plan = CompletionFieldsPlan(
+            "e1cRuntimeКонтекст.Данные",
+            "Результат = e1cRuntimeКонтекст.Данные;",
+            lambda: None,
+        )
+        with pytest.raises(ProtocolError, match="Invalid completion field schema"):
+            controller.submit_completion_helper(plan).wait_settled(3)
+        ledger = controller.capture_evaluation_ledger()
+        assert ledger.status().phase is CapturePhase.PAUSED
+        assert ledger.wait(1).state is CaptureEvaluationState.FAILED
+    finally:
+        observer_release.set()
         arbiter.close(timeout=3)
 
 

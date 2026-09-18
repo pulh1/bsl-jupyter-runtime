@@ -1,222 +1,219 @@
+"""Saved CAPTURE frames are lazy and stay fenced through public adapters."""
+
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from threading import RLock
 from types import SimpleNamespace
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from mcp.client import Client
 import pytest
 
-from onec_runtime.errors import ProtocolError
+from onec_runtime.errors import ProtocolError, StaleCaptureError
+from onec_runtime.execution.capture.inspection import (
+    TypedNativeVariable, TypedNativeVariablePage,
+)
+from onec_runtime.execution.capture.public_inspection import CaptureInspectionBridge
+from onec_runtime.execution.capture.scope import CaptureScope
+from onec_runtime.execution.capture.session_inspection_adapter import (
+    SessionCaptureInspectionAdapter,
+)
+from onec_runtime.rdbg.models import (
+    FrameVariable, ModuleLocation, StackFrame, StopEvent, TargetId,
+)
 from onec_runtime.session import RuntimeSession
 from onec_runtime_mcp.agent.capture_contracts import CaptureFence
 from onec_runtime_mcp.agent.contracts import ServiceResponse
 from onec_runtime_mcp.agent.mcp_profiles import McpProfile
 from onec_runtime_mcp.agent.runtime_backend import OnecRuntimeBackend
 from onec_runtime_mcp.agent.runtime_session import AgentRuntimeSession
-from onec_runtime.prototype_runtime import OperationState, PrototypeRuntimeController
-from onec_runtime.rdbg.models import (
-    FrameVariable,
-    LocalVariablesResult,
-    ModuleLocation,
-    StackFrame,
-    TargetId,
-)
-from onec_runtime.runtime_api import PrototypeRuntimeApi
 from onec_runtime_mcp.server import create_mcp_server
 
 
 TARGET = TargetId(UUID("22222222-2222-2222-2222-222222222222"), "DefAlias")
 OBJECT = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
 PROPERTY = UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
-BUSINESS = ModuleLocation("ConfigModule", "", OBJECT, PROPERTY, 53)
-CALLER = ModuleLocation("ConfigModule", "", OBJECT, PROPERTY, 17)
-KERNEL = ModuleLocation("ExtensionModule", "", OBJECT, PROPERTY, 60, "OnecInteractiveRuntime")
+BUSINESS = ModuleLocation("ConfigModule", "file:///private/business.bsl", OBJECT, PROPERTY, 53)
+CALLER = ModuleLocation("ConfigModule", "file:///private/caller.bsl", OBJECT, PROPERTY, 17)
+KERNEL = ModuleLocation("ExtensionModule", "file:///private/kernel.bsl", OBJECT, PROPERTY, 60, "OnecInteractiveRuntime")
 
 
-class PausedRdbg:
-    def __init__(self) -> None:
-        self.target = SimpleNamespace(target_id=TARGET)
-        self.calls: list[tuple[str, object]] = []
-        self.root_variables = (FrameVariable("Local", "Строка", '"updated"'),)
+class Ticket:
+    def __init__(self, result: object) -> None:
+        self.result = result
 
-    def local_variables(
-        self, stack_level: int, *, timeout_s: float, max_text_size: int,
-    ) -> LocalVariablesResult:
-        self.calls.append(("local_variables", stack_level))
-        assert timeout_s > 0
-        assert max_text_size == 512
-        if stack_level == 0:
-            return LocalVariablesResult(uuid4(), self.root_variables)
-        assert stack_level == 1
-        return LocalVariablesResult(
-            uuid4(),
-            (
-                FrameVariable("Rows", "Массив", "Массив", collection_size=4),
-                FrameVariable("Count", "Число", "4"),
+    def wait_initiator(self, timeout: float | None = None) -> object:
+        return self.result
+
+
+class PausedOwner:
+    def __init__(self, scope: CaptureScope) -> None:
+        self.capture_scope = scope
+        self.calls: list[tuple[object, ...]] = []
+        self.variables = {
+            0: (FrameVariable("Local", "Строка", '"updated"'),),
+            1: (
+                FrameVariable("Rows", "Массив", "private rows", collection_size=4),
+                FrameVariable("Count", "Число", "private 4"),
             ),
-        )
+        }
 
-def paused_api() -> tuple[PrototypeRuntimeApi, PausedRdbg]:
-    rdbg = PausedRdbg()
-    controller = PrototypeRuntimeController(rdbg, KERNEL)  # type: ignore[arg-type]
-    controller.state = OperationState.CAPTURED
-    controller.capture_frame_stack_level = 0
-    controller._capture_frame_variables = (
-        FrameVariable("Local", "Строка", '"secret"'),
-    )
-    controller._capture_stack_frames = (
+    def submit_capture_variable(self, name: str, *, stack_level: int = 0) -> Ticket:
+        self.calls.append(("variable", name, stack_level))
+        matches = tuple(
+            value for value in self.variables[stack_level]
+            if value.name.casefold() == name.casefold()
+        )
+        if len(matches) != 1:
+            raise ProtocolError("capture variable is unavailable")
+        return Ticket(matches[0])
+
+    def submit_capture_typed_variable_page(
+        self, *, stack_level: int, start: int, stop: int,
+    ) -> Ticket:
+        self.calls.append(("typed_page", stack_level, start, stop))
+        variables = self.variables[stack_level]
+        selected = variables[start:stop]
+        return Ticket(TypedNativeVariablePage(
+            tuple(TypedNativeVariable(v.name, v.type_name, v.collection_size) for v in selected),
+            len(variables),
+            stop if selected and stop < len(variables) else None,
+        ))
+
+
+def paused_adapter() -> tuple[SessionCaptureInspectionAdapter, PausedOwner, CaptureScope]:
+    frames = (
         StackFrame(TARGET, 0, BUSINESS),
         StackFrame(TARGET, 1, CALLER),
+        StackFrame(TARGET, 2, KERNEL),
     )
-    controller._capture_target_id = TARGET
-    return PrototypeRuntimeApi(controller), rdbg
+    stop = StopEvent(
+        TARGET, BUSINESS, "callStackFormed",
+        stack=(BUSINESS, CALLER, KERNEL), stack_frames=frames,
+    )
+    scope = CaptureScope.from_stop(1, 1, stop, 1)
+    scope.record_locals((FrameVariable("Local", "Строка", '"secret"'),))
+    scope.record_transfer("temporary-address")
+    scope.record_kernel_frame(2)
+    assert scope.record_main_command(1)
+    scope.record_context_begun()
+    scope.mark_ready()
+    owner = PausedOwner(scope)
+    return (
+        SessionCaptureInspectionAdapter(owner, CaptureInspectionBridge(owner)),
+        owner,
+        scope,
+    )
 
 
-def test_stack_only_exposes_existing_locations_without_reading_frame_values() -> None:
-    api, rdbg = paused_api()
+def test_saved_stack_and_root_metadata_need_no_remote_ticket() -> None:
+    adapter, owner, _scope = paused_adapter()
 
-    result = api.capture_stack(cursor=0, limit=1)
+    stack = adapter.capture_stack(cursor=0, limit=1)
+    root = adapter.capture_frame(level=0, cursor=0, limit=20)
 
-    assert result["total"] == 2
-    assert result["next_cursor"] == 1
-    assert result["frames"][0]["level"] == 0
-    assert result["frames"][0]["line"] == 53
-    assert rdbg.calls == []
-
-
-def test_current_capture_frame_reuses_mandatory_local_metadata() -> None:
-    api, rdbg = paused_api()
-
-    result = api.capture_frame(level=0, cursor=0, limit=20)
-
-    assert result["variables"] == ({"name": "Local", "type_name": "Строка"},)
-    assert rdbg.calls == []
+    assert stack["total"] == 3
+    assert stack["next_cursor"] == 1
+    assert stack["frames"][0]["line"] == 53
+    assert root["variables"] == ({"name": "Local", "type_name": "Строка"},)
+    assert owner.calls == []
+    assert "secret" not in str(root)
 
 
-def test_frame_page_reads_only_requested_level_and_keeps_values_hidden() -> None:
-    api, rdbg = paused_api()
+def test_nonroot_and_named_reads_use_only_requested_frame_ticket() -> None:
+    adapter, owner, _scope = paused_adapter()
 
-    result = api.capture_frame(level=1, cursor=0, limit=20)
+    page = adapter.capture_frame(level=1, cursor=0, limit=20)
+    named = adapter.capture_frame(level=1, cursor=0, limit=20, name="rows")
 
-    assert result["frame"]["level"] == 1
-    assert result["variables"] == (
-        {"name": "Rows", "type_name": "Массив"},
+    assert page["variables"] == (
+        {"name": "Rows", "type_name": "Массив", "collection_size": 4},
         {"name": "Count", "type_name": "Число"},
     )
-    assert rdbg.calls == [("local_variables", 1)]
-
-
-def test_named_frame_variable_uses_only_requested_local_metadata_for_size() -> None:
-    api, rdbg = paused_api()
-
-    result = api.capture_frame(level=1, cursor=0, limit=20, name="rows")
-
-    assert result["variables"] == (
-        {"name": "Rows", "type_name": "Массив", "presentation": "Массив", "collection_size": 4},
+    assert named["variables"] == (
+        {"name": "Rows", "type_name": "Массив", "collection_size": 4},
     )
-    assert rdbg.calls == [("local_variables", 1)]
+    assert owner.calls == [
+        ("typed_page", 1, 0, 20),
+        ("variable", "rows", 1),
+    ]
+    assert "private rows" not in str(page) + str(named)
 
 
-def test_named_capture_frame_refreshes_current_local_presentation() -> None:
-    api, rdbg = paused_api()
+def test_named_collection_size_is_refreshed_from_each_ticket() -> None:
+    adapter, owner, _scope = paused_adapter()
 
-    result = api.capture_frame(level=0, cursor=0, limit=20, name="local")
-
-    assert result["variables"] == ({
-        "name": "Local", "type_name": "Строка",
-        "presentation": '"updated"', "collection_size": None,
-    },)
-    assert rdbg.calls == [("local_variables", 0)]
-
-
-def test_named_capture_frame_refreshes_collection_size_after_mutation() -> None:
-    api, rdbg = paused_api()
-    api._controller._capture_frame_variables = (
-        FrameVariable("Rows", "Массив", "Массив", collection_size=1),
+    first = adapter.capture_frame(level=1, cursor=0, limit=20, name="Rows")
+    owner.variables[1] = (
+        FrameVariable("Rows", "Массив", "private rows", collection_size=5),
     )
-    rdbg.root_variables = (FrameVariable("Rows", "Массив", "Массив", collection_size=2),)
+    second = adapter.capture_frame(level=1, cursor=0, limit=20, name="Rows")
 
-    first = api.capture_frame(level=0, cursor=0, limit=20, name="Rows")
-    rdbg.root_variables = (FrameVariable("Rows", "Массив", "Массив", collection_size=3),)
-    second = api.capture_frame(level=0, cursor=0, limit=20, name="Rows")
-
-    assert first["variables"][0]["collection_size"] == 2
-    assert second["variables"][0]["collection_size"] == 3
-    assert rdbg.calls == [("local_variables", 0), ("local_variables", 0)]
+    assert first["variables"][0]["collection_size"] == 4
+    assert second["variables"][0]["collection_size"] == 5
+    assert owner.calls == [("variable", "Rows", 1)] * 2
+    assert "private rows" not in str(first) + str(second)
 
 
-def test_stack_redacts_kernel_identity_and_all_raw_urls() -> None:
-    api, rdbg = paused_api()
-    private_path = "file:///C:/server/private/runtime.bsl?session=secret"
-    api._controller._capture_stack_frames = (
-        StackFrame(TARGET, 0, ModuleLocation("ConfigModule", private_path, OBJECT, PROPERTY, 53)),
-        StackFrame(TARGET, 1, ModuleLocation("ExtensionModule", private_path, OBJECT, PROPERTY, 60, "OnecInteractiveRuntime")),
-    )
-    api._controller.kernel_location = api._controller._capture_stack_frames[1].location
+def test_named_root_variable_uses_fresh_ticket_but_hides_presentation() -> None:
+    adapter, owner, _scope = paused_adapter()
 
-    frames = api.capture_stack(cursor=0, limit=20)["frames"]
+    result = adapter.capture_frame(level=0, cursor=0, limit=20, name="local")
 
-    assert frames[0]["module_type"] == "ConfigModule"
-    assert "url" not in frames[0]
-    assert frames[1] == {
-        "level": 1, "runtime_kernel": True, "module_type": None,
+    assert result["variables"] == ({"name": "Local", "type_name": "Строка"},)
+    assert owner.calls == [("variable", "local", 0)]
+    assert "updated" not in str(result)
+    assert "secret" not in str(result)
+
+
+def test_kernel_coordinates_and_raw_urls_are_hidden_without_ticket() -> None:
+    adapter, owner, _scope = paused_adapter()
+
+    stack = adapter.capture_stack(cursor=0, limit=10)
+
+    assert stack["frames"][2] == {
+        "level": 2, "runtime_kernel": True, "module_type": None,
         "object_id": None, "property_id": None, "line": None,
         "extension_name": None,
     }
-    assert "secret" not in str(frames)
-    assert rdbg.calls == []
-
-
-def test_unknown_name_does_not_evaluate_an_expression() -> None:
-    api, rdbg = paused_api()
-
-    with pytest.raises(ProtocolError, match="variable"):
-        api.capture_frame(level=1, cursor=0, limit=20, name="Rows.Очистить()")
-
-    assert rdbg.calls == []
-
-
-def test_runtime_kernel_frame_variables_are_not_exposed() -> None:
-    api, rdbg = paused_api()
-    api._controller._capture_stack_frames += (StackFrame(TARGET, 2, KERNEL),)
-
+    assert "file:///" not in str(stack)
     with pytest.raises(ProtocolError, match="kernel"):
-        api.capture_frame(level=2, cursor=0, limit=20)
+        adapter.capture_frame(level=2, cursor=0, limit=20)
+    with pytest.raises(ProtocolError, match="variable name"):
+        adapter.capture_frame(level=1, cursor=0, limit=20, name="Rows.Очистить()")
+    assert owner.calls == []
 
-    assert rdbg.calls == []
 
+def test_root_frame_is_masked_when_its_module_is_the_runtime_kernel() -> None:
+    adapter, owner, scope = paused_adapter()
+    frames = (*scope.stack_frames[:2], StackFrame(TARGET, 2, BUSINESS))
+    scope.stop = replace(scope.stop, stack_frames=frames)
+    scope.stack_frames = frames
 
-def test_kernel_location_is_hidden_even_when_it_is_capture_level_zero() -> None:
-    api, rdbg = paused_api()
-    api._controller.kernel_location = BUSINESS
+    stack = adapter.capture_stack(cursor=0, limit=3)
 
-    stack = api.capture_stack(cursor=0, limit=20)
-
-    assert stack["frames"][0] == {
-        "level": 0, "runtime_kernel": True, "module_type": None,
-        "object_id": None, "property_id": None, "line": None,
-        "extension_name": None,
-    }
+    assert stack["frames"][0]["runtime_kernel"] is True
+    assert stack["frames"][0]["line"] is None
     with pytest.raises(ProtocolError, match="kernel"):
-        api.capture_frame(level=0, cursor=0, limit=20)
-    assert rdbg.calls == []
+        adapter.capture_frame(level=0, cursor=0, limit=20)
+    assert owner.calls == []
 
 
-def test_quarantine_revokes_stack_and_frame_reads_without_resuming() -> None:
-    api, rdbg = paused_api()
-    api.invalidate_capture_inspection()
+def test_invalidated_scope_revokes_stack_and_frame_reads() -> None:
+    adapter, owner, scope = paused_adapter()
+    scope.invalidate_inspection()
 
-    with pytest.raises(ProtocolError, match="quarantined"):
-        api.capture_stack(cursor=0, limit=20)
-    with pytest.raises(ProtocolError, match="quarantined"):
-        api.capture_frame(level=0, cursor=0, limit=20)
-    assert rdbg.calls == []
+    with pytest.raises(StaleCaptureError):
+        adapter.capture_stack(cursor=0, limit=20)
+    with pytest.raises(StaleCaptureError):
+        adapter.capture_frame(level=0, cursor=0, limit=20)
+    assert owner.calls == []
 
 
 def test_runtime_backend_rechecks_exact_capture_ticket_before_stack_read() -> None:
-    api, rdbg = paused_api()
+    adapter, owner, _scope = paused_adapter()
     core = object.__new__(RuntimeSession)
     core._operation_lock = RLock()
     core._active_capture_ticket = SimpleNamespace(
@@ -224,15 +221,15 @@ def test_runtime_backend_rechecks_exact_capture_ticket_before_stack_read() -> No
         source_revision=1, source_sha256="a" * 64,
         capture_generation=1, stop_sequence=1,
     )
-    core.runtime_api = api
+    core.runtime_api = adapter
     backend = OnecRuntimeBackend("runtime", AgentRuntimeSession(core))
     current = CaptureFence("intent", "operation", 1, "a" * 64, 1, 1)
     stale = CaptureFence("intent", "operation", 1, "a" * 64, 1, 2)
 
-    assert backend.capture_stack(current, cursor=0, limit=20)["total"] == 2
+    assert backend.capture_stack(current, cursor=0, limit=20)["total"] == 3
     with pytest.raises(ProtocolError, match="stale"):
         backend.capture_frame(stale, level=0, cursor=0, limit=20)
-    assert rdbg.calls == []
+    assert owner.calls == []
 
 
 def test_capture_mcp_exposes_stack_and_frame_only_on_explicit_calls() -> None:

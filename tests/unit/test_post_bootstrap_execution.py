@@ -19,7 +19,7 @@ from onec_runtime.execution.worker_activation import WorkerMaterializationSnapsh
 from onec_runtime.execution.value_materialization_router import ValueMaterializationRouter
 from onec_runtime.rdbg.models import DebugTarget, StopEvent
 from onec_runtime.rdbg.session import SessionState
-from onec_runtime.runtime_api import RuntimeReplyKind
+from onec_runtime.runtime_models import RuntimeReplyKind
 from onec_runtime.rdbg.models import EvaluationResult
 from onec_runtime.table_materialization import ReferencePolicy
 from onec_runtime.value_materialization import MaterializationOptions

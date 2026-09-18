@@ -136,14 +136,21 @@ def test_invalid_reference_options_fail_before_table_transfer(options) -> None:
 def test_current_session_default_chunk_size_is_advisory(method, expected_route) -> None:
     """RuntimeSession injects 2400; routed transfers accept this hint."""
 
-    from onec_runtime.execution.session_value_adapter import SessionValueMaterializationAdapter
+    from onec_runtime.execution.public_facade import PublicExecutionFacade
     from onec_runtime.session import RuntimeSession
+    from test_public_execution_facade import _Arbiter, _Controller, _Pipeline, unit
 
     router = RecordingRouter()
+    api = PublicExecutionFacade(
+        _Pipeline(), _Controller(), _Arbiter(),
+        source_unit_factory=unit,
+        status_reader=lambda: "status",
+        value_router=router,
+    )
     session = SimpleNamespace(
         _operation_lock=RLock(),
         config=SimpleNamespace(chunk_size=2400),
-        runtime_api=SessionValueMaterializationAdapter(router),
+        runtime_api=api,
         validate_value_reference=lambda handle: handle,
         _capture_materialization_caller_handoff=nullcontext,
     )

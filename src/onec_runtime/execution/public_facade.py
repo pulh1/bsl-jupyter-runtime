@@ -45,7 +45,9 @@ from onec_runtime.execution.controller.controller import ExecutionController
 from onec_runtime.execution.pipeline import CellExecutionPipeline, PreparedCellHandle
 from onec_runtime.execution.reply_presenter import RuntimeReplyPresenter
 from onec_runtime.execution.session_value_adapter import SessionValueMaterializationAdapter
-from onec_runtime.execution.source_identity import NotebookSourceIdentityFactory
+from onec_runtime.execution.source_identity import (
+    NotebookSourceIdentityFactory, PreparedSourceIdentityLease,
+)
 from onec_runtime.execution.value_reference import validate_public_direct_handle
 from onec_runtime.execution.value_projection_service import (
     ProjectionTicketPort, ValueProjectionService,
@@ -56,10 +58,9 @@ from onec_runtime.execution.worker_activation import WorkerMaterializationSnapsh
 from onec_runtime.execution.termination import (
     FileTerminationConfirmed, ServerTerminationConfirmed,
 )
-from onec_runtime.prototype_runtime import PartialWritebackError
 from onec_runtime.performance_profile import PhaseRecorder
 from onec_runtime.observation import ManagerOrigin, ValueSelection
-from onec_runtime.runtime_api import RuntimeReply
+from onec_runtime.runtime_models import PartialWritebackError, RuntimeReply
 from onec_runtime.runtime_contracts import OperationExecutionProvenance
 from onec_runtime.rdbg.models import ModuleLocation
 from onec_runtime.table_materialization import ReferencePolicy
@@ -104,12 +105,13 @@ class PreparedBslCell:
 
     __slots__ = (
         "_owner", "_candidate", "_prepared", "_source_unit",
-        "_provenance", "_consumed", "_lock",
+        "_provenance", "_consumed", "_lock", "_identity_lease",
     )
 
     def __init__(
         self, owner: object, candidate: PreparedCellHandle,
         prepared: PreparedCell, source_unit: SourceUnitRef,
+        identity_lease: PreparedSourceIdentityLease | None = None,
     ) -> None:
         self._owner = owner
         self._candidate = candidate
@@ -118,6 +120,7 @@ class PreparedBslCell:
         self._provenance: OperationExecutionProvenance | None = None
         self._consumed = False
         self._lock = Lock()
+        self._identity_lease = identity_lease
 
     @property
     def source_unit(self) -> SourceUnitRef:
@@ -127,14 +130,17 @@ class PreparedBslCell:
 
     def _claim(
         self, owner: object,
-    ) -> tuple[PreparedCellHandle, PreparedCell, OperationExecutionProvenance | None]:
+    ) -> tuple[
+        PreparedCellHandle, PreparedCell,
+        OperationExecutionProvenance | None, PreparedSourceIdentityLease | None,
+    ]:
         if self._owner is not owner:
             raise TypeError("Prepared BSL cell belongs to another facade")
         with self._lock:
             if self._consumed:
                 raise RuntimeError("Prepared BSL cell was already consumed")
             self._consumed = True
-            return self._candidate, self._prepared, self._provenance
+            return self._candidate, self._prepared, self._provenance, self._identity_lease
 
     def _read_provenance(
         self, owner: object,
@@ -366,32 +372,36 @@ class PublicExecutionFacade:
             raise TypeError("execution provenance callback must be callable")
         if on_execution_provenance is not None and self._provenance_reader is None:
             raise ProtocolError("execution provenance publication is not configured")
-        visible_unit = self._resolve_source_unit(source, source_unit)
+        visible_unit, lease = self._reserve_source_unit(source, source_unit)
+        try:
+            prepared_evidence: tuple[PreparedCell, OperationExecutionProvenance] | None = None
 
-        prepared_evidence: tuple[PreparedCell, OperationExecutionProvenance] | None = None
+            def read_prepared(prepared: PreparedCell) -> None:
+                nonlocal prepared_evidence
+                prepared_evidence = prepared, self._read_execution_provenance(
+                    prepared, visible_unit,
+                )
 
-        def read_prepared(prepared: PreparedCell) -> None:
-            nonlocal prepared_evidence
-            prepared_evidence = prepared, self._read_execution_provenance(
-                prepared, visible_unit,
+            def publish_admitted(prepared: PreparedCell) -> None:
+                assert on_execution_provenance is not None
+                if prepared_evidence is None or prepared_evidence[0] is not prepared:
+                    raise ProtocolError("admitted provenance has another prepared cell")
+                on_execution_provenance(prepared_evidence[1])
+
+            return self._pipeline.execute(
+                source, visible_unit,
+                wait_handoff=self._wait_handoff,
+                on_prepared=(
+                    read_prepared if on_execution_provenance is not None else None
+                ),
+                on_admitted=(
+                    publish_admitted if on_execution_provenance is not None else None
+                ),
+                on_admitted_ticket=lease.adopt if lease is not None else None,
             )
-
-        def publish_admitted(prepared: PreparedCell) -> None:
-            assert on_execution_provenance is not None
-            if prepared_evidence is None or prepared_evidence[0] is not prepared:
-                raise ProtocolError("admitted provenance has another prepared cell")
-            on_execution_provenance(prepared_evidence[1])
-
-        return self._pipeline.execute(
-            source, visible_unit,
-            wait_handoff=self._wait_handoff,
-            on_prepared=(
-                read_prepared if on_execution_provenance is not None else None
-            ),
-            on_admitted=(
-                publish_admitted if on_execution_provenance is not None else None
-            ),
-        )
+        finally:
+            if lease is not None:
+                lease.release()
 
     def prepare_bsl(
         self, source: str, *, source_unit: SourceUnitRef | None = None,
@@ -403,22 +413,28 @@ class PublicExecutionFacade:
         one-use handle; no Worker activation or RDBG command has begun.
         """
 
-        visible_unit = self._resolve_source_unit(source, source_unit)
-        prepared_cells: list[PreparedCell] = []
-        result = self._pipeline.prepare(
-            source, visible_unit,
-            wait_handoff=self._wait_handoff,
-            on_prepared=prepared_cells.append,
-        )
-        if isinstance(result, SourceDiagnostic):
-            return RuntimeReplyPresenter(self._status_reader).diagnostic_reply(result)
-        if isinstance(result, Unavailable):
-            return RuntimeReplyPresenter(self._status_reader).unavailable_reply(result)
-        if not isinstance(result, PreparedCellHandle) or len(prepared_cells) != 1:
-            raise TypeError("pipeline returned an invalid prepared BSL cell")
-        return PreparedBslCell(
-            self._prepared_owner, result, prepared_cells[0], visible_unit,
-        )
+        visible_unit, lease = self._reserve_source_unit(source, source_unit)
+        try:
+            prepared_cells: list[PreparedCell] = []
+            result = self._pipeline.prepare(
+                source, visible_unit,
+                wait_handoff=self._wait_handoff,
+                on_prepared=prepared_cells.append,
+            )
+            if isinstance(result, SourceDiagnostic):
+                return RuntimeReplyPresenter(self._status_reader).diagnostic_reply(result)
+            if isinstance(result, Unavailable):
+                return RuntimeReplyPresenter(self._status_reader).unavailable_reply(result)
+            if not isinstance(result, PreparedCellHandle) or len(prepared_cells) != 1:
+                raise TypeError("pipeline returned an invalid prepared BSL cell")
+            prepared = PreparedBslCell(
+                self._prepared_owner, result, prepared_cells[0], visible_unit, lease,
+            )
+            lease = None
+            return prepared
+        finally:
+            if lease is not None:
+                lease.release()
 
     def prepared_bsl_execution_provenance(
         self, prepared: PreparedBslCell,
@@ -454,7 +470,9 @@ class PublicExecutionFacade:
 
         if not isinstance(prepared, PreparedBslCell):
             raise TypeError("A prepared BSL cell is required")
-        prepared._claim(self._prepared_owner)
+        _candidate, _cell, _evidence, lease = prepared._claim(self._prepared_owner)
+        if lease is not None:
+            lease.release()
 
     def attempt_prepared_main_for_capture(
         self, prepared: PreparedBslCell,
@@ -506,28 +524,40 @@ class PublicExecutionFacade:
             raise TypeError("execution provenance callback must be callable")
         if on_execution_provenance is not None and self._provenance_reader is None:
             raise ProtocolError("execution provenance publication is not configured")
-        candidate, exact_cell, cached_evidence = prepared._claim(self._prepared_owner)
-        evidence = None
-        if on_execution_provenance is not None:
-            evidence = (
-                cached_evidence
-                if cached_evidence is not None
-                else self._read_execution_provenance(exact_cell, prepared.source_unit)
-            )
-
-        def publish_admitted(admitted: PreparedCell) -> None:
-            assert on_execution_provenance is not None and evidence is not None
-            if admitted is not exact_cell:
-                raise ProtocolError("admitted provenance has another prepared cell")
-            on_execution_provenance(evidence)
-
-        return self._pipeline.execute_prepared(
-            candidate,
-            wait_handoff=self._wait_handoff,
-            on_admitted=(publish_admitted if evidence is not None else None),
-            on_admitted_ticket=on_admitted_ticket,
-            validate_claimed=validate_claimed,
+        candidate, exact_cell, cached_evidence, lease = prepared._claim(
+            self._prepared_owner,
         )
+        try:
+            evidence = None
+            if on_execution_provenance is not None:
+                evidence = (
+                    cached_evidence
+                    if cached_evidence is not None
+                    else self._read_execution_provenance(exact_cell, prepared.source_unit)
+                )
+
+            def publish_admitted(admitted: PreparedCell) -> None:
+                assert on_execution_provenance is not None and evidence is not None
+                if admitted is not exact_cell:
+                    raise ProtocolError("admitted provenance has another prepared cell")
+                on_execution_provenance(evidence)
+
+            def adopted(ticket: ExecutionTicket) -> None:
+                if lease is not None:
+                    lease.adopt(ticket)
+                if on_admitted_ticket is not None:
+                    on_admitted_ticket(ticket)
+
+            return self._pipeline.execute_prepared(
+                candidate,
+                wait_handoff=self._wait_handoff,
+                on_admitted=(publish_admitted if evidence is not None else None),
+                on_admitted_ticket=adopted if lease is not None or on_admitted_ticket is not None else None,
+                validate_claimed=validate_claimed,
+            )
+        finally:
+            if lease is not None:
+                lease.release()
 
     def _resolve_source_unit(
         self, source: str, source_unit: SourceUnitRef | None,
@@ -544,6 +574,20 @@ class PublicExecutionFacade:
         if visible_unit.source_sha256 != source_sha256(source):
             raise ProtocolError("notebook source identity does not match cell text")
         return visible_unit
+
+    def _reserve_source_unit(
+        self, source: str, source_unit: SourceUnitRef | None,
+    ) -> tuple[SourceUnitRef, PreparedSourceIdentityLease | None]:
+        identity = self._source_identity
+        if identity is None:
+            return self._resolve_source_unit(source, source_unit), None
+        if not isinstance(source, str) or not source.strip():
+            raise ProtocolError("BSL cell is empty")
+        lease = identity.reserve(source, explicit=source_unit)
+        if lease.source_unit.source_sha256 != source_sha256(source):
+            lease.release()
+            raise ProtocolError("notebook source identity does not match cell text")
+        return lease.source_unit, lease
 
     def _read_execution_provenance(
         self, prepared: PreparedCell, source_unit: SourceUnitRef,
@@ -1053,14 +1097,18 @@ class PublicExecutionFacade:
                 ).start()
             raise
         except KeyboardInterrupt:
-            ticket.detach_waiter()
-            if on_detached_completion is not None:
-                Thread(
-                    target=_publish_detached,
-                    args=(ticket, on_detached_completion),
-                    name="onec-runtime-detached-execution",
-                    daemon=True,
-                ).start()
+            try:
+                if not ticket.status().settled:
+                    self._controller.request_stop(ticket)
+            finally:
+                ticket.detach_waiter()
+                if on_detached_completion is not None:
+                    Thread(
+                        target=_publish_detached,
+                        args=(ticket, on_detached_completion),
+                        name="onec-runtime-detached-execution",
+                        daemon=True,
+                    ).start()
             raise
         except BaseException as error:
             if on_completion is not None:

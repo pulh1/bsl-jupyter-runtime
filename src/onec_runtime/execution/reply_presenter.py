@@ -9,7 +9,7 @@ from onec_runtime.bsl.diagnostics import normalize_source_error
 from onec_runtime.execution.contracts import SourceDiagnostic, Unavailable
 
 if TYPE_CHECKING:
-    from onec_runtime.runtime_api import RuntimeStatus
+    from onec_runtime.runtime_models import RuntimeStatus
 
 
 class RuntimeReplyPresenter:
@@ -32,7 +32,7 @@ class RuntimeReplyPresenter:
             raise TypeError("pipeline diagnostic is invalid")
         status = self._status()
         normalized = self._normalize(diagnostic)
-        from onec_runtime.runtime_api import RuntimeReply, RuntimeReplyKind
+        from onec_runtime.runtime_models import RuntimeReply, RuntimeReplyKind
 
         return RuntimeReply(
             RuntimeReplyKind.SOURCE_FAILED,
@@ -53,7 +53,7 @@ class RuntimeReplyPresenter:
         if not isinstance(unavailable, Unavailable):
             raise TypeError("pipeline unavailable outcome is invalid")
         status = self._status()
-        from onec_runtime.runtime_api import RuntimeReply, RuntimeReplyKind
+        from onec_runtime.runtime_models import RuntimeReply, RuntimeReplyKind
 
         return RuntimeReply(
             RuntimeReplyKind.SOURCE_FAILED,
@@ -65,7 +65,7 @@ class RuntimeReplyPresenter:
 
     def _status(self) -> RuntimeStatus:
         status = self._status_reader()
-        from onec_runtime.runtime_api import RuntimeStatus
+        from onec_runtime.runtime_models import RuntimeStatus
 
         if not isinstance(status, RuntimeStatus):
             raise TypeError("reply presenter status reader returned an invalid value")

@@ -20,7 +20,7 @@ from onec_runtime.execution.main.policy import MainPreparedPayload
 from onec_runtime.execution.preparation import RoutePreparedStatement, WorkerCandidateIntent
 from onec_runtime.bsl.parser_target import PythonParserTarget
 from onec_runtime.rdbg.models import EvaluationResult
-from onec_runtime.runtime_api import (
+from onec_runtime.runtime_models import (
     CaptureCorrelationTicket, OperationState, RuntimeReplyKind,
 )
 

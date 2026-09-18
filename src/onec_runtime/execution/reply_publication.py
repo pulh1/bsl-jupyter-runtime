@@ -25,7 +25,7 @@ from onec_runtime.rdbg.models import EvaluationResult
 from onec_runtime.table_value import evaluation_to_python
 
 if TYPE_CHECKING:
-    from onec_runtime.runtime_api import CaptureCorrelationTicket, RuntimeReply
+    from onec_runtime.runtime_models import CaptureCorrelationTicket, RuntimeReply
 
 
 _BSL_FAILURE = "BSL execution failed"
@@ -95,7 +95,7 @@ class MainReplyPolicy:
     ) -> RuntimeReply:
         # RuntimeApi can import this policy before declaring its public reply
         # dataclasses; resolve the public contract only when publishing.
-        from onec_runtime.runtime_api import OperationState, RuntimeReply, RuntimeReplyKind
+        from onec_runtime.runtime_models import OperationState, RuntimeReply, RuntimeReplyKind
 
         if (
             not isinstance(outcome, (MainYield, MainConfirmedDecodeFailure))
@@ -215,7 +215,7 @@ class CaptureReplyPolicy:
     def publish(
         self, outcome: CaptureRemoteOutcome, record: CapturePublicationRecord,
     ) -> RuntimeReply:
-        from onec_runtime.runtime_api import OperationState, RuntimeReply, RuntimeReplyKind
+        from onec_runtime.runtime_models import OperationState, RuntimeReply, RuntimeReplyKind
 
         if not isinstance(outcome, CaptureRemoteOutcome):
             raise TypeError("CAPTURE publication requires a confirmed remote outcome")

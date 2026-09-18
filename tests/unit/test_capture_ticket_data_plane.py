@@ -1,6 +1,7 @@
 """Fenced CAPTURE inspection through controller tickets and saved stop data."""
 
 from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
 
@@ -26,6 +27,9 @@ class Ticket:
     def detach_waiter(self):
         self.detached = True
 
+    def status(self):
+        return SimpleNamespace(settled=False)
+
 
 class TicketController:
     def __init__(self, scope):
@@ -34,6 +38,10 @@ class TicketController:
         self.materialization_ticket = Ticket(b"private-payload")
         self.cleanup_ticket = Ticket(None)
         self.requested: list[tuple[object, ...]] = []
+        self.stopped: list[Ticket] = []
+
+    def request_stop(self, ticket: Ticket):
+        self.stopped.append(ticket)
 
     def submit_capture_variable(self, name: str, *, stack_level: int = 0):
         self.requested.append(("variable", name, stack_level))
@@ -130,7 +138,7 @@ def test_named_private_variable_and_materialization_wait_through_ticket_handoff(
     assert events == ["release", "reacquire"] * 3
 
 
-def test_interrupted_private_read_detaches_waiter_without_dropping_scope():
+def test_interrupted_private_read_requests_stop_without_dropping_scope():
     from onec_runtime.execution.capture.data_plane import CaptureTicketDataPlane
 
     scope = ready_scope()
@@ -143,6 +151,7 @@ def test_interrupted_private_read_detaches_waiter_without_dropping_scope():
         data.read_private_variable("Сумма")
 
     assert ticket.detached is True
+    assert controller.stopped == [ticket]
     assert controller.capture_scope is scope
 
 

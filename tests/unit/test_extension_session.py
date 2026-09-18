@@ -318,6 +318,9 @@ class _SessionModuleRuntimeApi:
     def owns_debug_ui_stream(self) -> bool:
         return False
 
+    def close(self) -> None:
+        """Retire the fake public execution owner during Session teardown."""
+
 
 class _IdleRdbg:
     def heartbeat(self) -> dict[str, object]:

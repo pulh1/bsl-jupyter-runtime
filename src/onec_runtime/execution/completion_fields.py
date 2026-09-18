@@ -28,7 +28,7 @@ from onec_runtime.rdbg.models import EvaluationResult
 from onec_runtime.table_value import evaluation_to_python
 
 if TYPE_CHECKING:
-    from onec_runtime.runtime_api import RuntimeNamespaceSnapshot
+    from onec_runtime.runtime_models import RuntimeNamespaceSnapshot
 
 
 MAX_COMPLETION_TEXT_CHARS = 20_000
@@ -51,6 +51,8 @@ class CompletionHelperController(Protocol):
     def submit_completion_helper(
         self, plan: CompletionFieldsPlan,
     ) -> LocalWaitTicket[tuple[str, ...]]: ...
+
+    def request_stop(self, ticket: LocalWaitTicket[tuple[str, ...]]) -> object: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,12 +160,13 @@ class CompletionFieldsService:
         ticket = self._controller.submit_completion_helper(plan)
         result = wait_initiator_locally(
             ticket, timeout_s=local_wait, wait_handoff=self._wait_handoff,
+            request_stop=lambda: self._controller.request_stop(ticket),
         )
         validate_current()
         return _validate_fields(result)
 
     def _read_namespace(self) -> RuntimeNamespaceSnapshot:
-        from onec_runtime.runtime_api import RuntimeNamespaceSnapshot
+        from onec_runtime.runtime_models import RuntimeNamespaceSnapshot
 
         snapshot = self._namespace_snapshot()
         if not isinstance(snapshot, RuntimeNamespaceSnapshot):

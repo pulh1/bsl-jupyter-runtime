@@ -23,6 +23,7 @@ def test_settled_timeout_error_does_not_detach_initiating_waiter() -> None:
         with pytest.raises(TimeoutError, match="remote plan failed"):
             wait_initiator_locally(
                 ticket, timeout_s=1, wait_handoff=nullcontext,
+                request_stop=lambda: arbiter.request_stop(ticket),
             )
         assert ticket.status().settled is True
         assert ticket.status().waiter_detached is False

@@ -7,6 +7,7 @@ from uuid import UUID
 
 import pytest
 
+from onec_runtime.capture_evaluation import CaptureEvaluationState, CapturePhase
 from onec_runtime.errors import ProtocolError, StaleCaptureError
 from onec_runtime.execution.arbiter import RdbgArbiter, RouteToken
 from onec_runtime.execution.capture.selected_table_materialization import (
@@ -263,11 +264,12 @@ def test_selected_descriptor_resolves_inside_owned_materialization_ticket(monkey
         observed = []
 
         def fake_execute(actual_scope, plan, *, port, shield_workspace,
-                         restore_workspace):
+                         restore_workspace, on_confirmed_failure):
+            assert callable(on_confirmed_failure)
             observed.append((actual_scope, plan.instruction, current_thread()))
             return Settlement(b"private table bytes")
 
-        monkeypatch.setattr(controller._capture_materialization_executor, "execute", fake_execute)
+        monkeypatch.setattr(controller._capture_private_data_plane.materialization_executor, "execute", fake_execute)
         request = CaptureSelectedTableTransferRequest(
             handle, scope, ReferencePolicy(), max_rows=1, max_bytes=2048,
             runtime_generation=1, context_generation=1,
@@ -284,6 +286,26 @@ def test_selected_descriptor_resolves_inside_owned_materialization_ticket(monkey
         controller.invalidate_capture_inspection()
         with pytest.raises((ProtocolError, StaleCaptureError)):
             controller.submit_capture_materialization(request)
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_selected_descriptor_registry_is_owned_by_private_data_plane() -> None:
+    from onec_runtime.execution.capture.manager_metadata import CaptureSelectedTableDescriptor
+    from onec_runtime.execution.controller.capture_private_data_plane import CapturePrivateDataPlane
+
+    _session, arbiter, controller, _service = _bound()
+    try:
+        scope = controller.capture_scope
+        assert scope is not None
+        descriptor = CaptureSelectedTableDescriptor(
+            scope, "Query", ("Manager",), "Staff", 0, 1, ("Employee",),
+        )
+        handle = controller.register_capture_table_descriptor(descriptor)
+        assert isinstance(controller._capture_private_data_plane, CapturePrivateDataPlane)
+        assert controller.require_capture_table_descriptor(handle, scope) is descriptor
+        assert "_capture_table_descriptors" not in vars(controller)
+        assert "_capture_table_descriptor_scope" not in vars(controller)
     finally:
         arbiter.close(timeout=3)
 
@@ -314,7 +336,7 @@ def test_bad_selected_key_retires_ledger_before_caller_retries(monkeypatch) -> N
 
         monkeypatch.setattr(controller_module, "_observe_capture_ticket", delayed)
         monkeypatch.setattr(
-            controller._capture_materialization_executor, "execute",
+            controller._capture_private_data_plane.materialization_executor, "execute",
             lambda *args, **kwargs: Settlement(b"confirmed"),
         )
         request = CaptureSelectedTableTransferRequest(
@@ -406,6 +428,43 @@ def test_confirmed_bad_probe_releases_ledger_before_observer_runs(monkeypatch) -
         arbiter.close(timeout=3)
 
 
+def test_manager_local_fence_rejection_retires_ledger_before_waiter(monkeypatch) -> None:
+    import onec_runtime.execution.controller.controller as controller_module
+    from onec_runtime.execution.capture.manager_metadata import CaptureManagerProbePlan
+
+    _session, arbiter, controller, _service = _bound()
+    scope = controller.capture_scope
+    assert scope is not None
+    release_observer = Event()
+    original_observer = controller_module._observe_capture_ticket
+    original_check = controller._require_capture_manager_metadata_ready_locked
+
+    def delayed_observer(ticket, ledger, receipt_id):
+        if receipt_id.startswith("manager-metadata-"):
+            assert release_observer.wait(10)
+        original_observer(ticket, ledger, receipt_id)
+
+    def reject_on_worker(selected_scope, *, allow_pending=False):
+        if allow_pending:
+            raise ProtocolError("local manager fence changed")
+        return original_check(selected_scope, allow_pending=allow_pending)
+
+    monkeypatch.setattr(controller_module, "_observe_capture_ticket", delayed_observer)
+    monkeypatch.setattr(
+        controller, "_require_capture_manager_metadata_ready_locked", reject_on_worker,
+    )
+    try:
+        plan = CaptureManagerProbePlan(scope, "Query", ("Manager",))
+        with pytest.raises(ProtocolError, match="local manager fence changed"):
+            controller.submit_capture_manager_metadata(plan).wait_settled(3)
+        ledger = controller.capture_evaluation_ledger()
+        assert ledger.status().phase is CapturePhase.PAUSED
+        assert ledger.wait(1).state is CaptureEvaluationState.FAILED
+    finally:
+        release_observer.set()
+        arbiter.close(timeout=3)
+
+
 def test_manager_and_metadata_handles_fail_after_scope_invalidation() -> None:
     session, arbiter, controller, service = _bound()
     try:
@@ -492,11 +551,13 @@ def test_selected_handle_materializes_through_facade_value_ports(monkeypatch) ->
     session.schema_names = ("Amount",)
     observed = []
 
-    def fake_execute(scope, plan, *, port, shield_workspace, restore_workspace):
+    def fake_execute(scope, plan, *, port, shield_workspace, restore_workspace,
+                     on_confirmed_failure):
+        assert callable(on_confirmed_failure)
         observed.append((scope, plan.instruction, current_thread()))
         return Settlement(TABLE_PAYLOAD)
 
-    monkeypatch.setattr(controller._capture_materialization_executor, "execute", fake_execute)
+    monkeypatch.setattr(controller._capture_private_data_plane.materialization_executor, "execute", fake_execute)
     catalog = lambda: WorkerMaterializationSnapshot(0, ())
     router = ValueMaterializationRouter(
         controller, arbiter, runtime_generation=1, context_generation=1,

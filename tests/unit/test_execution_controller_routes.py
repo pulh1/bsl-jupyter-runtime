@@ -10,6 +10,7 @@ import pytest
 from onec_runtime.errors import ProtocolError
 from onec_runtime.capture_values import VariableRole
 from onec_runtime.execution.arbiter import RdbgArbiter, RouteToken, Settlement
+from onec_runtime.execution.contracts import SubmissionReceipt
 from onec_runtime.capture_evaluation import CapturePhase
 from onec_runtime.execution.capture.cell_evaluator import CaptureCellEvaluator
 from onec_runtime.execution.capture.executor import CaptureExecutor
@@ -82,6 +83,202 @@ class CompleteSession(RouteSession):
             pending, timeout_s=timeout_s,
             on_transport_dispatch=lambda: None,
         )
+
+
+@pytest.mark.parametrize("interrupt_after_adopt", (False, True))
+def test_interrupt_during_receipt_adoption_leaves_no_main_ticket(
+    interrupt_after_adopt: bool,
+) -> None:
+    from onec_runtime.execution.controller.controller import ExecutionController
+
+    class InterruptedReceipt(SubmissionReceipt):
+        def adopt(self, ticket):
+            if interrupt_after_adopt:
+                super().adopt(ticket)
+            raise KeyboardInterrupt
+
+    session = CompleteSession()
+    arbiter = RdbgArbiter(session, RouteToken("runtime-1", 1, 0, "main"))
+    controller = ExecutionController(
+        arbiter,
+        MainExecutor(poll_interval_s=0.1),
+        CaptureExecutor(None, KERNEL, decode_command_id=evaluation_to_python),
+        CaptureCellEvaluator(),
+        BreakpointRegistry(KERNEL, (BUSINESS,)),
+        runtime_generation=1,
+    )
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            controller.submit_main("Результат = 1;", _receipt=InterruptedReceipt())
+
+        assert not arbiter.has_pending_operations
+        assert session.calls == []
+        if interrupt_after_adopt:
+            assert controller.main_operation is not None
+            assert controller.main_operation.phase is MainPhase.FAILED_BEFORE_DISPATCH
+        else:
+            assert controller.main_operation is None
+            assert controller.submit_main("Результат = 2;").wait_settled(3).kind.value == "capture"
+    finally:
+        arbiter.close(timeout=3)
+
+
+@pytest.mark.parametrize("interrupt_after_adopt", (False, True))
+def test_interrupt_during_receipt_adoption_releases_capture_slot(
+    interrupt_after_adopt: bool,
+) -> None:
+    from onec_runtime.execution.controller.controller import ExecutionController
+
+    class InterruptedReceipt(SubmissionReceipt):
+        def adopt(self, ticket):
+            if interrupt_after_adopt:
+                super().adopt(ticket)
+            raise KeyboardInterrupt
+
+    session = CompleteSession()
+    arbiter = RdbgArbiter(session, RouteToken("runtime-1", 1, 0, "main"))
+    controller = ExecutionController(
+        arbiter,
+        MainExecutor(poll_interval_s=0.1),
+        CaptureExecutor(None, KERNEL, decode_command_id=evaluation_to_python),
+        CaptureCellEvaluator(),
+        BreakpointRegistry(KERNEL, (BUSINESS,)),
+        runtime_generation=1,
+    )
+    try:
+        controller.submit_main("Результат = 1;").wait_settled(3)
+        ledger = controller.capture_evaluation_ledger()
+
+        with pytest.raises(KeyboardInterrupt):
+            controller.submit_capture_cell(
+                "Результат = 2;", _receipt=InterruptedReceipt(),
+            )
+
+        assert not arbiter.has_pending_operations
+        assert ledger.status().phase is CapturePhase.PAUSED
+        assert ledger.status().pending_evaluation_id is None
+        assert controller.submit_capture_cell("Результат = 3;").wait_settled(3).error_occurred is False
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_interrupt_after_capture_submit_return_cancels_unready_ticket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from onec_runtime.execution.controller.controller import ExecutionController
+
+    session = CompleteSession()
+    arbiter = RdbgArbiter(session, RouteToken("runtime-1", 1, 0, "main"))
+    controller = ExecutionController(
+        arbiter,
+        MainExecutor(poll_interval_s=0.1),
+        CaptureExecutor(None, KERNEL, decode_command_id=evaluation_to_python),
+        CaptureCellEvaluator(),
+        BreakpointRegistry(KERNEL, (BUSINESS,)),
+        runtime_generation=1,
+    )
+    try:
+        controller.submit_main("Результат = 1;").wait_settled(3)
+        ledger = controller.capture_evaluation_ledger()
+        original_submit = arbiter.submit
+
+        def interrupted_submit(*args, **kwargs):
+            original_submit(*args, **kwargs)
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(arbiter, "submit", interrupted_submit)
+        with pytest.raises(KeyboardInterrupt):
+            controller.submit_capture_cell("Результат = 2;")
+        monkeypatch.setattr(arbiter, "submit", original_submit)
+
+        assert not arbiter.has_pending_operations
+        assert ledger.status().phase is CapturePhase.PAUSED
+        assert ledger.status().pending_evaluation_id is None
+        assert controller.submit_capture_cell("Результат = 3;").wait_settled(3).error_occurred is False
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_interrupt_after_direct_continuation_point_submit_does_not_orphan_ticket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from onec_runtime.execution.controller.controller import ExecutionController
+
+    session = CompleteSession()
+    arbiter = RdbgArbiter(session, RouteToken("runtime-1", 1, 0, "main"))
+    controller = ExecutionController(
+        arbiter,
+        MainExecutor(poll_interval_s=0.1),
+        CaptureExecutor(None, KERNEL, decode_command_id=evaluation_to_python),
+        CaptureCellEvaluator(),
+        BreakpointRegistry(KERNEL, (BUSINESS,)),
+        runtime_generation=1,
+    )
+    try:
+        controller.submit_main("Результат = 1;").wait_settled(3)
+        controller._breakpoint_routes = object()
+        original_submit = arbiter.submit
+
+        def interrupted_submit(*args, **kwargs):
+            original_submit(*args, **kwargs)
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(arbiter, "submit", interrupted_submit)
+        with pytest.raises(KeyboardInterrupt):
+            controller.configure_continuation_capture_points((BUSINESS,))
+        monkeypatch.setattr(arbiter, "submit", original_submit)
+        controller._breakpoint_routes = None
+
+        assert not arbiter.has_pending_operations
+        assert controller.capture_scope is not None
+        assert controller.submit_capture_cell("Результат = 3;").wait_settled(3).error_occurred is False
+    finally:
+        arbiter.close(timeout=3)
+
+
+@pytest.mark.parametrize("path", ("variable", "page", "typed_page", "resume"))
+def test_interrupt_after_direct_capture_submit_preserves_usable_stop(
+    monkeypatch: pytest.MonkeyPatch, path: str,
+) -> None:
+    from onec_runtime.execution.controller.controller import ExecutionController
+
+    session = CompleteSession()
+    arbiter = RdbgArbiter(session, RouteToken("runtime-1", 1, 0, "main"))
+    controller = ExecutionController(
+        arbiter,
+        MainExecutor(poll_interval_s=0.1),
+        CaptureExecutor(None, KERNEL, decode_command_id=evaluation_to_python),
+        CaptureCellEvaluator(),
+        BreakpointRegistry(KERNEL, (BUSINESS,)),
+        runtime_generation=1,
+    )
+    try:
+        controller.submit_main("Результат = 1;").wait_settled(3)
+        ledger = controller.capture_evaluation_ledger()
+        original_submit = arbiter.submit
+
+        def interrupted_submit(*args, **kwargs):
+            original_submit(*args, **kwargs)
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(arbiter, "submit", interrupted_submit)
+        with pytest.raises(KeyboardInterrupt):
+            if path == "variable":
+                controller.submit_capture_variable("Amount")
+            elif path == "page":
+                controller.submit_capture_variable_page(stack_level=0, start=0, stop=1)
+            elif path == "typed_page":
+                controller.submit_capture_typed_variable_page(stack_level=0, start=0, stop=1)
+            else:
+                controller.submit_resume()
+        monkeypatch.setattr(arbiter, "submit", original_submit)
+
+        assert not arbiter.has_pending_operations
+        assert ledger.status().phase is CapturePhase.PAUSED
+        assert controller.capture_scope is not None
+        assert controller.submit_capture_cell("Результат = 3;").wait_settled(3).error_occurred is False
+    finally:
+        arbiter.close(timeout=3)
 
 
 def test_capture_variable_page_uses_owned_ticket_and_safe_names() -> None:

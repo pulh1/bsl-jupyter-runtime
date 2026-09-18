@@ -41,11 +41,6 @@ from onec_runtime.errors import (
     BslExecutionError,
     ProtocolError,
 )
-from onec_runtime.prototype_runtime import (
-    MainCompletion,
-    OperationHandle,
-    OperationState,
-)
 from onec_runtime.privacy import public_artifact_value
 import onec_runtime.server_worker as server_worker
 from onec_runtime.server_worker import (

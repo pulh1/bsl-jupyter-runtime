@@ -5,7 +5,6 @@ import json
 import pytest
 
 from onec_runtime.errors import MaterializationLimitError
-from onec_runtime.runtime_api import PrototypeRuntimeApi
 from onec_runtime.value_materialization import MaterializationOptions, decode_value_payload
 
 
@@ -15,6 +14,5 @@ def test_target_limit_envelope_routes_to_typed_value_error() -> None:
         separators=(",", ":"),
     ).encode("utf-8")
 
-    assert PrototypeRuntimeApi._payload_materialization_route(payload) == "value"
     with pytest.raises(MaterializationLimitError, match="items limit 1"):
         decode_value_payload(payload, MaterializationOptions(max_items=1))

@@ -17,7 +17,7 @@ from onec_runtime.execution.controller.controller import MainYield, MainYieldKin
 from onec_runtime.execution.main import MainOperation, MainPhase
 from onec_runtime.execution.main.completion import MainRemoteCompletion
 from onec_runtime.rdbg.models import EvaluationResult
-from onec_runtime.runtime_api import (
+from onec_runtime.runtime_models import (
     CaptureCorrelationTicket, OperationState, RuntimeReplyKind,
 )
 

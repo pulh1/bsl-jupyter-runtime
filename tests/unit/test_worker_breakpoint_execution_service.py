@@ -16,7 +16,7 @@ from onec_runtime.breakpoint_workspace import (
 from onec_runtime.bsl.source_maps import SourceUnitKind, SourceUnitRef
 from onec_runtime.errors import ProtocolError
 from onec_runtime.execution.arbiter import (
-    RdbgArbiter, RouteToken, Settlement, TargetTerminated,
+    CancelledBeforeEffect, RdbgArbiter, RouteToken, Settlement, TargetTerminated,
 )
 from arbiter_test_cleanup import confirm_test_server_terminated
 from onec_runtime.execution.worker_breakpoint_service import WorkerBreakpointService
@@ -254,35 +254,81 @@ def test_mutation_boundary_rejects_before_catalog_or_remote_effect(service) -> N
     assert session.calls == []
 
 
-def test_interrupted_worker_breakpoint_wait_detaches_only_caller(service) -> None:
+def test_interrupted_worker_breakpoint_wait_requests_stop(service) -> None:
     _api, catalog, workspace, _session, arbiter, _boundary = service
     tickets = []
+    stop_calls = []
     submit = arbiter.submit
+    entered = Event()
+    release = Event()
 
-    def record_submit(route, plan):
-        ticket = submit(route, plan)
+    def record_submit(route, plan, **kwargs):
+        def blocked_plan(port):
+            entered.set()
+            assert release.wait(5)
+            return plan(port)
+
+        ticket = submit(route, blocked_plan, **kwargs)
         tickets.append(ticket)
         return ticket
 
     @contextmanager
     def interrupted_wait():
+        assert entered.wait(5)
         raise KeyboardInterrupt()
         yield
 
     arbiter.submit = record_submit
+
+    def request_stop(ticket):
+        stop_calls.append(ticket)
+        return arbiter.request_stop(ticket)
+
     api = WorkerBreakpointService(
         arbiter, catalog, workspace,
         require_mutation_boundary=lambda: None,
         wait_handoff=interrupted_wait,
+        request_stop=request_stop,
     )
     unit = SourceUnitRef(SourceUnitKind.MODULE, "WorkerA", 1, "a" * 64)
 
-    with pytest.raises(KeyboardInterrupt):
-        api.add_worker_breakpoint(unit, "WorkerA", 2)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            api.add_worker_breakpoint(unit, "WorkerA", 2)
+        assert len(tickets) == 1
+        assert tickets[0].status().waiter_detached is True
+        assert tickets[0].status().stop_requested is True
+        assert stop_calls == tickets
+    finally:
+        release.set()
+        if tickets:
+            tickets[0].wait_settled(3)
 
-    assert len(tickets) == 1
-    assert tickets[0].status().waiter_detached is True
-    assert tickets[0].wait_settled(3).breakpoint.source_unit == unit
+
+def test_worker_breakpoint_submit_interrupt_rolls_back_receipted_ticket(service) -> None:
+    api, _catalog, _workspace, session, arbiter, _boundary = service
+    submitted = []
+    submit = arbiter.submit
+
+    def interrupt_after_adoption(*args, **kwargs):
+        ticket = submit(*args, **kwargs)
+        submitted.append(ticket)
+        raise KeyboardInterrupt
+
+    arbiter.submit = interrupt_after_adoption
+    unit = SourceUnitRef(SourceUnitKind.MODULE, "WorkerA", 1, "a" * 64)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            api.add_worker_breakpoint(unit, "WorkerA", 2)
+        assert len(submitted) == 1
+        assert submitted[0].status().settled is True
+        with pytest.raises(CancelledBeforeEffect):
+            submitted[0].wait_settled(0)
+        assert session.calls == []
+        assert api.list_worker_breakpoints() == ()
+    finally:
+        for ticket in submitted:
+            ticket.cancel_queued()
 
 
 def test_queued_mutation_rechecks_boundary_before_any_effect(service) -> None:
@@ -302,8 +348,8 @@ def test_queued_mutation_rechecks_boundary_before_any_effect(service) -> None:
     submitted = Event()
     original_submit = arbiter.submit
 
-    def tracked_submit(route, plan):
-        ticket = original_submit(route, plan)
+    def tracked_submit(route, plan, **kwargs):
+        ticket = original_submit(route, plan, **kwargs)
         submitted.set()
         return ticket
 

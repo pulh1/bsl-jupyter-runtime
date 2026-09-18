@@ -21,7 +21,7 @@ from onec_runtime.execution.namespace import RuntimeNamespaceOwner
 from onec_runtime.execution.worker_activation import WorkerActivationSnapshot
 
 if TYPE_CHECKING:
-    from onec_runtime.runtime_api import RuntimeNamespaceSnapshot, RuntimeStatus
+    from onec_runtime.runtime_models import RuntimeNamespaceSnapshot, RuntimeStatus
 
 
 class ExecutionActivity(str, Enum):
@@ -114,7 +114,7 @@ class ExecutionStatusProjection:
     def status(self) -> RuntimeStatus:
         """Return a local observation without inferring loss from a timeout."""
 
-        from onec_runtime.runtime_api import RuntimeStatus
+        from onec_runtime.runtime_models import RuntimeStatus
 
         facts = self._read_facts()
         worker = self._worker_snapshot()
@@ -147,7 +147,7 @@ class ExecutionStatusProjection:
         return facts
 
     def _read_namespace(self, facts: ControllerStatusFacts) -> RuntimeNamespaceSnapshot:
-        from onec_runtime.runtime_api import RuntimeNamespaceSnapshot
+        from onec_runtime.runtime_models import RuntimeNamespaceSnapshot
 
         namespace = self._namespace.namespace_snapshot()
         if not isinstance(namespace, RuntimeNamespaceSnapshot):
@@ -158,7 +158,7 @@ class ExecutionStatusProjection:
 
 
 def _state(facts: ControllerStatusFacts):
-    from onec_runtime.prototype_runtime import OperationState
+    from onec_runtime.runtime_models import OperationState
 
     if (
         facts.main_phase is MainPhase.LOST

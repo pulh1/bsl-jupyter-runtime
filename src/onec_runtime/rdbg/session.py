@@ -11,6 +11,7 @@ from uuid import UUID, uuid4
 
 from onec_runtime.errors import (
     CommandTimeout,
+    LocalVariablesResultTimeout,
     StopWaitIntervalElapsed,
     EvaluationDispatchUnknown,
     ProtocolError,
@@ -913,14 +914,17 @@ class RdbgSession:
         self,
         pending: PendingEvaluation,
     ) -> EvaluationResult | StopEvent | None:
-        if not self._event_queue:
-            return None
-        event = self._event_queue[0]
-        if isinstance(event, StopEvent):
-            return self._event_queue.popleft()
-        if event.result_id != pending.result_id:
-            raise ProtocolError("Evaluation event correlation mismatch")
-        return self._event_queue.popleft()
+        queued = list(self._event_queue)
+        for index, event in enumerate(queued):
+            if isinstance(event, StopEvent):
+                if event.target_id != pending.target_id:
+                    continue
+            elif event.result_id != pending.result_id:
+                raise ProtocolError("Evaluation event correlation mismatch")
+            del queued[index]
+            self._event_queue = deque(queued)
+            return event
+        return None
 
     def evaluate_collection(
         self,
@@ -1040,7 +1044,7 @@ class RdbgSession:
         def request_once() -> LocalVariablesResult:
             remaining = deadline - monotonic()
             if remaining <= 0:
-                raise CommandTimeout("Timed out waiting for local variables")
+                raise LocalVariablesResultTimeout("Timed out waiting for local variables")
             result_id = uuid4()
             response = self._request(
                 "evalLocalVariables",
@@ -1070,7 +1074,7 @@ class RdbgSession:
                 polled = (self._poll(interval) if on_transport_dispatch is None else
                           self._poll(interval, on_transport_dispatch=on_transport_dispatch))
                 self._ingest_poll_events(*polled)
-            raise CommandTimeout(
+            raise LocalVariablesResultTimeout(
                 f"Timed out waiting for local variables result {result_id}"
             )
 

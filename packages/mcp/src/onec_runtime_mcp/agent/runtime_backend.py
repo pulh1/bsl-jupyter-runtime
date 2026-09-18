@@ -43,10 +43,10 @@ from onec_runtime.config import RuntimeConfig
 from onec_runtime.bsl.lexer import BslLexError
 from onec_runtime.bsl.parser_target import BslParseError
 from onec_runtime.errors import BslExecutionError, ProtocolError
-from onec_runtime.prototype_runtime import OperationState, PartialWritebackError
 from onec_runtime.execution.public_facade import PreparedMainExecutionAttempt
-from onec_runtime.runtime_api import (
-    _PreparedMainExecutionAttempt,
+from onec_runtime.runtime_models import (
+    OperationState,
+    PartialWritebackError,
     RuntimeNamespaceSnapshot,
     RuntimeReply,
     RuntimeReplyKind,
@@ -503,7 +503,7 @@ class OnecRuntimeBackend:
         try:
             prepared = self._session.prepare_capture_hypothesis(source, capture)
         except (BslParseError, BslLexError, SemanticLoweringError):
-            # PrototypeRuntimeApi is the structured normalization boundary.
+            # RuntimeSession is the structured normalization boundary.
             # Raw source exceptions here mean a non-conforming session and
             # cannot be truthfully projected without its exact mapped branch.
             raise ProtocolError("CAPTURE preparation was not normalized") from None
@@ -754,9 +754,7 @@ class OnecRuntimeBackend:
             return CaptureRunOutcome(
                 BackendExecution(AgentOperationState.UNKNOWN, (), False, "unknown")
             )
-        if type(attempt) not in (
-            _PreparedMainExecutionAttempt, PreparedMainExecutionAttempt,
-        ):
+        if type(attempt) is not PreparedMainExecutionAttempt:
             return CaptureRunOutcome(
                 BackendExecution(AgentOperationState.UNKNOWN, (), False, "unknown")
             )

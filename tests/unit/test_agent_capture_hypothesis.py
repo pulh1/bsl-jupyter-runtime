@@ -16,9 +16,9 @@ from onec_runtime_mcp.agent.runtime_backend import CaptureHypothesisPreparationE
 from onec_runtime_mcp.agent.observation import ManagerOrigin, ObservationItem, ObservationPlan, ObservationResult, ObservationSource, ObservationSourceKind
 from onec_runtime_mcp.agent.proxies import SizeAccuracy, ValueSize
 from onec_runtime_mcp.agent.service import AgentWorkspaceService, _AdmittedRuntime
-from onec_runtime.prototype_runtime import OperationState
+from onec_runtime.runtime_models import OperationState
 from onec_runtime.errors import ProtocolError
-from onec_runtime.runtime_api import RuntimeNamespaceSnapshot, RuntimeReply, RuntimeReplyKind
+from onec_runtime.runtime_models import RuntimeNamespaceSnapshot, RuntimeReply, RuntimeReplyKind
 
 
 def _request() -> dict[str, object]:

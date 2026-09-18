@@ -13,9 +13,9 @@ from onec_runtime.execution.capture.writeback import (
 )
 from onec_runtime.execution.public_facade import PublicExecutionFacade
 from onec_runtime.execution.worker_activation import WorkerMaterializationSnapshot
-from onec_runtime.prototype_runtime import PartialWritebackError
+from onec_runtime.runtime_models import PartialWritebackError
 from onec_runtime.rdbg.models import EvaluationResult, ModifyResult
-from onec_runtime.runtime_api import RuntimeNamespaceSnapshot
+from onec_runtime.runtime_models import RuntimeNamespaceSnapshot
 
 from test_public_execution_facade import _Arbiter, _Controller, _Pipeline, unit
 

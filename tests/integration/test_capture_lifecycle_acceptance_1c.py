@@ -19,7 +19,7 @@ from onec_runtime.capture_values import UnavailableValueNode, ValueNode
 from onec_runtime.errors import CaptureShapeUnsupportedError, MaterializationLimitError
 from onec_runtime.kernel import COMMON_MODULE_PROPERTY_ID
 from onec_runtime.rdbg.models import ModuleLocation
-from onec_runtime.runtime_api import RuntimeReplyKind
+from onec_runtime.runtime_models import RuntimeReplyKind
 from onec_runtime_jupyter.extension import OnecValueProxy
 from test_worker_universe_1c import _fresh_live_harness
 

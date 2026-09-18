@@ -4,7 +4,7 @@
 
 `RuntimeConfig` импортируется из `onec_runtime.config`, `RuntimeSessionConfig`, `ExtensionMode` и `RuntimeSession` — из `onec_runtime.session`, а `InteractiveRuntimeSession` — из `onec_runtime_jupyter`. В `RuntimeConfig` обязательный `platform_bin` указывает каталог исполняемых файлов платформы; `connection_string` выбирает файловую или серверную ИБ. `RuntimeSessionConfig(runtime=..., source_root=..., extension_mode=...)` связывает сеанс с выгрузкой исходников и режимом установки расширения (`AUTO` или `MANUAL`). `source_root` нужен для загрузки модулей и точек по пути к файлу. Дополнительные параметры, включая `workspace`, `chunk_size` и `evidence_root`, используются при настройке окружения и переноса данных.
 
-Типы ответов `RuntimeReply`, `RuntimeReplyKind`, `RuntimeStatus` и `RuntimeNamespaceSnapshot` находятся в `onec_runtime.runtime_api`; `CaptureView`, `DebugFrame` и `StackPage` — в `onec_runtime.capture_inspection`; `CaptureStatus`, `CapturePhase`, `CaptureEvaluationOutcome`, `CaptureEvaluationState`, `CaptureEvaluationKind`, `CaptureEvaluationTiming` и `CaptureFailureDiagnostic` — в `onec_runtime.capture_evaluation`. `RuntimeDebugStop` находится в `onec_runtime.worker_breakpoints`, а его `StopReason` — в `onec_runtime.stop_routing`. Обычно эти объекты не нужно создавать вручную: их возвращают методы сеанса и текущего CAPTURE view.
+Типы ответов `RuntimeReply`, `RuntimeReplyKind`, `RuntimeStatus` и `RuntimeNamespaceSnapshot` находятся в `onec_runtime.runtime_models`; `CaptureView`, `DebugFrame` и `StackPage` — в `onec_runtime.capture_inspection`; `CaptureStatus`, `CapturePhase`, `CaptureEvaluationOutcome`, `CaptureEvaluationState`, `CaptureEvaluationKind`, `CaptureEvaluationTiming` и `CaptureFailureDiagnostic` — в `onec_runtime.capture_evaluation`. `RuntimeDebugStop` находится в `onec_runtime.worker_breakpoints`, а его `StopReason` — в `onec_runtime.stop_routing`. Обычно эти объекты не нужно создавать вручную: их возвращают методы сеанса и текущего CAPTURE view.
 
 `RuntimeSession` — пользовательская граница core runtime. После bootstrap `RuntimeSession.start()` создаёт `PublicExecutionFacade` с одним владельцем RDBG. Прямой вызов `runtime.runtime_api` может обойти блокировку и владение CAPTURE на уровне `RuntimeSession`; для прикладного Python-кода используйте методы сеанса. `RdbgArbiter`, его `ExecutionTicket` и `StopRequestOutcome` относятся к внутреннему слою исполнения, а не к API notebook.
 
@@ -118,7 +118,7 @@ value = bsl["Объект"].tabular_section("Строки").materialize(max_item
 `add_capture_point(path: str, line: int)` устанавливает точку по пути к модулю внутри `source_root` и номеру строки; возвращает `ModuleLocation`. `clear_capture_points()` удаляет заданные точки. После попадания в точку `runtime.current_capture()` возвращает `CaptureView` именно этой остановки. Сохранённый view нельзя использовать для новых чтений после продолжения или перехода к другой остановке.
 
 ```python
-from onec_runtime.runtime_api import RuntimeReplyKind
+from onec_runtime.runtime_models import RuntimeReplyKind
 
 runtime.add_capture_point(r"CommonModules\ExampleServer\Ext\Module.bsl", 120)
 # bsl_source_that_reaches_point — текст вашей MAIN-ячейки, вызывающей этот метод.

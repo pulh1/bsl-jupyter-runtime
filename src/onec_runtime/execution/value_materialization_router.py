@@ -13,7 +13,7 @@ import pandas as pd
 from onec_runtime.capture_evaluation import CaptureTransferPlan
 from onec_runtime.compact_table import decode_compact_table_payload
 from onec_runtime.errors import ProtocolError
-from onec_runtime.execution.arbiter import RdbgArbiter
+from onec_runtime.execution.arbiter import ExecutionTicket, RdbgArbiter
 from onec_runtime.execution.capture.data_plane import CaptureTicketDataPlane
 from onec_runtime.execution.capture.scope import CaptureScope
 from onec_runtime.execution.capture.selected_table_materialization import (
@@ -77,11 +77,14 @@ class ValueMaterializationRouter:
         context_generation: int,
         worker_catalog_snapshot: Callable[[], WorkerMaterializationSnapshot],
         wait_handoff: Callable[[], AbstractContextManager[None]] = nullcontext,
+        request_stop: Callable[[ExecutionTicket], object] | None = None,
     ) -> None:
         if not callable(worker_catalog_snapshot):
             raise TypeError("Worker catalog reader is required")
         if not callable(wait_handoff):
             raise TypeError("value transfer wait handoff is invalid")
+        if request_stop is not None and not callable(request_stop):
+            raise TypeError("value transfer Stop callback is invalid")
         self._controller = controller
         self._arbiter = arbiter
         self._worker_catalog_snapshot = worker_catalog_snapshot
@@ -96,6 +99,7 @@ class ValueMaterializationRouter:
             context_generation=context_generation,
             worker_catalog_snapshot=self._worker_snapshot,
             wait_handoff=wait_handoff,
+            request_stop=request_stop,
         )
 
     @property

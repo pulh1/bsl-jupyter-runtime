@@ -7,7 +7,7 @@ import pytest
 from onec_runtime.errors import ProtocolError
 from onec_runtime.execution.termination import FileTerminationConfirmed
 from onec_runtime.rdbg.models import TargetId
-from onec_runtime.runtime_api import RuntimeNamespaceSnapshot
+from onec_runtime.runtime_models import RuntimeNamespaceSnapshot
 from onec_runtime_jupyter import InteractiveRuntimeSession, install_runtime
 from onec_runtime_jupyter import session as session_module
 from onec_runtime_jupyter.extension import OnecRuntimeMagics

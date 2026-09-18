@@ -1,16 +1,11 @@
-"""Route MAIN and CAPTURE operations while one arbiter owns RDBG.
-
-This controller is a narrow execution path used by the new component
-contract. The public RuntimeApi still uses its transitional controller until
-Worker binding, inspection, materialization and writeback are migrated.
-"""
+"""Route public MAIN and CAPTURE operations while one arbiter owns RDBG."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
 from threading import RLock, Thread
-from typing import TYPE_CHECKING, Callable
+from typing import Callable
 from uuid import uuid4
 from weakref import WeakKeyDictionary
 
@@ -28,6 +23,7 @@ from onec_runtime.execution.arbiter import (
     ConfirmedFailure,
     ExecutionTicket,
     OutcomeUnknown,
+    Plan,
     RdbgArbiter,
     ReadyForPolicy,
     RouteToken,
@@ -35,7 +31,6 @@ from onec_runtime.execution.arbiter import (
     Settlement,
     StaleRoute,
     StopRequestOutcome,
-    TargetTerminated,
 )
 from onec_runtime.execution.capture.adapter import CaptureSetupAdapter
 from onec_runtime.execution.capture.cell_evaluator import CaptureCellEvaluator
@@ -45,12 +40,8 @@ from onec_runtime.execution.capture.inspection import CaptureInspectionExecutor
 from onec_runtime.execution.capture.manager_metadata import (
     CaptureManagerMetadataPlan, CaptureManagerProbePlan, CaptureTableSchemaPlan,
     CaptureSelectedTableDescriptor, CaptureSelectedTableSchemaPlan,
-    evaluate_capture_manager_metadata,
 )
-from onec_runtime.execution.capture.materialization import (
-    CaptureMaterializationExecutor,
-    CaptureMaterializationPlan,
-)
+from onec_runtime.execution.capture.materialization import CaptureMaterializationPlan
 from onec_runtime.execution.capture.selected_table_materialization import (
     CaptureSelectedTableTransferRequest,
 )
@@ -72,6 +63,20 @@ from onec_runtime.execution.contracts import (
     StalePreparation, StalePreparedDispatch, SubmissionReceipt, Unavailable,
 )
 from onec_runtime.execution.completion_fields import CompletionFieldsPlan
+from onec_runtime.execution.continuation_models import (
+    ContinuationAttemptEvidence, ContinuationAttemptSpec,
+)
+from onec_runtime.execution.controller.capture_data_plane import (
+    submit_typed_variable_page as submit_capture_typed_page_plan,
+    submit_variable as submit_capture_variable_plan,
+    submit_variable_page as submit_capture_page_plan,
+)
+from onec_runtime.execution.controller.capture_private_data_plane import (
+    CapturePrivateDataPlane,
+)
+from onec_runtime.execution.controller.stop_coordinator import (
+    StopContext, StopCoordinator, TargetExitProof,
+)
 from onec_runtime.execution.evaluation import (
     EvaluationSuspended, wait_for_pending_result,
 )
@@ -92,11 +97,8 @@ from onec_runtime.execution.worker import (
 )
 from onec_runtime.execution.worker_activation import PrebuiltWorkerIntent
 from onec_runtime.rdbg.models import EvaluationResult, ModuleLocation, StopEvent, TargetId
+from onec_runtime.runtime_models import CaptureCorrelationTicket, OperationState
 from onec_runtime.stop_routing import BreakpointRegistry, StopReason, classify_stop
-
-if TYPE_CHECKING:
-    from onec_runtime.runtime_api import CaptureCorrelationTicket
-    from onec_runtime.prototype_runtime import ContinuationAttemptSpec
 
 
 class MainYieldKind(str, Enum):
@@ -210,6 +212,48 @@ class _RawSettlementServices:
 
 class ExecutionController:
     """Choose the current route; executors own protocol command sequences."""
+
+    def _submit_direct_ticket(
+        self,
+        route: RouteToken,
+        plan: Plan,
+        *,
+        finalizer: Callable[[object], object] | None = None,
+        on_admitted: Callable[[ExecutionTicket], None] | None = None,
+        on_pre_effect_cancel: Callable[[], None] | None = None,
+    ) -> ExecutionTicket:
+        """Publish a direct ticket before dispatch and retain it on interruption."""
+
+        receipt = SubmissionReceipt()
+        try:
+            ticket = self._arbiter.submit(
+                route, plan, finalizer=finalizer, receipt=receipt,
+            )
+            if on_admitted is not None:
+                on_admitted(ticket)
+            self._arbiter.dispatch(ticket)
+            return ticket
+        except BaseException:
+            # submit() can return from arbiter admission and still be
+            # interrupted before its caller receives the ticket. The receipt
+            # is adopted under the same mailbox lock as queue insertion.
+            ticket = receipt.ticket
+            if ticket is None:
+                if on_pre_effect_cancel is not None:
+                    on_pre_effect_cancel()
+            else:
+                outcome = self.request_stop(ticket)
+                cancelled = outcome is StopRequestOutcome.CANCELLED_BEFORE_EFFECT
+                if outcome is StopRequestOutcome.ALREADY_SETTLED:
+                    try:
+                        ticket.wait_settled(0)
+                    except CancelledBeforeEffect:
+                        cancelled = True
+                    except BaseException:
+                        pass
+                if cancelled and on_pre_effect_cancel is not None:
+                    on_pre_effect_cancel()
+            raise
 
     def bind_worker_activation(self, activation: WorkerActivationPort) -> None:
         """Install the one Worker activation port before route preparation.
@@ -538,8 +582,7 @@ class ExecutionController:
                     self._preparation_revision += 1
                 return Settlement(None)
 
-            ticket = self._arbiter.submit(route, plan)
-            self._arbiter.dispatch(ticket)
+            ticket = self._submit_direct_ticket(route, plan)
         while not ticket.status().settled:
             if ticket.wait_unknown(timeout=1.0):
                 raise ProtocolError("CAPTURE point rearm outcome is unknown")
@@ -547,8 +590,6 @@ class ExecutionController:
 
     def prepare_capture_ticket(self) -> CaptureCorrelationTicket:
         """Bind an opaque capture intent to the next MAIN command and stop."""
-
-        from onec_runtime.runtime_api import CaptureCorrelationTicket
 
         with self._lock:
             operation = self.main_operation
@@ -646,12 +687,13 @@ class ExecutionController:
         )
         self._capture_message_collector = message_collector
         self._capture_inspection_executor = CaptureInspectionExecutor()
-        self._capture_materialization_executor = CaptureMaterializationExecutor()
-        self._capture_table_descriptors: dict[str, CaptureSelectedTableDescriptor] = {}
-        self._capture_table_descriptor_scope: CaptureScope | None = None
         self._capture_writeback_executor = CaptureWritebackExecutor()
         self._registry = registry
         self._breakpoint_routes = breakpoint_routes
+        self._capture_private_data_plane = CapturePrivateDataPlane(
+            shield_workspace=self._shield_capture_workspace,
+            restore_workspace=self._restore_capture_workspace,
+        )
         self._generation = runtime_generation
         self._initial_target_id = initial_target_id
         self._parser_target = parser_target
@@ -683,12 +725,15 @@ class ExecutionController:
         self._main_dispatch_operations: WeakKeyDictionary[
             ExecutionTicket, MainOperation | None
         ] = WeakKeyDictionary()
-        self._observed_stop_tickets: WeakKeyDictionary[ExecutionTicket, bool] = (
-            WeakKeyDictionary()
-        )
         self._confirmed_target_termination: (
             FileTerminationConfirmed | ServerTerminationConfirmed | None
         ) = None
+        self._stop_coordinator = StopCoordinator(
+            arbiter,
+            snapshot=self._stop_context,
+            cancelled_before_effect=self._stop_cancelled_before_effect,
+            confirmed_exit=self._stop_confirmed_exit,
+        )
 
     @property
     def confirmed_target_termination(
@@ -1049,8 +1094,6 @@ class ExecutionController:
                     raw_outcome: object = None
                     if self._route_settlement_service() is not None:
                         from onec_runtime.execution.settlement import WorkerPublished
-                        from onec_runtime.runtime_api import OperationState
-
                         handle = getattr(lease, "handle", None)
                         if handle is None:
                             raise ProtocolError("Worker activation has no generation handle")
@@ -1154,22 +1197,26 @@ class ExecutionController:
                 if lease is not None and not outcome_unknown:
                     schedule_release(lease, port)
 
-        ticket = self._arbiter.submit(route, plan, finalizer=finalizer)
+        ticket = self._arbiter.submit(
+            route, plan, finalizer=finalizer, receipt=receipt,
+        )
         if is_main:
             self._worker_activation_main_ticket = ticket
             self._main_dispatch_operations[ticket] = None
-        receipt.adopt(ticket)
         self._preparation_revision += 1
         self._arbiter.dispatch(ticket)
         return ticket
 
-    def request_stop(self, ticket: ExecutionTicket) -> object:
+    def request_stop(self, ticket: ExecutionTicket) -> StopRequestOutcome:
         """Fence the exact ticket and observe confirmed target exit locally.
 
         The observer waits on the ticket's mailbox only. It never reads RDBG
         events or infers target loss from an unknown/failed Stop attempt.
         """
 
+        return self._stop_coordinator.request_stop(ticket)
+
+    def _stop_context(self) -> StopContext:
         with self._lock:
             operation = self.main_operation
             scope = self.capture_scope
@@ -1178,51 +1225,32 @@ class ExecutionController:
                 operation.target if operation is not None and operation.target is not None
                 else self._initial_target_id
             )
-        outcome = self._arbiter.request_stop(ticket)
-        if outcome is StopRequestOutcome.CANCELLED_BEFORE_EFFECT:
-            with self._lock:
-                if self.main_operation is operation and operation is not None and (
-                    self._main_dispatch_operations.get(ticket) is operation
-                    and operation.phase is MainPhase.ADMITTED
-                ):
-                    operation.fail_before_dispatch()
-                if self._main_stop_ticket is ticket:
-                    self._main_stop_ticket = None
-                if self._worker_activation_main_ticket is ticket:
-                    self._worker_activation_main_ticket = None
-                self._preparation_revision += 1
-        elif outcome is StopRequestOutcome.REQUESTED:
-            with self._lock:
-                if ticket not in self._observed_stop_tickets:
-                    self._observed_stop_tickets[ticket] = True
-                    Thread(
-                        target=self._observe_stop_ticket,
-                        args=(ticket, operation, scope, target),
-                        name="onec-target-stop-observer",
-                        daemon=True,
-                    ).start()
-        return outcome
+            return StopContext(operation, scope, target)
 
-    def _observe_stop_ticket(
-        self, ticket: ExecutionTicket, operation: MainOperation | None,
-        scope: CaptureScope | None, target: TargetId | None,
+    def _stop_cancelled_before_effect(
+        self, ticket: ExecutionTicket, context: StopContext,
     ) -> None:
-        try:
-            ticket.wait_settled()
-        except TargetTerminated as terminated:
-            evidence = terminated.evidence
-            if target is not None and evidence.expected_target != target:
-                return
-        except BaseException:
-            # A settled cell error or unconfirmed teardown changes neither
-            # the target nor its stopped frame. Unknown outcomes keep waiting.
-            return
-        else:
-            return
+        with self._lock:
+            operation = context.operation
+            if self.main_operation is operation and operation is not None and (
+                self._main_dispatch_operations.get(ticket) is operation
+                and operation.phase is MainPhase.ADMITTED
+            ):
+                operation.fail_before_dispatch()
+            if self._main_stop_ticket is ticket:
+                self._main_stop_ticket = None
+            if self._worker_activation_main_ticket is ticket:
+                self._worker_activation_main_ticket = None
+            self._preparation_revision += 1
 
+    def _stop_confirmed_exit(
+        self, context: StopContext, evidence: TargetExitProof,
+    ) -> None:
         with self._lock:
             if self._confirmed_target_termination is not None:
                 return
+            operation = context.operation
+            scope = context.scope
             if self.main_operation is operation and operation is not None and not operation.terminal:
                 operation.mark_lost()
             if self.capture_scope is scope and scope is not None:
@@ -1381,6 +1409,7 @@ class ExecutionController:
                 )
 
             ticket: ExecutionTicket | None = None
+            publication = _receipt or SubmissionReceipt()
             try:
                 settlement = self._route_settlement_service()
                 if settlement is not None and _prepared_payload is not None:
@@ -1389,37 +1418,52 @@ class ExecutionController:
                         prior_capture_sequence=self._stop_sequence,
                         capture_ticket=planned_capture_ticket,
                     )
-                ticket = self._arbiter.submit(route, plan, finalizer=operation.settler)
+                ticket = self._arbiter.submit(
+                    route, plan, finalizer=operation.settler,
+                    receipt=publication,
+                )
                 self._main_dispatch_operations[ticket] = operation
                 self._planned_capture_ticket = None
                 self._main_stop_ticket = ticket
-                if _receipt is not None:
-                    _receipt.adopt(ticket)
                 self._preparation_revision += 1
                 self._arbiter.dispatch(ticket)
             except BaseException:
-                if _receipt is None or _receipt.ticket is None:
-                    if ticket is not None:
-                        self._main_dispatch_operations.pop(ticket, None)
-                    self._planned_capture_ticket = planned_capture_ticket
-                    if settlement is not None and _prepared_payload is not None:
-                        settlement.discard_main(operation)
-                    if self._main_stop_ticket is ticket:
-                        self._main_stop_ticket = None
-                    self.main_operation = None
-                    self._command_sequence -= 1
-                elif ticket is not None:
-                    # A published receipt survives a queue cancellation.  Only
-                    # confirmed pre-effect cancellation can terminate MAIN here.
-                    if ticket.cancel_queued():
-                        operation.fail_before_dispatch()
-                    elif ticket.status().settled:
+                published = publication.ticket
+                owned_ticket = (
+                    ticket if ticket is not None else
+                    published if isinstance(published, ExecutionTicket) else None
+                )
+                cancelled_before_effect = owned_ticket is None
+                if owned_ticket is not None:
+                    cancelled_before_effect = owned_ticket.cancel_queued()
+                    if not cancelled_before_effect and owned_ticket.status().settled:
                         try:
-                            ticket.wait_settled(timeout=0)
+                            owned_ticket.wait_settled(timeout=0)
                         except CancelledBeforeEffect:
-                            operation.fail_before_dispatch()
+                            cancelled_before_effect = True
                         except Exception:
                             pass
+                if cancelled_before_effect:
+                    if (
+                        owned_ticket is not None
+                        and _receipt is not None
+                        and _receipt.ticket is owned_ticket
+                    ):
+                        # The accepted MAIN command remains visible as a
+                        # terminal pre-dispatch operation to its caller.
+                        operation.fail_before_dispatch()
+                        if self._main_stop_ticket is owned_ticket:
+                            self._main_stop_ticket = None
+                    else:
+                        if owned_ticket is not None:
+                            self._main_dispatch_operations.pop(owned_ticket, None)
+                        self._planned_capture_ticket = planned_capture_ticket
+                        if settlement is not None and _prepared_payload is not None:
+                            settlement.discard_main(operation)
+                        if self._main_stop_ticket is owned_ticket:
+                            self._main_stop_ticket = None
+                        self.main_operation = None
+                        self._command_sequence -= 1
                 raise
             return ticket
 
@@ -1471,14 +1515,20 @@ class ExecutionController:
                 return published
 
             def plan(port: SessionPort) -> Settlement | ReadyForPolicy | ConfirmedFailure:
-                if _before_first_effect is not None:
-                    _before_first_effect()
-                activation = self._worker_activation
-                if activation is not None:
-                    lease = activation.pin_active(port=port)
-                    if lease is not None:
-                        self._schedule_worker_lease_release(lease, port)
-                scope.admit_cell_dirty_roots(dirty_roots)
+                try:
+                    if _before_first_effect is not None:
+                        _before_first_effect()
+                    activation = self._worker_activation
+                    if activation is not None:
+                        lease = activation.pin_active(port=port)
+                        if lease is not None:
+                            self._schedule_worker_lease_release(lease, port)
+                    scope.admit_cell_dirty_roots(dirty_roots)
+                except Exception as error:
+                    # These checks are local and precede the user evalExpr.
+                    # Publish the confirmed rejection before its ticket wakes.
+                    ledger.fail(receipt_id, "CAPTURE evaluation preparation failed")
+                    return ConfirmedFailure(error)
                 outcome = self._capture_cell_executor.execute(
                     scope,
                     lowered_source,
@@ -1517,39 +1567,62 @@ class ExecutionController:
             except BaseException:
                 ledger.discard_unstarted(receipt_id)
                 raise
+            publication = _receipt or SubmissionReceipt()
+            ticket: ExecutionTicket | None = None
+            observer: Thread | None = None
             try:
                 ticket = self._arbiter.submit(
                     route, plan,
                     finalizer=settle_ledger if _finalizer is not None else None,
+                    receipt=publication,
                 )
-            except BaseException:
-                ledger.discard_unstarted(receipt_id)
-                if settlement is not None and _prepared_payload is not None:
-                    settlement.discard_capture(_prepared_payload)
-                raise
-            if _receipt is not None:
-                _receipt.adopt(ticket)
-            self._capture_cell_operations[ticket] = _CaptureCellRepair(
-                cell_operation, scope, selected_policy, _finalizer is not None,
-                ledger, receipt_id,
-            )
-            self._preparation_revision += 1
-            try:
+                self._capture_cell_operations[ticket] = _CaptureCellRepair(
+                    cell_operation, scope, selected_policy, _finalizer is not None,
+                    ledger, receipt_id,
+                )
+                self._preparation_revision += 1
                 self._arbiter.dispatch(ticket)
+                observer = Thread(
+                    target=_observe_capture_ticket,
+                    args=(ticket, ledger, receipt_id),
+                    name="onec-capture-outcome-observer",
+                    daemon=True,
+                )
+                observer.start()
             except BaseException:
-                # ``dispatch`` has not entered transport. Retire both local
-                # reservations instead of retaining a queued inert ticket.
-                if ticket.cancel_queued():
+                published = publication.ticket
+                owned_ticket = (
+                    ticket if ticket is not None else
+                    published if isinstance(published, ExecutionTicket) else None
+                )
+                cancelled_before_effect = owned_ticket is None
+                if owned_ticket is not None:
+                    cancelled_before_effect = owned_ticket.cancel_queued()
+                    if not cancelled_before_effect and owned_ticket.status().settled:
+                        try:
+                            owned_ticket.wait_settled(timeout=0)
+                        except CancelledBeforeEffect:
+                            cancelled_before_effect = True
+                        except Exception:
+                            pass
+                if cancelled_before_effect:
+                    if owned_ticket is not None:
+                        self._capture_cell_operations.pop(owned_ticket, None)
                     ledger.discard_unstarted(receipt_id)
                     if settlement is not None and _prepared_payload is not None:
                         settlement.discard_capture(_prepared_payload)
+                elif owned_ticket is not None and (
+                    observer is None or observer.ident is None
+                ):
+                    # Dispatch may have entered transport before interruption.
+                    # Retain a local observer for its later confirmed outcome.
+                    Thread(
+                        target=_observe_capture_ticket,
+                        args=(owned_ticket, ledger, receipt_id),
+                        name="onec-capture-outcome-observer",
+                        daemon=True,
+                    ).start()
                 raise
-            Thread(
-                target=_observe_capture_ticket,
-                args=(ticket, ledger, receipt_id),
-                name="onec-capture-outcome-observer",
-                daemon=True,
-            ).start()
             return ticket
 
     def _route_settlement_service(self):
@@ -1672,9 +1745,6 @@ class ExecutionController:
         locations: tuple[ModuleLocation, ...],
     ) -> _ContinuationAdmission:
         """Plan one successor before writeback, without entering RDBG."""
-
-        from onec_runtime.prototype_runtime import ContinuationAttemptSpec
-        from onec_runtime.runtime_api import CaptureCorrelationTicket
 
         if not isinstance(spec, ContinuationAttemptSpec):
             raise TypeError("continuation attempt spec is required")
@@ -1800,8 +1870,7 @@ class ExecutionController:
                         self._registry = admission.original_registry
                     return Settlement(None)
 
-                ticket = self._arbiter.submit(admission.route, restore)
-                self._arbiter.dispatch(ticket)
+                ticket = self._submit_direct_ticket(admission.route, restore)
             else:
                 ticket = None
         if ticket is not None:
@@ -1827,8 +1896,6 @@ class ExecutionController:
         self, attempt_id: str,
     ) -> ContinuationAttemptEvidence:
         """Return ordered frame-write and Continue evidence for one attempt."""
-
-        from onec_runtime.prototype_runtime import ContinuationAttemptEvidence
 
         with self._lock:
             try:
@@ -1988,6 +2055,23 @@ class ExecutionController:
             if active_ledger is None or active_ledger.identity != scope.identity:
                 raise ProtocolError("CAPTURE evaluation ledger is unavailable")
             active_ledger.mark_resuming()
+
+            def admitted(ticket: ExecutionTicket) -> None:
+                if admission is not None:
+                    admission.resume_ticket = ticket
+                    admission.consumed = True
+                self._resume_ticket = ticket
+                self._main_stop_ticket = ticket
+                self._preparation_revision += 1
+
+            def cancel_before_effect() -> None:
+                active_ledger.discard_resuming()
+                if admission is not None:
+                    admission.resume_ticket = None
+                    admission.consumed = False
+                self._resume_ticket = None
+                self._main_stop_ticket = None
+
             try:
                 if admission is not None and admission.ticket is not None:
                     settlement = self._route_settlement_service()
@@ -1995,28 +2079,15 @@ class ExecutionController:
                     settlement.rebind_next_capture_ticket(
                         operation, admission.ticket,
                     )
-                ticket = self._arbiter.submit(route, plan, finalizer=operation.settler)
-                if admission is not None:
-                    admission.resume_ticket = ticket
+                return self._submit_direct_ticket(
+                    route, plan, finalizer=operation.settler,
+                    on_admitted=admitted,
+                    on_pre_effect_cancel=cancel_before_effect,
+                )
             except BaseException:
-                active_ledger.discard_resuming()
-                raise
-            self._resume_ticket = ticket
-            self._main_stop_ticket = ticket
-            self._preparation_revision += 1
-            try:
-                self._arbiter.dispatch(ticket)
-            except BaseException:
-                if ticket.cancel_queued():
+                if self._resume_ticket is None and active_ledger.status().phase is CapturePhase.RESUMING:
                     active_ledger.discard_resuming()
-                    self._resume_ticket = None
-                    self._main_stop_ticket = None
-                elif admission is not None:
-                    admission.consumed = True
                 raise
-            if admission is not None:
-                admission.consumed = True
-            return ticket
 
     def submit_capture_variable(
         self, name: str, *, stack_level: int = 0
@@ -2038,16 +2109,16 @@ class ExecutionController:
             ):
                 raise ProtocolError("No ready CAPTURE stop is available")
 
-            def plan(port: SessionPort) -> Settlement:
-                variable = self._capture_inspection_executor.read_variable(
-                    scope, name, stack_level=stack_level, port=port
-                )
-                return Settlement(variable)
+            def admitted(_ticket: ExecutionTicket) -> None:
+                self._preparation_revision += 1
 
-            ticket = self._arbiter.submit(route, plan)
-            self._preparation_revision += 1
-            self._arbiter.dispatch(ticket)
-            return ticket
+            return submit_capture_variable_plan(
+                scope, route, self._capture_inspection_executor,
+                lambda selected_route, plan: self._submit_direct_ticket(
+                    selected_route, plan, on_admitted=admitted,
+                ),
+                name, stack_level=stack_level,
+            )
 
     def submit_capture_variable_page(
         self, *, stack_level: int, start: int, stop: int,
@@ -2071,22 +2142,17 @@ class ExecutionController:
             ):
                 raise ProtocolError("No ready CAPTURE stop is available")
 
-            def plan(port: SessionPort) -> Settlement:
-                page = self._capture_inspection_executor.read_variable_page(
-                    scope,
-                    stack_level=stack_level,
-                    start=start,
-                    stop=stop,
-                    role=role,
-                    parameter_names=parameter_names,
-                    port=port,
-                )
-                return Settlement(page)
+            def admitted(_ticket: ExecutionTicket) -> None:
+                self._preparation_revision += 1
 
-            ticket = self._arbiter.submit(route, plan)
-            self._preparation_revision += 1
-            self._arbiter.dispatch(ticket)
-            return ticket
+            return submit_capture_page_plan(
+                scope, route, self._capture_inspection_executor,
+                lambda selected_route, plan: self._submit_direct_ticket(
+                    selected_route, plan, on_admitted=admitted,
+                ),
+                stack_level=stack_level, start=start, stop=stop,
+                role=role, parameter_names=parameter_names,
+            )
 
     def submit_capture_typed_variable_page(
         self, *, stack_level: int, start: int, stop: int,
@@ -2110,22 +2176,17 @@ class ExecutionController:
             ):
                 raise ProtocolError("No ready CAPTURE stop is available")
 
-            def plan(port: SessionPort) -> Settlement:
-                page = self._capture_inspection_executor.read_typed_variable_page(
-                    scope,
-                    stack_level=stack_level,
-                    start=start,
-                    stop=stop,
-                    port=port,
-                    role=role,
-                    parameter_names=parameter_names,
-                )
-                return Settlement(page)
+            def admitted(_ticket: ExecutionTicket) -> None:
+                self._preparation_revision += 1
 
-            ticket = self._arbiter.submit(route, plan)
-            self._preparation_revision += 1
-            self._arbiter.dispatch(ticket)
-            return ticket
+            return submit_capture_typed_page_plan(
+                scope, route, self._capture_inspection_executor,
+                lambda selected_route, plan: self._submit_direct_ticket(
+                    selected_route, plan, on_admitted=admitted,
+                ),
+                stack_level=stack_level, start=start, stop=stop,
+                role=role, parameter_names=parameter_names,
+            )
 
     def require_capture_manager_metadata_ready(self, scope: CaptureScope) -> None:
         """Check the exact local CAPTURE stop before a cached metadata read."""
@@ -2142,14 +2203,7 @@ class ExecutionController:
             raise TypeError("CAPTURE selected table descriptor is invalid")
         with self._lock:
             self._require_capture_manager_metadata_ready_locked(descriptor.scope)
-            if self._capture_table_descriptor_scope is not descriptor.scope:
-                self._capture_table_descriptors.clear()
-                self._capture_table_descriptor_scope = descriptor.scope
-            if len(self._capture_table_descriptors) >= 128:
-                raise ProtocolError("CAPTURE selected table descriptor limit exceeded")
-            handle = "capture_table_" + uuid4().hex
-            self._capture_table_descriptors[handle] = descriptor
-            return handle
+            return self._capture_private_data_plane.register_descriptor(descriptor)
 
     def require_capture_table_descriptor(
         self, handle: str, scope: CaptureScope,
@@ -2161,13 +2215,7 @@ class ExecutionController:
             self._require_capture_manager_metadata_ready_locked(
                 scope, allow_pending=allow_pending,
             )
-            if (
-                type(handle) is not str
-                or self._capture_table_descriptor_scope is not scope
-                or handle not in self._capture_table_descriptors
-            ):
-                raise ProtocolError("CAPTURE selected table handle is stale or invalid")
-            return self._capture_table_descriptors[handle]
+            return self._capture_private_data_plane.require_descriptor(handle, scope)
 
     def _require_capture_manager_metadata_ready_locked(
         self, scope: CaptureScope, *, allow_pending: bool = False,
@@ -2213,7 +2261,7 @@ class ExecutionController:
             assert route is not None and ledger is not None
             receipt_id = f"manager-metadata-{uuid4().hex}"
 
-            def worker_plan(port: SessionPort) -> ReadyForPolicy | ConfirmedFailure:
+            def check_current() -> None:
                 with self._lock:
                     if (
                         self._capture_evaluation_ledger is not ledger
@@ -2223,44 +2271,24 @@ class ExecutionController:
                     self._require_capture_manager_metadata_ready_locked(
                         scope, allow_pending=True,
                     )
-                self._shield_capture_workspace(port)
-                try:
-                    result = evaluate_capture_manager_metadata(metadata_plan, port)
-                except (OutcomeUnknown, EvaluationSuspended):
-                    raise
-                except BaseException as error:
-                    raise CaptureOperationRepairRequired("workspace_restore") from error
-                try:
-                    self._restore_capture_workspace(port)
-                except BaseException as error:
-                    raise CaptureOperationRepairRequired("workspace_restore") from error
-                try:
-                    decoded = metadata_plan.decode(result)
-                except Exception as error:
-                    # Decode is local and runs after the helper and workspace
-                    # restore are confirmed. Retire the ledger before the
-                    # ticket publishes this failure to its initiating waiter.
-                    ledger.fail(receipt_id, "CAPTURE manager metadata helper failed")
-                    return ConfirmedFailure(error)
-                return ReadyForPolicy(decoded)
+
+            worker_plan = self._capture_private_data_plane.manager_metadata_plan(
+                metadata_plan, ledger, receipt_id, check_current=check_current,
+            )
 
             def publish(value: object) -> object:
                 ledger.complete(receipt_id)
                 return value
 
             ledger.begin(receipt_id, CaptureEvaluationKind.INSPECTION)
-            try:
-                ticket = self._arbiter.submit(route, worker_plan, finalizer=publish)
-            except BaseException:
-                ledger.discard_unstarted(receipt_id)
-                raise
-            self._preparation_revision += 1
-            try:
-                self._arbiter.dispatch(ticket)
-            except BaseException:
-                if ticket.cancel_queued():
-                    ledger.discard_unstarted(receipt_id)
-                raise
+            def admitted(_ticket: ExecutionTicket) -> None:
+                self._preparation_revision += 1
+
+            ticket = self._submit_direct_ticket(
+                route, worker_plan, finalizer=publish,
+                on_admitted=admitted,
+                on_pre_effect_cancel=lambda: ledger.discard_unstarted(receipt_id),
+            )
             Thread(
                 target=_observe_capture_ticket,
                 args=(ticket, ledger, receipt_id),
@@ -2308,8 +2336,17 @@ class ExecutionController:
                     raise ProtocolError("Completion CAPTURE fence is unavailable")
                 receipt_id = f"completion-{uuid4().hex}"
 
-            def worker_plan(port: SessionPort) -> Settlement | ReadyForPolicy:
-                completion_plan.validate_current()
+            def worker_plan(
+                port: SessionPort,
+            ) -> Settlement | ReadyForPolicy | ConfirmedFailure:
+                try:
+                    completion_plan.validate_current()
+                except Exception as error:
+                    if ledger is not None:
+                        assert receipt_id is not None
+                        ledger.fail(receipt_id, "CAPTURE completion preparation failed")
+                        return ConfirmedFailure(error)
+                    raise
                 with self._lock:
                     current = self._value_route_snapshot_locked(allow_pending=True)
                     if (
@@ -2366,7 +2403,14 @@ class ExecutionController:
                     self._restore_capture_workspace(port)
                 except BaseException as error:
                     raise CaptureOperationRepairRequired("workspace_restore") from error
-                fields = completion_plan.accept_result(result)
+                try:
+                    fields = completion_plan.accept_result(result)
+                except Exception as error:
+                    if ledger is not None:
+                        assert receipt_id is not None
+                        ledger.fail(receipt_id, "CAPTURE completion helper failed")
+                        return ConfirmedFailure(error)
+                    raise
                 return (
                     ReadyForPolicy(fields)
                     if ledger is not None else Settlement(fields)
@@ -2380,24 +2424,20 @@ class ExecutionController:
             if ledger is not None:
                 assert receipt_id is not None
                 ledger.begin(receipt_id, CaptureEvaluationKind.MATERIALIZATION_HELPER)
-            try:
-                ticket = self._arbiter.submit(
-                    route, worker_plan,
-                    finalizer=publish if ledger is not None else None,
-                )
-            except BaseException:
+            def admitted(_ticket: ExecutionTicket) -> None:
+                self._preparation_revision += 1
+
+            def discard_unstarted() -> None:
                 if ledger is not None:
                     assert receipt_id is not None
                     ledger.discard_unstarted(receipt_id)
-                raise
-            self._preparation_revision += 1
-            try:
-                self._arbiter.dispatch(ticket)
-            except BaseException:
-                if ticket.cancel_queued() and ledger is not None:
-                    assert receipt_id is not None
-                    ledger.discard_unstarted(receipt_id)
-                raise
+
+            ticket = self._submit_direct_ticket(
+                route, worker_plan,
+                finalizer=publish if ledger is not None else None,
+                on_admitted=admitted,
+                on_pre_effect_cancel=discard_unstarted,
+            )
             if ledger is not None:
                 assert receipt_id is not None
                 Thread(
@@ -2439,31 +2479,19 @@ class ExecutionController:
                 raise ProtocolError("CAPTURE evaluation ledger is unavailable")
             receipt_id = f"materialization-{uuid4().hex}"
 
-            def plan(port: SessionPort) -> ReadyForPolicy | ConfirmedFailure:
-                try:
-                    if _before_first_effect is not None:
-                        _before_first_effect()
-                    selected_plan = transfer_plan
-                    if isinstance(selected_plan, CaptureSelectedTableTransferRequest):
-                        if selected_plan.runtime_generation != self._generation:
-                            raise ProtocolError("CAPTURE selected table generation is stale")
-                        descriptor = self.require_capture_table_descriptor(
-                            selected_plan.handle, scope, allow_pending=True,
-                        )
-                        selected_plan = selected_plan.prepare(descriptor)
-                except Exception as error:
-                    # These local checks precede RDBG. A confirmed rejection
-                    # must release the ledger before the ticket wakes a caller.
-                    ledger.fail(receipt_id, "CAPTURE materialization preparation failed")
-                    return ConfirmedFailure(error)
-                result = self._capture_materialization_executor.execute(
-                    scope,
-                    selected_plan,
-                    port=port,
-                    shield_workspace=self._shield_capture_workspace,
-                    restore_workspace=self._restore_capture_workspace,
+            def require_descriptor(
+                handle: str, selected_scope: CaptureScope,
+            ) -> CaptureSelectedTableDescriptor:
+                return self.require_capture_table_descriptor(
+                    handle, selected_scope, allow_pending=True,
                 )
-                return ReadyForPolicy(result.value, next_route=result.next_route)
+
+            plan = self._capture_private_data_plane.materialization_plan(
+                scope, transfer_plan, ledger, receipt_id,
+                runtime_generation=self._generation,
+                require_descriptor=require_descriptor,
+                before_first_effect=_before_first_effect,
+            )
 
             def publish(payload: object) -> object:
                 # Bytes stay private; the public CAPTURE ledger records only
@@ -2473,18 +2501,14 @@ class ExecutionController:
                 return payload
 
             ledger.begin(receipt_id, CaptureEvaluationKind.MATERIALIZATION_HELPER)
-            try:
-                ticket = self._arbiter.submit(route, plan, finalizer=publish)
-            except BaseException:
-                ledger.discard_unstarted(receipt_id)
-                raise
-            self._preparation_revision += 1
-            try:
-                self._arbiter.dispatch(ticket)
-            except BaseException:
-                if ticket.cancel_queued():
-                    ledger.discard_unstarted(receipt_id)
-                raise
+            def admitted(_ticket: ExecutionTicket) -> None:
+                self._preparation_revision += 1
+
+            ticket = self._submit_direct_ticket(
+                route, plan, finalizer=publish,
+                on_admitted=admitted,
+                on_pre_effect_cancel=lambda: ledger.discard_unstarted(receipt_id),
+            )
             Thread(
                 target=_observe_capture_ticket,
                 args=(ticket, ledger, receipt_id),
@@ -2516,19 +2540,12 @@ class ExecutionController:
             ):
                 raise ProtocolError("No confirmed CAPTURE cleanup failure can be retried")
 
-            def plan(port: SessionPort) -> Settlement:
-                return self._capture_materialization_executor.retry_confirmed_cleanup(
-                    scope,
-                    key,
-                    port=port,
-                    shield_workspace=self._shield_capture_workspace,
-                    restore_workspace=self._restore_capture_workspace,
-                )
+            plan = self._capture_private_data_plane.cleanup_retry_plan(scope, key)
 
-            ticket = self._arbiter.submit(route, plan)
-            self._preparation_revision += 1
-            self._arbiter.dispatch(ticket)
-            return ticket
+            def admitted(_ticket: ExecutionTicket) -> None:
+                self._preparation_revision += 1
+
+            return self._submit_direct_ticket(route, plan, on_admitted=admitted)
 
     def _resume_in_flight(self) -> bool:
         ticket = self._resume_ticket
@@ -2567,13 +2584,14 @@ class ExecutionController:
                         self._retain_main_worker_lease(operation, port)
                     raise
 
-            ticket = self._arbiter.submit(
+            def admitted(ticket: ExecutionTicket) -> None:
+                self._main_stop_ticket = ticket
+                self._preparation_revision += 1
+
+            return self._submit_direct_ticket(
                 route, plan, finalizer=operation.settler,
+                on_admitted=admitted,
             )
-            self._main_stop_ticket = ticket
-            self._preparation_revision += 1
-            self._arbiter.dispatch(ticket)
-            return ticket
 
     def _route_stop(
         self, port: SessionPort, operation: MainOperation, stop: StopEvent

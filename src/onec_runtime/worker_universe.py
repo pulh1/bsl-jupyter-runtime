@@ -2049,6 +2049,16 @@ class WorkerUniverseRegistry:
                 )
             )
 
+    def retained_source_units(self) -> tuple[SourceUnitRef, ...]:
+        """Read source identities from generations still owned by this registry."""
+
+        return tuple(
+            unit
+            for view in self._retained_debug_views()
+            for module in view.modules
+            for unit in module.source_units
+        )
+
     def _require_generation(
         self,
         handle: WorkerGenerationHandle,

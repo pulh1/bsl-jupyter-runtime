@@ -7,7 +7,10 @@ import pytest
 
 import onec_runtime.execution.arbiter as arbiter_module
 from arbiter_test_cleanup import confirm_test_server_terminated
-from onec_runtime.errors import CommandTimeout, EvaluationDispatchUnknown
+from onec_runtime.errors import (
+    CommandTimeout, EvaluationDispatchUnknown, LocalVariablesResultTimeout,
+    RdbgTransportTimeout,
+)
 from onec_runtime.rdbg.models import FrameVariable, LocalVariablesResult, PendingEvaluation, TargetId, EvaluationResult
 
 
@@ -15,6 +18,7 @@ from onec_runtime.execution.arbiter import (
     ConfirmedFailure, RdbgArbiter, RouteToken, Settlement, OutcomeUnknown, StaleRoute,
     CancelledBeforeEffect, WaiterDetached, ArbiterBusy,
 )
+from onec_runtime.execution.contracts import SubmissionReceipt
 
 
 class Session:
@@ -161,6 +165,26 @@ def test_local_variables_result_retires_transport_entry_before_next_ticket(runti
     arbiter.dispatch(later)
     assert later.wait(3) == 'later'
     assert [name for name, _ in session.calls] == ['locals', 'later', 'event']
+
+
+def test_local_variables_result_timeout_releases_read_only_ticket(runtime):
+    session, route, arbiter = runtime
+
+    def missing_result(*, stack_level, timeout_s, on_transport_dispatch):
+        on_transport_dispatch()
+        session.record('locals-request')
+        raise LocalVariablesResultTimeout('No local variables result arrived')
+
+    session.local_variables = missing_result
+    ticket = arbiter.submit(route, lambda port: Settlement(port.local_variables(timeout_s=0.1)))
+    arbiter.dispatch(ticket)
+    with pytest.raises(LocalVariablesResultTimeout):
+        ticket.wait_settled(3)
+    assert arbiter.active_ticket is None
+
+    successor = arbiter.submit(route, lambda port: Settlement('capture still paused'))
+    arbiter.dispatch(successor)
+    assert successor.wait(3) == 'capture still paused'
 
 
 def test_heartbeat_waits_behind_active_eval_and_runs_on_same_worker(runtime):
@@ -633,6 +657,24 @@ def test_continue_evaluation_refuses_foreign_stop_before_dispatch():
         close_stopped_eval_test_arbiter(arbiter, route, ticket, session)
 
 
+def test_interrupted_receipt_adoption_retires_unready_ticket(runtime) -> None:
+    session, route, arbiter = runtime
+
+    def interrupt(_ticket) -> None:
+        raise KeyboardInterrupt
+
+    receipt = SubmissionReceipt(interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        arbiter.submit(route, lambda _port: Settlement("orphan"), receipt=receipt)
+
+    assert receipt.ticket is not None
+    assert receipt.ticket.status().settled
+    assert session.calls == []
+    successor = arbiter.submit(route, lambda _port: Settlement("successor"))
+    arbiter.dispatch(successor)
+    assert successor.wait_settled(3) == "successor"
+
+
 @pytest.mark.parametrize(
     'outcome', [Settlement('premature'), ConfirmedFailure(ValueError('premature'))],
 )
@@ -803,7 +845,7 @@ def test_local_variables_timeout_after_dispatch_keeps_arbiter_owner():
     def timed_out(*, stack_level, timeout_s, on_transport_dispatch):
         on_transport_dispatch()
         session.record('locals-request')
-        raise CommandTimeout('HTTP response missing after request entry')
+        raise RdbgTransportTimeout('HTTP response missing after request entry')
 
     session.local_variables = timed_out
     ticket = arbiter.submit(route, lambda port: Settlement(port.local_variables(timeout_s=0.1)))

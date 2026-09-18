@@ -15,7 +15,10 @@ from onec_runtime.rdbg.models import StopEvent
 class MainRdbgPort(Protocol):
     """Methods needed by MAIN; arbiter owns the concrete session in the final route."""
 
-    def modify(self, variable: str, value_expression: str) -> object: ...
+    def modify(
+        self, variable: str, value_expression: str, *,
+        on_transport_dispatch: Callable[[], None] | None = None,
+    ) -> object: ...
 
     def continue_(
         self, *, on_transport_dispatch: Callable[[], None] | None = None
@@ -53,14 +56,16 @@ class MainExecutor:
         rdbg = self._port(port)
         install_workspace()
         before_command_write()
-        self._checked_modify(
-            rdbg.modify("ТекущаяИнструкция", bsl_string_literal(instruction)),
-            "ТекущаяИнструкция",
-        )
-        self._checked_modify(
-            rdbg.modify("ИдентификаторКоманды", str(operation.command_id)),
-            "ИдентификаторКоманды",
-        )
+        for variable, expression in (
+            ("ТекущаяИнструкция", bsl_string_literal(instruction)),
+            ("ИдентификаторКоманды", str(operation.command_id)),
+        ):
+            result = rdbg.modify(
+                variable, expression,
+                on_transport_dispatch=operation.command_write_requested,
+            )
+            operation.command_write_acknowledged()
+            self._checked_modify(result, variable)
         return self.resume(operation, before_continue=before_continue, port=rdbg)
 
     def resume(

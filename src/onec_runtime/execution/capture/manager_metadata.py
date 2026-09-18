@@ -243,6 +243,8 @@ class _MetadataTicket(Protocol):
 class _MetadataController(Protocol):
     capture_scope: CaptureScope | None
 
+    def request_stop(self, ticket: _MetadataTicket) -> object: ...
+
     def require_capture_manager_metadata_ready(self, scope: CaptureScope) -> None: ...
     def submit_capture_manager_metadata(
         self, plan: CaptureManagerMetadataPlan,
@@ -448,6 +450,7 @@ class CaptureManagerMetadataService:
             raise
         return wait_initiator_locally(
             ticket, timeout_s=remaining, wait_handoff=self._wait_handoff,
+            request_stop=lambda: self._controller.request_stop(ticket),
         )
 
 

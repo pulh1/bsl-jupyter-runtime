@@ -1,4 +1,4 @@
-"""Limit an initiating caller's ticket wait without cancelling remote work."""
+"""Bound initiating waits; timeout detaches while interrupt requests Stop."""
 
 from __future__ import annotations
 
@@ -41,8 +41,9 @@ def wait_initiator_locally(
     *,
     timeout_s: float | None,
     wait_handoff: Callable[[], AbstractContextManager[None]],
+    request_stop: Callable[[], object],
 ) -> _T:
-    """Detach a timed-out or interrupted waiter; leave its ticket owned."""
+    """Stop an interrupted ticket; a local timeout only detaches its waiter."""
 
     selected = validate_local_wait_timeout(timeout_s)
     try:
@@ -57,5 +58,9 @@ def wait_initiator_locally(
             ticket.detach_waiter()
         raise
     except KeyboardInterrupt:
-        ticket.detach_waiter()
+        try:
+            if not ticket.status().settled:
+                request_stop()
+        finally:
+            ticket.detach_waiter()
         raise

@@ -25,7 +25,7 @@ class _Pipeline:
 
     def execute(
         self, source, source_unit, *, wait_handoff=None,
-        on_prepared=None, on_admitted=None,
+        on_prepared=None, on_admitted=None, on_admitted_ticket=None,
     ):
         self.calls.append((source, source_unit))
         with wait_handoff():
@@ -34,6 +34,8 @@ class _Pipeline:
         if on_prepared is not None:
             self.calls.append(("provenance prepared",))
             on_prepared(prepared)
+        if on_admitted_ticket is not None:
+            on_admitted_ticket(_Ticket())
         if on_admitted is not None:
             on_admitted(prepared)
             self.calls.append(("admitted",))

@@ -107,6 +107,7 @@ class CaptureMaterializationExecutor:
         port: CaptureMaterializationPort,
         shield_workspace: Callable[[CaptureMaterializationPort], None],
         restore_workspace: Callable[[CaptureMaterializationPort], None],
+        on_confirmed_failure: Callable[[BaseException], None] | None = None,
     ) -> Settlement:
         """Return private bytes only after cleanup is confirmed.
 
@@ -115,6 +116,8 @@ class CaptureMaterializationExecutor:
         mandatory workspace restore keeps the arbiter ticket for repair. The
         plan must come from a CAPTURE materialization policy and already carry
         its safe handle, budgets, generation checks, and cleanup instruction.
+        The optional callback publishes a confirmed failure before the caller's
+        ticket is settled; unknown remote outcomes never invoke it.
         """
 
         self._validate(scope, plan)
@@ -210,9 +213,13 @@ class CaptureMaterializationExecutor:
             scope.note_temporary_cleanup_failure(key)
             failure = ConfirmedTemporaryKeyCleanupFailure(key)
             failure.policy_error = policy_error
+            if on_confirmed_failure is not None:
+                on_confirmed_failure(failure)
             raise failure
         scope.confirm_temporary_cleanup(key)
         if policy_error is not None:
+            if on_confirmed_failure is not None:
+                on_confirmed_failure(policy_error)
             raise policy_error
         assert payload is not None
         return Settlement(payload)

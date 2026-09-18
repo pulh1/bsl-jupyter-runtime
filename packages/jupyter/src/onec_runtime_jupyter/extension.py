@@ -28,8 +28,8 @@ from onec_runtime.capture_evaluation import (
     is_public_capture_evaluation_id,
 )
 from onec_runtime.errors import CaptureEvaluationPendingError, ProtocolError
-from onec_runtime.runtime_api import (
-    MAX_PROJECTION_POSITION,
+from onec_runtime.execution.value_transfer_plan import MAX_PROJECTION_POSITION
+from onec_runtime.runtime_models import (
     RuntimeNamespaceSnapshot,
     RuntimeReply,
     RuntimeReplyKind,

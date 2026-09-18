@@ -11,7 +11,7 @@ import pytest
 from onec_runtime.capture_evaluation import CapturePhase
 from onec_runtime.capture_inspection import DebugFrame
 from onec_runtime.capture_values import ValueNode, ValueShape
-from onec_runtime.runtime_api import RuntimeReplyKind
+from onec_runtime.runtime_models import RuntimeReplyKind
 from test_worker_universe_1c import _enter_synthetic_capture, _fresh_live_harness
 
 
