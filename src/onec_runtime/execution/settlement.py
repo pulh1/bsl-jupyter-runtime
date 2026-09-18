@@ -9,7 +9,7 @@ registration or namespace publication call.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from threading import RLock
 from typing import TYPE_CHECKING, Protocol
 
@@ -25,6 +25,7 @@ from onec_runtime.execution.reply_publication import (
     CapturePublicationRecord, CaptureRemoteOutcome, CaptureReplyPolicy,
     MainConfirmedDecodeFailure, MainPublicationRecord, MainReplyPolicy,
 )
+from onec_runtime.rdbg.models import StopEvent
 
 if TYPE_CHECKING:
     from onec_runtime.runtime_api import CaptureCorrelationTicket, OperationState, RuntimeReply
@@ -55,6 +56,8 @@ class _MainRegistration:
     payload: MainPreparedPayload = field(repr=False)
     record: MainPublicationRecord = field(repr=False)
     namespace_names: tuple[str, ...]
+    last_published_stop_sequence: int = 0
+    published_stop: StopEvent | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,6 +150,66 @@ class RouteSettlementService:
                 raise ValueError("MAIN command already has a publication record")
             self._main[operation.command_id] = registration
 
+    def next_capture_stop_sequence(self, operation: MainOperation) -> int:
+        """Read the successor stop number from this MAIN's published stop."""
+
+        with self._lock:
+            _, next_sequence = self._published_capture_successor(operation)
+            return next_sequence
+
+    def rebind_next_capture_ticket(
+        self, operation: MainOperation, ticket: CaptureCorrelationTicket,
+    ) -> None:
+        """Bind an opaque successor ticket to the same live MAIN publication.
+
+        This changes no remote state. A caller can replace an armed ticket for
+        the same next stop, but cannot bind one from another MAIN command or
+        skip a stop number.
+        """
+
+        from onec_runtime.runtime_api import CaptureCorrelationTicket
+
+        with self._lock:
+            registration, next_sequence = self._published_capture_successor(operation)
+            if not isinstance(ticket, CaptureCorrelationTicket):
+                raise TypeError("CaptureCorrelationTicket is required")
+            if (
+                not isinstance(ticket.ticket_id, str)
+                or not 0 < len(ticket.ticket_id) <= 256
+                or any(ord(character) < 32 for character in ticket.ticket_id)
+            ):
+                raise ValueError("CAPTURE ticket ID is invalid")
+            if (
+                type(ticket.expected_operation_id) is not int
+                or ticket.expected_operation_id != operation.command_id
+            ):
+                raise ValueError("CAPTURE ticket names another MAIN command")
+            if (
+                type(ticket.expected_stop_sequence) is not int
+                or ticket.expected_stop_sequence != next_sequence
+            ):
+                raise ValueError("CAPTURE ticket must name the next CAPTURE stop")
+            self._main[operation.command_id] = replace(
+                registration,
+                record=replace(registration.record, capture_ticket=ticket),
+            )
+
+    def _published_capture_successor(
+        self, operation: MainOperation,
+    ) -> tuple[_MainRegistration, int]:
+        if not isinstance(operation, MainOperation):
+            raise TypeError("MainOperation is required")
+        registration = self._main.get(operation.command_id)
+        if registration is None or registration.record.operation is not operation:
+            raise ValueError("MAIN operation has no matching publication record")
+        if (
+            operation.phase is not MainPhase.SUSPENDED_CAPTURE
+            or registration.last_published_stop_sequence <= 0
+            or operation.pending_stop is not registration.published_stop
+        ):
+            raise ValueError("MAIN operation has no published CAPTURE stop")
+        return registration, registration.last_published_stop_sequence + 1
+
     def register_capture(
         self, scope: CaptureScope, payload: CapturePreparedPayload,
         *, base_namespace_names: tuple[str, ...] = (),
@@ -214,6 +277,17 @@ class RouteSettlementService:
             if registration is None or registration.payload is not payload:
                 raise ValueError("MAIN yield has no matching publication record")
         reply = self._main_policy.publish(outcome, registration.record)
+        if isinstance(outcome, MainYield) and outcome.kind is MainYieldKind.CAPTURE:
+            with self._lock:
+                if self._main.get(outcome.operation.command_id) is not registration:
+                    raise ValueError("MAIN publication changed during CAPTURE settlement")
+                if reply.stop_sequence != registration.last_published_stop_sequence + 1:
+                    raise ValueError("CAPTURE stop is not the next MAIN stop")
+                self._main[outcome.operation.command_id] = replace(
+                    registration,
+                    last_published_stop_sequence=reply.stop_sequence,
+                    published_stop=outcome.scope.stop,
+                )
         if (
             isinstance(outcome, MainConfirmedDecodeFailure)
             or outcome.kind is MainYieldKind.COMPLETED

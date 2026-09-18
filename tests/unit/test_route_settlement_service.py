@@ -20,7 +20,9 @@ from onec_runtime.execution.main.policy import MainPreparedPayload
 from onec_runtime.execution.preparation import RoutePreparedStatement, WorkerCandidateIntent
 from onec_runtime.bsl.parser_target import PythonParserTarget
 from onec_runtime.rdbg.models import EvaluationResult
-from onec_runtime.runtime_api import OperationState, RuntimeReplyKind
+from onec_runtime.runtime_api import (
+    CaptureCorrelationTicket, OperationState, RuntimeReplyKind,
+)
 
 from test_execution_route_sequence import CAPTURE_STOP
 
@@ -50,9 +52,11 @@ def _payload(source: str, *, capture: bool = False):
     return MainPreparedPayload(common, statement)
 
 
-def _scope(operation: MainOperation, local_sequence: int) -> CaptureScope:
-    operation.stopped(CAPTURE_STOP, MainPhase.SUSPENDED_CAPTURE)
-    scope = CaptureScope.from_stop(1, operation.command_id, CAPTURE_STOP, local_sequence)
+def _scope(
+    operation: MainOperation, local_sequence: int, *, stop=CAPTURE_STOP,
+) -> CaptureScope:
+    operation.stopped(stop, MainPhase.SUSPENDED_CAPTURE)
+    scope = CaptureScope.from_stop(1, operation.command_id, stop, local_sequence)
     scope.record_locals(())
     scope.record_transfer("opaque-context-address")
     scope.record_kernel_frame(2)
@@ -100,6 +104,106 @@ def test_main_registration_preserves_source_and_namespace_until_resume_completio
     assert completed.changed_roots == ("Начисление",)
     assert namespace.names == ("Начисление",)
     assert service.pending_main_names(operation) == ()
+
+
+def test_next_capture_ticket_rebinds_retained_main_publication_after_stop():
+    from onec_runtime.execution.settlement import RouteSettlementService
+
+    namespace = NamespaceStore()
+    service = RouteSettlementService(namespace)
+    payload = _payload("Начисление = 1;")
+    operation = MainOperation(26, None, message_collector_key="__messages")
+    first_ticket = CaptureCorrelationTicket("capture_first", 26, 1)
+    service.register_main(
+        operation, payload, prior_capture_sequence=4, capture_ticket=first_ticket,
+    )
+    first_scope = _scope(operation, 5)
+    first_reply = service.settle_main(
+        MainYield(MainYieldKind.CAPTURE, operation, scope=first_scope), payload,
+    )
+    assert first_reply.capture_ticket == "capture_first"
+    assert service.next_capture_stop_sequence(operation) == 2
+
+    next_ticket = CaptureCorrelationTicket("capture_next", 26, 2)
+    service.rebind_next_capture_ticket(operation, next_ticket)
+    assert service.pending_main_names(operation) == ("Начисление",)
+    assert namespace.names == ()
+
+    operation.continue_requested()
+    operation.continue_acknowledged()
+    next_scope = _scope(operation, 6)
+    next_reply = service.settle_main(
+        MainYield(MainYieldKind.CAPTURE, operation, scope=next_scope), payload,
+    )
+    assert next_reply.stop_sequence == 2
+    assert next_reply.capture_ticket == "capture_next"
+    assert next_reply.changed_roots == ("Начисление",)
+
+
+def test_next_capture_ticket_rejects_foreign_or_nonsequential_rebind():
+    from onec_runtime.execution.settlement import RouteSettlementService
+
+    service = RouteSettlementService(NamespaceStore())
+    payload = _payload("Начисление = 1;")
+    operation = MainOperation(27, None, message_collector_key="__messages")
+    service.register_main(operation, payload, prior_capture_sequence=7)
+    next_ticket = CaptureCorrelationTicket("capture_next", 27, 2)
+    with pytest.raises(ValueError, match="published CAPTURE stop"):
+        service.next_capture_stop_sequence(operation)
+    with pytest.raises(ValueError, match="published CAPTURE stop"):
+        service.rebind_next_capture_ticket(operation, next_ticket)
+
+    scope = _scope(operation, 8)
+    service.settle_main(MainYield(MainYieldKind.CAPTURE, operation, scope=scope), payload)
+    impostor = MainOperation(27, None, message_collector_key="__messages")
+    with pytest.raises(ValueError, match="MAIN operation"):
+        service.next_capture_stop_sequence(impostor)
+    with pytest.raises(ValueError, match="MAIN operation"):
+        service.rebind_next_capture_ticket(impostor, next_ticket)
+    with pytest.raises(ValueError, match="MAIN command"):
+        service.rebind_next_capture_ticket(
+            operation, CaptureCorrelationTicket("capture_wrong", 28, 2),
+        )
+    for wrong_stop in (1, 3):
+        with pytest.raises(ValueError, match="next CAPTURE stop"):
+            service.rebind_next_capture_ticket(
+                operation, CaptureCorrelationTicket("capture_wrong", 27, wrong_stop),
+            )
+    with pytest.raises(TypeError, match="CaptureCorrelationTicket"):
+        service.rebind_next_capture_ticket(operation, object())
+    with pytest.raises(ValueError, match="ticket ID"):
+        service.rebind_next_capture_ticket(
+            operation, CaptureCorrelationTicket("", 27, 2),
+        )
+
+    operation.continue_requested()
+    operation.continue_acknowledged()
+    with pytest.raises(ValueError, match="published CAPTURE stop"):
+        service.next_capture_stop_sequence(operation)
+    with pytest.raises(ValueError, match="published CAPTURE stop"):
+        service.rebind_next_capture_ticket(operation, next_ticket)
+
+
+def test_next_capture_ticket_requires_the_current_stop_to_be_published():
+    from onec_runtime.execution.settlement import RouteSettlementService
+
+    service = RouteSettlementService(NamespaceStore())
+    payload = _payload("Начисление = 1;")
+    operation = MainOperation(29, None, message_collector_key="__messages")
+    service.register_main(operation, payload, prior_capture_sequence=4)
+    first_scope = _scope(operation, 5)
+    service.settle_main(MainYield(MainYieldKind.CAPTURE, operation, scope=first_scope), payload)
+
+    operation.continue_requested()
+    operation.continue_acknowledged()
+    _scope(operation, 6, stop=replace(CAPTURE_STOP))
+
+    with pytest.raises(ValueError, match="published CAPTURE stop"):
+        service.next_capture_stop_sequence(operation)
+    with pytest.raises(ValueError, match="published CAPTURE stop"):
+        service.rebind_next_capture_ticket(
+            operation, CaptureCorrelationTicket("capture_late", 29, 2),
+        )
 
 
 def test_main_bsl_failure_does_not_publish_prepared_namespace():
