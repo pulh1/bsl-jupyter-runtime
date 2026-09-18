@@ -1,12 +1,25 @@
 # Python API сеанса 1С
 
-Это руководство описывает публичные объекты текущей версии runtime, которые доступны из Python-ячейки notebook. Запуск с `RuntimeConfig`, `RuntimeSessionConfig` и `InteractiveRuntimeSession.start()` показан в [быстром старте](../README.md#быстрый-старт-в-vs-code). Все вызовы к 1С относятся к запущенному сеансу; обычные Python-вычисления не требуют обращения к debugger.
+Это руководство описывает публичные объекты runtime, доступные из Python-ячейки notebook. Запуск с `RuntimeConfig`, `RuntimeSessionConfig` и `InteractiveRuntimeSession.start()` показан в [быстром старте](../README.md#быстрый-старт-в-vs-code). Все вызовы к 1С относятся к запущенному сеансу; обычные Python-вычисления не требуют обращения к debugger.
 
 `RuntimeConfig` импортируется из `onec_runtime.config`, `RuntimeSessionConfig`, `ExtensionMode` и `RuntimeSession` — из `onec_runtime.session`, а `InteractiveRuntimeSession` — из `onec_runtime_jupyter`. В `RuntimeConfig` обязательный `platform_bin` указывает каталог исполняемых файлов платформы; `connection_string` выбирает файловую или серверную ИБ. `RuntimeSessionConfig(runtime=..., source_root=..., extension_mode=...)` связывает сеанс с выгрузкой исходников и режимом установки расширения (`AUTO` или `MANUAL`). `source_root` нужен для загрузки модулей и точек по пути к файлу. Дополнительные параметры, включая `workspace`, `chunk_size` и `evidence_root`, используются при настройке окружения и переноса данных.
 
 Типы ответов `RuntimeReply`, `RuntimeReplyKind`, `RuntimeStatus` и `RuntimeNamespaceSnapshot` находятся в `onec_runtime.runtime_api`; `CaptureView`, `DebugFrame` и `StackPage` — в `onec_runtime.capture_inspection`; `CaptureStatus`, `CapturePhase`, `CaptureEvaluationOutcome`, `CaptureEvaluationState`, `CaptureEvaluationKind`, `CaptureEvaluationTiming` и `CaptureFailureDiagnostic` — в `onec_runtime.capture_evaluation`. `RuntimeDebugStop` находится в `onec_runtime.worker_breakpoints`, а его `StopReason` — в `onec_runtime.stop_routing`. Обычно эти объекты не нужно создавать вручную: их возвращают методы сеанса и текущего CAPTURE view.
 
-`RuntimeSession` — пользовательская граница core runtime. Объект `runtime.runtime_api` сейчас имеет реализацию `PrototypeRuntimeApi` и собирается при запуске сеанса. Прямой вызов его методов в приложении может обойти блокировку и владение CAPTURE на уровне `RuntimeSession`; для обычного Python-кода используйте методы сеанса. `RdbgArbiter`, его `ExecutionTicket` и `StopRequestOutcome` относятся к внутреннему слою исполнения, а не к API notebook.
+`RuntimeSession` — пользовательская граница core runtime. `RuntimeSession.start()` сейчас собирает `PrototypeRuntimeApi`. Новый `PublicExecutionFacade` с единым владельцем RDBG проверяется через явную композицию после bootstrap; обычный `start()` его пока не выбирает. Прямой вызов `runtime.runtime_api` может обойти блокировку и владение CAPTURE на уровне `RuntimeSession`; для прикладного Python-кода используйте методы сеанса. `RdbgArbiter`, его `ExecutionTicket` и `StopRequestOutcome` относятся к внутреннему слою исполнения, а не к API notebook.
+
+## Доступность во время перехода на новый маршрут
+
+Примеры ниже выполняются на публичном сеансе, запущенном обычным `RuntimeSession.start()` или `InteractiveRuntimeSession.start()`. Для нового маршрута проверены отдельные контракты с вручную внедрённым `PublicExecutionFacade` и имитацией остановленного target. Это статическая проверка компонента и фасада, а не живая приёмка полного notebook и не способ запуска нового маршрута из приложения.
+
+| Возможность | Обычный `start()` | Вручную внедрённый новый маршрут |
+| --- | --- | --- |
+| `execute_bsl()`, `status()`, `namespace_snapshot()`, `resume_capture()`, `resume_debug_stop()` | Публичный путь через `PrototypeRuntimeApi` | Публичные вызовы связаны с controller/arbiter в компонентных тестах. |
+| `current_capture().stack`, `context.variables`, переменные кадров | Стек, контекст и переменные кадров, если соответствующий тип 1С поддерживается. | Сохранённый стек и `context.variables` для корневых имён. `DebugFrame` из `CaptureView.stack` пока не привязан к `frame.variables`; точечное чтение корня контекста даёт тип, размер и скрытый preview. Раскрытие потомков и деление на `parameters`/`locals` не подключены. |
+| `materialize()` и `to_df()` по прямому `Контекст.Имя` | Публичный перенос значений. | Проверен ограниченный перенос через ticket на подтверждённом маршруте MAIN idle или CAPTURE paused. |
+| `OnecValueProxy.head()`, срез и `tabular_section()` | Доступны через старые `project_value()`/`project_to_df()`. | Выбранный прокси создаётся локально, но вызов переноса через `project_value()`/`project_to_df()` ещё не связан с новым фасадом. |
+
+Таким образом, примеры раскрытия `node.rows`, `node.fields` и использования `frame.locals` ниже относятся к обычному `start()`. На вручную внедрённом маршруте страница `capture.context.variables[:10]` даёт только имена в `UnavailableValueNode`; точный запрос `capture.context.variables["Имя"]` возвращает непрозрачный `ValueNode` с типом и размером, если debugger может их прочитать. Его `preview` скрывает исходное значение. Для переноса поддерживаемого значения используйте отдельно `runtime.materialize("Контекст.КонтекстОтладки.Имя")`, пока этот CAPTURE stop подтверждён и доступен. При интеграции нового маршрута в `start()` эту матрицу нужно пересмотреть.
 
 ## Сеанс и выполнение
 
@@ -68,9 +81,9 @@ print(bsl["Количество"].materialize())
 | --- | --- |
 | `materialize(*, refs="presentation", ref_columns=None, uuid_suffix="__uuid", chunk_size=None, max_depth=32, max_items=100_000, max_bytes=64*1024*1024)` | Перенос поддерживаемого значения в Python с ограничениями глубины, числа элементов и объёма. |
 | `to_df(*, refs="presentation", ref_columns=None, uuid_suffix="__uuid", chunk_size=None)` | Перенос таблицы значений в `pandas.DataFrame`. |
-| `head(limit)` | Новый прокси на первые `limit` элементов таблицы/коллекции. |
-| `proxy[start:stop]` | Новый прокси на ограниченный срез без шага. |
-| `tabular_section(name)` | Новый прокси на табличную часть объекта. |
+| `head(limit)` | Новый прокси на первые `limit` элементов таблицы/коллекции; перенос выбранного диапазона сейчас работает на обычном `start()`. |
+| `proxy[start:stop]` | Новый прокси на ограниченный срез без шага; перенос выбранного диапазона сейчас работает на обычном `start()`. |
+| `tabular_section(name)` | Новый прокси на табличную часть объекта; перенос вложенного пути сейчас работает на обычном `start()`. |
 
 Для ссылочных значений `refs` принимает `"presentation"` (представление), `"uuid"` (идентификатор) или `"both"` (оба). `ref_columns` задаёт режим для отдельных колонок по имени; в режиме `"both"` дополнительная колонка получает суффикс `uuid_suffix`. Фактический Python-тип результата `materialize()` зависит от формы BSL-значения; `to_df()` предназначен для таблиц.
 
@@ -81,22 +94,28 @@ value = bsl["Объект"].tabular_section("Строки").materialize(max_item
 
 Материализация и чтение CAPTURE-переменных могут обращаться к остановленному 1С target. Пока другой CAPTURE-запрос выполняется, такой вызов может получить `CaptureBusyError`; после истечения ожидания CAPTURE-выражения может прийти `CaptureEvaluationPendingError`. Эти ошибки сами по себе не доказывают потерю остановленного кадра.
 
-При использовании `RuntimeSession` без Jupyter те же операции доступны по ограниченному handle постоянного контекста: `runtime.materialize("Контекст.Количество")` и `runtime.to_df("Контекст.Таблица", refs="uuid")`. Эти методы принимают те же параметры политики ссылок; `materialize()` дополнительно принимает `max_depth`, `max_items`, `max_bytes` и `timeout_s`.
+При использовании `RuntimeSession` без Jupyter те же операции доступны по ограниченному handle постоянного контекста: `runtime.materialize("Контекст.Количество")` и `runtime.to_df("Контекст.Таблица", refs="uuid")`. Handle должен быть прямым или точечным путём от `Контекст`, без вызовов методов и индексов. Эти методы принимают те же параметры политики ссылок; `materialize()` дополнительно принимает `max_depth`, `max_items`, `max_bytes` и `timeout_s`. На новом маршруте `to_df()` ограничен 100 000 строк и 64 МиБ, а `chunk_size` проверяется как положительная подсказка и пока не разбивает перенос на части. С расширением 0.1.8 и протоколом 4 превышение лимита строк даёт ошибку, а не усечённый `DataFrame`.
 
 ## Остановка CAPTURE
 
 `add_capture_point(path: str, line: int)` устанавливает точку по пути к модулю внутри `source_root` и номеру строки; возвращает `ModuleLocation`. `clear_capture_points()` удаляет заданные точки. После попадания в точку `runtime.current_capture()` возвращает `CaptureView` именно этой остановки. Сохранённый view нельзя использовать для новых чтений после продолжения или перехода к другой остановке.
 
 ```python
-runtime.add_capture_point(r"CommonModules\ExampleServer\Ext\Module.bsl", 120)
-# Следующая MAIN BSL-ячейка вызывает код, проходящий через эту строку.
-capture = runtime.current_capture()
-print(capture.status().phase.value)
+from onec_runtime.runtime_api import RuntimeReplyKind
 
-page = capture.stack[:10]
-print(page.total, page.next_cursor)
-for frame in page.frames:
-    print(frame)
+runtime.add_capture_point(r"CommonModules\ExampleServer\Ext\Module.bsl", 120)
+# bsl_source_that_reaches_point — текст вашей MAIN-ячейки, вызывающей этот метод.
+reply = runtime.execute_bsl(bsl_source_that_reaches_point)
+if reply.kind is RuntimeReplyKind.CAPTURED:
+    capture = runtime.current_capture()
+    print(capture.status().phase.value)
+
+    page = capture.stack[:10]
+    print(page.total, page.next_cursor)
+    for frame in page.frames:
+        print(frame)
+
+    reply = runtime.resume_capture()  # следующая остановка либо завершение той же MAIN-команды
 ```
 
 `CaptureView` содержит `operation_id`, `capture_generation`, `stop_sequence` и следующие средства:
@@ -107,6 +126,25 @@ for frame in page.frames:
 | `capture.wait(timeout_s=None, evaluation_id=None) -> CaptureEvaluationOutcome` | Ждёт исход конкретной или последней оценки. При истечении локального ожидания возвращает outcome с `state == pending`; не запускает и не отменяет оценку. Для старого view вызывает `StaleCaptureError`. |
 | `capture.stack[index]`, `capture.stack[start:stop]` | Один `DebugFrame` или страница `StackPage`. `capture.stack.native` открывает физические кадры, включая служебные. Срез должен иметь конечные границы и не больше 100 кадров. |
 | `capture.context.variables[name]`, `capture.context.variables[start:stop]` | Значение по точному имени или ограниченная страница переменных staged CAPTURE-контекста. |
+
+Для нового фасада с явной композицией следующий пример читает только подтверждённые метаданные текущей остановки. Срез стека или переменных всегда задавайте конечной границей; `StackPage` может также содержать маркер скрытых служебных кадров.
+
+```python
+from onec_runtime.capture_inspection import DebugFrame
+
+capture = runtime.current_capture()
+for frame in capture.stack[:10].frames:
+    if isinstance(frame, DebugFrame):
+        print(frame.native_level, frame.source, frame.line)
+
+names = [item.name for item in capture.context.variables[:10].items
+         if isinstance(item.name, str)]
+if names:
+    root = capture.context.variables[names[0]]
+    print(root.type_name, root.size)  # содержимое preview скрыто
+```
+
+`RuntimeSession.capture_stack(capture, ...)`, `capture_frame(capture, ...)` и `frame_variables(capture, ...)` принимают объект с fence/intent от интеграционного слоя. Они возвращают ограниченные словари для MCP и не принимают `CaptureView` вместо такого объекта. Для обычной Python-ячейки используйте `runtime.current_capture().stack` и `.context.variables`.
 
 `StackPage` содержит `frames`, `total`, `next_cursor`; `with_methods()` добавляет разрешённые по исходникам имена и сигнатуры методов. `DebugFrame` содержит `source`, `line`, `native_level`, `source_status`, `method_status`; `frame.variables`, `frame.parameters`, `frame.locals` открывают переменные этого кадра. Страницы переменных содержат `items`, `total`, `next_cursor`. Обычный `ValueNode` показывает `name`, `type_name`, `preview`, `size`, `shape`, `expandable` и разрешает ограниченное чтение через `children`, `fields`, `items`, `columns`, `rows`. Выбор страницы требует конечного среза; бесконечная итерация намеренно недоступна.
 
@@ -179,6 +217,20 @@ reply = runtime.resume_capture()
 ## Прерывание ячейки и Stop
 
 `KeyboardInterrupt` или кнопка остановки notebook прерывают ожидание Python-ячейки. После отправки команды в 1С это само по себе **не подтверждает** прекращение BSL-кода. Сначала проверьте `runtime.status()` (в notebook — `%bsl_status`). Если сохранилась текущая CAPTURE-остановка, `runtime.current_capture().status()` показывает её фазу; `capture.wait(timeout_s=..., evaluation_id=...)` позволяет наблюдать уже принятую оценку без повторной отправки. Истечение `timeout_s` у `capture.wait()` возвращает `pending`, а у `resume_capture()` прекращает ожидание вызывающего; эти интервалы не служат сроком выполнения BSL.
+
+```python
+# capture_bsl_source — текст CAPTURE-ячейки с возможным долгим выполнением.
+capture = runtime.current_capture()
+try:
+    runtime.execute_bsl(capture_bsl_source)
+except KeyboardInterrupt:
+    print(runtime.status().state.value)
+    state = capture.status()
+    if state.pending_evaluation_id is not None:
+        outcome = capture.wait(timeout_s=5,
+                               evaluation_id=state.pending_evaluation_id)
+        print(outcome.state.value)  # pending означает: результат ещё не получен
+```
 
 Для принятого CAPTURE `evalExpr` прерванный ожидающий вызов отвязывается от операции. Для принятого `resume_capture()` завершение также может прийти после ухода ожидающего Python-вызова. Новую CAPTURE-операцию отправляйте лишь после проверки текущего состояния: `evaluating_capture`, `resuming` и `recovering` не являются подтверждением нового свободного stop. При `main_pending` MAIN-команда ещё может исполняться или ждать debugger stop; `status()` показывает опубликованное состояние, не останавливая её.
 
