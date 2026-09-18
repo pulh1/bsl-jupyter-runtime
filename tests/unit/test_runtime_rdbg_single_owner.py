@@ -107,10 +107,21 @@ def test_runtime_session_routes_main_capture_resume_and_heartbeat_through_one_ow
         SimpleNamespace(),
         session,
         api,
-        SimpleNamespace(),
+        SimpleNamespace(append_jsonl=lambda *_args: None),
         heartbeat_interval_s=60.0,
     )
-    runtime.configure_capture_points((BUSINESS,))
+    runtime.verify_capture_points = lambda points: (
+        SimpleNamespace(location=BUSINESS),
+    )
+    intent = SimpleNamespace(
+        points=(object(),),
+        capture_intent_id="capture-intent",
+        operation_id="mcp-operation",
+        capture_generation=1,
+        source_revision=1,
+        source_sha256="source-hash",
+    )
+    armed = runtime.arm_capture_intent(intent)
 
     calls: list[tuple[str, Thread]] = []
     for name in (
@@ -146,6 +157,9 @@ def test_runtime_session_routes_main_capture_resume_and_heartbeat_through_one_ow
             lambda: runtime.execute_bsl("Результат = 1;")
         )
         assert captured.kind is RuntimeReplyKind.CAPTURED
+        assert captured.capture_ticket == armed.ticket_id
+        assert armed.expected_controller_operation_id == captured.operation_id
+        assert armed.expected_stop_sequence == captured.stop_sequence
         capture_view = runtime.current_capture()
         assert capture_view.status().phase is CapturePhase.PAUSED
 

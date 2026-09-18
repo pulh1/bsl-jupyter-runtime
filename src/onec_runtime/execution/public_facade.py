@@ -371,6 +371,11 @@ class PublicExecutionFacade:
 
         self._controller.configure_capture_points(locations)
 
+    def prepare_capture_ticket(self):
+        """Reserve opaque evidence for the next admitted MAIN capture stop."""
+
+        return self._controller.prepare_capture_ticket()
+
     def add_worker_breakpoint(
         self,
         source_unit: SourceUnitRef,

@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 from threading import RLock, Thread
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 from uuid import uuid4
 from weakref import WeakKeyDictionary
 
@@ -69,6 +69,9 @@ from onec_runtime.execution.worker import (
 )
 from onec_runtime.rdbg.models import EvaluationResult, ModuleLocation, StopEvent, TargetId
 from onec_runtime.stop_routing import BreakpointRegistry, StopReason, classify_stop
+
+if TYPE_CHECKING:
+    from onec_runtime.runtime_api import CaptureCorrelationTicket
 
 
 class MainYieldKind(str, Enum):
@@ -359,7 +362,29 @@ class ExecutionController:
                     self._registry.service, locations, self._registry.users,
                 )
             )
+            self._planned_capture_ticket = None
             self._preparation_revision += 1
+
+    def prepare_capture_ticket(self) -> CaptureCorrelationTicket:
+        """Bind an opaque capture intent to the next MAIN command and stop."""
+
+        from onec_runtime.runtime_api import CaptureCorrelationTicket
+
+        with self._lock:
+            operation = self.main_operation
+            if operation is not None and not operation.terminal:
+                raise ProtocolError("Capture ticket requires an idle MAIN route")
+            if self._main_worker_activation_pending() or self._arbiter.has_pending_operations:
+                raise ProtocolError("RDBG activity prevents capture ticket preparation")
+            if not self._registry.captures:
+                raise ProtocolError("Capture ticket requires armed capture points")
+            ticket = CaptureCorrelationTicket(
+                ticket_id=f"capture_{uuid4().hex}",
+                expected_operation_id=self._command_sequence + 1,
+                expected_stop_sequence=1,
+            )
+            self._planned_capture_ticket = ticket
+            return ticket
 
     def _install_main_workspace(self, port: SessionPort) -> None:
         routes = self._breakpoint_routes
@@ -430,6 +455,7 @@ class ExecutionController:
         self._lock = RLock()
         self._command_sequence = 0
         self._stop_sequence = 0
+        self._planned_capture_ticket: CaptureCorrelationTicket | None = None
         self.main_operation: MainOperation | None = None
         self.capture_scope: CaptureScope | None = None
         self._capture_evaluation_ledger: CaptureEvaluationLedger | None = None
@@ -941,6 +967,7 @@ class ExecutionController:
             if self.main_operation is not None and not self.main_operation.terminal:
                 raise ProtocolError("A MAIN command is still active")
             route = self._arbiter.current_route
+            planned_capture_ticket = self._planned_capture_ticket
             self._command_sequence += 1
             operation = MainOperation(
                 self._command_sequence, None,
@@ -995,8 +1022,10 @@ class ExecutionController:
                     settlement.register_main(
                         operation, _prepared_payload,
                         prior_capture_sequence=self._stop_sequence,
+                        capture_ticket=planned_capture_ticket,
                     )
                 ticket = self._arbiter.submit(route, plan, finalizer=operation.settler)
+                self._planned_capture_ticket = None
                 self._main_stop_ticket = ticket
                 if _receipt is not None:
                     _receipt.adopt(ticket)
@@ -1004,6 +1033,7 @@ class ExecutionController:
                 self._arbiter.dispatch(ticket)
             except BaseException:
                 if _receipt is None or _receipt.ticket is None:
+                    self._planned_capture_ticket = planned_capture_ticket
                     if settlement is not None and _prepared_payload is not None:
                         settlement.discard_main(operation)
                     if self._main_stop_ticket is ticket:
