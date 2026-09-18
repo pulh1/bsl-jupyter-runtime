@@ -153,6 +153,44 @@ def test_current_session_default_chunk_size_is_advisory(method, expected_route) 
     assert router.calls[0][0] == expected_route
 
 
+def test_runtime_session_value_calls_reach_composed_facade_adapter() -> None:
+    """The public Session signatures must use the new facade's value route."""
+
+    from onec_runtime.execution.public_facade import PublicExecutionFacade
+    from onec_runtime.session import RuntimeSession
+    from test_public_execution_facade import _Arbiter, _Controller, _Pipeline, unit
+
+    router = RecordingRouter()
+    api = PublicExecutionFacade(
+        _Pipeline(), _Controller(), _Arbiter(),
+        source_unit_factory=unit,
+        status_reader=lambda: "status",
+        value_router=router,
+    )
+    session = SimpleNamespace(
+        _operation_lock=RLock(),
+        config=SimpleNamespace(chunk_size=2400),
+        runtime_api=api,
+        validate_value_reference=lambda handle: handle,
+        _capture_materialization_caller_handoff=nullcontext,
+    )
+
+    assert RuntimeSession.to_df(session, "Контекст.Таблица", refs="uuid") == "frame"
+    assert RuntimeSession.materialize(
+        session, "Контекст.Значение", max_items=3, timeout_s=0.25,
+    ) == {"value": 7}
+    assert router.calls[0][0] == "to_df"
+    assert router.calls[0][2].refs == "uuid"
+    assert router.calls[1][0] == "materialize"
+    assert router.calls[1][2].max_items == 3
+
+    with pytest.raises(ValueError, match="chunk_size"):
+        RuntimeSession.to_df(session, "Контекст.Таблица", chunk_size=0)
+    with pytest.raises(ValueError, match="chunk_size"):
+        RuntimeSession.materialize(session, "Контекст.Значение", chunk_size=0)
+    assert len(router.calls) == 2
+
+
 @pytest.mark.parametrize("method", ["to_df", "materialize"])
 @pytest.mark.parametrize("chunk_size", [0, -1, True, 1.5, "128"])
 def test_chunk_hint_must_be_positive_integer(method, chunk_size) -> None:

@@ -2228,19 +2228,27 @@ class RuntimeSession:
         A handle has a form such as ``Контекст.Таблица``. ``refs`` selects
         presentation, UUID or both for references; ``ref_columns`` overrides
         that policy by column, and ``uuid_suffix`` names added UUID columns.
-        ``chunk_size`` bounds transfer chunks; ``profiler`` records local
-        transfer phases when supplied. A failed transfer does not itself
-        establish that an active CAPTURE frame was lost.
+        ``chunk_size`` is an advisory hint on the composed execution route;
+        that route transfers one bounded payload (at most 100,000 rows and
+        64 MiB). ``profiler`` records its overall routed transfer phase.
+        A failed transfer does not establish that a CAPTURE frame was lost.
         """
         with self._operation_lock:
             self.validate_value_reference(handle)
             with self._capture_materialization_caller_handoff():
-                return self.runtime_api.materialize_table(
+                transfer = getattr(
+                    self.runtime_api, "materialize_session_table", None,
+                )
+                if not callable(transfer):
+                    transfer = self.runtime_api.materialize_table
+                return transfer(
                     handle,
                     refs=refs,
                     ref_columns=ref_columns,
                     uuid_suffix=uuid_suffix,
-                    chunk_size=chunk_size or self.config.chunk_size,
+                    chunk_size=(
+                        self.config.chunk_size if chunk_size is None else chunk_size
+                    ),
                     profiler=profiler,
                 )
 
@@ -2273,9 +2281,10 @@ class RuntimeSession:
         """Copy a supported persistent BSL value at ``handle`` into Python.
 
         Reference options match :meth:`to_df`. ``max_depth``, ``max_items``
-        and ``max_bytes`` bound the result; ``chunk_size`` bounds transfer
-        chunks. ``timeout_s`` limits the local caller's wait for a CAPTURE
-        transfer, not the running BSL command. The Python result type depends
+        and ``max_bytes`` bound the result. ``chunk_size`` is an advisory
+        hint on the composed route, which transfers one bounded payload.
+        ``timeout_s`` limits the local caller's wait; the runtime retains
+        ownership of a dispatched operation. The Python result type depends
         on the BSL value's shape.
         """
         with self._operation_lock:
@@ -2284,7 +2293,9 @@ class RuntimeSession:
                 "refs": refs,
                 "ref_columns": ref_columns,
                 "uuid_suffix": uuid_suffix,
-                "chunk_size": chunk_size or self.config.chunk_size,
+                "chunk_size": (
+                    self.config.chunk_size if chunk_size is None else chunk_size
+                ),
                 "max_depth": max_depth,
                 "max_items": max_items,
                 "max_bytes": max_bytes,
@@ -2293,7 +2304,12 @@ class RuntimeSession:
             if timeout_s is not None:
                 options["timeout_s"] = timeout_s
             with self._capture_materialization_caller_handoff():
-                return self.runtime_api.materialize_value(
+                transfer = getattr(
+                    self.runtime_api, "materialize_session_value", None,
+                )
+                if not callable(transfer):
+                    transfer = self.runtime_api.materialize_value
+                return transfer(
                     handle,
                     **options,
                 )

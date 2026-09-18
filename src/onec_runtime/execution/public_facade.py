@@ -26,6 +26,7 @@ from onec_runtime.execution.capture.public_inspection import (
 )
 from onec_runtime.execution.controller.controller import ExecutionController
 from onec_runtime.execution.pipeline import CellExecutionPipeline
+from onec_runtime.execution.session_value_adapter import SessionValueMaterializationAdapter
 from onec_runtime.execution.source_identity import NotebookSourceIdentityFactory
 from onec_runtime.execution.value_reference import validate_public_direct_handle
 from onec_runtime.execution.worker_breakpoint_service import WorkerBreakpointService
@@ -114,6 +115,10 @@ class PublicExecutionFacade:
         self._value_router = (
             value_router_factory(self._wait_handoff)
             if value_router_factory is not None else value_router
+        )
+        self._session_value_adapter = (
+            SessionValueMaterializationAdapter(self._value_router)
+            if self._value_router is not None else None
         )
         self._capture_inspection = CaptureInspectionBridge(
             controller, wait_handoff=self._wait_handoff,
@@ -269,6 +274,22 @@ class PublicExecutionFacade:
         if router is None:
             raise ProtocolError("value transfer route is not configured")
         return router.materialize_value(handle, options)
+
+    def materialize_session_value(self, handle: str, **options: object) -> object:
+        """Apply RuntimeSession's value options to the current value route."""
+
+        adapter = self._session_value_adapter
+        if adapter is None:
+            raise ProtocolError("value transfer route is not configured")
+        return adapter.materialize_value(handle, **options)
+
+    def materialize_session_table(self, handle: str, **options: object) -> pd.DataFrame:
+        """Apply RuntimeSession's table options to the current value route."""
+
+        adapter = self._session_value_adapter
+        if adapter is None:
+            raise ProtocolError("value transfer route is not configured")
+        return adapter.materialize_table(handle, **options)
 
     def validate_value_reference(self, handle: str) -> str:
         """Validate a direct public Context handle without reading target data."""
