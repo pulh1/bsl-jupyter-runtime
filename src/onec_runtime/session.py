@@ -1549,6 +1549,8 @@ class RuntimeSession:
             if self._closed:
                 raise ProtocolError("ZUP demo runtime session is closed")
             self._require_capture_fence(capture)
+            if isinstance(self.runtime_api, PublicExecutionFacade):
+                return self.runtime_api.prepare_bsl(source)
             return self.runtime_api.prepare_capture_hypothesis(source)
 
     def execute_prepared_capture_hypothesis(
@@ -1558,6 +1560,11 @@ class RuntimeSession:
             if self._closed:
                 raise ProtocolError("ZUP demo runtime session is closed")
             self._require_capture_fence(capture)
+            if isinstance(self.runtime_api, PublicExecutionFacade):
+                with self.runtime_api.execution_caller_handoff(
+                    self._release_operation_lock_for_capture_wait
+                ):
+                    return self.runtime_api.execute_prepared_bsl(prepared)
             bind = getattr(
                 self.runtime_api,
                 "capture_session_caller_handoff",
@@ -1575,6 +1582,8 @@ class RuntimeSession:
         with self._operation_lock:
             if self._closed:
                 raise ProtocolError("ZUP demo runtime session is closed")
+            if isinstance(self.runtime_api, PublicExecutionFacade):
+                return self.runtime_api.prepared_bsl_execution_provenance(prepared)
             return self.runtime_api.prepared_capture_hypothesis_provenance(
                 prepared
             )
