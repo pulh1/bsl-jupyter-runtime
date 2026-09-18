@@ -233,18 +233,19 @@ class PublicExecutionFacade:
         """Continue the current CAPTURE stop without losing the owning ticket.
 
         Dirty roots and successor points are admitted in the same controller
-        ticket before writeback and Continue. Continuation attempt IDs still
-        require their public evidence binding before dispatch.
+        ticket before writeback and Continue. A previously committed successor
+        admission binds its attempt ID and next-stop correlation ticket.
         ``timeout_s`` limits this caller's wait, never remote BSL execution.
         """
 
-        if continuation_attempt_id is not None:
-            raise ProtocolError("continuation attempt admission is not configured")
         _validate_wait_timeout(timeout_s)
-        ticket = self._controller.submit_resume(
-            dirty_roots=dirty_roots,
-            successor_locations=successor_locations,
-        )
+        submission = {
+            "dirty_roots": dirty_roots,
+            "successor_locations": successor_locations,
+        }
+        if continuation_attempt_id is not None:
+            submission["continuation_attempt_id"] = continuation_attempt_id
+        ticket = self._controller.submit_resume(**submission)
         return self._wait_for_reply(
             ticket, timeout_s=timeout_s,
             on_completion=on_completion,
@@ -406,6 +407,24 @@ class PublicExecutionFacade:
         """Configure idle capture locations through the controller owner."""
 
         self._controller.configure_capture_points(locations)
+
+    def begin_continuation_admission(
+        self, spec: object, locations: tuple[ModuleLocation, ...],
+    ) -> object:
+        """Plan one successor of the live MAIN command without RDBG I/O."""
+
+        return self._controller.begin_continuation_admission(spec, locations)
+
+    def continuation_attempt_evidence(self, attempt_id: str) -> object:
+        """Read the controller's ordered writeback and Continue evidence."""
+
+        return self._controller.continuation_attempt_evidence(attempt_id)
+
+    @staticmethod
+    def continuation_admission_is_uncertain() -> bool:
+        """Local successor planning has no transport-ambiguous effect."""
+
+        return False
 
     def prepare_capture_ticket(self):
         """Reserve opaque evidence for the next admitted MAIN capture stop."""

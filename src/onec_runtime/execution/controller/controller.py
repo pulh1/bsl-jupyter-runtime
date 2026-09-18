@@ -50,7 +50,9 @@ from onec_runtime.execution.capture.policy import CaptureCellPolicy, CapturePrep
 from onec_runtime.execution.capture.scope import (
     CaptureContextState, CaptureFrameIdentity, CaptureScope,
 )
-from onec_runtime.execution.capture.writeback import CaptureWritebackExecutor
+from onec_runtime.execution.capture.writeback import (
+    CaptureWritebackExecutor, RootWritePhase,
+)
 from onec_runtime.execution.breakpoint_routes import RouteBreakpointWorkspace
 from onec_runtime.execution.contracts import (
     Accepted, Current, PreparationContext, PreparedCell, Rejected,
@@ -72,6 +74,7 @@ from onec_runtime.stop_routing import BreakpointRegistry, StopReason, classify_s
 
 if TYPE_CHECKING:
     from onec_runtime.runtime_api import CaptureCorrelationTicket
+    from onec_runtime.prototype_runtime import ContinuationAttemptSpec
 
 
 class MainYieldKind(str, Enum):
@@ -107,6 +110,49 @@ class _CaptureCellRepair:
     policy_bound: bool
     ledger: CaptureEvaluationLedger
     receipt_id: str
+
+
+class _ContinuationAdmission:
+    """Local successor plan for the exact paused scope; no RDBG side effect."""
+
+    def __init__(
+        self, controller: ExecutionController, scope: CaptureScope,
+        operation: MainOperation, route: RouteToken,
+        spec: ContinuationAttemptSpec,
+        locations: tuple[ModuleLocation, ...],
+        ticket: CaptureCorrelationTicket | None,
+    ) -> None:
+        self._controller = controller
+        self.scope = scope
+        self.operation = operation
+        self.route = route
+        self.spec = spec
+        self.locations = locations
+        self.ticket = ticket
+        self.committed = False
+        self.consumed = False
+        self.closed = False
+        self.continue_state = "unattempted"
+
+    def commit(self) -> None:
+        with self._controller._lock:
+            self._controller._require_continuation_admission(self)
+            self.committed = True
+
+    def rollback(self) -> None:
+        with self._controller._lock:
+            if self.closed:
+                return
+            if self.consumed:
+                raise ProtocolError("Dispatched continuation cannot be rolled back")
+            if self._controller._continuation_admission is self:
+                self._controller._continuation_admission = None
+            self.closed = True
+
+    def quarantine(self) -> None:
+        # Preparing the successor has no remote effect. Revoking its public
+        # admission cannot by itself invalidate the confirmed old frame.
+        self.rollback()
 
 
 class _RawSettlementServices:
@@ -456,6 +502,8 @@ class ExecutionController:
         self._command_sequence = 0
         self._stop_sequence = 0
         self._planned_capture_ticket: CaptureCorrelationTicket | None = None
+        self._continuation_admission: _ContinuationAdmission | None = None
+        self._continuation_attempts: dict[str, _ContinuationAdmission] = {}
         self.main_operation: MainOperation | None = None
         self.capture_scope: CaptureScope | None = None
         self._capture_evaluation_ledger: CaptureEvaluationLedger | None = None
@@ -1299,13 +1347,136 @@ class ExecutionController:
 
             self._arbiter.reconcile(ticket, plan)
 
+    def begin_continuation_admission(
+        self, spec: ContinuationAttemptSpec,
+        locations: tuple[ModuleLocation, ...],
+    ) -> _ContinuationAdmission:
+        """Plan one successor before writeback, without entering RDBG."""
+
+        from onec_runtime.prototype_runtime import ContinuationAttemptSpec
+        from onec_runtime.runtime_api import CaptureCorrelationTicket
+
+        if not isinstance(spec, ContinuationAttemptSpec):
+            raise TypeError("continuation attempt spec is required")
+        if type(locations) is not tuple or any(
+            type(location) is not ModuleLocation for location in locations
+        ):
+            raise TypeError("successor capture locations are invalid")
+        if len(set(locations)) != len(locations):
+            raise ValueError("successor capture locations must be unique")
+        with self._lock:
+            scope = self.capture_scope
+            operation = self.main_operation
+            route = self._capture_route
+            if (
+                scope is None
+                or scope.context_state is not CaptureContextState.READY
+                or scope.frame_identity is not CaptureFrameIdentity.CONFIRMED
+                or operation is None
+                or operation.phase is not MainPhase.SUSPENDED_CAPTURE
+                or route is None
+                or route != self._arbiter.current_route
+                or self._resume_in_flight()
+            ):
+                raise ProtocolError("Continuation requires the current CAPTURE stop")
+            if self._continuation_admission is not None:
+                raise ProtocolError("A continuation attempt is already admitted")
+            if spec.attempt_id in self._continuation_attempts:
+                raise ProtocolError("Continuation attempt ID was already used")
+            if self._arbiter.has_pending_operations:
+                raise ProtocolError("RDBG activity prevents continuation admission")
+            if locations and self._breakpoint_routes is None:
+                raise ProtocolError("Successor capture requires a shared breakpoint workspace")
+            settlement = self._route_settlement_service()
+            if settlement is None:
+                raise ProtocolError("MAIN publication is unavailable")
+            next_sequence = settlement.next_capture_stop_sequence(operation)
+            ticket = (
+                CaptureCorrelationTicket(
+                    f"capture_{uuid4().hex}", operation.command_id, next_sequence,
+                )
+                if locations else None
+            )
+            admission = _ContinuationAdmission(
+                self, scope, operation, route, spec, locations, ticket,
+            )
+            self._continuation_admission = admission
+            self._continuation_attempts[spec.attempt_id] = admission
+            return admission
+
+    def _require_continuation_admission(
+        self, admission: _ContinuationAdmission,
+    ) -> None:
+        if (
+            admission.closed
+            or self._continuation_admission is not admission
+            or self.capture_scope is not admission.scope
+            or self.main_operation is not admission.operation
+            or self._capture_route != admission.route
+            or self._arbiter.current_route != admission.route
+            or admission.operation.phase is not MainPhase.SUSPENDED_CAPTURE
+            or admission.scope.context_state is not CaptureContextState.READY
+            or admission.scope.frame_identity is not CaptureFrameIdentity.CONFIRMED
+        ):
+            raise ProtocolError("Continuation admission belongs to another stop")
+
+    def continuation_attempt_evidence(
+        self, attempt_id: str,
+    ) -> ContinuationAttemptEvidence:
+        """Return ordered frame-write and Continue evidence for one attempt."""
+
+        from onec_runtime.prototype_runtime import ContinuationAttemptEvidence
+
+        with self._lock:
+            try:
+                admission = self._continuation_attempts[attempt_id]
+            except KeyError as error:
+                raise ProtocolError("continuation attempt is unknown") from error
+            ledger = admission.scope.writeback_ledger
+            statuses: list[tuple[str, str]] = []
+            for root in admission.spec.dirty_roots:
+                phase = (
+                    RootWritePhase.UNATTEMPTED if ledger is None
+                    else ledger.record(root).phase
+                )
+                status = {
+                    RootWritePhase.UNATTEMPTED: "unattempted",
+                    RootWritePhase.EXPORT_PENDING: "unattempted",
+                    RootWritePhase.EXPORTED: "unattempted",
+                    RootWritePhase.MODIFY_SENT: "sent",
+                    RootWritePhase.SUCCEEDED: "succeeded",
+                    RootWritePhase.FAILED: "failed",
+                    RootWritePhase.UNKNOWN: "outcome_unknown",
+                }[phase]
+                statuses.append((root, status))
+            return ContinuationAttemptEvidence(
+                tuple(statuses), admission.continue_state,
+            )
+
     def submit_resume(
         self, *, dirty_roots: tuple[str, ...] = (),
         successor_locations: tuple[ModuleLocation, ...] | None = None,
+        continuation_attempt_id: str | None = None,
     ) -> ExecutionTicket:
         """Rearm successor points, write dirty roots and resume the same MAIN."""
 
         with self._lock:
+            admission: _ContinuationAdmission | None = None
+            if continuation_attempt_id is None and self._continuation_admission is not None:
+                raise ProtocolError("An admitted continuation attempt must be used")
+            if continuation_attempt_id is not None:
+                admission = self._continuation_admission
+                if (
+                    admission is None
+                    or admission.spec.attempt_id != continuation_attempt_id
+                    or not admission.committed
+                    or admission.consumed
+                    or successor_locations is not None
+                    or dirty_roots != admission.spec.dirty_roots
+                ):
+                    raise ProtocolError("Continuation attempt is not admitted")
+                self._require_continuation_admission(admission)
+                successor_locations = admission.locations
             if self._resume_in_flight():
                 raise ProtocolError("CAPTURE resume has already been admitted")
             scope = self.capture_scope
@@ -1373,7 +1544,16 @@ class ExecutionController:
                     self._capture_executor.end_scope(
                         scope, port=CaptureSetupAdapter(port)
                     )
-                    self._main_executor.continue_command(operation, port=port)
+                    if admission is not None:
+                        admission.continue_state = "planned"
+                    try:
+                        self._main_executor.continue_command(operation, port=port)
+                    except BaseException:
+                        if admission is not None and operation.phase is MainPhase.UNKNOWN:
+                            admission.continue_state = "outcome_unknown"
+                        raise
+                    if admission is not None:
+                        admission.continue_state = "acknowledged"
                 except BaseException:
                     if operation.phase is MainPhase.UNKNOWN:
                         scope.mark_unverified()
@@ -1403,6 +1583,12 @@ class ExecutionController:
                 raise ProtocolError("CAPTURE evaluation ledger is unavailable")
             active_ledger.mark_resuming()
             try:
+                if admission is not None and admission.ticket is not None:
+                    settlement = self._route_settlement_service()
+                    assert settlement is not None
+                    settlement.rebind_next_capture_ticket(
+                        operation, admission.ticket,
+                    )
                 ticket = self._arbiter.submit(route, plan, finalizer=operation.settler)
             except BaseException:
                 active_ledger.discard_resuming()
@@ -1417,7 +1603,15 @@ class ExecutionController:
                     active_ledger.discard_resuming()
                     self._resume_ticket = None
                     self._main_stop_ticket = None
+                elif admission is not None:
+                    admission.consumed = True
+                    admission.closed = True
+                    self._continuation_admission = None
                 raise
+            if admission is not None:
+                admission.consumed = True
+                admission.closed = True
+                self._continuation_admission = None
             return ticket
 
     def submit_capture_variable(

@@ -71,7 +71,12 @@ class _Controller:
         self.debug_resume = _Ticket()
         self.calls: list[str] = []
 
-    def submit_resume(self, *, dirty_roots=(), successor_locations=None):
+    def submit_resume(
+        self, *, dirty_roots=(), successor_locations=None,
+        continuation_attempt_id=None,
+    ):
+        if continuation_attempt_id is not None:
+            raise ProtocolError("continuation attempt is not admitted")
         self.calls.append(("capture", dirty_roots, successor_locations))
         return self.resume
 
