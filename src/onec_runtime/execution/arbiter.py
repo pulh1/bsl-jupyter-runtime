@@ -178,6 +178,16 @@ class ExecutionTicket:
         self._effect_target: TargetId | None = None
         self._value: Any = None
         self._error: BaseException | None = None
+        self._post_settlement_cleanup_plan: Plan | None = None
+        self._post_settlement_cleanup: ExecutionTicket | None = None
+        self._post_settlement_parent: ExecutionTicket | None = None
+
+    @property
+    def post_settlement_cleanup(self) -> ExecutionTicket | None:
+        """The cleanup ticket queued after this ticket's confirmed settlement."""
+
+        with self._owner._mailbox:
+            return self._post_settlement_cleanup
 
     def status(self) -> TicketStatus:
         with self._owner._mailbox:
@@ -262,6 +272,24 @@ class SessionPort:
                 raise StaleRoute('Route handoff requires a newer epoch of this incarnation')
             self._owner._route = next_route
             self._owner._mailbox.notify_all()
+
+    def register_post_settlement_cleanup(self, plan: Plan) -> None:
+        """Queue one cleanup after this confirmed ticket settles.
+
+        The cleanup gets a fresh port, so ambiguous cleanup transport belongs
+        to its own ticket rather than replacing the user-visible result.
+        """
+
+        self._check()
+        if not callable(plan):
+            raise TypeError('post-settlement cleanup plan must be callable')
+        with self._owner._mailbox:
+            if (self._owner._active is not self._ticket
+                    or self._ticket._phase != 'running'):
+                raise RuntimeError('Cleanup registration requires the active plan')
+            if self._ticket._post_settlement_cleanup_plan is not None:
+                raise RuntimeError('Only one post-settlement cleanup may be registered')
+            self._ticket._post_settlement_cleanup_plan = plan
 
     def _transport_entered(self) -> None:
         self._check()
@@ -497,6 +525,7 @@ class RdbgArbiter:
         self._active: ExecutionTicket | None = None
         self._reconciliation: Plan | None = None
         self._server_teardown: ServerTeardownAttempt | None = None
+        self._cleanup_debt: ExecutionTicket | None = None
         self._closed = False
         self._worker = Thread(target=self._run, name='rdbg-arbiter', daemon=True)
         self._worker.start()
@@ -553,6 +582,26 @@ class RdbgArbiter:
                 raise RuntimeError('Ticket is no longer queued')
             ticket._ready = True
             self._mailbox.notify_all()
+
+    def retry_post_settlement_cleanup(self, ticket: ExecutionTicket) -> ExecutionTicket:
+        """Retry a confirmed failed cleanup without replaying its parent plan."""
+
+        with self._mailbox:
+            self._check_ticket(ticket)
+            plan = ticket._post_settlement_cleanup_plan
+            previous = ticket._post_settlement_cleanup
+            if (plan is None or previous is None or previous._phase != 'settled'
+                    or previous._error is None or self._cleanup_debt is not ticket):
+                raise ArbiterBusy('Cleanup is not a confirmed retryable failure')
+            if self._closed or self._active is not None:
+                raise ArbiterBusy('Cleanup retry requires an idle arbiter')
+            cleanup = ExecutionTicket(self, self._route, plan)
+            cleanup._post_settlement_parent = ticket
+            cleanup._ready = True
+            ticket._post_settlement_cleanup = cleanup
+            self._queue.appendleft(cleanup)
+            self._mailbox.notify_all()
+            return cleanup
 
     def request_stop(self, ticket: ExecutionTicket) -> StopRequestOutcome:
         """Fence user dispatch; a later stop plan must establish remote termination.
@@ -703,6 +752,8 @@ class RdbgArbiter:
                 self._mailbox.wait_for(lambda: self._closed or self._server_teardown is not None or
                     self._reconciliation is not None or (
                     self._active is None and bool(self._queue) and self._queue[0]._ready
+                    and (self._cleanup_debt is None
+                         or self._queue[0]._post_settlement_parent is self._cleanup_debt)
                 ))
                 if self._closed:
                     return
@@ -771,19 +822,41 @@ class RdbgArbiter:
                         ticket._error = error
                         self._mailbox.notify_all()
                     else:
+                        cleanup_plan = ticket._post_settlement_cleanup_plan
+                        if cleanup_plan is not None:
+                            self._queue_post_settlement_cleanup(ticket, cleanup_plan)
                         self._settle(ticket, error=error)
+                        if ticket._post_settlement_parent is not None:
+                            self._cleanup_debt = ticket._post_settlement_parent
                         self._active = None
             else:
                 with self._mailbox:
+                    cleanup_plan = ticket._post_settlement_cleanup_plan
                     if isinstance(outcome, ConfirmedFailure):
                         self._settle(ticket, error=outcome.error)
                     else:
                         if outcome.next_route is not None:
                             self._route = outcome.next_route
                         self._settle(ticket, value=outcome.value)
+                    if cleanup_plan is not None:
+                        self._queue_post_settlement_cleanup(ticket, cleanup_plan)
+                    if ticket._post_settlement_parent is self._cleanup_debt:
+                        self._cleanup_debt = None
                     self._active = None
+                    self._mailbox.notify_all()
             finally:
                 port._live = False
+
+    def _queue_post_settlement_cleanup(
+        self, parent: ExecutionTicket, plan: Plan,
+    ) -> None:
+        """Queue cleanup before already-waiting work after parent settlement."""
+
+        cleanup = ExecutionTicket(self, self._route, plan)
+        cleanup._post_settlement_parent = parent
+        cleanup._ready = True
+        parent._post_settlement_cleanup = cleanup
+        self._queue.appendleft(cleanup)
 
     def _run_server_teardown(self, attempt: ServerTeardownAttempt) -> None:
         assert get_ident() == self._worker.ident

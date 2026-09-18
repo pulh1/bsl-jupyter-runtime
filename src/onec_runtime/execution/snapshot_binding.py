@@ -17,6 +17,9 @@ from onec_runtime.bsl import (
     WorkerExport,
 )
 from onec_runtime.bsl.notebook_cells import NotebookCellProjection
+from onec_runtime.bsl.notebook_methods import (
+    NotebookMethodSet, merge_notebook_methods,
+)
 from onec_runtime.bsl.parser_target import PythonParserTarget
 from onec_runtime.execution.contracts import (
     CommonCell,
@@ -39,16 +42,18 @@ class RouteSnapshotGuard:
     version: int
     namespace_names: tuple[str, ...] = field(repr=False)
     worker_exports: tuple[WorkerExport, ...] = field(repr=False)
+    previous_methods: NotebookMethodSet | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True, repr=False)
 class RoutePreparationSnapshot:
-    """One locally consistent namespace and Worker catalog observation."""
+    """One locally consistent namespace, Worker catalog and method observation."""
 
     owner: object = field(repr=False)
     version: int
     namespace_names: tuple[str, ...] = field(repr=False)
     worker_exports: tuple[WorkerExport, ...] = field(repr=False)
+    previous_methods: NotebookMethodSet | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if type(self.version) is not int or self.version < 0:
@@ -64,6 +69,14 @@ class RoutePreparationSnapshot:
         if type(self.worker_exports) is not tuple:
             raise ValueError("Worker exports must be an immutable tuple")
         SemanticNotebookLowerer.prepare_worker_exports(self.worker_exports)
+        if self.previous_methods is not None and not isinstance(
+            self.previous_methods, NotebookMethodSet
+        ):
+            raise ValueError("previous notebook methods snapshot is invalid")
+        if self.previous_methods is not None and not set(
+            self.previous_methods.exports
+        ).issubset(self.worker_exports):
+            raise ValueError("previous notebook method catalog is inconsistent")
 
     def for_pipeline(self) -> PreparationSnapshots:
         """Keep the generic pipeline's three snapshot fields mutually bound."""
@@ -72,7 +85,8 @@ class RoutePreparationSnapshot:
             self.namespace_names,
             self.worker_exports,
             RouteSnapshotGuard(
-                self.owner, self.version, self.namespace_names, self.worker_exports
+                self.owner, self.version, self.namespace_names,
+                self.worker_exports, self.previous_methods,
             ),
         )
 
@@ -141,8 +155,13 @@ class SnapshotRouteBinding:
         candidate_catalog = SemanticNotebookLowerer.prepare_worker_exports(
             tuple(catalog.values())
         )
+        method_set_candidate = merge_notebook_methods(
+            guard.previous_methods, cell,
+        )
         return WorkerCandidateIntent(
-            projection, cell.exports, candidate_catalog, guard.namespace_names, guard
+            projection, cell, cell.exports, candidate_catalog,
+            guard.namespace_names, guard,
+            guard.previous_methods, method_set_candidate,
         )
 
     def bind(

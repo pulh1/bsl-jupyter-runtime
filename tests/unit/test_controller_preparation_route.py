@@ -1,19 +1,22 @@
 """Controller-selected statement preparation has one fenced admission path."""
 
+from dataclasses import replace
 from threading import Event, Thread, get_ident
+from uuid import UUID
 
 import pytest
 
 from onec_runtime.bsl.parser_target import PythonParserTarget
 from onec_runtime.bsl.source_maps import SourceUnitKind, SourceUnitRef, source_sha256
 from onec_runtime.execution.arbiter import (
-    CancelledBeforeEffect, RdbgArbiter, RouteToken, Settlement, WaiterDetached,
+    CancelledBeforeEffect, OutcomeUnknown, RdbgArbiter, ReadyForPolicy,
+    RouteToken, Settlement, WaiterDetached,
 )
-import onec_runtime.execution.arbiter as arbiter_module
 from onec_runtime.errors import EvaluationDispatchUnknown
 from onec_runtime.execution.capture.cell_evaluator import CaptureCellEvaluator
 from onec_runtime.execution.capture.executor import CaptureExecutor
 from onec_runtime.execution.capture.policy import CaptureCellPolicy
+from onec_runtime.execution.capture.scope import CaptureContextState
 from onec_runtime.execution.common import NotebookCommonParser
 from onec_runtime.execution.contracts import (
     Accepted, Current, PreparedCell, Rejected, SourceDiagnostic,
@@ -22,11 +25,12 @@ from onec_runtime.execution.contracts import (
 from onec_runtime.execution.main import MainExecutor, MainPhase
 from onec_runtime.execution.main.policy import MainCellPolicy
 from onec_runtime.execution.snapshot_binding import RoutePreparationSnapshot
-from onec_runtime.rdbg.models import EvaluationResult
+from onec_runtime.execution.worker import WorkerActivationUnknown
+from onec_runtime.rdbg.models import EvaluationResult, ModifyResult
 from onec_runtime.stop_routing import BreakpointRegistry
 from onec_runtime.table_value import evaluation_to_python
 
-from test_execution_controller_routes import BUSINESS, CompleteSession, KERNEL
+from test_execution_controller_routes import BUSINESS, CompleteSession, KERNEL, TARGET
 
 
 def _common(source: str, parser: PythonParserTarget):
@@ -38,12 +42,13 @@ def _common(source: str, parser: PythonParserTarget):
     return result
 
 
-def _runtime(snapshot_provider, *, session=None, settlement_services=None):
+def _runtime(snapshot_provider, *, session=None, settlement_services=None, worker_activation=None):
     from onec_runtime.execution.controller.controller import ExecutionController
 
     session = session or CompleteSession()
     arbiter = RdbgArbiter(session, RouteToken("runtime-1", 1, 0, "main"))
     parser = PythonParserTarget.from_generated()
+    kwargs = {} if worker_activation is None else {"worker_activation": worker_activation}
     controller = ExecutionController(
         arbiter,
         MainExecutor(poll_interval_s=0.1),
@@ -54,6 +59,7 @@ def _runtime(snapshot_provider, *, session=None, settlement_services=None):
         parser_target=parser,
         snapshot_provider=snapshot_provider,
         settlement_services=settlement_services,
+        **kwargs,
     )
     return controller, arbiter, session, parser
 
@@ -64,6 +70,20 @@ def _prepared(controller, parser, source: str):
     prepared = context.policy.prepare(common, context.capabilities.for_pipeline(), context)
     assert isinstance(prepared, PreparedCell)
     return context, prepared
+
+
+def _previous_methods(parser, result: int):
+    from onec_runtime.bsl.notebook_cells import split_notebook_cell
+    from onec_runtime.bsl.notebook_methods import merge_notebook_methods
+
+    source = f"Функция Старый() Экспорт\nВозврат {result};\nКонецФункции"
+    unit = SourceUnitRef(
+        SourceUnitKind.NOTEBOOK_CELL, "previous-method", 1,
+        source_sha256(source),
+    )
+    return merge_notebook_methods(
+        None, split_notebook_cell(parser, source, source_unit=unit)
+    )
 
 
 def test_main_policy_settles_once_on_arbiter_after_capture_setup() -> None:
@@ -377,6 +397,144 @@ def test_policy_does_not_settle_rejected_or_cancelled_before_effect_cell() -> No
         arbiter.close(timeout=3)
 
 
+@pytest.mark.parametrize("capture_count", [1, 2])
+def test_main_policy_and_message_key_survive_capture_until_resumed_completion(
+    capture_count: int,
+) -> None:
+    from onec_runtime.execution.reply_publication import (
+        MainPublicationRecord, MainReplyPolicy,
+    )
+    from onec_runtime.runtime_api import RuntimeReplyKind
+
+    class MessageSession(CompleteSession):
+        def __init__(self) -> None:
+            super().__init__(capture_count=capture_count)
+            self.message_reads: list[str] = []
+
+        def wait_evaluation_event(self, pending, *, timeout_s, on_transport_dispatch):
+            if self.expression.startswith(
+                "RuntimeKernelServer.ЗабратьСообщенияЯчейкиИзКонтекста("
+            ):
+                on_transport_dispatch()
+                self._record("wait_eval")
+                self.pending = None
+                self.message_reads.append(self.expression)
+                return EvaluationResult(
+                    pending.result_id, "Строка", '"[\\"after resume\\"]"', False,
+                    value_string='["after resume"]',
+                )
+            return super().wait_evaluation_event(
+                pending, timeout_s=timeout_s,
+                on_transport_dispatch=on_transport_dispatch,
+            )
+
+    class Services:
+        def __init__(self) -> None:
+            self.record = None
+            self.policy = MainReplyPolicy()
+            self.publications = []
+
+        def settle_main(self, outcome, payload):
+            if self.record is None:
+                self.record = MainPublicationRecord(
+                    outcome.operation, prior_capture_sequence=0,
+                    message_collector_key=payload.statement.message_collector_key,
+                )
+            self.publications.append((self.record, payload))
+            return self.policy.publish(outcome, self.record)
+
+    services = Services()
+    session = MessageSession()
+    owner = object()
+    controller, arbiter, _session, parser = _runtime(
+        lambda: RoutePreparationSnapshot(owner, 1, (), ()),
+        session=session, settlement_services=services,
+    )
+    try:
+        context, prepared = _prepared(controller, parser, "Результат = 1;")
+        payload = prepared.payload
+        statement = replace(payload.statement, message_collector_key="__main_messages_1")
+        prepared = replace(prepared, payload=replace(payload, statement=statement))
+        accepted = controller.submit_cell(
+            context, prepared, context.capabilities.for_pipeline().guards,
+            SubmissionReceipt(),
+        )
+        assert isinstance(accepted, Accepted)
+        first = accepted.ticket.wait_settled(3)
+        assert first.kind is RuntimeReplyKind.CAPTURED
+        operation = controller.main_operation
+        assert services.record.operation is operation
+
+        if capture_count == 2:
+            later_capture = controller.submit_resume().wait_settled(3)
+            assert later_capture.kind is RuntimeReplyKind.CAPTURED
+            assert later_capture.operation_id == first.operation_id
+            assert later_capture.stop_sequence == 2
+        second = controller.submit_resume().wait_settled(3)
+        assert second.kind is RuntimeReplyKind.MAIN_COMPLETED
+        assert second.operation_id == first.operation_id == operation.command_id
+        assert second.result == 3
+        assert second.messages == ("after resume",)
+        assert len(services.publications) == capture_count + 1
+        assert all(record is services.record for record, _payload in services.publications)
+        assert all(payload is prepared.payload for _record, payload in services.publications)
+        assert session.message_reads == [
+            'RuntimeKernelServer.ЗабратьСообщенияЯчейкиИзКонтекста(Контекст, "__main_messages_1")'
+        ]
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_main_completion_reads_prepared_message_key_without_capture() -> None:
+    class MessageSession(CompleteSession):
+        def __init__(self) -> None:
+            super().__init__(capture_count=0)
+            self.message_reads: list[str] = []
+
+        def wait_evaluation_event(self, pending, *, timeout_s, on_transport_dispatch):
+            if self.expression.startswith(
+                "RuntimeKernelServer.ЗабратьСообщенияЯчейкиИзКонтекста("
+            ):
+                on_transport_dispatch()
+                self._record("wait_eval")
+                self.pending = None
+                self.message_reads.append(self.expression)
+                return EvaluationResult(
+                    pending.result_id, "Строка", '"[\\"initial completion\\"]"', False,
+                    value_string='["initial completion"]',
+                )
+            return super().wait_evaluation_event(
+                pending, timeout_s=timeout_s,
+                on_transport_dispatch=on_transport_dispatch,
+            )
+
+    owner = object()
+    session = MessageSession()
+    controller, arbiter, _session, parser = _runtime(
+        lambda: RoutePreparationSnapshot(owner, 1, (), ()), session=session,
+    )
+    try:
+        context, prepared = _prepared(controller, parser, "Результат = 1;")
+        statement = replace(
+            prepared.payload.statement, message_collector_key="__initial_messages"
+        )
+        prepared = replace(
+            prepared, payload=replace(prepared.payload, statement=statement)
+        )
+        accepted = controller.submit_cell(
+            context, prepared, context.capabilities.for_pipeline().guards,
+            SubmissionReceipt(),
+        )
+        assert isinstance(accepted, Accepted)
+        completed = accepted.ticket.wait_settled(3)
+        assert completed.completion.messages == ("initial completion",)
+        assert session.message_reads == [
+            'RuntimeKernelServer.ЗабратьСообщенияЯчейкиИзКонтекста(Контекст, "__initial_messages")'
+        ]
+    finally:
+        arbiter.close(timeout=3)
+
+
 def test_main_snapshot_stale_rejects_before_rdbg_and_adopts_before_dispatch() -> None:
     owner = object()
     version = [1]
@@ -408,6 +566,66 @@ def test_main_snapshot_stale_rejects_before_rdbg_and_adopts_before_dispatch() ->
         assert accepted.ticket.wait_initiator().kind.value == "capture"
         assert isinstance(controller.validate_preparation(current, current_guards), StalePreparation)
     finally:
+        arbiter.close(timeout=3)
+
+
+def test_previous_methods_change_rejects_preparation_at_same_version() -> None:
+    parser = PythonParserTarget.from_generated()
+    owner = object()
+    old = _previous_methods(parser, 1)
+    new = _previous_methods(parser, 2)
+    assert old.exports == new.exports
+    snapshots = [RoutePreparationSnapshot(owner, 1, (), old.exports, old)]
+    controller, arbiter, session, _parser = _runtime(lambda: snapshots[0])
+    try:
+        context, prepared = _prepared(controller, parser, "Результат = 1;")
+        guards = context.capabilities.for_pipeline().guards
+        snapshots[0] = RoutePreparationSnapshot(owner, 1, (), new.exports, new)
+        assert isinstance(controller.validate_preparation(context, guards), StalePreparation)
+        receipt = SubmissionReceipt()
+        assert isinstance(controller.submit_cell(context, prepared, guards, receipt), Rejected)
+        assert receipt.ticket is None
+        assert session.calls == []
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_previous_methods_change_after_admission_rejects_before_remote_effects() -> None:
+    from onec_runtime.execution.controller.controller import StalePreparedDispatch
+
+    parser = PythonParserTarget.from_generated()
+    owner = object()
+    old = _previous_methods(parser, 1)
+    new = _previous_methods(parser, 2)
+    assert old.exports == new.exports
+    entered = Event()
+    release = Event()
+    caller_thread = get_ident()
+    snapshots = [RoutePreparationSnapshot(owner, 1, (), old.exports, old)]
+
+    def provider():
+        if get_ident() != caller_thread:
+            entered.set()
+            assert release.wait(3)
+        return snapshots[0]
+
+    controller, arbiter, session, _parser = _runtime(provider)
+    try:
+        context, prepared = _prepared(controller, parser, "Результат = 1;")
+        accepted = controller.submit_cell(
+            context, prepared, context.capabilities.for_pipeline().guards,
+            SubmissionReceipt(),
+        )
+        assert isinstance(accepted, Accepted)
+        assert entered.wait(3)
+        snapshots[0] = RoutePreparationSnapshot(owner, 1, (), new.exports, new)
+        release.set()
+        with pytest.raises(StalePreparedDispatch):
+            accepted.ticket.wait_settled(3)
+        assert session.calls == []
+        assert controller.main_operation.phase is MainPhase.FAILED_BEFORE_DISPATCH
+    finally:
+        release.set()
         arbiter.close(timeout=3)
 
 
@@ -809,5 +1027,423 @@ def test_worker_method_intent_is_local_until_controller_can_activate_artifact(
         assert isinstance(rejected.reason, Unavailable)
         assert receipt.ticket is None
         assert session.calls == []
+    finally:
+        arbiter.close(timeout=3)
+
+
+@pytest.mark.parametrize("capture", [False, True])
+@pytest.mark.parametrize("with_statement", [False, True])
+def test_worker_intent_activates_after_ticket_admission_and_releases_on_its_route(
+    capture: bool, with_statement: bool,
+) -> None:
+    """A method projection is activated by the arbiter before deferred BSL only."""
+
+    events: list[tuple[str, object]] = []
+
+    class Lease:
+        def release(self, *, port) -> None:
+            events.append(("release", port))
+
+        def retain_outcome_unknown(self, *, port) -> None:
+            events.append(("retain", port))
+
+    class Activation:
+        def activate(self, intent, *, port):
+            events.append(("activate", intent, port))
+            return Lease()
+
+    owner = object()
+    controller, arbiter, session, parser = _runtime(
+        lambda: RoutePreparationSnapshot(owner, 1, (), ()),
+        worker_activation=Activation(),
+    )
+    try:
+        if capture:
+            controller.submit_main("Результат = 1;").wait_settled(3)
+        context = controller.await_preparation_context()
+        source = "Функция Посчитать() Экспорт\nВозврат 1;\nКонецФункции\n"
+        if with_statement:
+            source += "Итог = Посчитать();"
+        prepared = context.policy.prepare(
+            _common(source, parser), context.capabilities.for_pipeline(), context
+        )
+        assert isinstance(prepared, PreparedCell)
+        receipt = SubmissionReceipt()
+        modifications_before = sum(name == "modify" for name, _thread in session.calls)
+        accepted = controller.submit_cell(
+            context, prepared, context.capabilities.for_pipeline().guards, receipt
+        )
+        assert isinstance(accepted, Accepted)
+        assert receipt.ticket is accepted.ticket
+        result = accepted.ticket.wait_settled(3)
+        release_parent = accepted.ticket
+        if not with_statement:
+            assert result is None
+        if with_statement and not capture:
+            assert result.kind.value == "capture"
+            assert [event[0] for event in events] == ["activate"]
+            release_parent = controller.submit_resume()
+            assert release_parent.wait_settled(3).kind.value == "completed"
+        cleanup = release_parent.post_settlement_cleanup
+        assert cleanup is not None
+        assert cleanup.wait_settled(3) is None
+        assert [event[0] for event in events] == ["activate", "release"]
+        assert events[0][1] is prepared.payload.worker_intent
+        assert events[0][2] is not events[1][1]
+        if with_statement:
+            if capture:
+                assert session.expression.startswith(
+                    "RuntimeKernelServer.ВыполнитьКодВКонтекстеОтладки("
+                )
+            else:
+                assert sum(name == "modify" for name, _thread in session.calls) > modifications_before
+        else:
+            assert sum(name == "modify" for name, _thread in session.calls) == modifications_before
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_worker_activation_unknown_stays_on_accepted_ticket_without_user_bsl() -> None:
+    """An ambiguous activation is an owned ticket outcome, never a rejection."""
+
+    calls = []
+
+    class Lease:
+        def release(self, *, port) -> None:
+            calls.append(("release", port))
+
+        def retain_outcome_unknown(self, *, port) -> None:
+            calls.append(("retain", port))
+
+    class Activation:
+        def activate(self, intent, *, port):
+            calls.append((intent, port))
+            raise WorkerActivationUnknown(Lease(), "Worker promotion reply was lost")
+
+    owner = object()
+    controller, arbiter, session, parser = _runtime(
+        lambda: RoutePreparationSnapshot(owner, 1, (), ()),
+        worker_activation=Activation(),
+    )
+    try:
+        context, prepared = _prepared(
+            controller, parser,
+            "Функция Посчитать() Экспорт\nВозврат 1;\nКонецФункции\nИтог = Посчитать();",
+        )
+        receipt = SubmissionReceipt()
+        accepted = controller.submit_cell(
+            context, prepared, context.capabilities.for_pipeline().guards, receipt
+        )
+        assert isinstance(accepted, Accepted)
+        assert accepted.ticket.wait_unknown(3)
+        assert receipt.ticket is accepted.ticket
+        assert calls and calls[0][0] is prepared.payload.worker_intent
+        assert calls[1][0] == "retain" and calls[1][1] is calls[0][1]
+        assert not any(name == "modify" for name, _thread in session.calls)
+        assert controller.main_operation is None
+
+        arbiter.reconcile(accepted.ticket, lambda _port: ReadyForPolicy(None))
+        assert accepted.ticket.wait_settled(3) is None
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_confirmed_worker_release_failure_preserves_capture_cell_result() -> None:
+    """A post-result pin debt must not replace an already confirmed eval."""
+
+    released = Event()
+    release_attempts = [0]
+
+    class Lease:
+        def release(self, *, port) -> None:
+            release_attempts[0] += 1
+            released.set()
+            if release_attempts[0] == 1:
+                raise ValueError("Worker pin release was rejected")
+
+        def retain_outcome_unknown(self, *, port) -> None:
+            raise AssertionError("The release failure was confirmed")
+
+    class Activation:
+        def activate(self, intent, *, port):
+            return Lease()
+
+    owner = object()
+    controller, arbiter, _session, parser = _runtime(
+        lambda: RoutePreparationSnapshot(owner, 1, (), ()),
+        worker_activation=Activation(),
+    )
+    try:
+        controller.submit_main("Результат = 1;").wait_settled(3)
+        context, prepared = _prepared(
+            controller, parser,
+            "Функция Посчитать() Экспорт\nВозврат 1;\nКонецФункции\n"
+            "Итог = Посчитать();",
+        )
+        accepted = controller.submit_cell(
+            context, prepared, context.capabilities.for_pipeline().guards,
+            SubmissionReceipt(),
+        )
+        assert isinstance(accepted, Accepted)
+        result = accepted.ticket.wait_settled(3)
+        assert result.error_occurred is False
+        assert released.wait(3)
+        cleanup = accepted.ticket.post_settlement_cleanup
+        assert cleanup is not None
+        with pytest.raises(ValueError, match="Worker pin release was rejected"):
+            cleanup.wait_settled(3)
+        assert controller.capture_scope is not None
+        assert controller.capture_scope.context_state is CaptureContextState.READY
+        later = controller.submit_capture_cell("РезультатИнструкции = 4;")
+        assert later.status().phase == "queued"
+        retry = arbiter.retry_post_settlement_cleanup(accepted.ticket)
+        assert retry.wait_settled(3) is None
+        assert release_attempts == [2]
+        assert later.wait_settled(3).error_occurred is False
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_confirmed_main_completion_survives_worker_pin_release_failure() -> None:
+    """The completed MAIN command is publishable before Worker cleanup debt."""
+
+    released = Event()
+
+    class Lease:
+        def release(self, *, port) -> None:
+            released.set()
+            raise ValueError("Worker pin release was rejected")
+
+        def retain_outcome_unknown(self, *, port) -> None:
+            raise AssertionError("The release failure was confirmed")
+
+    class Activation:
+        def activate(self, intent, *, port):
+            return Lease()
+
+    owner = object()
+    controller, arbiter, _session, parser = _runtime(
+        lambda: RoutePreparationSnapshot(owner, 1, (), ()),
+        session=CompleteSession(capture_count=0),
+        worker_activation=Activation(),
+    )
+    try:
+        context, prepared = _prepared(
+            controller, parser,
+            "Функция Посчитать() Экспорт\nВозврат 1;\nКонецФункции\n"
+            "Итог = Посчитать();",
+        )
+        accepted = controller.submit_cell(
+            context, prepared, context.capabilities.for_pipeline().guards,
+            SubmissionReceipt(),
+        )
+        assert isinstance(accepted, Accepted)
+        completed = accepted.ticket.wait_settled(3)
+        assert completed.kind.value == "completed"
+        assert completed.completion.result == 3
+        assert released.wait(3)
+        cleanup = accepted.ticket.post_settlement_cleanup
+        assert cleanup is not None
+        with pytest.raises(ValueError, match="Worker pin release was rejected"):
+            cleanup.wait_settled(3)
+        assert controller.main_operation.phase is MainPhase.COMPLETED
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_confirmed_worker_activation_failure_settles_ticket_before_user_bsl() -> None:
+    class Activation:
+        def activate(self, intent, *, port):
+            del intent, port
+            raise ValueError("Worker artifact was rejected")
+
+    owner = object()
+    controller, arbiter, session, parser = _runtime(
+        lambda: RoutePreparationSnapshot(owner, 1, (), ()),
+        worker_activation=Activation(),
+    )
+    try:
+        context, prepared = _prepared(
+            controller, parser,
+            "Функция Посчитать() Экспорт\nВозврат 1;\nКонецФункции\nИтог = Посчитать();",
+        )
+        accepted = controller.submit_cell(
+            context, prepared, context.capabilities.for_pipeline().guards,
+            SubmissionReceipt(),
+        )
+        assert isinstance(accepted, Accepted)
+        with pytest.raises(ValueError, match="Worker artifact was rejected"):
+            accepted.ticket.wait_settled(3)
+        assert controller.main_operation is None
+        assert not any(name == "modify" for name, _thread in session.calls)
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_worker_main_dispatch_unknown_retains_moved_operation_lease() -> None:
+    events = []
+
+    class Lease:
+        def release(self, *, port) -> None:
+            events.append(("release", port))
+
+        def retain_outcome_unknown(self, *, port) -> None:
+            events.append(("retain", port))
+
+    class Activation:
+        def activate(self, intent, *, port):
+            events.append(("activate", intent, port))
+            return Lease()
+
+    class UnknownInstructionSession(CompleteSession):
+        def modify(self, variable, value_expression, *, on_transport_dispatch):
+            if variable == "ТекущаяИнструкция":
+                on_transport_dispatch()
+                self._record("modify")
+                raise OutcomeUnknown("instruction reply was lost")
+            return super().modify(variable, value_expression,
+                                 on_transport_dispatch=on_transport_dispatch)
+
+    owner = object()
+    controller, arbiter, _session, parser = _runtime(
+        lambda: RoutePreparationSnapshot(owner, 1, (), ()),
+        session=UnknownInstructionSession(), worker_activation=Activation(),
+    )
+    try:
+        context, prepared = _prepared(
+            controller, parser,
+            "Функция Посчитать() Экспорт\nВозврат 1;\nКонецФункции\nИтог = Посчитать();",
+        )
+        accepted = controller.submit_cell(
+            context, prepared, context.capabilities.for_pipeline().guards,
+            SubmissionReceipt(),
+        )
+        assert isinstance(accepted, Accepted)
+        assert accepted.ticket.wait_unknown(3)
+        assert controller.main_operation is not None
+        assert controller.main_operation.phase is MainPhase.UNKNOWN
+        assert [event[0] for event in events] == ["activate", "retain"]
+
+        from onec_runtime.execution.termination import FileTerminationConfirmed
+        arbiter.retire_terminated_target(
+            accepted.ticket, arbiter.current_route,
+            FileTerminationConfirmed(TARGET, 1, -15),
+        )
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_confirmed_worker_main_precontinue_failure_releases_lease_and_terminalizes_main() -> None:
+    events = []
+
+    class Lease:
+        def release(self, *, port) -> None:
+            events.append(("release", port))
+
+        def retain_outcome_unknown(self, *, port) -> None:
+            events.append(("retain", port))
+
+    class Activation:
+        def activate(self, intent, *, port):
+            events.append(("activate", intent, port))
+            return Lease()
+
+    class RejectedInstructionSession(CompleteSession):
+        def modify(self, variable, value_expression, *, on_transport_dispatch):
+            if variable == "ТекущаяИнструкция":
+                on_transport_dispatch()
+                self._record("modify")
+                return ModifyResult(UUID(int=91), "Ошибка", "", True, "rejected")
+            return super().modify(variable, value_expression,
+                                 on_transport_dispatch=on_transport_dispatch)
+
+    owner = object()
+    controller, arbiter, _session, parser = _runtime(
+        lambda: RoutePreparationSnapshot(owner, 1, (), ()),
+        session=RejectedInstructionSession(), worker_activation=Activation(),
+    )
+    try:
+        context, prepared = _prepared(
+            controller, parser,
+            "Функция Посчитать() Экспорт\nВозврат 1;\nКонецФункции\nИтог = Посчитать();",
+        )
+        accepted = controller.submit_cell(
+            context, prepared, context.capabilities.for_pipeline().guards,
+            SubmissionReceipt(),
+        )
+        assert isinstance(accepted, Accepted)
+        with pytest.raises(Exception, match="ТекущаяИнструкция"):
+            accepted.ticket.wait_settled(3)
+        assert controller.main_operation is not None
+        assert controller.main_operation.phase is MainPhase.FAILED_BEFORE_DISPATCH
+        assert [event[0] for event in events] == ["activate", "release"]
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_worker_main_keeps_its_policy_and_message_key_across_capture_resume() -> None:
+    class MessageSession(CompleteSession):
+        def wait_evaluation_event(self, pending, *, timeout_s, on_transport_dispatch):
+            if self.expression.startswith(
+                "RuntimeKernelServer.ЗабратьСообщенияЯчейкиИзКонтекста("
+            ):
+                on_transport_dispatch()
+                self._record("wait_eval")
+                self.pending = None
+                return EvaluationResult(
+                    pending.result_id, "Строка", '"[]"', False,
+                    value_string="[]",
+                )
+            return super().wait_evaluation_event(
+                pending, timeout_s=timeout_s,
+                on_transport_dispatch=on_transport_dispatch,
+            )
+
+    class Lease:
+        def release(self, *, port) -> None:
+            pass
+
+        def retain_outcome_unknown(self, *, port) -> None:
+            pass
+
+    class Activation:
+        def activate(self, intent, *, port):
+            return Lease()
+
+    class SettlementServices:
+        def settle_main(self, outcome, payload):
+            return ("published", outcome, payload)
+
+    owner = object()
+    controller, arbiter, _session, parser = _runtime(
+        lambda: RoutePreparationSnapshot(owner, 1, (), ()),
+        session=MessageSession(),
+        worker_activation=Activation(),
+        settlement_services=SettlementServices(),
+    )
+    try:
+        context, prepared = _prepared(
+            controller, parser,
+            "Функция Посчитать() Экспорт\nВозврат 1;\nКонецФункции\nИтог = Посчитать();",
+        )
+        accepted = controller.submit_cell(
+            context, prepared, context.capabilities.for_pipeline().guards,
+            SubmissionReceipt(),
+        )
+        assert isinstance(accepted, Accepted)
+        stopped = accepted.ticket.wait_settled(3)
+        assert stopped[0] == "published"
+        assert stopped[1].kind.value == "capture"
+        operation = controller.main_operation
+        assert operation is not None
+        assert operation.message_collector_key == (
+            prepared.payload.deferred_statement.message_collector_key
+        )
+
+        finished = controller.submit_resume().wait_settled(3)
+        assert finished[0] == "published"
+        assert finished[1].kind.value == "completed"
+        assert finished[1].operation is operation
+        assert finished[2] is prepared.payload
     finally:
         arbiter.close(timeout=3)

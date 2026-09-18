@@ -19,6 +19,8 @@ from onec_runtime.bsl import (
     WorkerExport,
 )
 from onec_runtime.bsl.source_maps import MappedSource
+from onec_runtime.bsl.notebook_cells import NotebookCellProjection
+from onec_runtime.bsl.notebook_methods import NotebookMethodSet
 from onec_runtime.worker_universe import OperationGenerationPin
 
 
@@ -51,14 +53,19 @@ class WorkerCandidateIntent:
     """Local method projection and catalog expected by later Worker activation.
 
     This is neither a built artifact nor a published Worker generation.
-    ``guard`` binds it to the snapshot checked again at admission.
+    ``cell`` and ``method_set_candidate`` keep retained method bodies and
+    visible source origins. ``guard`` binds them to the snapshot checked again
+    at admission.
     """
 
     projection: MappedSource = field(repr=False)
-    exports: tuple[WorkerExport, ...]
-    candidate_catalog: tuple[WorkerExport, ...]
-    namespace_names: tuple[str, ...]
+    cell: NotebookCellProjection = field(repr=False)
+    exports: tuple[WorkerExport, ...] = field(repr=False)
+    candidate_catalog: tuple[WorkerExport, ...] = field(repr=False)
+    namespace_names: tuple[str, ...] = field(repr=False)
     guard: object = field(repr=False)
+    previous_methods: NotebookMethodSet | None = field(repr=False)
+    method_set_candidate: NotebookMethodSet = field(repr=False)
 
 
 def prepare_statement(
@@ -69,7 +76,7 @@ def prepare_statement(
 ) -> RoutePreparedStatement:
     """Lower one mapped statement with the route's immutable policy."""
     key_factory = request.message_key_factory
-    message_key = key_factory(mode) if key_factory is not None else ""
+    message_key = (key_factory(mode) if key_factory is not None else "") or "__onec_cell_messages"
     catalog = (
         request.complete_catalog(request.candidate_catalog)
         if request.candidate_catalog is not None
@@ -91,7 +98,7 @@ def prepare_statement(
         lowering = lower_mapped(
             request.statement,
             **route_argument,
-            message_collector_key=message_key or "__onec_cell_messages",
+            message_collector_key=message_key,
             worker_exports=catalog,
         )
     else:
@@ -99,7 +106,7 @@ def prepare_statement(
             lowering = request.lowerer.lower(
                 request.statement.text,
                 mode=mode,
-                message_collector_key=message_key or "__onec_cell_messages",
+                message_collector_key=message_key,
             )
     lowering = request.with_pin_prelude(
         lowering,

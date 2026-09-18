@@ -198,6 +198,160 @@ def test_best_effort_heartbeat_skips_busy_owner_and_runs_when_idle(runtime):
     assert len({thread for _, thread in session.calls}) == 1
 
 
+def test_post_settlement_cleanup_runs_before_later_ticket_and_preserves_parent_reply(runtime):
+    session, route, arbiter = runtime
+    entered = Event()
+    release = Event()
+
+    def user_plan(port):
+        port.register_post_settlement_cleanup(
+            lambda cleanup_port: Settlement(evaluate(cleanup_port, 'cleanup'))
+        )
+        entered.set()
+        assert release.wait(3)
+        return Settlement('user-reply')
+
+    user = arbiter.submit(route, user_plan)
+    arbiter.dispatch(user)
+    assert entered.wait(3)
+    later = arbiter.submit(route, lambda port: Settlement(evaluate(port, 'later')))
+    arbiter.dispatch(later)
+    release.set()
+
+    assert user.wait(3) == 'user-reply'
+    cleanup = user.post_settlement_cleanup
+    assert cleanup is not None
+    assert cleanup.wait(3) == 'cleanup'
+    assert later.wait(3) == 'later'
+    assert [name for name, _ in session.calls] == ['cleanup', 'event', 'later', 'event']
+
+
+def test_confirmed_post_settlement_cleanup_failure_is_observable_and_retryable(runtime):
+    _session, route, arbiter = runtime
+    attempts = []
+
+    def cleanup(_port):
+        attempts.append('cleanup')
+        if len(attempts) == 1:
+            raise ValueError('cleanup rejected')
+        return Settlement('released')
+
+    def user_plan(port):
+        port.register_post_settlement_cleanup(cleanup)
+        return Settlement('user-reply')
+
+    user = arbiter.submit(route, user_plan)
+    arbiter.dispatch(user)
+    assert user.wait(3) == 'user-reply'
+    first = user.post_settlement_cleanup
+    assert first is not None
+    with pytest.raises(ValueError, match='cleanup rejected'):
+        first.wait(3)
+
+    retry = arbiter.retry_post_settlement_cleanup(user)
+    assert retry.wait(3) == 'released'
+    assert user.post_settlement_cleanup is retry
+
+
+def test_confirmed_cleanup_debt_holds_already_queued_later_work_until_retry(runtime):
+    session, route, arbiter = runtime
+    cleanup_entered = Event()
+    release_cleanup = Event()
+    attempts = []
+
+    def cleanup(_port):
+        attempts.append('cleanup')
+        if len(attempts) == 1:
+            cleanup_entered.set()
+            assert release_cleanup.wait(3)
+            raise ValueError('cleanup rejected')
+        return Settlement('released')
+
+    def user_plan(port):
+        port.register_post_settlement_cleanup(cleanup)
+        return Settlement('user-reply')
+
+    user = arbiter.submit(route, user_plan)
+    arbiter.dispatch(user)
+    assert user.wait(3) == 'user-reply'
+    first = user.post_settlement_cleanup
+    assert first is not None and cleanup_entered.wait(3)
+    later = arbiter.submit(route, lambda port: Settlement(evaluate(port, 'later')))
+    arbiter.dispatch(later)
+    release_cleanup.set()
+    with pytest.raises(ValueError, match='cleanup rejected'):
+        first.wait(3)
+    with pytest.raises(TimeoutError):
+        later.wait(0.05)
+    assert session.calls == []
+
+    assert arbiter.retry_post_settlement_cleanup(user).wait(3) == 'released'
+    assert later.wait(3) == 'later'
+
+
+def test_post_settlement_cleanup_uses_route_installed_by_parent_settlement(runtime):
+    _session, route, arbiter = runtime
+    next_route = RouteToken(route.incarnation, route.epoch + 1, 0, 'next')
+
+    def user_plan(port):
+        def cleanup(_cleanup_port):
+            assert arbiter.current_route == next_route
+            return Settlement('released')
+
+        port.register_post_settlement_cleanup(cleanup)
+        return Settlement('user-reply', next_route=next_route)
+
+    user = arbiter.submit(route, user_plan)
+    arbiter.dispatch(user)
+    assert user.wait(3) == 'user-reply'
+    cleanup = user.post_settlement_cleanup
+    assert cleanup is not None and cleanup.wait(3) == 'released'
+    later = arbiter.submit(next_route, lambda _port: Settlement('later'))
+    arbiter.dispatch(later)
+    assert later.wait(3) == 'later'
+
+
+def test_post_settlement_cleanup_runs_after_confirmed_parent_exception(runtime):
+    _session, route, arbiter = runtime
+    cleaned = []
+
+    def user_plan(port):
+        port.register_post_settlement_cleanup(
+            lambda _cleanup_port: cleaned.append('released') or Settlement('released')
+        )
+        raise ValueError('instruction rejected')
+
+    user = arbiter.submit(route, user_plan)
+    arbiter.dispatch(user)
+    with pytest.raises(ValueError, match='instruction rejected'):
+        user.wait(3)
+    cleanup = user.post_settlement_cleanup
+    assert cleanup is not None and cleanup.wait(3) == 'released'
+    assert cleaned == ['released']
+
+
+def test_ambiguous_post_settlement_cleanup_owns_arbiter_after_parent_reply(runtime):
+    session, route, arbiter = runtime
+
+    def user_plan(port):
+        port.register_post_settlement_cleanup(
+            lambda cleanup_port: Settlement(evaluate(cleanup_port, 'ambiguous'))
+        )
+        return Settlement('user-reply')
+
+    user = arbiter.submit(route, user_plan)
+    arbiter.dispatch(user)
+    assert user.wait(3) == 'user-reply'
+    cleanup = user.post_settlement_cleanup
+    assert cleanup is not None and cleanup.wait_unknown(3)
+    assert arbiter.active_ticket is cleanup
+    assert arbiter.try_heartbeat() is None
+    from onec_runtime.execution.termination import FileTerminationConfirmed
+    arbiter.retire_terminated_target(
+        cleanup, route, FileTerminationConfirmed(session.pending.target_id, 1234, -15)
+    )
+
+
 def test_heartbeat_rejects_pending_eval_before_transport(runtime):
     session, route, arbiter = runtime
 

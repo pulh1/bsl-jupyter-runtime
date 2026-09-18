@@ -5543,3 +5543,141 @@ def test_notebook_descriptor_repr_never_exposes_source_binary_or_paths(
     assert SOURCE not in rendered
     assert "notebook-worker-binary" not in rendered
     assert str(tmp_path.resolve()) not in rendered
+
+
+def test_worker_activation_adapter_promotes_over_supplied_port_and_retains_methods(
+    tmp_path: Path,
+) -> None:
+    """An activation must keep omitted methods and use only its admitted port."""
+    from onec_runtime.execution.common import NotebookCommonParser
+    from onec_runtime.execution.snapshot_binding import (
+        RoutePreparationSnapshot, SnapshotRouteBinding,
+    )
+    from onec_runtime.execution.worker_activation import WorkerUniverseActivationAdapter
+
+    parser = PythonParserTarget.from_generated()
+    owner = object()
+    host = worker_universe.WorkerUniverseRegistry(
+        runtime_generation=7, context_generation=3,
+    )
+    target = _UniverseTargetExecutor()
+    port = object()
+    observed_ports: list[object] = []
+
+    def execute(supplied_port: object, source: str) -> object:
+        observed_ports.append(supplied_port)
+        assert supplied_port is port
+        candidate = host._pending
+        assert candidate is not None
+        target.acknowledge(candidate)
+        return target(source)
+
+    adapter = WorkerUniverseActivationAdapter(
+        host,
+        notebook_builder=_notebook_builder(tmp_path),
+        instruction_runner=execute,
+        target_profile="server-test",
+        worker_breakpoints_present=lambda: False,
+    )
+
+    def intent(source: str, revision: int):
+        unit = SourceUnitRef(
+            SourceUnitKind.NOTEBOOK_CELL, "activation", revision,
+            source_sha256(source),
+        )
+        common = NotebookCommonParser(parser).prepare(source, unit)
+        snapshot = RoutePreparationSnapshot(
+            owner, revision, (), adapter.worker_exports, adapter.active_methods,
+        )
+        return SnapshotRouteBinding(
+            parser, owner=owner, version=revision,
+        ).worker_intent(common, snapshot.for_pipeline())
+
+    first = adapter.activate(intent(
+        "Функция Первый() Экспорт\nВозврат 1;\nКонецФункции\nИтог = Первый();", 1,
+    ), port=port)
+    old_pin = first.pin
+    second = adapter.activate(intent(
+        "Функция Второй() Экспорт\nВозврат 2;\nКонецФункции", 2,
+    ), port=port)
+
+    assert observed_ports and set(observed_ports) == {port}
+    assert {export.method for export in adapter.active_methods.exports} == {
+        "Первый", "Второй",
+    }
+    assert host.active_handle is second.handle
+    assert old_pin.handle is first.handle
+    ordinary = adapter.pin_active()
+    assert ordinary is not None and ordinary.pin.handle is second.handle
+    ordinary.release(port=port)
+    first.release(port=port)
+    second.release(port=port)
+    assert host.active_handle is second.handle
+
+
+def test_worker_activation_adapter_retains_unknown_stage_without_replay(
+    tmp_path: Path,
+) -> None:
+    """An ambiguous stage must keep its owner even if the host is already broken."""
+    from onec_runtime.execution.common import NotebookCommonParser
+    from onec_runtime.execution.snapshot_binding import (
+        RoutePreparationSnapshot, SnapshotRouteBinding,
+    )
+    from onec_runtime.execution.worker import WorkerActivationUnknown
+    from onec_runtime.execution.worker_activation import WorkerUniverseActivationAdapter
+
+    host = worker_universe.WorkerUniverseRegistry(
+        runtime_generation=7, context_generation=3,
+    )
+    target = _UniverseTargetExecutor()
+    target.fault = "connect"
+    port = object()
+    calls = 0
+
+    def execute(supplied_port: object, source: str) -> object:
+        nonlocal calls
+        assert supplied_port is port
+        calls += 1
+        candidate = host._pending
+        assert candidate is not None
+        target.acknowledge(candidate)
+        return target(source)
+
+    adapter = WorkerUniverseActivationAdapter(
+        host, notebook_builder=_notebook_builder(tmp_path),
+        instruction_runner=execute, target_profile="server-test",
+        worker_breakpoints_present=lambda: False,
+    )
+    parser = PythonParserTarget.from_generated()
+    source = "Функция Первый() Экспорт\nВозврат 1;\nКонецФункции"
+    unit = SourceUnitRef(
+        SourceUnitKind.NOTEBOOK_CELL, "unknown", 1, source_sha256(source),
+    )
+    common = NotebookCommonParser(parser).prepare(source, unit)
+    owner = object()
+    intent = SnapshotRouteBinding(parser, owner=owner, version=1).worker_intent(
+        common, RoutePreparationSnapshot(owner, 1, (), ()).for_pipeline(),
+    )
+
+    with pytest.raises(WorkerActivationUnknown) as caught:
+        adapter.activate(intent, port=port)
+    caught.value.lease.retain_outcome_unknown(port=port)
+    assert host.state is worker_universe.WorkerUniverseState.BROKEN
+    assert calls == 1
+
+
+def test_worker_activation_adapter_requires_breakpoint_inventory(
+    tmp_path: Path,
+) -> None:
+    """Promotion cannot silently omit the Worker breakpoint workspace transaction."""
+    from onec_runtime.execution.worker_activation import WorkerUniverseActivationAdapter
+
+    host = worker_universe.WorkerUniverseRegistry(
+        runtime_generation=7, context_generation=3,
+    )
+    with pytest.raises(TypeError, match="breakpoint"):
+        WorkerUniverseActivationAdapter(
+            host,
+            notebook_builder=_notebook_builder(tmp_path),
+            instruction_runner=lambda _port, _source: None,
+        )

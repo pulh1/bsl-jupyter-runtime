@@ -64,6 +64,15 @@ class CompleteSession(RouteSession):
             self._record("wait_eval")
             self.pending = None
             return EvaluationResult(pending.result_id, "Строка", '""', False)
+        if self.expression.startswith(
+            "RuntimeKernelServer.ЗабратьСообщенияЯчейкиИзКонтекста("
+        ):
+            self._record("wait_eval")
+            self.pending = None
+            return EvaluationResult(
+                pending.result_id, "Строка", '"[]"', False,
+                value_string="[]",
+            )
         return super().wait_evaluation_event(
             pending, timeout_s=timeout_s,
             on_transport_dispatch=lambda: None,
@@ -343,7 +352,10 @@ def test_confirmed_variable_inspection_failure_does_not_poison_capture() -> None
         arbiter.close(timeout=3)
 
 
-def test_user_breakpoint_resumes_same_main_operation_on_owned_worker() -> None:
+@pytest.mark.parametrize("settle", [False, True])
+def test_user_breakpoint_resumes_same_main_operation_on_owned_worker(
+    settle: bool,
+) -> None:
     from onec_runtime.execution.controller.controller import (
         ExecutionController,
         MainYieldKind,
@@ -375,11 +387,20 @@ def test_user_breakpoint_resumes_same_main_operation_on_owned_worker() -> None:
         runtime_generation=1,
     )
     try:
-        stopped = controller.submit_main("Результат = 1;").wait(3)
+        finalizer = (lambda outcome: ("published", outcome)) if settle else None
+        stopped_reply = controller.submit_main(
+            "Результат = 1;", _finalizer=finalizer,
+        ).wait(3)
+        stopped = stopped_reply[1] if settle else stopped_reply
+        if settle:
+            assert stopped_reply[0] == "published"
         assert stopped.kind is MainYieldKind.DEBUG_STOP
         assert stopped.operation.phase is MainPhase.SUSPENDED_USER
 
-        finished = controller.submit_resume_debug_stop().wait(3)
+        finished_reply = controller.submit_resume_debug_stop().wait(3)
+        finished = finished_reply[1] if settle else finished_reply
+        if settle:
+            assert finished_reply[0] == "published"
         assert finished.kind is MainYieldKind.COMPLETED
         assert finished.operation is stopped.operation
         assert finished.operation.phase is MainPhase.COMPLETED

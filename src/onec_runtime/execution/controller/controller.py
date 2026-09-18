@@ -19,6 +19,7 @@ from onec_runtime.execution.arbiter import (
     CancelledBeforeEffect,
     ConfirmedFailure,
     ExecutionTicket,
+    OutcomeUnknown,
     RdbgArbiter,
     ReadyForPolicy,
     RouteToken,
@@ -50,8 +51,12 @@ from onec_runtime.execution.contracts import (
 from onec_runtime.execution.main import MainExecutor, MainOperation, MainPhase
 from onec_runtime.execution.main.completion import MainRemoteCompletion, read_main_completion
 from onec_runtime.execution.main.policy import MainCellPolicy, MainPreparedPayload
+from onec_runtime.execution.preparation import WorkerCandidateIntent
 from onec_runtime.execution.snapshot_binding import (
     RoutePreparationSnapshot, RouteSnapshotGuard, SnapshotRouteBinding,
+)
+from onec_runtime.execution.worker import (
+    WorkerActivationLease, WorkerActivationPort, WorkerActivationUnknown,
 )
 from onec_runtime.rdbg.models import EvaluationResult, StopEvent
 from onec_runtime.stop_routing import BreakpointRegistry, StopReason, classify_stop
@@ -114,6 +119,7 @@ class ExecutionController:
         parser_target: PythonParserTarget | None = None,
         snapshot_provider: Callable[[], RoutePreparationSnapshot] | None = None,
         settlement_services: object | None = None,
+        worker_activation: WorkerActivationPort | None = None,
     ) -> None:
         if type(runtime_generation) is not int or runtime_generation <= 0:
             raise ValueError("runtime_generation must be positive")
@@ -131,6 +137,7 @@ class ExecutionController:
         self._settlement_services = (
             settlement_services if settlement_services is not None else _RawSettlementServices()
         )
+        self._worker_activation = worker_activation
         self._lock = RLock()
         self._command_sequence = 0
         self._stop_sequence = 0
@@ -139,6 +146,8 @@ class ExecutionController:
         self._capture_route: RouteToken | None = None
         self._resume_ticket: ExecutionTicket | None = None
         self._main_stop_ticket: ExecutionTicket | None = None
+        self._worker_activation_main_ticket: ExecutionTicket | None = None
+        self._main_worker_leases: dict[int, WorkerActivationLease] = {}
         self._preparation_revision = 0
         self._preparations: dict[object, _PreparationRecord] = {}
         self._capture_cell_operations: WeakKeyDictionary[
@@ -265,11 +274,13 @@ class ExecutionController:
             or guards.version != snapshot.version
             or guards.namespace_names != snapshot.namespace_names
             or guards.worker_exports != snapshot.worker_exports
+            or guards.previous_methods != snapshot.previous_methods
             or not isinstance(live, RoutePreparationSnapshot)
             or live.owner is not snapshot.owner
             or live.version != snapshot.version
             or live.namespace_names != snapshot.namespace_names
             or live.worker_exports != snapshot.worker_exports
+            or live.previous_methods != snapshot.previous_methods
         ):
             return StalePreparation("namespace or Worker snapshot changed")
         return Current()
@@ -302,18 +313,30 @@ class ExecutionController:
                 if not isinstance(payload, MainPreparedPayload):
                     return Rejected(StalePreparation("MAIN prepared payload is invalid"))
                 statement = payload.statement
+                worker_intent = payload.worker_intent
+                deferred_statement = payload.deferred_statement
             else:
                 if not isinstance(payload, CapturePreparedPayload):
                     return Rejected(StalePreparation("CAPTURE prepared payload is invalid"))
                 statement = payload.statement
-            if statement is None:
+                worker_intent = payload.worker_intent
+                deferred_statement = payload.deferred_statement
+            if worker_intent is not None:
+                if statement is not None:
+                    return Rejected(StalePreparation("Worker payload has an eager statement"))
+                activation = self._worker_activation
+                if activation is None:
+                    return Rejected(Unavailable("Worker activation is not configured"))
+            elif statement is None:
                 return Rejected(Unavailable("Worker artifacts or empty statements are unsupported"))
+            selected_statement = deferred_statement if worker_intent is not None else statement
             if (
                 isinstance(payload, CapturePreparedPayload)
-                and payload.dirty_roots != statement.lowering.dirty_roots
+                and selected_statement is not None
+                and payload.dirty_roots != selected_statement.lowering.dirty_roots
             ):
                 return Rejected(StalePreparation("CAPTURE dirty roots do not match lowering"))
-            source = statement.lowering.source
+            source = None if selected_statement is None else selected_statement.lowering.source
 
             def finalizer(raw_outcome: object) -> object:
                 return context.policy.settle(
@@ -330,16 +353,29 @@ class ExecutionController:
                         or fresh.version != record.snapshot.version
                         or fresh.namespace_names != record.snapshot.namespace_names
                         or fresh.worker_exports != record.snapshot.worker_exports
+                        or fresh.previous_methods != record.snapshot.previous_methods
                     ):
                         raise StalePreparedDispatch(
                             "statement snapshot changed before dispatch"
                         )
+
+            if worker_intent is not None:
+                try:
+                    ticket = self._submit_worker_cell(
+                        context, payload, worker_intent, source,
+                        receipt=receipt, preflight=preflight, finalizer=finalizer,
+                    )
+                except StaleRoute:
+                    return Rejected(StalePreparation("arbiter route changed"))
+                self._preparations.pop(context.preparation_nonce, None)
+                return Accepted(ticket)
 
             try:
                 if isinstance(context.policy, MainCellPolicy):
                     ticket = self.submit_main(
                         source, _receipt=receipt, _before_first_effect=preflight,
                         _finalizer=finalizer,
+                        _message_collector_key=statement.message_collector_key,
                     )
                 else:
                     ticket = self.submit_capture_cell(
@@ -352,25 +388,197 @@ class ExecutionController:
             self._preparations.pop(context.preparation_nonce, None)
             return Accepted(ticket)
 
+    def _submit_worker_cell(
+        self,
+        context: PreparationContext,
+        payload: MainPreparedPayload | CapturePreparedPayload,
+        intent: WorkerCandidateIntent,
+        source: str | None,
+        *,
+        receipt: SubmissionReceipt,
+        preflight: Callable[[], None],
+        finalizer: Callable[[object], object],
+    ) -> ExecutionTicket:
+        """Run post-admission Worker activation and its optional deferred statement."""
+
+        activation_port = self._worker_activation
+        if activation_port is None:
+            raise RuntimeError("Worker activation was not checked")
+        route = self._arbiter.current_route
+        is_main = isinstance(context.policy, MainCellPolicy)
+        scope = self.capture_scope
+        if not is_main and (
+            scope is None
+            or scope.context_state is not CaptureContextState.READY
+            or self.main_operation is None
+            or self.main_operation.phase is not MainPhase.SUSPENDED_CAPTURE
+            or self._capture_route != route
+        ):
+            raise StaleRoute("CAPTURE route changed")
+
+        ticket: ExecutionTicket | None = None
+
+        def schedule_release(lease: WorkerActivationLease, port: SessionPort) -> None:
+            def cleanup(cleanup_port: SessionPort) -> Settlement:
+                lease.release(port=cleanup_port)
+                return Settlement(None)
+
+            port.register_post_settlement_cleanup(cleanup)
+
+        def plan(port: SessionPort) -> ReadyForPolicy:
+            lease: WorkerActivationLease | None = None
+            outcome_unknown = False
+            operation: MainOperation | None = None
+            try:
+                preflight()
+                lease = activation_port.activate(intent, port=port)
+                if source is None:
+                    if is_main:
+                        with self._lock:
+                            self._worker_activation_main_ticket = None
+                    return ReadyForPolicy(None)
+                if is_main:
+                    with self._lock:
+                        if self.main_operation is not None and not self.main_operation.terminal:
+                            raise StaleRoute("MAIN operation was admitted during Worker activation")
+                        self._command_sequence += 1
+                        assert isinstance(payload, MainPreparedPayload)
+                        assert payload.deferred_statement is not None
+                        operation = MainOperation(
+                            self._command_sequence, None,
+                            settler=finalizer,
+                            message_collector_key=(
+                                payload.deferred_statement.message_collector_key
+                            ),
+                        )
+                        self.main_operation = operation
+                        self.capture_scope = None
+                        self._capture_route = None
+                        self._resume_ticket = None
+                        self._worker_activation_main_ticket = None
+                        self._main_worker_leases[operation.command_id] = lease
+                    lease = None
+                    stop = self._main_executor.dispatch(
+                        operation, source,
+                        install_workspace=lambda: port.set_breakpoints(self._registry.full_locations),
+                        before_command_write=lambda: None,
+                        before_continue=lambda: None,
+                        port=port,
+                    )
+                    outcome = self._route_stop(port, operation, stop)
+                    return ReadyForPolicy(outcome.value, next_route=outcome.next_route)
+
+                assert scope is not None
+                cell_operation = CaptureCellOperation(scope.identity)
+                outcome = self._capture_cell_executor.execute(
+                    scope, source, port=port,
+                    shield_workspace=lambda worker: worker.set_breakpoints(
+                        self._registry.evaluation_locations
+                    ),
+                    restore_workspace=lambda worker: worker.set_breakpoints(
+                        self._registry.full_locations
+                    ),
+                    cleanup=lambda worker: None,
+                    result_policy=lambda result: result,
+                    operation=cell_operation,
+                )
+                if isinstance(outcome, ConfirmedFailure):
+                    raise outcome.error
+                return ReadyForPolicy(outcome.value, next_route=outcome.next_route)
+            except WorkerActivationUnknown as error:
+                outcome_unknown = True
+                error.lease.retain_outcome_unknown(port=port)
+                raise
+            except OutcomeUnknown:
+                outcome_unknown = True
+                if lease is not None:
+                    lease.retain_outcome_unknown(port=port)
+                if is_main:
+                    with self._lock:
+                        if operation is not None:
+                            self._retain_main_worker_lease(operation, port)
+                        if self.main_operation is not None and not self.main_operation.terminal:
+                            self.main_operation.mark_unknown()
+                raise
+            except BaseException:
+                if is_main:
+                    with self._lock:
+                        if operation is None:
+                            self._worker_activation_main_ticket = None
+                        elif operation.phase is MainPhase.ADMITTED:
+                            operation.fail_before_dispatch()
+                            self._schedule_main_worker_lease_release(operation, port)
+                raise
+            finally:
+                if lease is not None and not outcome_unknown:
+                    schedule_release(lease, port)
+
+        ticket = self._arbiter.submit(route, plan, finalizer=finalizer)
+        if is_main:
+            self._worker_activation_main_ticket = ticket
+        receipt.adopt(ticket)
+        self._preparation_revision += 1
+        self._arbiter.dispatch(ticket)
+        return ticket
+
     def request_stop(self, ticket: ExecutionTicket) -> object:
         return self._arbiter.request_stop(ticket)
+
+    def _main_worker_activation_pending(self) -> bool:
+        ticket = self._worker_activation_main_ticket
+        if ticket is None:
+            return False
+        if ticket.status().settled:
+            self._worker_activation_main_ticket = None
+            return False
+        return True
+
+    def _schedule_main_worker_lease_release(
+        self, operation: MainOperation, port: SessionPort,
+    ) -> None:
+        lease = self._main_worker_leases.get(operation.command_id)
+        if lease is None:
+            return
+
+        def cleanup(cleanup_port: SessionPort) -> Settlement:
+            lease.release(port=cleanup_port)
+            with self._lock:
+                if self._main_worker_leases.get(operation.command_id) is lease:
+                    self._main_worker_leases.pop(operation.command_id)
+            return Settlement(None)
+
+        port.register_post_settlement_cleanup(cleanup)
+
+    def _retain_main_worker_lease(
+        self, operation: MainOperation, port: SessionPort,
+    ) -> None:
+        lease = self._main_worker_leases.get(operation.command_id)
+        if lease is not None:
+            lease.retain_outcome_unknown(port=port)
 
     def submit_main(
         self, instruction: str, *,
         _receipt: SubmissionReceipt | None = None,
         _before_first_effect: Callable[[], None] | None = None,
         _finalizer: Callable[[object], object] | None = None,
+        _message_collector_key: str = "",
     ) -> ExecutionTicket:
         """Admit one MAIN command and return its first-stop ticket."""
 
         if not isinstance(instruction, str) or not instruction.strip():
             raise ValueError("MAIN instruction must be non-empty text")
         with self._lock:
+            if self._main_worker_activation_pending():
+                raise ProtocolError("A MAIN Worker activation is still active")
             if self.main_operation is not None and not self.main_operation.terminal:
                 raise ProtocolError("A MAIN command is still active")
             route = self._arbiter.current_route
             self._command_sequence += 1
-            operation = MainOperation(self._command_sequence, None)
+            operation = MainOperation(
+                self._command_sequence, None,
+                settler=_finalizer,
+                message_collector_key=_message_collector_key,
+            )
             self.main_operation = operation
             self.capture_scope = None
             self._capture_route = None
@@ -394,7 +602,7 @@ class ExecutionController:
                     port=port,
                 )
                 outcome = self._route_stop(port, operation, stop)
-                if _finalizer is None:
+                if operation.settler is None:
                     return outcome
                 return ReadyForPolicy(
                     outcome.value, next_route=outcome.next_route
@@ -402,7 +610,7 @@ class ExecutionController:
 
             ticket: ExecutionTicket | None = None
             try:
-                ticket = self._arbiter.submit(route, plan, finalizer=_finalizer)
+                ticket = self._arbiter.submit(route, plan, finalizer=operation.settler)
                 self._main_stop_ticket = ticket
                 if _receipt is not None:
                     _receipt.adopt(ticket)
@@ -605,20 +813,21 @@ class ExecutionController:
             if scope.temporary_cleanup_debts:
                 raise ProtocolError("CAPTURE temporary cleanup debt requires repair")
 
-            def plan(port: SessionPort) -> Settlement:
-                ledger = scope.begin_writeback()
-                assert scope.kernel_stack_level is not None
-                self._capture_writeback_executor.flush(
-                    port, ledger, stack_level=scope.kernel_stack_level
-                )
-                self._capture_executor.end_scope(
-                    scope, port=CaptureSetupAdapter(port)
-                )
+            def plan(port: SessionPort) -> Settlement | ReadyForPolicy:
                 try:
+                    ledger = scope.begin_writeback()
+                    assert scope.kernel_stack_level is not None
+                    self._capture_writeback_executor.flush(
+                        port, ledger, stack_level=scope.kernel_stack_level
+                    )
+                    self._capture_executor.end_scope(
+                        scope, port=CaptureSetupAdapter(port)
+                    )
                     self._main_executor.continue_command(operation, port=port)
                 except BaseException:
                     if operation.phase is MainPhase.UNKNOWN:
                         scope.mark_unverified()
+                        self._retain_main_worker_lease(operation, port)
                     raise
                 scope.mark_closed()
                 with self._lock:
@@ -628,9 +837,14 @@ class ExecutionController:
                 next_route = self._next_route("main")
                 port.handoff_route(next_route)
                 stop = self._main_executor.await_stop(port=port)
-                return self._route_stop(port, operation, stop)
+                outcome = self._route_stop(port, operation, stop)
+                if operation.settler is None:
+                    return outcome
+                return ReadyForPolicy(
+                    outcome.value, next_route=outcome.next_route
+                )
 
-            ticket = self._arbiter.submit(route, plan)
+            ticket = self._arbiter.submit(route, plan, finalizer=operation.settler)
             self._resume_ticket = ticket
             self._main_stop_ticket = ticket
             self._preparation_revision += 1
@@ -770,11 +984,23 @@ class ExecutionController:
                 raise ProtocolError("No user breakpoint can be resumed")
             route = self._arbiter.current_route
 
-            def plan(port: SessionPort) -> Settlement:
-                stop = self._main_executor.resume(operation, port=port)
-                return self._route_stop(port, operation, stop)
+            def plan(port: SessionPort) -> Settlement | ReadyForPolicy:
+                try:
+                    stop = self._main_executor.resume(operation, port=port)
+                    outcome = self._route_stop(port, operation, stop)
+                    if operation.settler is None:
+                        return outcome
+                    return ReadyForPolicy(
+                        outcome.value, next_route=outcome.next_route
+                    )
+                except BaseException:
+                    if operation.phase is MainPhase.UNKNOWN:
+                        self._retain_main_worker_lease(operation, port)
+                    raise
 
-            ticket = self._arbiter.submit(route, plan)
+            ticket = self._arbiter.submit(
+                route, plan, finalizer=operation.settler,
+            )
             self._main_stop_ticket = ticket
             self._preparation_revision += 1
             self._arbiter.dispatch(ticket)
@@ -785,8 +1011,12 @@ class ExecutionController:
     ) -> Settlement:
         reason = classify_stop(stop, self._registry).reason
         if reason is StopReason.MAIN_SERVICE:
-            completion = read_main_completion(port, operation)
+            completion = read_main_completion(
+                port, operation,
+                message_collector_key=operation.message_collector_key,
+            )
             operation.complete(completion)
+            self._schedule_main_worker_lease_release(operation, port)
             return Settlement(MainYield(MainYieldKind.COMPLETED, operation, completion=completion))
         if reason is StopReason.CAPTURE:
             operation.stopped(stop, MainPhase.SUSPENDED_CAPTURE)

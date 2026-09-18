@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Callable
 
 from onec_runtime.rdbg.models import StopEvent, TargetId
 
@@ -21,6 +22,8 @@ class MainPhase(str, Enum):
 class MainOperation:
     command_id: int
     target: TargetId | None
+    settler: Callable[[object], object] | None = field(default=None, repr=False)
+    message_collector_key: str = field(default="", repr=False)
     phase: MainPhase = field(default=MainPhase.ADMITTED, init=False)
     pending_stop: StopEvent | None = field(default=None, init=False, repr=False)
     completion: object | None = field(default=None, init=False, repr=False)
