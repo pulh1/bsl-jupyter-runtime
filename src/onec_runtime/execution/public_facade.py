@@ -33,6 +33,9 @@ from onec_runtime.execution.capture.public_inspection import (
 from onec_runtime.execution.capture.session_inspection_adapter import (
     SessionCaptureInspectionAdapter,
 )
+from onec_runtime.execution.capture.manager_metadata import (
+    CaptureManagerMetadataService,
+)
 from onec_runtime.execution.capture.writeback import (
     CaptureExportFailed, CaptureModifyFailed,
 )
@@ -52,6 +55,7 @@ from onec_runtime.execution.worker_module_lifecycle import WorkerModuleLifecycle
 from onec_runtime.execution.worker_activation import WorkerMaterializationSnapshot
 from onec_runtime.prototype_runtime import PartialWritebackError
 from onec_runtime.performance_profile import PhaseRecorder
+from onec_runtime.observation import ManagerOrigin, ValueSelection
 from onec_runtime.runtime_api import RuntimeReply
 from onec_runtime.runtime_contracts import OperationExecutionProvenance
 from onec_runtime.rdbg.models import ModuleLocation
@@ -253,6 +257,9 @@ class PublicExecutionFacade:
         self._session_capture_inspection = SessionCaptureInspectionAdapter(
             controller, self._capture_inspection, wait_handoff=self._wait_handoff,
         )
+        self._capture_manager_metadata = CaptureManagerMetadataService(
+            controller, wait_handoff=self._wait_handoff,
+        )
         self._worker_breakpoint_service: WorkerBreakpointService | None = None
         self._worker_module_service: WorkerModuleLifecycleService | None = None
 
@@ -450,6 +457,13 @@ class PublicExecutionFacade:
             raise ProtocolError("execution provenance has another visible source")
         return provenance
 
+    def configure_capture_source_resolver(
+        self, resolver: CaptureSourceResolver | None,
+    ) -> None:
+        """Resolve future CAPTURE frames using current project source metadata."""
+
+        self._capture_inspection.configure_source_resolver(resolver)
+
     def resume_capture(
         self,
         *,
@@ -551,9 +565,39 @@ class PublicExecutionFacade:
         return adapter.materialize_table(handle, **options)
 
     def validate_value_reference(self, handle: str) -> str:
-        """Validate a direct public Context handle without reading target data."""
+        """Validate direct Context or exact-stop metadata references locally."""
 
+        if isinstance(handle, str) and handle.startswith((
+            "capture_manager_", "capture_table_metadata_",
+        )):
+            return self._capture_manager_metadata.validate_value_reference(handle)
         return validate_public_direct_handle(handle)
+
+    def resolve_capture_manager_origin(
+        self, origin: ManagerOrigin, *, timeout_s: float | None = None,
+    ) -> Mapping[str, object]:
+        """Prove a frame-local manager with one owned CAPTURE helper ticket."""
+
+        return self._capture_manager_metadata.resolve_manager_origin(
+            origin, timeout_s=timeout_s,
+        )
+
+    def capture_temporary_tables(
+        self,
+        manager_handle: str,
+        *,
+        names: tuple[str, ...] | None,
+        cursor: int,
+        limit: int,
+        selection: ValueSelection | None,
+        timeout_s: float | None = None,
+    ) -> Mapping[str, object]:
+        """Read only a bounded schema; selected rows await a resolver port."""
+
+        return self._capture_manager_metadata.temporary_tables(
+            manager_handle, names=names, cursor=cursor, limit=limit,
+            selection=selection, timeout_s=timeout_s,
+        )
 
     def _require_value_projection(self) -> ValueProjectionService:
         service = self._value_projection

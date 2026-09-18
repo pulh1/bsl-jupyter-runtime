@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import AbstractContextManager, nullcontext
+from threading import RLock
 from typing import Callable, Protocol, TypeAlias
 
 from onec_runtime.capture_inspection import (
@@ -84,16 +85,31 @@ class CaptureInspectionBridge:
         self._policy = policy
         self._wait_handoff = wait_handoff
         self._resolve_sources = resolve_sources
+        self._resolver_lock = RLock()
+
+    def configure_source_resolver(
+        self, resolver: CaptureSourceResolver | None,
+    ) -> None:
+        """Bind source metadata for future stops while no scope is active."""
+
+        if resolver is not None and not callable(resolver):
+            raise TypeError("CAPTURE source resolver is invalid")
+        with self._resolver_lock:
+            if self._controller.capture_scope is not None:
+                raise ProtocolError("Cannot change source resolver during an active CAPTURE scope")
+            self._resolve_sources = resolver
 
     def current(self) -> CaptureInspection:
         """Bind a stack/frame/context API to the active ready CAPTURE scope."""
 
-        scope = self._controller.capture_scope
+        with self._resolver_lock:
+            scope = self._controller.capture_scope
+            resolve_sources = self._resolve_sources
         if not isinstance(scope, CaptureScope):
             raise ProtocolError("CAPTURE inspection requires an active scope")
         data = CaptureTicketDataPlane(
             self._controller, scope, wait_handoff=self._wait_handoff,  # type: ignore[arg-type]
-            resolve_sources=self._resolve_sources,
+            resolve_sources=resolve_sources,
         )
         values = CaptureTicketValueProjection(
             self._controller, scope, policy=self._policy,  # type: ignore[arg-type]
