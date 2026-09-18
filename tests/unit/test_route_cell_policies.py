@@ -56,6 +56,10 @@ class _Binding:
             with_pin_prelude=lambda lowered, pin, mode: lowered,
         )
 
+    def worker_intent(self, common, snapshots):
+        assert common.source_maps.worker_candidate is None
+        return None
+
     def _message_key(self, mode):
         self.modes.append(mode)
         return "__main_messages" if mode is LoweringMode.MAIN else "__capture_messages"

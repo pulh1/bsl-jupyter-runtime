@@ -8,8 +8,10 @@ from onec_runtime.execution.capture.scope import (
     CaptureFrameIdentity,
     CaptureScope,
 )
-from onec_runtime.execution.evaluation import EvaluationPort, evaluate_until_result
-from onec_runtime.rdbg.models import EvaluationResult
+from onec_runtime.execution.evaluation import (
+    EvaluationPort, evaluate_until_result, wait_for_pending_result,
+)
+from onec_runtime.rdbg.models import EvaluationResult, PendingEvaluation
 
 
 class CaptureCellEvaluator:
@@ -51,4 +53,23 @@ class CaptureCellEvaluator:
             max_text_size=self._max_text_size,
             request_timeout_s=self._request_timeout_s,
             wait_interval_s=self._wait_interval_s,
+        )
+
+    def await_pending(
+        self,
+        scope: CaptureScope,
+        pending: PendingEvaluation,
+        *,
+        port: EvaluationPort,
+    ) -> EvaluationResult:
+        """Reconcile the exact owned CAPTURE eval without another dispatch."""
+
+        if (
+            scope.context_state is not CaptureContextState.READY
+            or scope.frame_identity is not CaptureFrameIdentity.CONFIRMED
+            or scope.kernel_stack_level is None
+        ):
+            raise RuntimeError("CAPTURE scope is not ready for pending evaluation")
+        return wait_for_pending_result(
+            port, pending, wait_interval_s=self._wait_interval_s
         )

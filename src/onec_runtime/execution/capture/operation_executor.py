@@ -20,7 +20,7 @@ from onec_runtime.execution.capture.scope import (
     CaptureStopIdentity,
 )
 from onec_runtime.execution.evaluation import EvaluationPort, EvaluationSuspended
-from onec_runtime.rdbg.models import EvaluationResult, ModuleLocation
+from onec_runtime.rdbg.models import EvaluationResult, ModuleLocation, PendingEvaluation
 
 
 class CaptureCellWorkerPort(EvaluationPort, Protocol):
@@ -154,6 +154,29 @@ class CaptureCellOperationExecutor:
         self._require_matching_operation(operation, scope)
         if operation.confirmed_result is None:
             raise RuntimeError("CAPTURE cell has no confirmed result to repair")
+        return self._finish_confirmed_result(
+            operation, scope, port=port, restore_workspace=restore_workspace,
+            cleanup=cleanup, result_policy=result_policy,
+        )
+
+    def reconcile_pending_result(
+        self,
+        operation: CaptureCellOperation,
+        scope: CaptureScope,
+        pending: PendingEvaluation,
+        *,
+        port: CaptureCellWorkerPort,
+        restore_workspace: Callable[[CaptureCellWorkerPort], None],
+        cleanup: Callable[[CaptureCellWorkerPort], None],
+        result_policy: Callable[[EvaluationResult], object],
+    ) -> Settlement | ConfirmedFailure:
+        """Finish the accepted expression identified by its pending capability."""
+
+        self._require_matching_operation(operation, scope)
+        if not operation.evaluation_started or operation.confirmed_result is not None:
+            raise RuntimeError("CAPTURE cell has no pending result to reconcile")
+        result = self._evaluator.await_pending(scope, pending, port=port)
+        operation.confirmed_result = result
         return self._finish_confirmed_result(
             operation, scope, port=port, restore_workspace=restore_workspace,
             cleanup=cleanup, result_policy=result_policy,

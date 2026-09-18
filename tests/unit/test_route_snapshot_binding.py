@@ -12,6 +12,7 @@ from onec_runtime.bsl.source_maps import SourceUnitKind, SourceUnitRef, source_s
 from onec_runtime.execution.common import NotebookCommonParser
 from onec_runtime.execution.contracts import PreparationContext, PreparedCell, SourceDiagnostic
 from onec_runtime.execution.main.policy import MainCellPolicy
+from onec_runtime.execution.capture.policy import CaptureCellPolicy
 
 
 def _contract():
@@ -105,17 +106,48 @@ def test_binding_rejects_mixed_snapshot_components() -> None:
         binding.bind(common, mixed)
 
 
-def test_statement_binding_refuses_unprepared_worker_method_definitions() -> None:
+@pytest.mark.parametrize("policy_type", [MainCellPolicy, CaptureCellPolicy])
+def test_mixed_cell_prepares_worker_intent_and_lowers_call_with_candidate_catalog(
+    policy_type,
+) -> None:
     contract = _contract()
     parser = PythonParserTarget.from_generated()
     owner = object()
-    snapshot = contract.RoutePreparationSnapshot(owner, 7, (), ())
+    existing = WorkerExport("СтарыйМетод", "СтарыйМетод")
+    snapshot = contract.RoutePreparationSnapshot(owner, 7, ("Клиент",), (existing,))
     common = _common(
         "Функция Посчитать() Экспорт\nВозврат 1;\nКонецФункции\nИтог = Посчитать();",
         parser,
     )
-    assert common.parsed_units.has_methods
-    binding = contract.SnapshotRouteBinding(parser, owner=owner, version=7)
+    policy = policy_type(contract.SnapshotRouteBinding(parser, owner=owner, version=7))
+    context = PreparationContext(object(), object(), policy, snapshot)
 
-    with pytest.raises(ValueError, match="Worker methods"):
-        binding.bind(common, snapshot.for_pipeline())
+    prepared = policy.prepare(common, snapshot.for_pipeline(), context)
+
+    assert isinstance(prepared, PreparedCell)
+    intent = prepared.payload.worker_intent
+    assert intent.projection is common.source_maps.worker_candidate
+    assert intent.exports == (WorkerExport("Посчитать", "Посчитать"),)
+    assert intent.candidate_catalog == (existing, WorkerExport("Посчитать", "Посчитать"))
+    assert intent.namespace_names == ("Клиент",)
+    assert intent.guard == snapshot.for_pipeline().guards
+    assert prepared.payload.statement is None
+    assert "Контекст.RuntimeWorker.Посчитать()" in prepared.payload.deferred_statement.lowering.source
+
+
+@pytest.mark.parametrize("policy_type", [MainCellPolicy, CaptureCellPolicy])
+def test_method_only_cell_prepares_local_worker_intent_without_statement(policy_type) -> None:
+    contract = _contract()
+    parser = PythonParserTarget.from_generated()
+    owner = object()
+    snapshot = contract.RoutePreparationSnapshot(owner, 7, (), ())
+    common = _common("Функция Посчитать() Экспорт\nВозврат 1;\nКонецФункции", parser)
+    policy = policy_type(contract.SnapshotRouteBinding(parser, owner=owner, version=7))
+    context = PreparationContext(object(), object(), policy, snapshot)
+
+    prepared = policy.prepare(common, snapshot.for_pipeline(), context)
+
+    assert isinstance(prepared, PreparedCell)
+    assert prepared.payload.statement is None
+    assert prepared.payload.worker_intent.projection is common.source_maps.worker_candidate
+    assert prepared.payload.worker_intent.exports == (WorkerExport("Посчитать", "Посчитать"),)

@@ -530,6 +530,21 @@ class RdbgArbiter:
             self._queue.append(ticket)
             return ticket
 
+    def try_heartbeat(self) -> ExecutionTicket | None:
+        """Queue one best-effort heartbeat only while the RDBG owner is idle."""
+
+        with self._mailbox:
+            if (self._closed or self._active is not None or self._queue
+                    or self._reconciliation is not None or self._server_teardown is not None):
+                return None
+            ticket = ExecutionTicket(
+                self, self._route, lambda port: Settlement(port.heartbeat())
+            )
+            self._queue.append(ticket)
+            ticket._ready = True
+            self._mailbox.notify_all()
+            return ticket
+
     def dispatch(self, ticket: ExecutionTicket) -> None:
         """Called only after the submitting layer has published its ticket."""
         with self._mailbox:

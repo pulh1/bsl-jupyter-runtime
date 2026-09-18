@@ -181,6 +181,23 @@ def test_heartbeat_waits_behind_active_eval_and_runs_on_same_worker(runtime):
     assert len({thread for _, thread in session.calls}) == 1
 
 
+def test_best_effort_heartbeat_skips_busy_owner_and_runs_when_idle(runtime):
+    session, route, arbiter = runtime
+    active = arbiter.submit(route, lambda port: Settlement(evaluate(port, 'blocked')))
+    arbiter.dispatch(active)
+    try:
+        assert session.entered.wait(3)
+        assert arbiter.try_heartbeat() is None
+        assert arbiter.has_pending_operations
+    finally:
+        session.release.set()
+    assert active.wait_settled(3) == 'blocked'
+    heartbeat = arbiter.try_heartbeat()
+    assert heartbeat is not None
+    assert heartbeat.wait_settled(3) == {'rtt_ms': 1.0, 'target_state': 'stopped'}
+    assert len({thread for _, thread in session.calls}) == 1
+
+
 def test_heartbeat_rejects_pending_eval_before_transport(runtime):
     session, route, arbiter = runtime
 

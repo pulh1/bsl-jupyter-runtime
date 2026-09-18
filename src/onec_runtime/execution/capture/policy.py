@@ -18,7 +18,9 @@ from onec_runtime.execution.contracts import (
     PreparedCell,
     SourceDiagnostic,
 )
-from onec_runtime.execution.preparation import RoutePreparationInput, RoutePreparedStatement
+from onec_runtime.execution.preparation import (
+    RoutePreparationInput, RoutePreparedStatement, WorkerCandidateIntent,
+)
 
 
 class CapturePreparationBinding(Protocol):
@@ -28,12 +30,18 @@ class CapturePreparationBinding(Protocol):
         self, common: CommonCell, snapshots: PreparationSnapshots
     ) -> RoutePreparationInput: ...
 
+    def worker_intent(
+        self, common: CommonCell, snapshots: PreparationSnapshots
+    ) -> WorkerCandidateIntent | None: ...
+
 
 @dataclass(frozen=True, slots=True)
 class CapturePreparedPayload:
     common: CommonCell = field(repr=False)
     statement: RoutePreparedStatement | None = field(repr=False)
     dirty_roots: tuple[str, ...] = ()
+    worker_intent: WorkerCandidateIntent | None = field(default=None, repr=False)
+    deferred_statement: RoutePreparedStatement | None = field(default=None, repr=False)
 
 
 class CaptureSettlementPort(Protocol):
@@ -63,6 +71,10 @@ class CaptureCellPolicy:
         if not isinstance(maps, OperationSourceMapBundle):
             raise TypeError("CAPTURE requires notebook source maps")
         statement = maps.statement_execution
+        worker_intent = (
+            self._binding.worker_intent(common, snapshots)
+            if maps.worker_candidate is not None else None
+        )
         lowered: RoutePreparedStatement | None = None
         dirty_roots: tuple[str, ...] = ()
         if statement is not None:
@@ -90,7 +102,13 @@ class CaptureCellPolicy:
         return PreparedCell(
             context.route_token,
             context.preparation_nonce,
-            CapturePreparedPayload(common, lowered, dirty_roots),
+            CapturePreparedPayload(
+                common,
+                None if worker_intent is not None else lowered,
+                dirty_roots,
+                worker_intent,
+                lowered if worker_intent is not None else None,
+            ),
         )
 
     def settle(self, outcome: object, prepared: PreparedCell, services: object) -> object:

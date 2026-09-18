@@ -311,12 +311,7 @@ def test_capture_policy_reconciles_pending_eval_then_restores_workspace_once() -
         with pytest.raises(WaiterDetached):
             ticket.wait_initiator(3)
 
-        def finish(port):
-            result = port.wait_evaluation_event(pending, timeout_s=1)
-            port.set_breakpoints((KERNEL, BUSINESS))
-            return arbiter_module.ReadyForPolicy(result)
-
-        arbiter.reconcile(ticket, finish)
+        controller.reconcile_capture_pending_eval(ticket)
         assert ticket.wait_settled(3) == "capture-policy-reply"
         assert len(settlements) == 1
         assert settlements[0][0].error_occurred is False
@@ -787,20 +782,32 @@ def test_preparation_waits_for_resumed_main_completion() -> None:
         arbiter.close(timeout=3)
 
 
-def test_worker_method_artifact_path_is_explicitly_outside_statement_binding() -> None:
+@pytest.mark.parametrize("with_statement", [False, True])
+def test_worker_method_intent_is_local_until_controller_can_activate_artifact(
+    with_statement: bool,
+) -> None:
     owner = object()
     controller, arbiter, session, parser = _runtime(
         lambda: RoutePreparationSnapshot(owner, 1, (), ())
     )
     try:
         context = controller.await_preparation_context()
-        common = _common(
-            "Функция Посчитать() Экспорт\nВозврат 1;\nКонецФункции\n"
-            "Итог = Посчитать();",
-            parser,
+        source = "Функция Посчитать() Экспорт\nВозврат 1;\nКонецФункции\n"
+        if with_statement:
+            source += "Итог = Посчитать();"
+        common = _common(source, parser)
+        prepared = context.policy.prepare(common, context.capabilities.for_pipeline(), context)
+        assert isinstance(prepared, PreparedCell)
+        assert prepared.payload.worker_intent.projection is common.source_maps.worker_candidate
+        assert prepared.payload.statement is None
+        assert (prepared.payload.deferred_statement is not None) is with_statement
+        receipt = SubmissionReceipt()
+        rejected = controller.submit_cell(
+            context, prepared, context.capabilities.for_pipeline().guards, receipt
         )
-        with pytest.raises(ValueError, match="Worker methods require an artifact"):
-            context.policy.prepare(common, context.capabilities.for_pipeline(), context)
+        assert isinstance(rejected, Rejected)
+        assert isinstance(rejected.reason, Unavailable)
+        assert receipt.ticket is None
         assert session.calls == []
     finally:
         arbiter.close(timeout=3)

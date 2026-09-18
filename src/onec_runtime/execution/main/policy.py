@@ -18,7 +18,9 @@ from onec_runtime.execution.contracts import (
     SourceDiagnostic,
 )
 from onec_runtime.execution.main.preparation import MainCellPreparer
-from onec_runtime.execution.preparation import RoutePreparationInput, RoutePreparedStatement
+from onec_runtime.execution.preparation import (
+    RoutePreparationInput, RoutePreparedStatement, WorkerCandidateIntent,
+)
 
 
 class MainPreparationBinding(Protocol):
@@ -32,11 +34,17 @@ class MainPreparationBinding(Protocol):
         self, common: CommonCell, snapshots: PreparationSnapshots
     ) -> RoutePreparationInput: ...
 
+    def worker_intent(
+        self, common: CommonCell, snapshots: PreparationSnapshots
+    ) -> WorkerCandidateIntent | None: ...
+
 
 @dataclass(frozen=True, slots=True)
 class MainPreparedPayload:
     common: CommonCell = field(repr=False)
     statement: RoutePreparedStatement | None = field(repr=False)
+    worker_intent: WorkerCandidateIntent | None = field(default=None, repr=False)
+    deferred_statement: RoutePreparedStatement | None = field(default=None, repr=False)
 
 
 class MainSettlementPort(Protocol):
@@ -64,6 +72,10 @@ class MainCellPolicy:
         if not isinstance(maps, OperationSourceMapBundle):
             raise TypeError("MAIN requires notebook source maps")
         statement = maps.statement_execution
+        worker_intent = (
+            self._binding.worker_intent(common, snapshots)
+            if maps.worker_candidate is not None else None
+        )
         lowered: RoutePreparedStatement | None = None
         if statement is not None:
             request = self._binding.bind(common, snapshots)
@@ -89,7 +101,12 @@ class MainCellPolicy:
         return PreparedCell(
             context.route_token,
             context.preparation_nonce,
-            MainPreparedPayload(common, lowered),
+            MainPreparedPayload(
+                common,
+                None if worker_intent is not None else lowered,
+                worker_intent,
+                lowered if worker_intent is not None else None,
+            ),
         )
 
     def settle(self, outcome: object, prepared: PreparedCell, services: object) -> object:

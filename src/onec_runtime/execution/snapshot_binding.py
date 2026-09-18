@@ -2,7 +2,7 @@
 
 This local binding has no target or Worker lease. The controller must validate
 the guard again at admission, then acquire any required Worker pin before a
-remote side effect. Worker method definitions need a separate artifact path.
+remote side effect. Method projections remain deferred until that admission.
 """
 
 from __future__ import annotations
@@ -23,7 +23,9 @@ from onec_runtime.execution.contracts import (
     OperationSourceMapBundle,
     PreparationSnapshots,
 )
-from onec_runtime.execution.preparation import RoutePreparationInput
+from onec_runtime.execution.preparation import (
+    RoutePreparationInput, WorkerCandidateIntent,
+)
 from onec_runtime.worker_universe import OperationGenerationPin
 
 
@@ -76,7 +78,7 @@ class RoutePreparationSnapshot:
 
 
 class SnapshotRouteBinding:
-    """Build a fresh lowerer for a statement-only route preparation.
+    """Build a fresh lowerer and optional method intent from one snapshot.
 
     ``owner`` is compared by identity. ``version`` is the version selected by
     the route context, not a remote-state read. Admission must compare that
@@ -96,9 +98,9 @@ class SnapshotRouteBinding:
         self._owner = owner
         self._version = version
 
-    def bind(
+    def _checked_cell(
         self, common: CommonCell, snapshots: PreparationSnapshots
-    ) -> RoutePreparationInput:
+    ) -> tuple[OperationSourceMapBundle, NotebookCellProjection, RouteSnapshotGuard]:
         guard = snapshots.guards
         if not isinstance(guard, RouteSnapshotGuard):
             raise RouteSnapshotMismatch("route snapshot guard has another type")
@@ -118,20 +120,49 @@ class SnapshotRouteBinding:
         cell = common.parsed_units
         if not isinstance(cell, NotebookCellProjection):
             raise TypeError("statement binding requires a notebook projection")
-        if cell.has_methods:
-            raise ValueError("Worker methods require an artifact preparation binding")
+        return maps, cell, guard
+
+    def worker_intent(
+        self, common: CommonCell, snapshots: PreparationSnapshots
+    ) -> WorkerCandidateIntent | None:
+        """Describe a local Worker candidate without building or publishing it."""
+
+        maps, cell, guard = self._checked_cell(common, snapshots)
+        projection = maps.worker_candidate
+        if projection is None:
+            if cell.has_methods:
+                raise ValueError("Worker projection is missing")
+            return None
+        if projection is not cell.worker or not cell.exports:
+            raise ValueError("Worker projection and exports do not match")
+        catalog = {export.public_path.casefold(): export for export in guard.worker_exports}
+        for export in cell.exports:
+            catalog[export.public_path.casefold()] = export
+        candidate_catalog = SemanticNotebookLowerer.prepare_worker_exports(
+            tuple(catalog.values())
+        )
+        return WorkerCandidateIntent(
+            projection, cell.exports, candidate_catalog, guard.namespace_names, guard
+        )
+
+    def bind(
+        self, common: CommonCell, snapshots: PreparationSnapshots
+    ) -> RoutePreparationInput:
+        maps, _cell, guard = self._checked_cell(common, snapshots)
         statement = maps.statement_execution
         if statement is None:
             raise ValueError("statement binding requires executable statements")
+        intent = self.worker_intent(common, snapshots)
+        catalog = guard.worker_exports if intent is None else intent.candidate_catalog
         lowerer = SemanticNotebookLowerer(
             self._parser_target,
-            context_names=names,
-            worker_exports=exports,
+            context_names=guard.namespace_names,
+            worker_exports=catalog,
         )
         return RoutePreparationInput(
             statement=statement,
             lowerer=lowerer,
-            candidate_catalog=exports,
+            candidate_catalog=catalog,
             operation_pin=None,
             message_key_factory=None,
             complete_catalog=_identity_catalog,

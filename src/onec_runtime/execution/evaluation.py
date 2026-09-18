@@ -54,19 +54,25 @@ def evaluate_until_result(
     BSL expression. A transport exception propagates for reconciliation.
     """
 
-    if (
-        isinstance(wait_interval_s, bool)
-        or not isinstance(wait_interval_s, (int, float))
-        or not isfinite(float(wait_interval_s))
-        or wait_interval_s <= 0
-    ):
-        raise ValueError("evaluation wait interval must be finite and positive")
+    _validate_wait_interval(wait_interval_s)
     pending = port.start_evaluation(
         expression,
         max_text_size=max_text_size,
         stack_level=stack_level,
         timeout_s=request_timeout_s,
     )
+    return wait_for_pending_result(port, pending, wait_interval_s=wait_interval_s)
+
+
+def wait_for_pending_result(
+    port: EvaluationPort,
+    pending: PendingEvaluation,
+    *,
+    wait_interval_s: float = 6.0,
+) -> EvaluationResult:
+    """Wait for the same accepted expression without sending another eval."""
+
+    _validate_wait_interval(wait_interval_s)
     while True:
         try:
             event = port.wait_evaluation_event(pending, timeout_s=wait_interval_s)
@@ -77,3 +83,13 @@ def evaluate_until_result(
         if isinstance(event, StopEvent):
             raise EvaluationSuspended(pending, event)
         return event
+
+
+def _validate_wait_interval(wait_interval_s: float) -> None:
+    if (
+        isinstance(wait_interval_s, bool)
+        or not isinstance(wait_interval_s, (int, float))
+        or not isfinite(float(wait_interval_s))
+        or wait_interval_s <= 0
+    ):
+        raise ValueError("evaluation wait interval must be finite and positive")

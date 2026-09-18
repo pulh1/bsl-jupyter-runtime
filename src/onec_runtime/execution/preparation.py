@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from onec_runtime.bsl import (
     LoweringMode,
@@ -44,6 +44,21 @@ class RoutePreparationInput:
 class RoutePreparedStatement:
     lowering: SemanticLoweringResult
     message_collector_key: str
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerCandidateIntent:
+    """Local method projection and catalog expected by later Worker activation.
+
+    This is neither a built artifact nor a published Worker generation.
+    ``guard`` binds it to the snapshot checked again at admission.
+    """
+
+    projection: MappedSource = field(repr=False)
+    exports: tuple[WorkerExport, ...]
+    candidate_catalog: tuple[WorkerExport, ...]
+    namespace_names: tuple[str, ...]
+    guard: object = field(repr=False)
 
 
 def prepare_statement(

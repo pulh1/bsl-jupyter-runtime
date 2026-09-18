@@ -540,6 +540,51 @@ class ExecutionController:
 
             self._arbiter.reconcile(ticket, plan)
 
+    def reconcile_capture_pending_eval(self, ticket: ExecutionTicket) -> None:
+        """Observe an accepted CAPTURE eval and finish its original ticket."""
+
+        with self._lock:
+            repair = self._capture_cell_operations.get(ticket)
+            scope = self.capture_scope
+            status = ticket.status()
+            pending = status.pending_capability
+            if (
+                repair is None
+                or scope is not repair.scope
+                or scope is None
+                or scope.context_state is not CaptureContextState.READY
+                or scope.frame_identity is not CaptureFrameIdentity.CONFIRMED
+                or ticket is not self._arbiter.active_ticket
+                or status.phase != "unknown"
+                or pending is None
+                or not repair.operation.evaluation_started
+                or repair.operation.confirmed_result is not None
+                or self._capture_route != self._arbiter.current_route
+            ):
+                raise ProtocolError("No owned CAPTURE eval can be reconciled")
+
+            def plan(port: SessionPort) -> Settlement | ReadyForPolicy | ConfirmedFailure:
+                outcome = self._capture_cell_executor.reconcile_pending_result(
+                    repair.operation,
+                    repair.scope,
+                    pending,
+                    port=port,
+                    restore_workspace=lambda worker: worker.set_breakpoints(
+                        self._registry.full_locations
+                    ),
+                    cleanup=lambda worker: None,
+                    result_policy=repair.result_policy,
+                )
+                if isinstance(outcome, ConfirmedFailure):
+                    return outcome
+                if repair.policy_bound:
+                    return ReadyForPolicy(
+                        outcome.value, next_route=outcome.next_route
+                    )
+                return outcome
+
+            self._arbiter.reconcile(ticket, plan)
+
     def submit_resume(self) -> ExecutionTicket:
         """Write dirty roots, close CAPTURE, and resume the same MAIN command."""
 

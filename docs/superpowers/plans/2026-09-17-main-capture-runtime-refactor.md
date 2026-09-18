@@ -6,6 +6,16 @@
 
 **Constraints:** Preserve existing public APIs while migrating their internals. No live 1C claim from unit tests. Keep all new runtime behavior in `src/onec_runtime` and notebook lifecycle in `packages/jupyter`. Treat source text, frame values, IDs and transport payloads as private. Never convert an unverified target into a proven lost frame.
 
+## Public cutover gate (audit 2026-09-18)
+
+The component controller and arbiter run MAIN → CAPTURE → resume in tests, but `RuntimeSession` still builds `PrototypeRuntimeController` and `PrototypeRuntimeApi`. The live notebook acceptance on extension 0.1.7/protocol 4 therefore qualifies the legacy public path, not the new single-owner path. Switch public construction only when these dependencies are joined on the same RDBG owner:
+
+- [ ] Pure preparation produces Worker candidate intent, namespace/message metadata and guarded snapshots; accepted ticket owns Worker activation/pin and publication. Method-only cells must work.
+- [ ] MAIN/CAPTURE settlement returns the existing `RuntimeReply`/provenance and proxy generations through route-specific policy services. `RuntimeSession.execute_bsl()` releases its operation lock before ticket waiting.
+- [ ] CAPTURE frame/value proxies, variable inspection, materialization, cleanup and resume call the component controller; heartbeat and shutdown also use the arbiter. No legacy coordinator or direct runtime `RdbgSession` reader remains after bootstrap.
+- [ ] KeyboardInterrupt/Stop completes the fenced ticket's target teardown or reports `stop_unknown`; confirmed replacement invalidates old value and frame proxies before exposing the new runtime.
+- [ ] The public single-owner test covers `RuntimeSession.execute_bsl()` → CAPTURE cell → `resume_capture()`, heartbeat and Stop. Then run focused regressions and opt-in live acceptance again on a temporary infobase.
+
 ## 0. Stabilize protocol evidence and domain lifetimes
 
 Files: `src/onec_runtime/rdbg/session.py`, `src/onec_runtime/errors.py`, `src/onec_runtime/capture_evaluation.py`, `src/onec_runtime/execution/main/operation.py`, `src/onec_runtime/prototype_runtime.py` and focused unit tests.
