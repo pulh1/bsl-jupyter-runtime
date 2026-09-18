@@ -50,6 +50,93 @@ class ExportFailsOnce(CompleteSession):
         )
 
 
+def test_paused_capture_can_rearm_points_and_ticket_same_main() -> None:
+    rdbg = CompleteSession(capture_count=2)
+    composed = compose_fresh_post_bootstrap_execution(
+        rdbg, KERNEL, runtime_generation=7,
+        stopped_target=rdbg.target, capture_locations=(BUSINESS,),
+        notebook_builder=lambda *_args, **_kwargs: None,
+    )
+    api = composed.execution.facade
+    try:
+        api.configure_capture_points((BUSINESS,))
+        first_ticket = api.prepare_capture_ticket()
+        first = api.execute_bsl("Результат = 1;")
+        assert first.kind is RuntimeReplyKind.CAPTURED
+        assert first.capture_ticket == first_ticket.ticket_id
+
+        other = replace(BUSINESS, line=51)
+        api.configure_continuation_capture_points((other,))
+        assert composed.breakpoint_workspace.confirmed_snapshot.captures == (other,)
+        next_ticket = api.prepare_capture_ticket()
+        assert next_ticket.expected_operation_id == first.operation_id
+        assert next_ticket.expected_stop_sequence == 2
+        api.configure_continuation_capture_points((BUSINESS,))
+        second = api.resume_capture()
+        assert second.kind is RuntimeReplyKind.CAPTURED
+        assert second.operation_id == first.operation_id
+        assert second.capture_ticket == next_ticket.ticket_id
+    finally:
+        api.close()
+
+
+def test_session_rearms_existing_capture_intent_for_next_stop(tmp_path: Path) -> None:
+    platform = tmp_path / "bin"
+    platform.mkdir()
+    for name in ("1cv8.exe", "1cv8c.exe", "dbgs.exe"):
+        (platform / name).touch()
+    infobase = tmp_path / "base"
+    infobase.mkdir()
+    (infobase / "1Cv8.1CD").write_bytes(b"synthetic")
+    config = RuntimeSessionConfig(
+        RuntimeConfig(
+            workspace=tmp_path / "workspace", platform_bin=platform,
+            connection_string=f'File="{infobase}";',
+        ),
+        evidence_root=tmp_path / "evidence",
+    )
+    rdbg = CompleteSession(capture_count=2)
+    api = compose_fresh_post_bootstrap_execution(
+        rdbg, KERNEL, runtime_generation=7,
+        stopped_target=rdbg.target, capture_locations=(BUSINESS,),
+        notebook_builder=lambda *_args, **_kwargs: None,
+    ).execution.facade
+    runtime = RuntimeSession(
+        config, SimpleNamespace(ensure_running=lambda: None),
+        SimpleNamespace(), rdbg, api,
+        SimpleNamespace(append_jsonl=lambda *_args: None),
+        heartbeat_interval_s=60.0,
+    )
+    point = SimpleNamespace(name="capture", line=50)
+    runtime.verify_capture_points = lambda _points: (
+        SimpleNamespace(location=BUSINESS),
+    )
+
+    def intent(generation: int):
+        return SimpleNamespace(
+            points=(point,), capture_intent_id=f"intent-{generation}",
+            operation_id=f"request-{generation}",
+            capture_generation=generation, source_revision=1,
+            source_sha256="source-hash",
+        )
+
+    try:
+        first_arming = runtime.arm_capture_intent(intent(1))
+        first = runtime.execute_bsl("Результат = 1;")
+        assert first.capture_ticket == first_arming.ticket_id
+
+        second_arming = runtime.arm_capture_intent(intent(2))
+        assert second_arming.expected_controller_operation_id == first.operation_id
+        assert second_arming.expected_stop_sequence == 2
+        second = runtime.resume_capture()
+        assert second.kind is RuntimeReplyKind.CAPTURED
+        assert second.capture_ticket == second_arming.ticket_id
+    finally:
+        runtime._heartbeat_stop.set()
+        runtime._heartbeat_thread.join(timeout=2)
+        api.close()
+
+
 def test_successor_commit_waits_for_confirmed_next_stop() -> None:
     class HeldSecondStop(CompleteSession):
         def __init__(self) -> None:

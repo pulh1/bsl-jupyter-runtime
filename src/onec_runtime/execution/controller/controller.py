@@ -18,7 +18,7 @@ from onec_runtime.capture import (
     build_live_capture_root_transfer_call, build_live_current_capture_call,
 )
 from onec_runtime.capture_evaluation import (
-    CaptureEvaluationKind, CaptureFailureDiagnostic,
+    CaptureEvaluationKind, CaptureFailureDiagnostic, CapturePhase,
 )
 from onec_runtime.bsl.parser_target import PythonParserTarget
 from onec_runtime.errors import BslExecutionError, ProtocolError, StaleCaptureError
@@ -438,6 +438,64 @@ class ExecutionController:
             self._planned_capture_ticket = None
             self._preparation_revision += 1
 
+    def configure_continuation_capture_points(
+        self, locations: tuple[ModuleLocation, ...],
+    ) -> None:
+        """Replace points on a confirmed paused scope through one arbiter ticket."""
+
+        if type(locations) is not tuple or any(
+            type(location) is not ModuleLocation for location in locations
+        ) or len(set(locations)) != len(locations):
+            raise TypeError("continuation capture locations are invalid")
+        with self._lock:
+            scope = self.capture_scope
+            operation = self.main_operation
+            route = self._capture_route
+            ledger = self._capture_evaluation_ledger
+            routes = self._breakpoint_routes
+            if (
+                scope is None
+                or scope.context_state is not CaptureContextState.READY
+                or scope.frame_identity is not CaptureFrameIdentity.CONFIRMED
+                or operation is None
+                or operation.phase is not MainPhase.SUSPENDED_CAPTURE
+                or route is None
+                or route != self._arbiter.current_route
+                or ledger is None
+                or ledger.status().phase is not CapturePhase.PAUSED
+                or self._continuation_admission is not None
+                or self._resume_in_flight()
+                or self._arbiter.has_pending_operations
+                or routes is None
+            ):
+                raise ProtocolError("Continuation points require an idle CAPTURE stop")
+            original_registry = self._registry
+
+            def plan(port: SessionPort) -> Settlement:
+                routes.rearm_captured_successor(
+                    original_registry, locations, port=port,
+                )
+                with self._lock:
+                    if (
+                        self.capture_scope is not scope
+                        or self.main_operation is not operation
+                        or self._capture_route != route
+                    ):
+                        raise ProtocolError("CAPTURE route changed during point rearm")
+                    self._registry = BreakpointRegistry(
+                        original_registry.service, locations,
+                        original_registry.users,
+                    )
+                    self._preparation_revision += 1
+                return Settlement(None)
+
+            ticket = self._arbiter.submit(route, plan)
+            self._arbiter.dispatch(ticket)
+        while not ticket.status().settled:
+            if ticket.wait_unknown(timeout=1.0):
+                raise ProtocolError("CAPTURE point rearm outcome is unknown")
+        ticket.wait_settled(0)
+
     def prepare_capture_ticket(self) -> CaptureCorrelationTicket:
         """Bind an opaque capture intent to the next MAIN command and stop."""
 
@@ -446,7 +504,34 @@ class ExecutionController:
         with self._lock:
             operation = self.main_operation
             if operation is not None and not operation.terminal:
-                raise ProtocolError("Capture ticket requires an idle MAIN route")
+                scope = self.capture_scope
+                ledger = self._capture_evaluation_ledger
+                if (
+                    operation.phase is not MainPhase.SUSPENDED_CAPTURE
+                    or scope is None
+                    or scope.context_state is not CaptureContextState.READY
+                    or scope.frame_identity is not CaptureFrameIdentity.CONFIRMED
+                    or self._capture_route != self._arbiter.current_route
+                    or ledger is None
+                    or ledger.status().phase is not CapturePhase.PAUSED
+                    or self._continuation_admission is not None
+                    or self._resume_in_flight()
+                    or self._arbiter.has_pending_operations
+                    or not self._registry.captures
+                ):
+                    raise ProtocolError("Capture ticket requires a paused CAPTURE route")
+                settlement = self._route_settlement_service()
+                if settlement is None:
+                    raise ProtocolError("MAIN publication is unavailable")
+                ticket = CaptureCorrelationTicket(
+                    ticket_id=f"capture_{uuid4().hex}",
+                    expected_operation_id=operation.command_id,
+                    expected_stop_sequence=(
+                        settlement.next_capture_stop_sequence(operation)
+                    ),
+                )
+                settlement.rebind_next_capture_ticket(operation, ticket)
+                return ticket
             if self._main_worker_activation_pending() or self._arbiter.has_pending_operations:
                 raise ProtocolError("RDBG activity prevents capture ticket preparation")
             if not self._registry.captures:

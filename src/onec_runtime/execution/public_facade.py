@@ -450,6 +450,13 @@ class PublicExecutionFacade:
 
         self._controller.configure_capture_points(locations)
 
+    def configure_continuation_capture_points(
+        self, locations: tuple[ModuleLocation, ...],
+    ) -> None:
+        """Rearm the same stopped CAPTURE target through the arbiter."""
+
+        self._controller.configure_continuation_capture_points(locations)
+
     def begin_continuation_admission(
         self, spec: object, locations: tuple[ModuleLocation, ...],
     ) -> object:
