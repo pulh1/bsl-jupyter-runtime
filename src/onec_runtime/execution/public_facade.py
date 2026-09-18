@@ -9,20 +9,24 @@ from __future__ import annotations
 
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from math import isfinite
-from threading import Thread, local
+from threading import Lock, Thread, local
 from typing import Callable, Iterator, Mapping, Protocol, cast
 from uuid import UUID
 
 import pandas as pd
 
 from onec_runtime.bsl.source_maps import SourceUnitRef, source_sha256
-from onec_runtime.bsl.module_catalog import CommonModuleCatalogSnapshot
+from onec_runtime.bsl.module_catalog import (
+    CommonModuleCatalogSnapshot, SessionCommonModuleCatalog,
+)
 from onec_runtime.bsl.module_universe import WorkerModuleUnit
 from onec_runtime.capture_evaluation import CapturePhase
 from onec_runtime.capture_inspection import CaptureView
 from onec_runtime.errors import NoActiveCaptureError, ProtocolError
 from onec_runtime.execution.arbiter import ExecutionTicket, RdbgArbiter
-from onec_runtime.execution.contracts import PreparedCell
+from onec_runtime.execution.contracts import (
+    PreparedCell, SourceDiagnostic, Unavailable,
+)
 from onec_runtime.execution.capture.public_inspection import (
     CaptureInspection, CaptureInspectionBridge, CaptureSourceResolver,
 )
@@ -35,7 +39,8 @@ from onec_runtime.execution.capture.writeback import (
 from onec_runtime.execution.capture.ticket_materialization import WorkerTransferCatalog
 from onec_runtime.execution.completion_fields import CompletionFieldsService
 from onec_runtime.execution.controller.controller import ExecutionController
-from onec_runtime.execution.pipeline import CellExecutionPipeline
+from onec_runtime.execution.pipeline import CellExecutionPipeline, PreparedCellHandle
+from onec_runtime.execution.reply_presenter import RuntimeReplyPresenter
 from onec_runtime.execution.session_value_adapter import SessionValueMaterializationAdapter
 from onec_runtime.execution.source_identity import NotebookSourceIdentityFactory
 from onec_runtime.execution.value_reference import validate_public_direct_handle
@@ -47,6 +52,7 @@ from onec_runtime.execution.worker_module_lifecycle import WorkerModuleLifecycle
 from onec_runtime.execution.worker_activation import WorkerMaterializationSnapshot
 from onec_runtime.prototype_runtime import PartialWritebackError
 from onec_runtime.performance_profile import PhaseRecorder
+from onec_runtime.runtime_api import RuntimeReply
 from onec_runtime.runtime_contracts import OperationExecutionProvenance
 from onec_runtime.rdbg.models import ModuleLocation
 from onec_runtime.table_materialization import ReferencePolicy
@@ -79,6 +85,62 @@ class ValueTransferPort(Protocol):
         self, handle: str, count: int,
         *, policy: ReferencePolicy | None = None, max_bytes: int,
     ) -> pd.DataFrame: ...
+
+
+class PreparedBslCell:
+    """One-use public wrapper around one exact generic pipeline preparation.
+
+    The wrapper belongs to the facade that selected its source identity. It
+    exposes only that identity and verified provenance; route and snapshot
+    guards remain inside the pipeline handle until admission.
+    """
+
+    __slots__ = (
+        "_owner", "_candidate", "_prepared", "_source_unit",
+        "_provenance", "_consumed", "_lock",
+    )
+
+    def __init__(
+        self, owner: object, candidate: PreparedCellHandle,
+        prepared: PreparedCell, source_unit: SourceUnitRef,
+    ) -> None:
+        self._owner = owner
+        self._candidate = candidate
+        self._prepared = prepared
+        self._source_unit = source_unit
+        self._provenance: OperationExecutionProvenance | None = None
+        self._consumed = False
+        self._lock = Lock()
+
+    @property
+    def source_unit(self) -> SourceUnitRef:
+        """Exact visible notebook source unit selected during preparation."""
+
+        return self._source_unit
+
+    def _claim(
+        self, owner: object,
+    ) -> tuple[PreparedCellHandle, PreparedCell, OperationExecutionProvenance | None]:
+        if self._owner is not owner:
+            raise TypeError("Prepared BSL cell belongs to another facade")
+        with self._lock:
+            if self._consumed:
+                raise RuntimeError("Prepared BSL cell was already consumed")
+            self._consumed = True
+            return self._candidate, self._prepared, self._provenance
+
+    def _read_provenance(
+        self, owner: object,
+        reader: Callable[[PreparedCell], OperationExecutionProvenance],
+    ) -> OperationExecutionProvenance:
+        if self._owner is not owner:
+            raise TypeError("Prepared BSL cell belongs to another facade")
+        with self._lock:
+            if self._consumed:
+                raise RuntimeError("Prepared BSL cell was already consumed")
+            if self._provenance is None:
+                self._provenance = reader(self._prepared)
+            return self._provenance
 
 
 class PublicExecutionFacade:
@@ -155,6 +217,7 @@ class PublicExecutionFacade:
             if worker_catalog_snapshot is not None else None
         )
         self._provenance_reader = provenance_reader
+        self._prepared_owner = object()
         self._caller_handoff = local()
         self._value_router = (
             value_router_factory(self._wait_handoff)
@@ -249,32 +312,19 @@ class PublicExecutionFacade:
     ) -> object:
         """Execute one notebook BSL cell on the controller-selected route."""
 
-        if not isinstance(source, str) or not source.strip():
-            raise ProtocolError("BSL cell is empty")
         if on_execution_provenance is not None and not callable(on_execution_provenance):
             raise TypeError("execution provenance callback must be callable")
         if on_execution_provenance is not None and self._provenance_reader is None:
             raise ProtocolError("execution provenance publication is not configured")
-        visible_unit = (
-            self._source_identity.next_unit(source, explicit=source_unit)
-            if self._source_identity is not None
-            else source_unit or self._source_unit_factory(source)
-        )
-        if not isinstance(visible_unit, SourceUnitRef):
-            raise TypeError("source unit factory must return SourceUnitRef")
-        if visible_unit.source_sha256 != source_sha256(source):
-            raise ProtocolError("notebook source identity does not match cell text")
+        visible_unit = self._resolve_source_unit(source, source_unit)
 
         prepared_evidence: tuple[PreparedCell, OperationExecutionProvenance] | None = None
 
         def read_prepared(prepared: PreparedCell) -> None:
             nonlocal prepared_evidence
-            reader = self._provenance_reader
-            assert reader is not None
-            provenance = reader(prepared)
-            if not isinstance(provenance, OperationExecutionProvenance):
-                raise TypeError("provenance reader returned an invalid record")
-            prepared_evidence = prepared, provenance
+            prepared_evidence = prepared, self._read_execution_provenance(
+                prepared, visible_unit,
+            )
 
         def publish_admitted(prepared: PreparedCell) -> None:
             assert on_execution_provenance is not None
@@ -292,6 +342,113 @@ class PublicExecutionFacade:
                 publish_admitted if on_execution_provenance is not None else None
             ),
         )
+
+    def prepare_bsl(
+        self, source: str, *, source_unit: SourceUnitRef | None = None,
+    ) -> PreparedBslCell | RuntimeReply:
+        """Prepare one BSL cell locally with its exact public source identity.
+
+        A source diagnostic or unavailable route returns the established
+        ``RuntimeReply`` failure type. A successful result is an opaque,
+        one-use handle; no Worker activation or RDBG command has begun.
+        """
+
+        visible_unit = self._resolve_source_unit(source, source_unit)
+        prepared_cells: list[PreparedCell] = []
+        result = self._pipeline.prepare(
+            source, visible_unit,
+            wait_handoff=self._wait_handoff,
+            on_prepared=prepared_cells.append,
+        )
+        if isinstance(result, SourceDiagnostic):
+            return RuntimeReplyPresenter(self._status_reader).diagnostic_reply(result)
+        if isinstance(result, Unavailable):
+            return RuntimeReplyPresenter(self._status_reader).unavailable_reply(result)
+        if not isinstance(result, PreparedCellHandle) or len(prepared_cells) != 1:
+            raise TypeError("pipeline returned an invalid prepared BSL cell")
+        return PreparedBslCell(
+            self._prepared_owner, result, prepared_cells[0], visible_unit,
+        )
+
+    def prepared_bsl_execution_provenance(
+        self, prepared: PreparedBslCell,
+    ) -> OperationExecutionProvenance:
+        """Read verified hashes for a still unsubmitted prepared BSL cell."""
+
+        if not isinstance(prepared, PreparedBslCell):
+            raise TypeError("A prepared BSL cell is required")
+        if self._provenance_reader is None:
+            raise ProtocolError("execution provenance publication is not configured")
+        return prepared._read_provenance(
+            self._prepared_owner,
+            lambda cell: self._read_execution_provenance(cell, prepared.source_unit),
+        )
+
+    def execute_prepared_bsl(
+        self,
+        prepared: PreparedBslCell,
+        *,
+        on_execution_provenance: (
+            Callable[[OperationExecutionProvenance], None] | None
+        ) = None,
+    ) -> object:
+        """Consume one exact preparation through the controller's admission."""
+
+        if not isinstance(prepared, PreparedBslCell):
+            raise TypeError("A prepared BSL cell is required")
+        if on_execution_provenance is not None and not callable(on_execution_provenance):
+            raise TypeError("execution provenance callback must be callable")
+        if on_execution_provenance is not None and self._provenance_reader is None:
+            raise ProtocolError("execution provenance publication is not configured")
+        candidate, exact_cell, cached_evidence = prepared._claim(self._prepared_owner)
+        evidence = None
+        if on_execution_provenance is not None:
+            evidence = (
+                cached_evidence
+                if cached_evidence is not None
+                else self._read_execution_provenance(exact_cell, prepared.source_unit)
+            )
+
+        def publish_admitted(admitted: PreparedCell) -> None:
+            assert on_execution_provenance is not None and evidence is not None
+            if admitted is not exact_cell:
+                raise ProtocolError("admitted provenance has another prepared cell")
+            on_execution_provenance(evidence)
+
+        return self._pipeline.execute_prepared(
+            candidate,
+            wait_handoff=self._wait_handoff,
+            on_admitted=(publish_admitted if evidence is not None else None),
+        )
+
+    def _resolve_source_unit(
+        self, source: str, source_unit: SourceUnitRef | None,
+    ) -> SourceUnitRef:
+        if not isinstance(source, str) or not source.strip():
+            raise ProtocolError("BSL cell is empty")
+        visible_unit = (
+            self._source_identity.next_unit(source, explicit=source_unit)
+            if self._source_identity is not None
+            else source_unit or self._source_unit_factory(source)
+        )
+        if not isinstance(visible_unit, SourceUnitRef):
+            raise TypeError("source unit factory must return SourceUnitRef")
+        if visible_unit.source_sha256 != source_sha256(source):
+            raise ProtocolError("notebook source identity does not match cell text")
+        return visible_unit
+
+    def _read_execution_provenance(
+        self, prepared: PreparedCell, source_unit: SourceUnitRef,
+    ) -> OperationExecutionProvenance:
+        reader = self._provenance_reader
+        if reader is None:
+            raise ProtocolError("execution provenance publication is not configured")
+        provenance = reader(prepared)
+        if not isinstance(provenance, OperationExecutionProvenance):
+            raise TypeError("provenance reader returned an invalid record")
+        if provenance.visible_source_sha256 != source_unit.source_sha256:
+            raise ProtocolError("execution provenance has another visible source")
+        return provenance
 
     def resume_capture(
         self,
@@ -642,7 +799,7 @@ class PublicExecutionFacade:
         self,
         units: tuple[WorkerModuleUnit, ...],
         *,
-        common_modules: CommonModuleCatalogSnapshot,
+        common_modules: CommonModuleCatalogSnapshot | SessionCommonModuleCatalog,
         breakpoint_policy: WorkerBreakpointReloadPolicy = (
             WorkerBreakpointReloadPolicy.STRICT
         ),
