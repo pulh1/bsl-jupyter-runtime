@@ -1924,7 +1924,12 @@ class RuntimeSession:
     ) -> RuntimeReply:
         with self._operation_lock:
             active = self._active_capture_ticket
-            reply = self.runtime_api.resume_debug_stop(timeout_s=timeout_s)
+            bind = getattr(self.runtime_api, "execution_caller_handoff", None)
+            if callable(bind):
+                with bind(self._release_operation_lock_for_capture_wait):
+                    reply = self.runtime_api.resume_debug_stop(timeout_s=timeout_s)
+            else:
+                reply = self.runtime_api.resume_debug_stop(timeout_s=timeout_s)
             if active is None or reply.state in {
                 OperationState.CAPTURED,
                 OperationState.DEBUG_STOPPED,
