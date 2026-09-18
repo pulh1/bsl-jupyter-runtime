@@ -159,12 +159,17 @@ class WorkerBreakpointService:
         except BaseException:
             ticket.cancel_queued()
             raise
-        with self._wait_handoff():
-            if ticket.wait_unknown():
-                raise BreakpointWorkspaceOutcomeUnknown(
-                    "Worker breakpoint workspace outcome is unknown"
-                )
-            return ticket.wait_settled()
+        try:
+            with self._wait_handoff():
+                if ticket.wait_unknown():
+                    raise BreakpointWorkspaceOutcomeUnknown(
+                        "Worker breakpoint workspace outcome is unknown"
+                    )
+                return ticket.wait_settled()
+        except KeyboardInterrupt:
+            # Caller interruption does not cancel an admitted workspace plan.
+            ticket.detach_waiter()
+            raise
 
     def _quarantine(self, proposal: WorkerBreakpointPlan) -> None:
         try:

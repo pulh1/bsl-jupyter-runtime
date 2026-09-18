@@ -254,6 +254,37 @@ def test_mutation_boundary_rejects_before_catalog_or_remote_effect(service) -> N
     assert session.calls == []
 
 
+def test_interrupted_worker_breakpoint_wait_detaches_only_caller(service) -> None:
+    _api, catalog, workspace, _session, arbiter, _boundary = service
+    tickets = []
+    submit = arbiter.submit
+
+    def record_submit(route, plan):
+        ticket = submit(route, plan)
+        tickets.append(ticket)
+        return ticket
+
+    @contextmanager
+    def interrupted_wait():
+        raise KeyboardInterrupt()
+        yield
+
+    arbiter.submit = record_submit
+    api = WorkerBreakpointService(
+        arbiter, catalog, workspace,
+        require_mutation_boundary=lambda: None,
+        wait_handoff=interrupted_wait,
+    )
+    unit = SourceUnitRef(SourceUnitKind.MODULE, "WorkerA", 1, "a" * 64)
+
+    with pytest.raises(KeyboardInterrupt):
+        api.add_worker_breakpoint(unit, "WorkerA", 2)
+
+    assert len(tickets) == 1
+    assert tickets[0].status().waiter_detached is True
+    assert tickets[0].wait_settled(3).breakpoint.source_unit == unit
+
+
 def test_queued_mutation_rechecks_boundary_before_any_effect(service) -> None:
     api, _catalog, _workspace, session, arbiter, boundary = service
     unit = SourceUnitRef(SourceUnitKind.MODULE, "WorkerA", 1, "a" * 64)
