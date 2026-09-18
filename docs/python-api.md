@@ -58,6 +58,23 @@ runtime.close()
 
 `RuntimeNamespaceSnapshot` содержит `names`, `runtime_generation`, `context_generation`. Поколения используются для проверки актуальности прокси. Состав состояний `OperationState` включает `idle`, `main_pending`, `captured`, `capture_setup_failed`, `evaluating_capture`, `debug_stopped`, `resuming`, `recovering`, `completed`, `failed` и другие диагностические состояния; не считайте любое состояние, отличное от `captured`, потерей target. `main_pending` означает, что MAIN-команда ещё ждёт исхода или следующей остановки; `evaluating_capture` и `resuming` означают занятую CAPTURE-операцию. `status()` не сообщает, завершилось ли удалённое выполнение после прерывания одного лишь Python-ожидания.
 
+## Worker-модули и точки останова
+
+`RuntimeSession.load_worker_module(path)` загружает общий модуль из файла BSL под настроенным `source_root` и возвращает `WorkerGenerationHandle`. Дальнейшая загрузка создаёт новое поколение; сохранённый handle относится к своему поколению и сеансу. После перезапуска сеанса старый handle недействителен. `load_worker_modules(units, *, breakpoint_policy=...)` принимает непустой кортеж `WorkerModuleUnit` для программной публикации нескольких модулей. Это API использует `SessionCommonModuleCatalog` текущего сеанса для разрешения зависимостей полного набора модулей.
+
+```python
+generation = runtime.load_worker_module("CommonModules/Расчеты/Module.bsl")
+point = runtime.add_worker_breakpoint("CommonModules/Расчеты/Module.bsl", 12)
+print(point.breakpoint.id, point.resolution.value)
+
+# После изменения файла сначала повторно загрузите модуль.
+runtime.remove_worker_breakpoint(point.breakpoint.id)
+```
+
+`add_worker_breakpoint(path, line)` принимает строковый путь и номер строки от 1 только для модуля, уже загруженного через файл. `worker_breakpoint_status(id)` и `list_worker_breakpoints()` возвращают `WorkerBreakpointStatus`: `enabled`, `resolution`, `reason`, число установленных привязок и состояния поколений. `set_worker_breakpoint_enabled(id, enabled)` меняет активность, `remove_worker_breakpoint(id)` удаляет точку. После `load_worker_modules(...)` метод `last_worker_breakpoint_reload_report()` показывает исход последней попытки (`committed`, `aborted` или `quarantined`) и несовместимые точки. Политика `WorkerBreakpointReloadPolicy.STRICT` сохраняет их как препятствие публикации; `RESET_INCOMPATIBLE` разрешает удалить несовместимые точки с отражением удаления в отчёте. При явно управляемых поколениях `release_worker_generation(handle)` освобождает указанное поколение; не подставляйте handle другого сеанса.
+
+Типы `WorkerModuleUnit` и `WorkerGenerationHandle` импортируются из `onec_runtime.bsl.module_universe` и `onec_runtime.worker_universe`, типы точек и отчёта — из `onec_runtime.worker_breakpoints`. На новом маршруте загрузка и изменение точек проходят через ticket одного RDBG arbiter; этот маршрут ещё не выбран обычным `RuntimeSession.start()` и не проходил живую приёмку на notebook.
+
 Если `reply.kind == RuntimeReplyKind.DEBUG_STOPPED`, поле `reply.debug_stop` содержит `RuntimeDebugStop`: `reason`, `origin`, `operation_id`, `location`, `frames` и `breakpoint_ids`. `reason` — значение `StopReason` (`user_breakpoint`, `pause`, `exception` и другие причины); `origin` указывает на MAIN или CAPTURE evaluation. Продолжайте такую остановку через `runtime.resume_debug_stop()`. Для `RuntimeReplyKind.CAPTURED` используйте `runtime.current_capture()` и `runtime.resume_capture()`.
 
 ## `%%bsl` и значения в Python
