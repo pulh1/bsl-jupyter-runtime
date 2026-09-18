@@ -418,6 +418,11 @@ class PublicExecutionFacade:
             inspection.context,
         )
 
+    def invalidate_capture_inspection(self) -> None:
+        """Revoke frame and value handles after uncertain local preparation."""
+
+        self._controller.invalidate_capture_inspection()
+
     def materialize(
         self,
         handle: str,

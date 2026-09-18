@@ -316,6 +316,21 @@ class ExecutionController:
                 raise ProtocolError("No ready CAPTURE evaluation ledger is available")
             return ledger
 
+    def invalidate_capture_inspection(self) -> None:
+        """Revoke saved frame handles while retaining the stopped MAIN route.
+
+        A caller can lose confidence in its source or inspection preparation
+        without proving that the debugger frame was released. The scope keeps
+        its execution lifecycle; all existing frame and value handles fail
+        their inspection fence after this local revocation.
+        """
+
+        with self._lock:
+            scope = self.capture_scope
+            if scope is None or not self._capture_view_scope_is_current(scope):
+                raise ProtocolError("No ready CAPTURE inspection is available")
+            scope.invalidate_inspection()
+
     def _capture_view_scope_is_current(self, expected: CaptureScope) -> bool:
         # Ledger waits hold their own condition.  This predicate must not
         # acquire the controller lock, because admission can call the ledger

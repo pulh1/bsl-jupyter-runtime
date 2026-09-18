@@ -6,7 +6,7 @@ from decimal import Decimal
 from hashlib import sha256
 
 from onec_runtime.bsl.source_maps import SourceUnitKind, SourceUnitRef, source_sha256
-from onec_runtime.errors import ProtocolError
+from onec_runtime.errors import ProtocolError, StaleCaptureError
 from onec_runtime.execution.namespace import RuntimeNamespaceOwner
 from onec_runtime.execution.post_bootstrap import (
     compose_fresh_post_bootstrap_execution, compose_post_bootstrap_execution,
@@ -85,6 +85,10 @@ def test_post_bootstrap_factory_builds_one_core_with_public_facade() -> None:
         assert resolved_frames
         cell = composed.facade.execute_bsl("Результат = 2;")
         assert cell.kind is RuntimeReplyKind.CAPTURE_CELL
+        stack = composed.facade.capture_inspection().stack
+        composed.facade.invalidate_capture_inspection()
+        with pytest.raises(StaleCaptureError):
+            _ = stack[:1]
         final = composed.facade.resume_capture()
         assert final.kind is RuntimeReplyKind.MAIN_COMPLETED
     finally:
