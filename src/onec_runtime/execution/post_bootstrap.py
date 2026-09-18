@@ -29,6 +29,7 @@ from onec_runtime.execution.worker_activation import (
     WorkerActivationSnapshot, WorkerMaterializationSnapshot,
     WorkerUniverseActivationAdapter,
 )
+from onec_runtime.execution.worker_breakpoint_service import WorkerBreakpointService
 from onec_runtime.rdbg.models import DebugTarget, ModuleLocation, TargetId
 from onec_runtime.runtime_contracts import OperationExecutionProvenance
 from onec_runtime.server_worker import NotebookWorkerArtifactBuilder
@@ -56,6 +57,7 @@ class FreshPostBootstrapExecution:
     breakpoint_workspace: BreakpointWorkspaceController
     breakpoint_routes: RouteBreakpointWorkspace
     worker_breakpoints: WorkerBreakpointCoordinator
+    worker_breakpoint_service: WorkerBreakpointService
     worker_activation: WorkerActivationPort
 
 
@@ -239,12 +241,24 @@ def compose_fresh_post_bootstrap_execution(
             target_profile=target_profile,
         )
         activation["adapter"] = bound
+
+        def require_worker_mutation_boundary() -> None:
+            composed.core.controller.worker_mutation_route()
+
+        worker_breakpoint_service = WorkerBreakpointService(
+            composed.core.arbiter,
+            worker_breakpoints,
+            workspace,
+            require_mutation_boundary=require_worker_mutation_boundary,
+            wait_handoff=composed.facade._wait_handoff,
+        )
+        composed.facade.bind_worker_breakpoint_service(worker_breakpoint_service)
     except BaseException:
         composed.facade.close()
         raise
     return FreshPostBootstrapExecution(
         composed, namespace, worker_universe, workspace, routes,
-        worker_breakpoints, bound,
+        worker_breakpoints, worker_breakpoint_service, bound,
     )
 
 

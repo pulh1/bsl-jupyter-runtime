@@ -20,10 +20,12 @@ from onec_runtime.runtime_api import RuntimeReplyKind
 from onec_runtime.rdbg.models import EvaluationResult
 from onec_runtime.table_materialization import ReferencePolicy
 from onec_runtime.value_materialization import MaterializationOptions
+from onec_runtime.worker_breakpoints import WorkerBreakpointResolution
 
 from test_execution_controller_routes import BUSINESS, KERNEL, TARGET, CompleteSession
 from test_main_idle_materialization import Session as ValueSession, TARGET as VALUE_TARGET
 from test_compact_table import compact_payload
+from test_worker_breakpoints import _debug_view
 
 
 class _Replies:
@@ -238,6 +240,50 @@ def test_fresh_post_bootstrap_composes_worker_snapshot_and_one_breakpoint_owner(
         assert composed.execution.core.breakpoint_routes is composed.breakpoint_routes
         assert composed.breakpoint_routes.worker_owner is composed.breakpoint_workspace
         assert composed.worker_activation._breakpoint_workspace._workspace is composed.breakpoint_workspace
+    finally:
+        composed.execution.facade.close()
+
+
+def test_fresh_composition_routes_worker_breakpoint_install_through_its_arbiter(
+    tmp_path,
+) -> None:
+    session = CompleteSession()
+    composed = compose_fresh_post_bootstrap_execution(
+        session, KERNEL,
+        runtime_generation=7,
+        stopped_target=session.target,
+        capture_locations=(BUSINESS,),
+        notebook_builder=lambda *_args, **_kwargs: None,
+    )
+    try:
+        view = _debug_view(tmp_path)
+        module = view.modules[0]
+        composed.worker_breakpoints.set_views((view,))
+
+        status = composed.execution.facade.add_worker_breakpoint(
+            module.source_unit, module.canonical_module, 2,
+        )
+
+        assert status.resolution is WorkerBreakpointResolution.RESOLVED
+        assert composed.worker_breakpoint_service.worker_breakpoint_status(
+            status.breakpoint.id,
+        ) == status
+        assert status.installed_binding_count == 1
+        assert composed.breakpoint_workspace.confirmed_snapshot.worker_slots
+
+        assert composed.execution.facade.execute_bsl(
+            "Результат = 1;",
+        ).kind is RuntimeReplyKind.CAPTURED
+        disabled = composed.execution.facade.set_worker_breakpoint_enabled(
+            status.breakpoint.id, False,
+        )
+        assert disabled.enabled is False
+        assert composed.execution.facade.resume_capture().kind is RuntimeReplyKind.MAIN_COMPLETED
+
+        breakpoint_calls = [thread for name, thread in session.calls
+                            if name == "set_breakpoints"]
+        assert len(breakpoint_calls) >= 2
+        assert all(thread.name == "rdbg-arbiter" for thread in breakpoint_calls)
     finally:
         composed.execution.facade.close()
 

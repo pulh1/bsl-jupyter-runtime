@@ -11,6 +11,7 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext
 from math import isfinite
 from threading import Thread, local
 from typing import Callable, Iterator, Protocol
+from uuid import UUID
 
 import pandas as pd
 
@@ -27,10 +28,12 @@ from onec_runtime.execution.controller.controller import ExecutionController
 from onec_runtime.execution.pipeline import CellExecutionPipeline
 from onec_runtime.execution.source_identity import NotebookSourceIdentityFactory
 from onec_runtime.execution.value_reference import validate_public_direct_handle
+from onec_runtime.execution.worker_breakpoint_service import WorkerBreakpointService
 from onec_runtime.runtime_contracts import OperationExecutionProvenance
 from onec_runtime.rdbg.models import ModuleLocation
 from onec_runtime.table_materialization import ReferencePolicy
 from onec_runtime.value_materialization import MaterializationOptions
+from onec_runtime.worker_breakpoints import WorkerBreakpointStatus
 
 
 class ValueTransferPort(Protocol):
@@ -115,6 +118,18 @@ class PublicExecutionFacade:
         self._capture_inspection = CaptureInspectionBridge(
             controller, wait_handoff=self._wait_handoff,
         )
+        self._worker_breakpoint_service: WorkerBreakpointService | None = None
+
+    def bind_worker_breakpoint_service(self, service: WorkerBreakpointService) -> None:
+        """Bind one shared breakpoint owner during fresh runtime composition."""
+
+        if not isinstance(service, WorkerBreakpointService):
+            raise TypeError("Worker breakpoint service is required")
+        if service.arbiter is not self._arbiter:
+            raise ProtocolError("Worker breakpoints require this runtime's RDBG owner")
+        if self._worker_breakpoint_service is not None:
+            raise ProtocolError("Worker breakpoint service is already bound")
+        self._worker_breakpoint_service = service
 
     @contextmanager
     def execution_caller_handoff(
@@ -332,6 +347,56 @@ class PublicExecutionFacade:
         """Configure idle capture locations through the controller owner."""
 
         self._controller.configure_capture_points(locations)
+
+    def add_worker_breakpoint(
+        self,
+        source_unit: SourceUnitRef,
+        canonical_module: str,
+        line: int,
+        *, enabled: bool = True,
+        column: int | None = None,
+    ) -> WorkerBreakpointStatus:
+        """Install one logical Worker breakpoint through the shared owner."""
+
+        return self._require_worker_breakpoint_service().add_worker_breakpoint(
+            source_unit, canonical_module, line, enabled=enabled, column=column,
+        )
+
+    def remove_worker_breakpoint(self, breakpoint_id: UUID) -> None:
+        """Remove one logical Worker breakpoint at a stable route boundary."""
+
+        self._require_worker_breakpoint_service().remove_worker_breakpoint(
+            breakpoint_id,
+        )
+
+    def set_worker_breakpoint_enabled(
+        self, breakpoint_id: UUID, enabled: bool,
+    ) -> WorkerBreakpointStatus:
+        """Set the enabled state and install the resulting shared workspace."""
+
+        return self._require_worker_breakpoint_service().set_worker_breakpoint_enabled(
+            breakpoint_id, enabled,
+        )
+
+    def worker_breakpoint_status(
+        self, breakpoint_id: UUID,
+    ) -> WorkerBreakpointStatus:
+        """Read a confirmed logical Worker breakpoint without RDBG I/O."""
+
+        return self._require_worker_breakpoint_service().worker_breakpoint_status(
+            breakpoint_id,
+        )
+
+    def list_worker_breakpoints(self) -> tuple[WorkerBreakpointStatus, ...]:
+        """Read the confirmed logical Worker breakpoint catalog locally."""
+
+        return self._require_worker_breakpoint_service().list_worker_breakpoints()
+
+    def _require_worker_breakpoint_service(self) -> WorkerBreakpointService:
+        service = self._worker_breakpoint_service
+        if service is None:
+            raise ProtocolError("Worker breakpoint service is not configured")
+        return service
 
     def try_heartbeat_ticket(self) -> ExecutionTicket | None:
         """Queue a keepalive only while the single RDBG owner is idle."""

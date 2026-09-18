@@ -65,6 +65,12 @@ class WorkerBreakpointService:
         self._require_mutation_boundary = require_mutation_boundary
         self._wait_handoff = wait_handoff
 
+    @property
+    def arbiter(self) -> RdbgArbiter:
+        """The sole RDBG owner used for every breakpoint mutation."""
+
+        return self._arbiter
+
     def add_worker_breakpoint(
         self,
         source_unit: SourceUnitRef,
