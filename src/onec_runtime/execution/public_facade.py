@@ -53,6 +53,9 @@ from onec_runtime.execution.value_projection_service import (
 from onec_runtime.execution.worker_breakpoint_service import WorkerBreakpointService
 from onec_runtime.execution.worker_module_lifecycle import WorkerModuleLifecycleService
 from onec_runtime.execution.worker_activation import WorkerMaterializationSnapshot
+from onec_runtime.execution.termination import (
+    FileTerminationConfirmed, ServerTerminationConfirmed,
+)
 from onec_runtime.prototype_runtime import PartialWritebackError
 from onec_runtime.performance_profile import PhaseRecorder
 from onec_runtime.observation import ManagerOrigin, ValueSelection
@@ -615,6 +618,14 @@ class PublicExecutionFacade:
         """Read a local runtime projection without entering RDBG."""
 
         return self._status_reader()
+
+    @property
+    def confirmed_target_termination(
+        self,
+    ) -> FileTerminationConfirmed | ServerTerminationConfirmed | None:
+        """Exact Stop proof for the owner that may replace this runtime."""
+
+        return self._controller.confirmed_target_termination
 
     def namespace_snapshot(self) -> object:
         """Read confirmed names and the proxy generation fence locally."""

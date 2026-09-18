@@ -233,7 +233,7 @@ reply = runtime.resume_capture()
 
 ## Прерывание ячейки и Stop
 
-`KeyboardInterrupt` или кнопка остановки notebook прерывают ожидание Python-ячейки. После отправки команды в 1С это само по себе **не подтверждает** прекращение BSL-кода. Сначала проверьте `runtime.status()` (в notebook — `%bsl_status`). Если сохранилась текущая CAPTURE-остановка, `runtime.current_capture().status()` показывает её фазу; `capture.wait(timeout_s=..., evaluation_id=...)` позволяет наблюдать уже принятую оценку без повторной отправки. Истечение `timeout_s` у `capture.wait()` возвращает `pending`, а у `resume_capture()` прекращает ожидание вызывающего; эти интервалы не служат сроком выполнения BSL.
+`KeyboardInterrupt` или кнопка остановки notebook прерывают ожидание Python-ячейки и, если её операция уже принята, запрашивают Stop у владельца исполнения. После отправки команды в 1С это само по себе **не подтверждает** прекращение BSL-кода. Сначала проверьте `runtime.status()` (в notebook — `%bsl_status`). Если сохранилась текущая CAPTURE-остановка, `runtime.current_capture().status()` показывает её фазу; `capture.wait(timeout_s=..., evaluation_id=...)` позволяет наблюдать уже принятую оценку без повторной отправки. Истечение `timeout_s` у `capture.wait()` возвращает `pending`, а у `resume_capture()` прекращает ожидание вызывающего; эти интервалы не служат сроком выполнения BSL.
 
 ```python
 # capture_bsl_source — текст CAPTURE-ячейки с возможным долгим выполнением.
@@ -252,6 +252,8 @@ except KeyboardInterrupt:
 Для принятого CAPTURE `evalExpr` прерванный ожидающий вызов отвязывается от операции. Для принятого `resume_capture()` завершение также может прийти после ухода ожидающего Python-вызова. Новую CAPTURE-операцию отправляйте лишь после проверки текущего состояния: `evaluating_capture`, `resuming` и `recovering` не являются подтверждением нового свободного stop. При `main_pending` MAIN-команда ещё может исполняться или ждать debugger stop; `status()` показывает опубликованное состояние, не останавливая её.
 
 У `RuntimeSession` и `InteractiveRuntimeSession` пока нет публичного `request_stop()` или `abort_current()`. Внутренний `RdbgArbiter.request_stop(ticket)` возвращает `StopRequestOutcome`: `CANCELLED_BEFORE_EFFECT` означает локальную отмену до удалённого действия, `REQUESTED` означает принятую заявку и запрет новых действий этой операции, `ALREADY_SETTLED` означает, что ticket уже завершён. `REQUESTED` и поле `TicketStatus.stop_requested` **не являются** доказательством остановки или завершения target. Эти объекты предназначены для владельца исполнения; notebook-код не должен создавать tickets или вызывать arbiter напрямую.
+
+Когда владелец исполнения подтвердил завершение именно привязанного target, `RuntimeSession.confirmed_target_termination` содержит доказательство (`FileTerminationConfirmed` или `ServerTerminationConfirmed`). При следующем обращении через `InteractiveRuntimeSession` или `%%bsl` notebook-владелец закрывает старый сеанс, создаёт новый с той же конфигурацией и заново устанавливает namespace. Сохранённые Python-прокси значений старого сеанса становятся недействительными; сохранённые `CaptureView` также нельзя использовать для нового останова. Пока исход Stop неизвестен или очистка старого сеанса не завершена, автоматической замены нет.
 
 ## Ошибки и практические границы
 

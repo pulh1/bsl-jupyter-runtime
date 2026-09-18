@@ -690,6 +690,10 @@ class OnecRuntimeMagics(Magics):
         return _display_status(self._runtime().status())
 
     def _runtime(self) -> NotebookRuntime:
+        owner = getattr(self.shell, "_onec_interactive_runtime_owner", None)
+        recover = getattr(owner, "_recover_confirmed_stop", None)
+        if callable(recover):
+            recover()
         runtime = self.shell.user_ns.get(RUNTIME_NAMESPACE_NAME)
         if runtime is None:
             raise UsageError(

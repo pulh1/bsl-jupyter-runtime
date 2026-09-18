@@ -85,7 +85,9 @@ from onec_runtime.execution.arbiter import ArbiterBusy
 from onec_runtime.execution.post_bootstrap import (
     FreshPostBootstrapExecution, compose_fresh_post_bootstrap_execution,
 )
-from onec_runtime.execution.termination import FileTargetProcessLease
+from onec_runtime.execution.termination import (
+    FileTargetProcessLease, FileTerminationConfirmed, ServerTerminationConfirmed,
+)
 from onec_runtime.execution.public_facade import PublicExecutionFacade
 from onec_runtime.performance_profile import PhaseRecorder
 from onec_runtime.processes import FileModeProcesses
@@ -2418,6 +2420,16 @@ class RuntimeSession:
     def status(self) -> RuntimeStatus:
         """Return the current runtime state and generation identifiers."""
         return self.runtime_api.status()
+
+    @property
+    def confirmed_target_termination(
+        self,
+    ) -> FileTerminationConfirmed | ServerTerminationConfirmed | None:
+        """Proof that Stop ended this session's exact execution target."""
+
+        if not isinstance(self.runtime_api, PublicExecutionFacade):
+            return None
+        return self.runtime_api.confirmed_target_termination
 
     def current_capture(self) -> CaptureView:
         """Return a view fenced to the current CAPTURE stop.
