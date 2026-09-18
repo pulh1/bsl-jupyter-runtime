@@ -39,6 +39,10 @@ from onec_runtime.execution.capture.cell_evaluator import CaptureCellEvaluator
 from onec_runtime.execution.capture.evaluation_ledger import CaptureEvaluationLedger
 from onec_runtime.execution.capture.executor import CaptureExecutor
 from onec_runtime.execution.capture.inspection import CaptureInspectionExecutor
+from onec_runtime.execution.capture.manager_metadata import (
+    CaptureManagerMetadataPlan, CaptureManagerProbePlan, CaptureTableSchemaPlan,
+    evaluate_capture_manager_metadata,
+)
 from onec_runtime.execution.capture.materialization import (
     CaptureMaterializationExecutor,
     CaptureMaterializationPlan,
@@ -1928,6 +1932,103 @@ class ExecutionController:
             ticket = self._arbiter.submit(route, plan)
             self._preparation_revision += 1
             self._arbiter.dispatch(ticket)
+            return ticket
+
+    def require_capture_manager_metadata_ready(self, scope: CaptureScope) -> None:
+        """Check the exact local CAPTURE stop before a cached metadata read."""
+
+        with self._lock:
+            self._require_capture_manager_metadata_ready_locked(scope)
+
+    def _require_capture_manager_metadata_ready_locked(
+        self, scope: CaptureScope, *, allow_pending: bool = False,
+    ) -> None:
+        operation = self.main_operation
+        ledger = self._capture_evaluation_ledger
+        if (
+            self._continuation_admission is not None
+            or self._resume_in_flight()
+            or self.capture_scope is not scope
+            or scope.context_state is not CaptureContextState.READY
+            or scope.frame_identity is not CaptureFrameIdentity.CONFIRMED
+            or not scope.published
+            or scope.inspection_target_id != scope.identity.target_id
+            or scope.frame_stack_level is None
+            or scope.kernel_stack_level is None
+            or operation is None
+            or operation.phase is not MainPhase.SUSPENDED_CAPTURE
+            or operation.pending_stop is not scope.stop
+            or self._capture_route is None
+            or self._capture_route != self._arbiter.current_route
+            or ledger is None
+            or ledger.identity != scope.identity
+            or self._arbiter.has_pending_operations and not allow_pending
+        ):
+            raise ProtocolError("CAPTURE manager metadata stop is unavailable")
+
+    def submit_capture_manager_metadata(
+        self, metadata_plan: CaptureManagerMetadataPlan,
+    ) -> ExecutionTicket:
+        """Evaluate one private manager proof or bounded schema on this stop."""
+
+        if not isinstance(
+            metadata_plan, (CaptureManagerProbePlan, CaptureTableSchemaPlan),
+        ):
+            raise TypeError("CAPTURE manager metadata plan is required")
+        with self._lock:
+            scope = metadata_plan.scope
+            self._require_capture_manager_metadata_ready_locked(scope)
+            route = self._capture_route
+            ledger = self._capture_evaluation_ledger
+            assert route is not None and ledger is not None
+            receipt_id = f"manager-metadata-{uuid4().hex}"
+
+            def worker_plan(port: SessionPort) -> ReadyForPolicy:
+                with self._lock:
+                    if (
+                        self._capture_evaluation_ledger is not ledger
+                        or self._capture_route != route
+                    ):
+                        raise ProtocolError("CAPTURE manager metadata fence changed")
+                    self._require_capture_manager_metadata_ready_locked(
+                        scope, allow_pending=True,
+                    )
+                self._shield_capture_workspace(port)
+                try:
+                    result = evaluate_capture_manager_metadata(metadata_plan, port)
+                except (OutcomeUnknown, EvaluationSuspended):
+                    raise
+                except BaseException as error:
+                    raise CaptureOperationRepairRequired("workspace_restore") from error
+                try:
+                    self._restore_capture_workspace(port)
+                except BaseException as error:
+                    raise CaptureOperationRepairRequired("workspace_restore") from error
+                return ReadyForPolicy(metadata_plan.decode(result))
+
+            def publish(value: object) -> object:
+                ledger.complete(receipt_id)
+                return value
+
+            ledger.begin(receipt_id, CaptureEvaluationKind.INSPECTION)
+            try:
+                ticket = self._arbiter.submit(route, worker_plan, finalizer=publish)
+            except BaseException:
+                ledger.discard_unstarted(receipt_id)
+                raise
+            self._preparation_revision += 1
+            try:
+                self._arbiter.dispatch(ticket)
+            except BaseException:
+                if ticket.cancel_queued():
+                    ledger.discard_unstarted(receipt_id)
+                raise
+            Thread(
+                target=_observe_capture_ticket,
+                args=(ticket, ledger, receipt_id),
+                name="onec-capture-manager-metadata-observer",
+                daemon=True,
+            ).start()
             return ticket
 
     def submit_completion_helper(
