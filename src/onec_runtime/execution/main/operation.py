@@ -25,6 +25,9 @@ class MainOperation:
     settler: Callable[[object], object] | None = field(default=None, repr=False)
     message_collector_key: str = field(default="", repr=False)
     phase: MainPhase = field(default=MainPhase.ADMITTED, init=False)
+    # Set only by the Continue transport-entry callback. Admission, Worker
+    # activation and command writes do not prove user MAIN was dispatched.
+    command_dispatch_attempted: bool = field(default=False, init=False)
     pending_stop: StopEvent | None = field(default=None, init=False, repr=False)
     completion: object | None = field(default=None, init=False, repr=False)
 
@@ -41,6 +44,7 @@ class MainOperation:
     def continue_requested(self) -> None:
         self._require_live()
         # Until acknowledgement, the previous frame may already have gone.
+        self.command_dispatch_attempted = True
         self.phase = MainPhase.UNKNOWN
         self.pending_stop = None
 

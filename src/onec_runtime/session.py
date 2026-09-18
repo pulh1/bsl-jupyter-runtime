@@ -1420,13 +1420,16 @@ class RuntimeSession:
                 native_metadata or config.layer != SourceLayer.AUTO or extension_name is not None
             ) else None
             resolver = CommonModuleCaptureResolver(project, source_root)
+            stack_resolver = (
+                None if catalog is None else ConfigurationFrameResolver(catalog)
+            )
             self.runtime_api.configure_capture_points(())
+            if isinstance(self.runtime_api, PublicExecutionFacade):
+                self.runtime_api.configure_capture_source_resolver(stack_resolver)
             self._file_capture_points = ()
             self._capture_source_resolver = resolver
             self._capture_source_catalog = catalog
-            self._capture_stack_source_resolver = (
-                None if catalog is None else ConfigurationFrameResolver(catalog)
-            )
+            self._capture_stack_source_resolver = stack_resolver
             self._capture_source_bindings = {}
             self._capture_locations = {}
 
@@ -1437,6 +1440,8 @@ class RuntimeSession:
                     "capture source cannot change during an active capture"
                 )
             self.runtime_api.configure_capture_points(())
+            if isinstance(self.runtime_api, PublicExecutionFacade):
+                self.runtime_api.configure_capture_source_resolver(None)
             self._file_capture_points = ()
             self._capture_source_resolver = None
             self._capture_source_catalog = None

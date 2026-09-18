@@ -15,6 +15,7 @@ from onec_runtime.errors import (
     CaptureSourceNotConfigured,
     ProtocolError,
 )
+from onec_runtime.execution.public_facade import PublicExecutionFacade
 from onec_runtime.kernel import OBJECT_MODULE_PROPERTY_ID
 from onec_runtime.rdbg.models import ModuleLocation, StackFrame, TargetId
 from onec_runtime.runtime_api import PrototypeRuntimeApi
@@ -154,6 +155,26 @@ def test_clear_capture_source_disarms_and_invalidates_bindings(
         session.resolve_capture_points((request(),))
     with pytest.raises(ValueError, match="not resolved by this capture source"):
         session.verify_capture_points(old)
+
+
+def test_public_facade_receives_rebound_frame_source_resolver(tmp_path: Path) -> None:
+    calls: list[tuple[str, object]] = []
+    facade = object.__new__(PublicExecutionFacade)
+    facade.configure_capture_points = (
+        lambda locations: calls.append(("points", locations))
+    )
+    facade.configure_capture_source_resolver = (
+        lambda resolver: calls.append(("resolver", resolver))
+    )
+    session = bare_capture_session(cast(RecordingCaptureApi, facade))
+
+    session.configure_capture_source("ut", FIXTURES / "designer_base")
+    configured = session._capture_stack_source_resolver
+    assert configured is not None
+    assert calls == [("points", ()), ("resolver", configured)]
+
+    session.clear_capture_source()
+    assert calls[-2:] == [("points", ()), ("resolver", None)]
 
 
 def test_disarm_failure_preserves_existing_source_and_bindings(
