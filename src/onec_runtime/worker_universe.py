@@ -49,6 +49,7 @@ from onec_runtime.server_worker import (
     _worker_artifact_diagnostic_source_from_snapshot,
     _worker_reload_platform_message,
     rebind_worker_artifact_binary,
+    remap_worker_artifact_stage_error,
     stage_worker_module_instruction,
     validate_production_worker_artifact,
     validate_worker_export_catalog,
@@ -3003,6 +3004,19 @@ class ServerWorkerUniverseRegistry:
             def abort(error: BaseException) -> object:
                 if _worker_promotion_failure_phase(error) is not None:
                     self._record_uninstantiable_candidate_module(candidate, error)
+                    if isinstance(error, BslExecutionError):
+                        try:
+                            error = remap_worker_artifact_stage_error(
+                                error,
+                                candidate_manifest_sha256=candidate.manifest.sha256,
+                                candidate_artifacts=self._host._candidate_diagnostics(
+                                    candidate
+                                ),
+                            )
+                        except BaseException:
+                            # Diagnostic enrichment must never replace a
+                            # confirmed platform failure.
+                            pass
                     self._abort_pre_swap(candidate, error)
                 self._break_pending(candidate)
                 raise _promotion_unknown(candidate) from None

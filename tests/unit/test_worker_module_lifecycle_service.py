@@ -37,7 +37,9 @@ from onec_runtime.worker_breakpoints import (
     WorkerBreakpointReloadOutcome, WorkerBreakpointReloadPolicy,
     WorkerBreakpointReloadReport, WorkerBreakpointCoordinator,
 )
-from onec_runtime.worker_universe import WorkerGenerationHandle, WorkerUniverseRegistry
+from onec_runtime.worker_universe import (
+    WorkerGenerationHandle, WorkerUniverseRegistry, WorkerUniverseState,
+)
 
 from test_execution_route_sequence import TARGET
 from test_worker_universe import (
@@ -611,8 +613,9 @@ def test_existing_activation_owner_can_publish_module_artifacts_on_supplied_port
     adapter.release_generation(handle, port=port)
 
 
-def test_module_publication_maps_confirmed_create_failure_to_candidate_source(
+def test_module_publication_does_not_read_diagnostics_on_success(
     tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     lowered, context = _lowered()
     descriptor = _builder(tmp_path)[0].build(
@@ -621,6 +624,65 @@ def test_module_publication_maps_confirmed_create_failure_to_candidate_source(
     host = WorkerUniverseRegistry(runtime_generation=1, context_generation=1)
     target = _UniverseTargetExecutor()
     port = object()
+
+    def reject_diagnostic_lookup(_candidate):
+        pytest.fail("successful Worker publication read diagnostic evidence")
+
+    monkeypatch.setattr(host, "_candidate_diagnostics", reject_diagnostic_lookup)
+
+    def execute(supplied_port, source):
+        assert supplied_port is port
+        candidate = host._pending
+        assert candidate is not None
+        target.acknowledge(candidate)
+        return target(source)
+
+    notebook_root = tmp_path / "notebook-success-no-diagnostics"
+    notebook_root.mkdir()
+    adapter = WorkerUniverseActivationAdapter(
+        host,
+        notebook_builder=_notebook_builder(notebook_root),
+        instruction_runner=execute,
+        worker_breakpoints_present=lambda: False,
+        target_profile="server-test",
+    )
+
+    handle = adapter.publish_modules((descriptor,), port=port)
+
+    assert handle is host.active_handle
+    assert adapter.snapshot().active_handle is handle
+
+
+@pytest.mark.parametrize("diagnostic_failure", (None, "lookup", "remap"))
+def test_module_publication_maps_confirmed_create_failure_to_candidate_source(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    diagnostic_failure: str | None,
+) -> None:
+    lowered, context = _lowered()
+    descriptor = _builder(tmp_path)[0].build(
+        lowered, visible_source_context=context,
+    )
+    host = WorkerUniverseRegistry(runtime_generation=1, context_generation=1)
+    target = _UniverseTargetExecutor()
+    port = object()
+    raw_errors: list[BslExecutionError] = []
+
+    if diagnostic_failure == "lookup":
+        def reject_diagnostic_lookup(_candidate):
+            raise KeyboardInterrupt("diagnostic-only failure")
+
+        monkeypatch.setattr(
+            host, "_candidate_diagnostics", reject_diagnostic_lookup,
+        )
+    elif diagnostic_failure == "remap":
+        def reject_remap(*_args, **_kwargs):
+            raise ValueError("diagnostic-only failure")
+
+        monkeypatch.setattr(
+            "onec_runtime.worker_universe.remap_worker_artifact_stage_error",
+            reject_remap,
+        )
 
     def execute(supplied_port, source):
         assert supplied_port is port
@@ -643,10 +705,12 @@ def test_module_publication_maps_confirmed_create_failure_to_candidate_source(
                 "planned create failure [ОшибкаКомпиляцииВстроенногоЯзыка]"
             )
             diagnostic_length = len(diagnostic.encode("utf-16-le")) // 2
-            raise BslExecutionError(
+            error = BslExecutionError(
                 f"onec-worker-root-prepare-stage=create\n{marker.group(0)};"
                 f"diagnostic_utf16_length={diagnostic_length}\n{diagnostic}"
             )
+            raw_errors.append(error)
+            raise error
         return target(source)
 
     notebook_root = tmp_path / "notebook-create-failure"
@@ -661,6 +725,16 @@ def test_module_publication_maps_confirmed_create_failure_to_candidate_source(
 
     with pytest.raises(BslExecutionError) as captured:
         adapter.publish_modules((descriptor,), port=port)
+
+    if diagnostic_failure is not None:
+        assert captured.value is raw_errors[0]
+        assert captured.value.diagnostic is None
+        assert "diagnostic-only failure" not in str(captured.value)
+        assert host.active_handle is None
+        assert host.state is WorkerUniverseState.EMPTY
+        assert host._pending is None
+        assert adapter.snapshot().revision == 0
+        return
 
     diagnostic = captured.value.diagnostic
     assert diagnostic is not None
