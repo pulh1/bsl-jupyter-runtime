@@ -29,7 +29,7 @@ from onec_runtime.worker_breakpoints import (
 )
 from onec_runtime.server_worker import (
     NotebookWorkerArtifactBuilder, WorkerArtifact, WorkerSourceProvenance,
-    validate_production_worker_artifact,
+    remap_worker_artifact_stage_error, validate_production_worker_artifact,
 )
 from onec_runtime.worker_universe import (
     OperationGenerationPin,
@@ -326,6 +326,7 @@ class WorkerUniverseActivationAdapter:
             artifacts + (() if notebook is None else (notebook,)),
             export_catalog=public_catalog,
         )
+        candidate_diagnostics = self._host._candidate_diagnostics(candidate)
         self._bound.port = port
         try:
             handle = (
@@ -336,6 +337,12 @@ class WorkerUniverseActivationAdapter:
                     record_report=breakpoints_present,
                 )
             )
+        except BslExecutionError as error:
+            raise remap_worker_artifact_stage_error(
+                error,
+                candidate_manifest_sha256=candidate.manifest.sha256,
+                candidate_artifacts=candidate_diagnostics,
+            ) from None
         except (
             OutcomeUnknown, WorkerPromotionOutcomeUnknown,
             BreakpointWorkspaceOutcomeUnknown,

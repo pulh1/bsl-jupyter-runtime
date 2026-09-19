@@ -1,6 +1,7 @@
 """Module generations use one stopped-route arbiter owner."""
 
 from pathlib import Path
+import re
 from threading import Event, Thread, current_thread
 from types import SimpleNamespace
 from uuid import UUID
@@ -13,7 +14,7 @@ from onec_runtime.breakpoint_workspace import (
 from onec_runtime.bsl.source_maps import (
     SourceUnitKind, SourceUnitRef, mapped_visible_source, source_sha256,
 )
-from onec_runtime.errors import ProtocolError, StaleWorkerGeneration
+from onec_runtime.errors import BslExecutionError, ProtocolError, StaleWorkerGeneration
 from onec_runtime.bsl.module_catalog import (
     CommonModuleCatalogSnapshot, CommonModuleDescriptor, CommonModuleScope,
     SessionCommonModuleCatalog,
@@ -608,6 +609,78 @@ def test_existing_activation_owner_can_publish_module_artifacts_on_supplied_port
     assert adapter.snapshot().worker_exports == descriptor.exports
     assert adapter.materialization_snapshot().registrations
     adapter.release_generation(handle, port=port)
+
+
+def test_module_publication_maps_confirmed_create_failure_to_candidate_source(
+    tmp_path,
+) -> None:
+    lowered, context = _lowered()
+    descriptor = _builder(tmp_path)[0].build(
+        lowered, visible_source_context=context,
+    )
+    host = WorkerUniverseRegistry(runtime_generation=1, context_generation=1)
+    target = _UniverseTargetExecutor()
+    port = object()
+
+    def execute(supplied_port, source):
+        assert supplied_port is port
+        candidate = host._pending
+        assert candidate is not None
+        target.acknowledge(candidate)
+        if "onec-worker-root-prepare-stage=" in source:
+            marker = re.search(
+                r"onec-worker-artifact-stage="
+                r"artifact_sha256=[0-9a-f]{64};"
+                r"logical_name_sha256=[0-9a-f]{64};"
+                r"phase=create;boundary=create",
+                source,
+            )
+            assert marker is not None
+            module = candidate.manifest.modules[0]
+            diagnostic = (
+                "{ВнешняяОбработка."
+                f"{module.registration_name}.МодульОбъекта(1,1)}}: "
+                "planned create failure [ОшибкаКомпиляцииВстроенногоЯзыка]"
+            )
+            diagnostic_length = len(diagnostic.encode("utf-16-le")) // 2
+            raise BslExecutionError(
+                f"onec-worker-root-prepare-stage=create\n{marker.group(0)};"
+                f"diagnostic_utf16_length={diagnostic_length}\n{diagnostic}"
+            )
+        return target(source)
+
+    notebook_root = tmp_path / "notebook-create-failure"
+    notebook_root.mkdir()
+    adapter = WorkerUniverseActivationAdapter(
+        host,
+        notebook_builder=_notebook_builder(notebook_root),
+        instruction_runner=execute,
+        worker_breakpoints_present=lambda: False,
+        target_profile="server-test",
+    )
+
+    with pytest.raises(BslExecutionError) as captured:
+        adapter.publish_modules((descriptor,), port=port)
+
+    diagnostic = captured.value.diagnostic
+    assert diagnostic is not None
+    assert diagnostic.source_unit is not None
+    assert (
+        diagnostic.source_unit.unit_id,
+        diagnostic.source_unit.revision,
+        diagnostic.source_unit.source_sha256,
+    ) == (
+        lowered.analysis.unit.logical_name,
+        lowered.analysis.unit.revision,
+        lowered.analysis.unit.mapped_source.artifact.source_sha256,
+    )
+    assert diagnostic.visible_location is not None
+    assert (
+        diagnostic.visible_location.line,
+        diagnostic.visible_location.column,
+    ) == (1, 1)
+    assert host.active_handle is None
+    assert adapter.snapshot().revision == 0
 
 
 def test_module_publication_retains_notebook_method_route_names(tmp_path) -> None:

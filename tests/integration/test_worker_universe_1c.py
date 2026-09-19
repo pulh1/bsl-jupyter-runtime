@@ -19,6 +19,7 @@ import psutil
 import pytest
 
 import onec_runtime.bsl.module_universe as module_universe
+import onec_runtime.processes as runtime_processes
 import onec_runtime.worker_universe as worker_universe
 from integration.jupyter_bsl_fixture.extension import (
     FIXTURE_EXTENSION_NAME,
@@ -41,7 +42,9 @@ from onec_runtime.bsl import (
 )
 from onec_runtime.bsl.diagnostics import (
     DiagnosticStage,
+    ErrorTraceFrameOrigin,
     MappingConfidence,
+    WorkerDiagnosticArtifact,
     parse_platform_diagnostic,
 )
 from onec_runtime.bsl.module_universe import DEPENDENCY_ALIAS_INITIALIZER_REGION
@@ -83,6 +86,10 @@ _HOST_SOURCE = _REPOSITORY / "tests" / "fixtures" / "onec" / "MinimalHostConfigu
 _OWNED_PROCESS_NAMES = {"1cv8.exe", "1cv8c.exe", "dbgs.exe"}
 _EXPECTED_PRODUCT_VERSION = "8.3.27.2170"
 _SETTINGS_OBJECT_KEY = "onec-interactive-runtime-task9"
+
+_NESTED_ERROR_SOURCE = (
+    'Чтение = Новый ЧтениеТекста("<task-diagnostics-missing-file>");'
+)
 
 _MODULE_A_SOURCE = f"""#\u041e\u0431\u043b\u0430\u0441\u0442\u044c \u041f\u0443\u0431\u043b\u0438\u0447\u043d\u044b\u0439\u041a\u043e\u043d\u0442\u0440\u0430\u043a\u0442
 \u041f\u0435\u0440\u0435\u043c \u041f\u043e\u0441\u043b\u0435\u0434\u043d\u0435\u0435\u0417\u043d\u0430\u0447\u0435\u043d\u0438\u0435;
@@ -442,12 +449,60 @@ class LiveWorkerUniverseHarness:
             self.phase_seconds[phase] = perf_counter() - started
 
     @property
+    def worker_module_service(self):
+        service = self.session.runtime_api._worker_module_service
+        assert service is not None
+        return service
+
+    @property
+    def worker_activation(self):
+        return self.worker_module_service._publisher
+
+    @property
+    def worker_artifact_preparer(self):
+        return self.worker_module_service._prepare_artifacts
+
+    @property
     def host_registry(self):
-        return self.session.runtime_api._worker_universe
+        return self.worker_activation._host
 
     @property
     def target_registry(self):
-        return self.session.runtime_api._worker_universe_target
+        return self.worker_activation._target
+
+    def confirmed_worker_artifact(self, unit: WorkerModuleUnit):
+        entry = self.worker_module_service._confirmed.get(
+            unit.logical_name.casefold()
+        )
+        if entry is None or entry.unit != unit:
+            return None
+        return entry.artifact
+
+    def diagnostic_artifacts(
+        self, manifest_sha256: str,
+    ) -> tuple[WorkerDiagnosticArtifact, ...]:
+        views = tuple(
+            view
+            for view in self.host_registry._retained_debug_views()
+            if view.manifest.sha256 == manifest_sha256
+        )
+        assert len(views) == 1
+        view = views[0]
+        return tuple(
+            WorkerDiagnosticArtifact(
+                logical_name=descriptor.logical_name,
+                revision=descriptor.revision,
+                artifact_sha256=module.artifact_sha256,
+                registration_name=descriptor.registration_name,
+                manifest_sha256=view.manifest.sha256,
+                source_map_sha256=module.source_map_sha256,
+                mapped_source=module.mapped_source,
+                visible_source_context=module.visible_context,
+            )
+            for descriptor, module in zip(
+                view.manifest.modules, view.modules, strict=True,
+            )
+        )
 
 
 def _close_and_verify_live_session(session: RuntimeSession) -> None:
@@ -1023,10 +1078,10 @@ def _enter_synthetic_capture(harness: LiveWorkerUniverseHarness) -> RuntimeReply
 
 
 def _execute_capture_worker_call(harness: LiveWorkerUniverseHarness) -> RuntimeReply:
-    prepared = harness.session.runtime_api.prepare_capture_hypothesis(
+    prepared = harness.session.runtime_api.prepare_bsl(
         f"РезультатИнструкции = {MODULE_A}.ДанныеЗависимости();"
     )
-    return harness.session.runtime_api.execute_prepared_capture_hypothesis(prepared)
+    return harness.session.runtime_api.execute_prepared_bsl(prepared)
 
 
 def run_breakpoint_pinned_generation_gate(
@@ -1179,8 +1234,12 @@ def test_worker_breakpoint_capture_evaluation_does_not_stop_live(
         assert result["same_breakpoint_stops_in_main"] is True
 
 
-def _cached_worker_artifact(api: object, unit: WorkerModuleUnit):
-    return api._worker_module_artifacts[_worker_artifact_key(unit)]  # type: ignore[attr-defined]
+def _cached_worker_artifact(
+    harness: LiveWorkerUniverseHarness, unit: WorkerModuleUnit,
+):
+    artifact = harness.confirmed_worker_artifact(unit)
+    assert artifact is not None
+    return artifact
 
 
 @pytest.mark.integration
@@ -1191,9 +1250,9 @@ def test_original_overloaded_cycle_and_registration_coexistence_live(
 ) -> None:
     contract = worker_universe_source_contract()
     with _fresh_live_harness(tmp_path) as harness:
-        api = harness.session.runtime_api
-        counter = _CountingRealArtifactBuilder(api._worker_module_builder)
-        api._worker_module_builder = counter
+        preparer = harness.worker_artifact_preparer
+        counter = _CountingRealArtifactBuilder(preparer._builder)
+        preparer._builder = counter
 
         original = harness.measure(
             "load.original_b",
@@ -1442,11 +1501,11 @@ def _run_two_promotion_capture_gate(
     assert harness.host_registry.registration_refcount(b17_registration) > 0
 
     for _ in range(2):
-        prepared = harness.session.runtime_api.prepare_capture_hypothesis(
+        prepared = harness.session.runtime_api.prepare_bsl(
             f"РезультатИнструкции = {MODULE_A}.\u041f\u0440\u043e\u0432\u0435\u0440\u0438\u0442\u044c\u0426\u0438\u043a\u043b();"
         )
         hypothesis = (
-            harness.session.runtime_api.execute_prepared_capture_hypothesis(
+            harness.session.runtime_api.execute_prepared_bsl(
                 prepared
             )
         )
@@ -1540,19 +1599,19 @@ def test_compile_and_runtime_diagnostics_are_mapped_from_real_1c(
 ) -> None:
     contract = worker_universe_source_contract()
     with _fresh_live_harness(tmp_path) as harness:
-        api = harness.session.runtime_api
         g17 = harness.session.load_worker_modules(
             contract.g17_units,
         )
         manifest = _active_manifest(harness)
         registrations = dict(harness.target_registry._registrations)
 
-        production_builder = api._worker_module_builder
+        preparer = harness.worker_artifact_preparer
+        production_builder = preparer._builder
         generated_failure = _InvalidGeneratedAliasBuilder(
             production_builder,
             revision=28,
         )
-        api._worker_module_builder = generated_failure
+        preparer._builder = generated_failure
         b28 = _unit(MODULE_B, 28, _module_b_source(28), contract.catalog)
         try:
             with pytest.raises(BslExecutionError) as generated_raised:
@@ -1560,7 +1619,7 @@ def test_compile_and_runtime_diagnostics_are_mapped_from_real_1c(
                     (contract.module_a, b28),
                 )
         finally:
-            api._worker_module_builder = production_builder
+            preparer._builder = production_builder
         assert generated_failure.mutated is True
         generated = generated_raised.value.diagnostic
         assert generated is not None
@@ -1585,6 +1644,16 @@ def test_compile_and_runtime_diagnostics_are_mapped_from_real_1c(
         )
         assert generated.dependency_anchor == SourceSpan(253, 354)
         assert generated.method_anchor == SourceSpan(253, 354)
+        generated_frames = tuple(
+            frame for frame in generated.frames
+            if frame.source_unit == generated.source_unit
+            and frame.mapping_confidence is MappingConfidence.NEAREST
+        )
+        assert generated_frames
+        assert any(
+            frame.related_visible_span == generated.related_visible_span
+            for frame in generated_frames
+        )
         assert generated_failure.expected_lowered_offset is not None
         assert generated_failure.mutated_source is not None
         expected_generated_offset = generated_failure.expected_lowered_offset
@@ -1674,6 +1743,16 @@ def test_compile_and_runtime_diagnostics_are_mapped_from_real_1c(
         assert exact.related_visible_span is None
         assert exact.dependency_anchor is None
         assert exact.method_anchor is None
+        exact_frames = tuple(
+            frame for frame in exact.frames
+            if frame.source_unit == exact.source_unit
+            and frame.mapping_confidence is MappingConfidence.EXACT
+        )
+        assert exact_frames
+        assert any(
+            frame.visible_location == exact.visible_location
+            for frame in exact_frames
+        )
         assert exact.lowered_location is not None
         assert (
             exact.lowered_location.line,
@@ -1681,7 +1760,7 @@ def test_compile_and_runtime_diagnostics_are_mapped_from_real_1c(
             exact.lowered_location.offset,
             exact.lowered_location.span,
         ) == (2, 13, exact_offset, SourceSpan(exact_offset, exact_offset + 1))
-        assert _worker_artifact_key(bad_exact) not in api._worker_module_artifacts
+        assert harness.confirmed_worker_artifact(bad_exact) is None
         assert exact.execution_artifact_sha256 is not None
         assert len(exact.execution_artifact_sha256) == 64
         assert exact.source_map_sha256 is not None
@@ -1712,6 +1791,16 @@ def test_compile_and_runtime_diagnostics_are_mapped_from_real_1c(
         assert runtime.succeeded is False
         assert runtime.diagnostic is not None
         assert runtime.diagnostic.stage is DiagnosticStage.EXECUTION
+        canonical_worker_frames = tuple(
+            frame for frame in runtime.diagnostic.frames
+            if frame.origin is ErrorTraceFrameOrigin.WORKER_ARTIFACT
+        )
+        assert [frame.logical_name for frame in canonical_worker_frames] == [
+            MODULE_B, MODULE_A,
+        ]
+        assert [frame.mapping_confidence for frame in canonical_worker_frames] == [
+            MappingConfidence.EXACT, MappingConfidence.EXACT,
+        ]
         assert [
             frame.logical_name for frame in runtime.diagnostic.worker_frames
         ] == [MODULE_B, MODULE_A]
@@ -1761,7 +1850,7 @@ def test_compile_and_runtime_diagnostics_are_mapped_from_real_1c(
         assert runtime.diagnostic.platform_diagnostic is not None
         admitted_diagnostics = {
             item.logical_name: item
-            for item in api._worker_generation_diagnostics[manifest.sha256]
+            for item in harness.diagnostic_artifacts(manifest.sha256)
         }
         manifest_modules = {item.logical_name: item for item in manifest.modules}
         expected_runtime_registrations = (
@@ -1780,10 +1869,14 @@ def test_compile_and_runtime_diagnostics_are_mapped_from_real_1c(
             admitted_diagnostics[MODULE_A].artifact_sha256,
         )
         assert admitted_diagnostics[MODULE_B].source_map_sha256 == (
-            _cached_worker_artifact(api, contract.module_b_g17).source_map_sha256
+            _cached_worker_artifact(
+                harness, contract.module_b_g17,
+            ).source_map_sha256
         )
         assert admitted_diagnostics[MODULE_A].source_map_sha256 == (
-            _cached_worker_artifact(api, contract.module_a).source_map_sha256
+            _cached_worker_artifact(
+                harness, contract.module_a,
+            ).source_map_sha256
         )
         b_lowered_offset = admitted_diagnostics[MODULE_B].mapped_source.text.index(
             "\u0412\u044b\u0437\u0432\u0430\u0442\u044c\u0418\u0441\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u0435"
@@ -1847,6 +1940,128 @@ def test_compile_and_runtime_diagnostics_are_mapped_from_real_1c(
             (a_frame.lowered_location.line, None),
         )
 
+        nested = harness.session.execute_bsl(_NESTED_ERROR_SOURCE)
+        assert nested.kind is RuntimeReplyKind.MAIN_COMPLETED
+        assert nested.succeeded is False
+        assert nested.diagnostic is not None
+        assert nested.diagnostic.stage is DiagnosticStage.EXECUTION
+        assert nested.diagnostic.platform_diagnostic is not None
+        assert "task-diagnostics-missing-file" in (
+            nested.diagnostic.platform_diagnostic
+        )
+        assert "по причине:" in nested.diagnostic.platform_diagnostic.casefold()
+        assert len(nested.diagnostic.causes) >= 2
+        assert nested.diagnostic.causes_truncated is False
+        assert nested.diagnostic.frames
+
+
+@pytest.mark.integration
+@pytest.mark.live_1c
+@pytest.mark.timeout(600)
+def test_nested_diagnostic_is_parsed_from_english_1c_client(
+    tmp_path: Path,
+) -> None:
+    production_command = runtime_processes.debuggee_command
+
+    def english_command(*args: object, **kwargs: object) -> list[str]:
+        command = production_command(*args, **kwargs)  # type: ignore[arg-type]
+        language_index = command.index("/Lru")
+        command[language_index] = "/Len"
+        return command
+
+    with patch.object(
+        runtime_processes,
+        "debuggee_command",
+        english_command,
+    ):
+        with _fresh_live_harness(tmp_path) as harness:
+            nested = harness.session.execute_bsl(_NESTED_ERROR_SOURCE)
+
+            assert nested.kind is RuntimeReplyKind.MAIN_COMPLETED
+            assert nested.succeeded is False
+            assert nested.diagnostic is not None
+            assert nested.diagnostic.stage is DiagnosticStage.EXECUTION
+            assert nested.diagnostic.platform_diagnostic is not None
+            assert "task-diagnostics-missing-file" in (
+                nested.diagnostic.platform_diagnostic
+            )
+            assert "Reason:" in nested.diagnostic.platform_diagnostic
+            assert len(nested.diagnostic.causes) >= 2
+            assert nested.diagnostic.causes_truncated is False
+            assert nested.diagnostic.frames
+
+
+@pytest.mark.integration
+@pytest.mark.live_1c
+@pytest.mark.timeout(600)
+def test_capture_failure_retry_and_late_main_diagnostic_live(
+    tmp_path: Path,
+) -> None:
+    with _fresh_live_harness(tmp_path) as harness:
+        harness.session.configure_capture_points((_capture_location(harness),))
+        captured = harness.session.execute_bsl(
+            "СинтетическийРезультат = "
+            "RuntimeKernelServer.СинтетическийCapture(100);\n"
+            'ВызватьИсключение "task-diagnostics-late-main";'
+        )
+        assert captured.kind is RuntimeReplyKind.CAPTURED
+
+        failed_prepared = (
+            harness.session.runtime_api.prepare_bsl(
+                'ВызватьИсключение "task-diagnostics-capture";'
+            )
+        )
+        failed = (
+            harness.session.runtime_api.execute_prepared_bsl(
+                failed_prepared
+            )
+        )
+        assert failed.kind is RuntimeReplyKind.CAPTURE_CELL
+        assert failed.succeeded is False
+        assert failed.diagnostic is not None
+        assert failed.diagnostic.platform_diagnostic is not None
+        assert "task-diagnostics-capture" in (
+            failed.diagnostic.platform_diagnostic
+        )
+        assert failed.diagnostic.frames
+
+        with patch(
+            "onec_runtime.execution.reply_publication.parse_platform_diagnostic"
+        ) as parse_spy:
+            success_prepared = (
+                harness.session.runtime_api.prepare_bsl(
+                    "РезультатИнструкции = 42;"
+                )
+            )
+            success = (
+                harness.session.runtime_api.execute_prepared_bsl(
+                    success_prepared
+                )
+            )
+        assert success.kind is RuntimeReplyKind.CAPTURE_CELL
+        assert success.succeeded is True
+        assert success.diagnostic is None
+        parse_spy.assert_not_called()
+
+        late_main = harness.session.resume_capture()
+        assert late_main.kind is RuntimeReplyKind.MAIN_COMPLETED
+        assert late_main.succeeded is False
+        assert late_main.diagnostic is not None
+        assert late_main.diagnostic.platform_diagnostic is not None
+        assert "task-diagnostics-late-main" in (
+            late_main.diagnostic.platform_diagnostic
+        )
+        assert late_main.diagnostic.frames
+
+        with patch(
+            "onec_runtime.execution.reply_publication.parse_platform_diagnostic"
+        ) as parse_spy:
+            recovered = harness.session.execute_bsl("Результат = 7;")
+        assert recovered.kind is RuntimeReplyKind.MAIN_COMPLETED
+        assert recovered.succeeded is True
+        assert recovered.diagnostic is None
+        parse_spy.assert_not_called()
+
 
 @pytest.mark.integration
 @pytest.mark.live_1c
@@ -1904,10 +2119,7 @@ def test_real_phase_failures_are_atomic_and_retain_connected_candidates(
                     f"onec-worker-root-prepare-stage={phase}"
                     in str(raised.value)
                 )
-            assert (
-                _worker_artifact_key(candidate_b)
-                not in harness.session.runtime_api._worker_module_artifacts
-            )
+            assert harness.confirmed_worker_artifact(candidate_b) is None
             injected_registrations = set(
                 re.findall(
                     r"OnecRuntime_[0-9a-f]{8}_[0-9a-f]{16}",
@@ -2009,10 +2221,7 @@ def test_lost_real_swap_acknowledgement_poisons_runtime_and_cleans_on_close(
         assert receipt.root_swap_ms >= 0
         assert harness.host_registry._state.value == "broken"
         assert target._broken is True
-        assert (
-            _worker_artifact_key(contract.module_b_g18)
-            not in harness.session.runtime_api._worker_module_artifacts
-        )
+        assert harness.confirmed_worker_artifact(contract.module_b_g18) is None
         candidate_only = set(target._registrations) - {
             item.registration_name for item in g17_manifest.modules
         }
