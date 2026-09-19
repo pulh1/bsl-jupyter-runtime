@@ -7,12 +7,15 @@ import json
 import pytest
 
 from onec_runtime.bsl.diagnostics import (
+    DiagnosticTextSpan,
     DiagnosticCoordinateSpace,
     DiagnosticStage,
+    ErrorTraceFrameOrigin,
     MappingConfidence,
     PlatformCoordinateCodec,
     VisibleSourceContext,
     WorkerDiagnosticArtifact,
+    normalize_platform_diagnostic_trace,
     parse_platform_diagnostic,
     normalize_source_error,
     remap_platform_diagnostic,
@@ -129,6 +132,229 @@ def _worker_diagnostic_artifact_from_mapped(
         mapped_source=mapped,
         visible_source_context=VisibleSourceContext({unit: visible_source}),
     )
+
+
+def _diagnostic_text(raw: str, span: DiagnosticTextSpan | None) -> str | None:
+    return None if span is None else raw[span.start : span.end]
+
+
+def test_parses_ordered_causes_frames_and_platform_fragments() -> None:
+    raw = (
+        "Ошибка оболочки\n"
+        "{ОбщийМодуль.Верхний.Модуль(10,2)}: верхний кадр\n"
+        "по причине:\n"
+        "Деление на ноль\n"
+        "{<Неизвестный модуль>(2,5)}: выражение 1 / 0\n"
+        "  дополнительный контекст\n"
+        "{ОбщийМодуль.Нижний.Модуль(20)}: вызывающий кадр"
+    )
+
+    parsed = parse_platform_diagnostic(raw)
+
+    assert [_diagnostic_text(raw, item.summary_span) for item in parsed.causes] == [
+        "Ошибка оболочки",
+        "Деление на ноль",
+    ]
+    assert [item.frame_ordinals for item in parsed.causes] == [(0,), (1, 2)]
+    assert [item.cause_ordinal for item in parsed.frames] == [0, 1, 1]
+    assert [_diagnostic_text(raw, item.detail_span) for item in parsed.frames] == [
+        "верхний кадр",
+        "выражение 1 / 0\n  дополнительный контекст",
+        "вызывающий кадр",
+    ]
+    assert [item.location.column for item in parsed.frames] == [2, 5, None]
+
+
+def test_english_reason_and_line_only_native_frame_form_two_causes() -> None:
+    raw = (
+        "Error getting value of context attribute\n"
+        "{Документ.ПриемНаРаботу.МодульОбъекта(15)}:Вызвать();\n"
+        "Reason:\n"
+        "Attempt to obtain an uninitialized value"
+    )
+
+    parsed = parse_platform_diagnostic(raw)
+
+    assert len(parsed.causes) == 2
+    assert parsed.causes[0].frame_ordinals == (0,)
+    assert parsed.causes[1].frame_ordinals == ()
+    assert parsed.frames[0].location.module_name == (
+        "Документ.ПриемНаРаботу.МодульОбъекта"
+    )
+    assert parsed.frames[0].location.column is None
+    assert parsed.platform_diagnostic == raw
+
+
+def test_inner_query_coordinates_are_not_mapped_as_bsl() -> None:
+    source = "Контекст = Подготовить();\nРезультат = Контекст.Запрос.Выполнить();"
+    raw = (
+        "Error calling context method (Выполнить)\n"
+        "{(2)}:Результат = Контекст.Запрос.Выполнить();\n"
+        "{RuntimeExtension ОбщийМодуль.RuntimeKernelServer.Модуль(122)}:Выполнить();\n"
+        "Reason:\n"
+        "{(1, 14)}: Table not found MissingTable"
+    )
+
+    diagnostic = normalize_platform_diagnostic_trace(
+        parse_platform_diagnostic(raw),
+        stage=DiagnosticStage.EXECUTION,
+        executed=_wrapped(source),
+        visible_source_context=_visible_context(source),
+    )
+
+    assert [item.origin for item in diagnostic.frames] == [
+        ErrorTraceFrameOrigin.EXECUTED_ARTIFACT,
+        ErrorTraceFrameOrigin.NATIVE_MODULE,
+        ErrorTraceFrameOrigin.UNKNOWN,
+    ]
+    outer, _, query = diagnostic.frames
+    assert outer.visible_location is not None
+    assert outer.visible_location.line == 2
+    assert query.platform_location.module_name is None
+    assert (query.platform_location.line, query.platform_location.column) == (1, 14)
+    assert query.mapping_confidence is MappingConfidence.UNKNOWN
+    assert query.lowered_location is None
+
+
+def test_cause_and_frame_limits_are_independent() -> None:
+    raw = "\nпо причине:\n".join(
+        f"Причина {index}\n{{Модуль{index}(1,1)}}: кадр"
+        for index in range(33)
+    )
+    raw += "\n" + "\n".join(
+        f"{{ДополнительныйМодуль{index}(1,1)}}: кадр"
+        for index in range(96)
+    )
+
+    parsed = parse_platform_diagnostic(raw)
+
+    assert len(parsed.causes) == 32
+    assert parsed.causes_truncated is True
+    assert len(parsed.frames) == 128
+    assert parsed.frames_truncated is True
+    assert parsed.platform_diagnostic_truncated is False
+
+
+def test_unrecognized_blocks_are_retained_as_opaque_text() -> None:
+    raw = (
+        "{ОбщийМодуль.Первый.Модуль(1,1)}: first\n"
+        "{not a module label(7,4)}: opaque\n"
+        "{ОбщийМодуль.Второй.Модуль(2,1)}: second"
+    )
+
+    parsed = parse_platform_diagnostic(raw)
+
+    opaque = "".join(raw[span.start : span.end] for span in parsed.opaque_spans)
+    assert "{not a module label(7,4)}: opaque" in opaque
+
+
+def test_main_trace_maps_every_generated_frame_and_visible_line() -> None:
+    source = "Первый();\nВторой();"
+    diagnostic = remap_platform_diagnostic(
+        parse_platform_diagnostic(
+            "{<Неизвестный модуль>(1,1)}: first\n"
+            "{<Неизвестный модуль>(2,1)}: second"
+        ),
+        _wrapped(source),
+        stage=DiagnosticStage.EXECUTION,
+        visible_source_context=_visible_context(source),
+    )
+
+    assert [frame.origin for frame in diagnostic.frames] == [
+        ErrorTraceFrameOrigin.EXECUTED_ARTIFACT,
+        ErrorTraceFrameOrigin.EXECUTED_ARTIFACT,
+    ]
+    assert [frame.mapping_confidence for frame in diagnostic.frames] == [
+        MappingConfidence.EXACT,
+        MappingConfidence.EXACT,
+    ]
+    assert [frame.visible_location.line for frame in diagnostic.frames] == [1, 2]
+
+
+def test_native_trace_keeps_direct_platform_coordinates_without_map() -> None:
+    diagnostic = normalize_platform_diagnostic_trace(
+        parse_platform_diagnostic(
+            "{ОбщийМодуль.Сервис.Модуль(12)}: native frame"
+        ),
+        stage=DiagnosticStage.EXECUTION,
+    )
+
+    frame = diagnostic.frames[0]
+    assert frame.origin is ErrorTraceFrameOrigin.NATIVE_MODULE
+    assert (frame.platform_location.line, frame.platform_location.column) == (12, None)
+    assert frame.mapping_confidence is MappingConfidence.UNKNOWN
+    assert frame.visible_location is None
+
+
+def test_line_only_main_frame_maps_only_one_exact_code_span() -> None:
+    exact_source = "    Результат = 1;"
+    exact = remap_platform_diagnostic(
+        parse_platform_diagnostic("{<Неизвестный модуль>(1)}: exact"),
+        _wrapped(exact_source),
+        stage=DiagnosticStage.EXECUTION,
+        visible_source_context=_visible_context(exact_source),
+    )
+
+    unit = SourceUnitRef(
+        SourceUnitKind.NOTEBOOK_CELL,
+        "ambiguous-cell",
+        1,
+        source_sha256("Первый();Пропуск();Второй();"),
+    )
+    visible = mapped_visible_source("Первый();Пропуск();Второй();", unit)
+    builder = SourceTransformBuilder(visible)
+    builder.copy(SourceSpan(0, 9))
+    builder.copy(SourceSpan(19, len(visible.text)))
+    ambiguous_source = builder.build(SourceArtifactKind.EXECUTED_BSL)
+    ambiguous = remap_platform_diagnostic(
+        parse_platform_diagnostic("{<Неизвестный модуль>(1)}: ambiguous"),
+        ambiguous_source,
+        stage=DiagnosticStage.EXECUTION,
+        visible_source_context=VisibleSourceContext(
+            {unit: "Первый();Пропуск();Второй();"}
+        ),
+    )
+
+    assert exact.frames[0].mapping_confidence is MappingConfidence.EXACT
+    assert exact.frames[0].lowered_location.column == 5
+    assert ambiguous.frames[0].mapping_confidence is MappingConfidence.UNKNOWN
+    assert ambiguous.frames[0].lowered_location is None
+
+
+def test_mixed_trace_maps_worker_main_and_native_frames_in_order() -> None:
+    manifest = "c" * 64
+    worker = _worker_diagnostic_artifact(
+        "МодульБ",
+        18,
+        "OnecRuntime_bbbbbbbb_bbbbbbbbbbbbbbbb",
+        "b" * 64,
+        manifest,
+    )
+    source = "Результат = 1;"
+    raw = (
+        f"{{ВнешняяОбработка.{worker.registration_name}.МодульОбъекта(2,1)}}: worker\n"
+        "{ОбщийМодуль.Сервис.Модуль(7,3)}: native\n"
+        "{<Неизвестный модуль>(1,1)}: main"
+    )
+
+    diagnostic = normalize_platform_diagnostic_trace(
+        parse_platform_diagnostic(raw),
+        stage=DiagnosticStage.EXECUTION,
+        executed=_wrapped(source),
+        visible_source_context=_visible_context(source),
+        pinned_manifest_sha256=manifest,
+        pinned_artifacts=(worker,),
+    )
+
+    assert [frame.origin for frame in diagnostic.frames] == [
+        ErrorTraceFrameOrigin.WORKER_ARTIFACT,
+        ErrorTraceFrameOrigin.NATIVE_MODULE,
+        ErrorTraceFrameOrigin.EXECUTED_ARTIFACT,
+    ]
+    assert diagnostic.frames[0].logical_name == "МодульБ"
+    assert diagnostic.frames[0].mapping_confidence is MappingConfidence.EXACT
+    assert diagnostic.frames[1].mapping_confidence is MappingConfidence.UNKNOWN
+    assert diagnostic.frames[2].mapping_confidence is MappingConfidence.EXACT
 
 
 def test_parses_unknown_module_location_without_rewriting_message() -> None:
@@ -299,12 +525,17 @@ def test_rejects_non_module_braced_labels() -> None:
     assert parsed.line is None
 
 
-def test_platform_diagnostic_is_code_point_bounded_and_hashes_original() -> None:
-    raw = "{<Неизвестный модуль>(1,1)}: " + "😀" * 5000
+def test_platform_diagnostic_is_utf8_byte_bounded_and_hashes_original() -> None:
+    raw = "{<Неизвестный модуль>(1,1)}: " + "😀" * 20_000
 
     parsed = parse_platform_diagnostic(raw)
+    retained_size = len(parsed.platform_diagnostic.encode("utf-8"))
 
-    assert len(parsed.platform_diagnostic) == 4096
+    assert retained_size <= 64 * 1024
+    assert retained_size + len("😀".encode("utf-8")) > 64 * 1024
+    assert parsed.platform_diagnostic.encode("utf-8").decode("utf-8") == (
+        parsed.platform_diagnostic
+    )
     assert parsed.platform_diagnostic_truncated is True
     assert parsed.platform_diagnostic_sha256 == hashlib.sha256(
         raw.encode("utf-8")
@@ -1079,7 +1310,7 @@ def test_worker_stage_does_not_parse_canonical_locator_beyond_prose_bound() -> N
         manifest,
     )
     raw = (
-        "x" * 4096
+        "x" * (64 * 1024)
         + "\n{ВнешняяОбработка."
         + artifact.registration_name
         + ".МодульОбъекта(1,1)}: hidden"
@@ -1096,7 +1327,7 @@ def test_worker_stage_does_not_parse_canonical_locator_beyond_prose_bound() -> N
     assert diagnostic.mapping_confidence is MappingConfidence.UNKNOWN
     assert diagnostic.code == "worker_artifact_location_unmapped"
     assert diagnostic.platform_diagnostic_truncated
-    assert diagnostic.platform_diagnostic == raw[:4096]
+    assert diagnostic.platform_diagnostic == "x" * (64 * 1024)
 
 
 def test_worker_stage_does_not_fallback_to_wrapper_or_wrong_worker_location() -> None:
@@ -1234,7 +1465,7 @@ def test_runtime_canonical_line_only_worker_frames_map_exactly_in_order() -> Non
     ]
 
 
-def test_line_only_worker_parser_rejects_host_and_decorated_shapes() -> None:
+def test_line_only_parser_keeps_native_paths_without_worker_classification() -> None:
     registration = "OnecRuntime_aaaaaaaa_aaaaaaaaaaaaaaaa"
     raw = (
         "{ОбщийМодуль.RuntimeKernelServer.Модуль(12)}: host\n"
@@ -1244,7 +1475,10 @@ def test_line_only_worker_parser_rejects_host_and_decorated_shapes() -> None:
 
     parsed = parse_platform_diagnostic(raw)
 
-    assert parsed.locations == ()
+    assert [item.line for item in parsed.locations] == [12, 2]
+    assert all(
+        item.worker_artifact_location is None for item in parsed.locations
+    )
 
 
 def test_line_only_worker_unknown_registration_never_maps_to_known_artifact() -> None:
