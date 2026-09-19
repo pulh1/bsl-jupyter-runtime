@@ -6,9 +6,19 @@ from uuid import uuid4
 
 import pytest
 
-from onec_runtime.bsl.diagnostics import VisibleSourceContext
+from onec_runtime.bsl.diagnostics import (
+    ErrorTraceFrameOrigin,
+    VisibleSourceContext,
+    WorkerDiagnosticArtifact,
+)
 from onec_runtime.bsl.source_maps import (
-    SourceUnitKind, SourceUnitRef, mapped_visible_source, source_sha256,
+    SourceArtifactKind,
+    SourceSpan,
+    SourceTransformBuilder,
+    SourceUnitKind,
+    SourceUnitRef,
+    mapped_visible_source,
+    source_sha256,
 )
 from onec_runtime.execution.capture.scope import (
     CaptureContextState, CaptureFrameIdentity, CaptureScope,
@@ -36,6 +46,27 @@ def _source(source: str):
         source_sha256(source),
     )
     return mapped_visible_source(source, unit), VisibleSourceContext({unit: source}), unit
+
+
+def _worker_artifact() -> WorkerDiagnosticArtifact:
+    source = "Функция Посчитать() Экспорт\nВозврат 1 / 0;\nКонецФункции"
+    unit = SourceUnitRef(
+        SourceUnitKind.MODULE, "Расчеты", 3, source_sha256(source),
+    )
+    visible = mapped_visible_source(source, unit)
+    builder = SourceTransformBuilder(visible)
+    builder.copy(SourceSpan(0, len(source)))
+    mapped = builder.build(SourceArtifactKind.WORKER_PROJECTION)
+    return WorkerDiagnosticArtifact(
+        logical_name="Расчеты",
+        revision=3,
+        artifact_sha256="a" * 64,
+        registration_name="OnecRuntime_aaaaaaaa_aaaaaaaaaaaaaaaa",
+        manifest_sha256="b" * 64,
+        source_map_sha256=mapped.source_map_sha256,
+        mapped_source=mapped,
+        visible_source_context=VisibleSourceContext({unit: source}),
+    )
 
 
 def test_publication_import_does_not_require_completed_runtime_api_contracts():
@@ -188,6 +219,121 @@ def test_main_error_diagnostic_maps_to_its_saved_visible_source():
     assert reply.diagnostic.visible_location.column == source.index("/") + 1
 
 
+def test_main_error_publishes_mixed_worker_native_and_cell_frames() -> None:
+    publication = _publication_module()
+    worker = _worker_artifact()
+    source = "Результат = 1 / 0;"
+    mapped, visible, unit = _source(source)
+    operation = MainOperation(11, None)
+    record = publication.MainPublicationRecord(
+        operation, prior_capture_sequence=0,
+        executed_source=mapped, visible_source_context=visible,
+    )
+    error = (
+        f"{{ВнешняяОбработка.{worker.registration_name}.МодульОбъекта(2,9)}}: worker\n"
+        "{ОбщийМодуль.Сервис.Модуль(7,3)}: native\n"
+        f"{{<Неизвестный модуль>(1,{source.index('/') + 1})}}: cell"
+    )
+    completion = MainRemoteCompletion(None, error, ())
+    operation.remote_completed()
+    operation.complete(completion)
+
+    reply = publication.MainReplyPolicy().publish(
+        MainYield(
+            MainYieldKind.COMPLETED,
+            operation,
+            completion=completion,
+            pinned_manifest_sha256=worker.manifest_sha256,
+            pinned_artifacts=(worker,),
+        ),
+        record,
+    )
+
+    assert reply.succeeded is False
+    assert reply.error == "BSL execution failed"
+    assert reply.diagnostic is not None
+    assert [frame.origin for frame in reply.diagnostic.frames] == [
+        ErrorTraceFrameOrigin.WORKER_ARTIFACT,
+        ErrorTraceFrameOrigin.NATIVE_MODULE,
+        ErrorTraceFrameOrigin.EXECUTED_ARTIFACT,
+    ]
+    assert reply.diagnostic.frames[0].logical_name == "Расчеты"
+    assert reply.diagnostic.frames[2].source_unit == unit
+
+
+def test_late_main_native_error_after_capture_keeps_platform_trace() -> None:
+    publication = _publication_module()
+    operation = MainOperation(19, None)
+    scope = _ready_scope(operation, local_sequence=1)
+    record = publication.MainPublicationRecord(operation, prior_capture_sequence=0)
+    policy = publication.MainReplyPolicy()
+
+    stopped = policy.publish(
+        MainYield(MainYieldKind.CAPTURE, operation, scope=scope), record,
+    )
+    assert stopped.kind is RuntimeReplyKind.CAPTURED
+
+    error = "{ОбщийМодуль.ПослеВозврата.Модуль(27)}: поздняя ошибка"
+    completion = MainRemoteCompletion(None, error, ())
+    operation.remote_completed()
+    operation.complete(completion)
+    completed = policy.publish(
+        MainYield(MainYieldKind.COMPLETED, operation, completion=completion), record,
+    )
+
+    assert completed.succeeded is False
+    assert completed.diagnostic is not None
+    assert completed.diagnostic.platform_diagnostic == error
+    assert completed.diagnostic.frames[0].origin is ErrorTraceFrameOrigin.NATIVE_MODULE
+
+
+def test_successful_main_reply_does_not_parse_diagnostics(monkeypatch) -> None:
+    publication = _publication_module()
+    operation = MainOperation(23, None)
+    record = publication.MainPublicationRecord(operation, prior_capture_sequence=0)
+    completion = MainRemoteCompletion(42, "", ())
+    operation.remote_completed()
+    operation.complete(completion)
+    calls = 0
+
+    def unexpected_parse(_error):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("successful completion must not parse diagnostics")
+
+    monkeypatch.setattr(publication, "parse_platform_diagnostic", unexpected_parse)
+    reply = publication.MainReplyPolicy().publish(
+        MainYield(MainYieldKind.COMPLETED, operation, completion=completion), record,
+    )
+
+    assert reply.succeeded is True
+    assert reply.diagnostic is None
+    assert calls == 0
+
+
+def test_diagnostic_parser_failure_does_not_mask_confirmed_bsl_error(
+    monkeypatch,
+) -> None:
+    publication = _publication_module()
+    operation = MainOperation(29, None)
+    record = publication.MainPublicationRecord(operation, prior_capture_sequence=0)
+    completion = MainRemoteCompletion(None, "planned BSL failure", ())
+    operation.remote_completed()
+    operation.complete(completion)
+
+    def fail_parse(_error):
+        raise RuntimeError("diagnostic parser failed")
+
+    monkeypatch.setattr(publication, "parse_platform_diagnostic", fail_parse)
+    reply = publication.MainReplyPolicy().publish(
+        MainYield(MainYieldKind.COMPLETED, operation, completion=completion), record,
+    )
+
+    assert reply.succeeded is False
+    assert reply.error == "BSL execution failed"
+    assert reply.diagnostic is None
+
+
 @pytest.mark.parametrize(
     ("error_occurred", "want_succeeded", "want_result", "want_error"),
     [
@@ -251,6 +397,25 @@ def test_capture_bsl_error_diagnostic_uses_its_own_cell_source():
     assert reply.diagnostic.visible_location is not None
     assert reply.diagnostic.visible_location.column == source.index("/") + 1
     assert scope.context_state is CaptureContextState.READY
+
+
+def test_capture_native_error_without_cell_source_keeps_platform_trace():
+    publication = _publication_module()
+    operation = MainOperation(5, None)
+    scope = _ready_scope(operation, local_sequence=1)
+    record = publication.CapturePublicationRecord(scope)
+    error = "{Справочник.Товары.МодульМенеджера(1173)}: native failure"
+    remote = publication.CaptureRemoteOutcome(
+        EvaluationResult(uuid4(), "Ошибка", "", True, error),
+    )
+
+    reply = publication.CaptureReplyPolicy().publish(remote, record)
+
+    assert reply.succeeded is False
+    assert reply.error == "BSL execution failed"
+    assert reply.diagnostic is not None
+    assert reply.diagnostic.platform_diagnostic == error
+    assert reply.diagnostic.frames[0].origin is ErrorTraceFrameOrigin.NATIVE_MODULE
 
 
 def test_capture_result_decode_error_is_a_failed_cell_not_a_lost_scope():
