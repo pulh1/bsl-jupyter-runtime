@@ -6,6 +6,7 @@ from html import escape
 from inspect import Parameter, signature
 import json
 import keyword
+from pathlib import Path
 import re
 from shlex import split
 from threading import Lock
@@ -23,6 +24,7 @@ from onec_runtime.runtime_contracts import (
     sanitize_normalized_diagnostic,
 )
 from onec_runtime.bsl import SourceUnitKind, SourceUnitRef, source_sha256
+from onec_runtime.bsl.diagnostics import ErrorTraceFrameOrigin
 from onec_runtime.capture_evaluation import (
     CaptureEvaluationKind,
     is_public_capture_evaluation_id,
@@ -41,6 +43,8 @@ from onec_runtime.privacy import (
     diagnostic_to_public_wire,
     public_artifact_value,
 )
+
+from .diagnostic_trace import render_error_trace
 
 
 RUNTIME_NAMESPACE_NAME = "_onec_runtime"
@@ -758,6 +762,10 @@ class OnecRuntimeMagics(Magics):
             source_unit=source_unit,
             execution_provenance=execution_provenance,
             known_source_unit=known_source_unit,
+            source_root=(
+                _diagnostic_source_root(self._runtime(), reply.kind)
+                if not reply.succeeded else None
+            ),
         )
         if not reply.succeeded:
             # Publish the rich diagnostic before raising: failed cells have no
@@ -769,7 +777,7 @@ class OnecRuntimeMagics(Magics):
                 else diagnostic_to_public_wire(reply.diagnostic)
             )
             summary = (
-                displayed.text
+                "Ошибка BSL; подробная диагностика выше"
                 if self._display_config().mode == "presentation"
                 else diagnostic.get("runtime_summary", "BSL execution failed")
             )
@@ -853,6 +861,7 @@ def _display_reply(
     source_unit: SourceUnitRef | None = None,
     execution_provenance: OperationExecutionProvenance | None = None,
     known_source_unit: SourceUnitRef | None = None,
+    source_root: Path | str | None = None,
 ) -> NotebookDisplay:
     selected = config or NotebookDisplayConfig.presentation()
     has_normalized_diagnostic = reply.diagnostic is not None
@@ -956,6 +965,7 @@ def _display_reply(
         text += " diagnostic=unavailable"
     elif payload.get("error"):
         text += f" error={payload['error']}"
+    html = None
     if selected.mode == "presentation" and not reply.succeeded:
         stage = public_diagnostic.get("stage")
         stage_label = {
@@ -965,20 +975,35 @@ def _display_reply(
             "execution": "исполнения",
         }.get(stage, "исполнения")
         safe_diagnostic = sanitize_normalized_diagnostic(reply.diagnostic)
+        request_origin_verified = (
+            current_source_unit is not None
+            and isinstance(execution_provenance, OperationExecutionProvenance)
+            and isinstance(source_unit, SourceUnitRef)
+            and execution_provenance.visible_source_sha256
+            == source_unit.source_sha256
+        )
+        artifact_origin_verified = (
+            request_origin_verified
+            and safe_diagnostic is not None
+            and execution_provenance.executed_source_sha256
+            == safe_diagnostic.execution_artifact_sha256
+            and execution_provenance.source_map_sha256
+            == safe_diagnostic.source_map_sha256
+        )
+        native_origin_verified = (
+            request_origin_verified
+            and safe_diagnostic is not None
+            and safe_diagnostic.execution_artifact_sha256 is not None
+            and safe_diagnostic.source_map_sha256 is not None
+            and any(
+                frame.origin is ErrorTraceFrameOrigin.NATIVE_MODULE
+                for frame in safe_diagnostic.frames
+            )
+        )
         unlocated_origin_verified = (
             source_unit is None
-            or (
-                current_source_unit is not None
-                and isinstance(execution_provenance, OperationExecutionProvenance)
-                and isinstance(source_unit, SourceUnitRef)
-                and safe_diagnostic is not None
-                and execution_provenance.visible_source_sha256
-                == source_unit.source_sha256
-                and execution_provenance.executed_source_sha256
-                == safe_diagnostic.execution_artifact_sha256
-                and execution_provenance.source_map_sha256
-                == safe_diagnostic.source_map_sha256
-            )
+            or artifact_origin_verified
+            or native_origin_verified
         )
         reason = None
         if public_diagnostic and (
@@ -996,9 +1021,60 @@ def _display_reply(
         location = public_diagnostic.get("visible_location")
         if isinstance(location, dict) and "source_unit" in payload:
             text += f" (строка {location['line']}, колонка {location['column']})"
+        worker_origin_verified = (
+            request_origin_verified
+            and isinstance(diagnostic_unit, SourceUnitRef)
+            and diagnostic_unit.kind is SourceUnitKind.MODULE
+            and safe_diagnostic is not None
+            and any(
+                frame.origin is ErrorTraceFrameOrigin.WORKER_ARTIFACT
+                and frame.source_unit == diagnostic_unit
+                for frame in safe_diagnostic.frames
+            )
+        )
+        trace = None
+        if (
+            public_diagnostic
+            and (diagnostic_unit is not None or unlocated_origin_verified)
+        ) or worker_origin_verified:
+            try:
+                trace = render_error_trace(
+                    reply.diagnostic,
+                    heading=f"Ошибка {stage_label} BSL",
+                    visible_source=visible_source,
+                    source_unit=source_unit,
+                    source_root=source_root,
+                )
+            except BaseException:
+                pass
+        if trace is not None:
+            text = trace
+            html = "<pre>" + escape(trace) + "</pre>"
     if selected.mode == "diagnostic":
         text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-    return NotebookDisplay(text, payload, diagnostic=selected.mode == "diagnostic")
+    return NotebookDisplay(
+        text, payload, diagnostic=selected.mode == "diagnostic", html=html,
+    )
+
+
+def _diagnostic_source_root(
+    runtime: object,
+    reply_kind: RuntimeReplyKind,
+) -> Path | str | None:
+    try:
+        config = getattr(runtime, "config", None)
+        source_root = getattr(config, "source_root", None)
+        if reply_kind is RuntimeReplyKind.CAPTURE_CELL:
+            active_capture = getattr(runtime, "_capture_source_resolver", None)
+            active_root = getattr(active_capture, "source_root", None)
+            if isinstance(active_root, (Path, str)):
+                return active_root
+        if source_root is None:
+            capture_source = getattr(config, "capture_source", None)
+            source_root = getattr(capture_source, "source_root", None)
+    except BaseException:
+        return None
+    return source_root if isinstance(source_root, (Path, str)) else None
 
 
 def _safe_platform_reason(diagnostic: object) -> str | None:

@@ -46,6 +46,7 @@ from onec_runtime.runtime_models import (
 )
 from onec_runtime.bsl import (
     DiagnosticStage,
+    MappingConfidence,
     SourceArtifactKind,
     SourceSpan,
     SourceTransformBuilder,
@@ -56,6 +57,10 @@ from onec_runtime.bsl import (
     parse_platform_diagnostic,
     remap_platform_diagnostic,
     source_sha256,
+)
+from onec_runtime.bsl.diagnostics import (
+    ErrorTraceFrameOrigin,
+    normalize_platform_diagnostic_trace,
 )
 
 
@@ -264,8 +269,15 @@ def test_failed_reply_is_an_ipython_error_with_safe_rich_diagnostics(
         rendered = captured.stdout + captured.stderr + json.dumps(
             captured.outputs[0].data, ensure_ascii=False
         ) + repr(result.error_in_exec)
-        for secret in ("RAW platform", "private-connection", "9182"):
-            assert secret not in rendered
+        assert "RAW platform" not in rendered
+        machine = json.dumps(payload, ensure_ascii=False)
+        assert "private-connection" not in machine
+        assert "9182" not in machine
+        assert "private-connection" not in repr(result.error_in_exec)
+        if normalized and magic.startswith("%%bsl"):
+            assert "private-connection" in rendered
+        else:
+            assert "private-connection" not in rendered
     finally:
         InteractiveShell.clear_instance()
 
@@ -325,8 +337,12 @@ def test_retained_cell_diagnostic_keeps_issued_identity_without_new_cell_excerpt
     if mode == "diagnostic":
         assert payload["diagnostic_details"]["excerpt"] is None
     rendered = json.dumps(payload, ensure_ascii=False)
-    for forbidden in ("NEW_CELL_CONTENT", original, "private-connection"):
+    for forbidden in ("NEW_CELL_CONTENT", original):
         assert forbidden not in rendered
+    if mode == "diagnostic":
+        assert "private-connection" in rendered
+    else:
+        assert "private-connection" not in rendered
 
 
 @pytest.mark.parametrize("defect", ["hash", "unknown_unit", "replacement", "unload"])
@@ -748,6 +764,303 @@ def test_presentation_mode_shows_write_cause_when_platform_has_no_cell_location(
     assert "строка" not in displayed.text
 
 
+def test_presentation_renders_full_cause_chain_and_mixed_stack() -> None:
+    source = "Результат = 1 / 0;"
+    unit = SourceUnitRef(
+        SourceUnitKind.NOTEBOOK_CELL, "trace-cell", 1, source_sha256(source),
+    )
+    raw = (
+        "Error getting value of context attribute\n"
+        "{<Неизвестный модуль>(1,1)}: Результат = 1 / 0;\n"
+        "Reason:\n"
+        "Attempt to obtain an uninitialized value\n"
+        "{ОбщийМодуль.Сервис.Модуль(7)}: Возврат Значение;"
+    )
+    diagnostic = normalize_platform_diagnostic_trace(
+        parse_platform_diagnostic(raw),
+        stage=DiagnosticStage.EXECUTION,
+        executed=mapped_visible_source(source, unit),
+        visible_source_context=VisibleSourceContext({unit: source}),
+    )
+    reply = RuntimeReply(
+        RuntimeReplyKind.MAIN_COMPLETED,
+        12,
+        OperationState.FAILED,
+        succeeded=False,
+        error="untrusted RuntimeReply error fallback",
+        diagnostic=diagnostic,
+    )
+
+    displayed = _display_reply(
+        reply,
+        NotebookDisplayConfig.presentation(),
+        visible_source=source,
+        source_unit=unit,
+        execution_provenance=OperationExecutionProvenance(
+            visible_source_sha256=unit.source_sha256,
+            executed_source_sha256=diagnostic.execution_artifact_sha256,
+            source_map_sha256=diagnostic.source_map_sha256,
+            mode="main",
+        ),
+    )
+
+    assert "Причины:" in displayed.text
+    assert "Error getting value of context attribute" in displayed.text
+    assert "Attempt to obtain an uninitialized value" in displayed.text
+    assert "Стек (1С):" in displayed.text
+    assert "ОбщийМодуль.Сервис.Модуль (строка 7)" in displayed.text
+    assert "фрагмент 1С: Возврат Значение;" in displayed.text
+    assert "Исходное сообщение 1С:" in displayed.text
+    assert raw not in json.dumps(displayed.payload, ensure_ascii=False)
+    assert "platform_diagnostic" not in displayed.payload.get("diagnostic", {})
+
+
+def test_presentation_marks_derived_cell_frame_as_approximate() -> None:
+    source = "Результат = Сервис.Вызвать();"
+    unit = SourceUnitRef(
+        SourceUnitKind.NOTEBOOK_CELL, "derived-cell", 1, source_sha256(source),
+    )
+    builder = SourceTransformBuilder(mapped_visible_source(source, unit))
+    builder.derived(
+        "Результат = __Generated();",
+        SourceSpan(0, len(source)),
+        "call_rewrite",
+    )
+    executed = builder.build(SourceArtifactKind.EXECUTED_BSL)
+    diagnostic = normalize_platform_diagnostic_trace(
+        parse_platform_diagnostic(
+            "Ошибка 1С\n{<Неизвестный модуль>(1,1)}: Результат = __Generated();"
+        ),
+        stage=DiagnosticStage.EXECUTION,
+        executed=executed,
+        visible_source_context=VisibleSourceContext({unit: source}),
+    )
+    assert diagnostic.frames[0].mapping_confidence is MappingConfidence.NEAREST
+    provenance = OperationExecutionProvenance(
+        visible_source_sha256=unit.source_sha256,
+        executed_source_sha256=diagnostic.execution_artifact_sha256,
+        source_map_sha256=diagnostic.source_map_sha256,
+        mode="main",
+    )
+    reply = RuntimeReply(
+        RuntimeReplyKind.MAIN_COMPLETED,
+        12,
+        OperationState.FAILED,
+        succeeded=False,
+        diagnostic=diagnostic,
+    )
+
+    displayed = _display_reply(
+        reply,
+        NotebookDisplayConfig.presentation(),
+        visible_source=source,
+        source_unit=unit,
+        execution_provenance=provenance,
+    )
+
+    assert "Ячейка BSL — сгенерированный код" in displayed.text
+    assert "ориентир: ячейка BSL, строка 1 (приблизительно)" in displayed.text
+    assert "фрагмент 1С: Результат = __Generated();" in displayed.text
+
+
+def test_error_renderer_failure_does_not_replace_runtime_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reply = RuntimeReply(
+        RuntimeReplyKind.MAIN_COMPLETED,
+        12,
+        OperationState.FAILED,
+        succeeded=False,
+        diagnostic=normalize_platform_diagnostic_trace(
+            parse_platform_diagnostic("Ошибка 1С"),
+            stage=DiagnosticStage.EXECUTION,
+        ),
+    )
+
+    def fail_renderer(*args: object, **kwargs: object) -> None:
+        raise KeyboardInterrupt("diagnostic renderer failed")
+
+    monkeypatch.setattr(
+        "onec_runtime_jupyter.extension.render_error_trace", fail_renderer,
+    )
+    displayed = _display_reply(reply, NotebookDisplayConfig.presentation())
+
+    assert "Ошибка" in displayed.text
+    assert displayed.payload["succeeded"] is False
+
+
+def test_success_does_not_invoke_error_renderer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reply = RuntimeReply(
+        RuntimeReplyKind.CAPTURED,
+        12,
+        OperationState.CAPTURED,
+        stop_sequence=1,
+    )
+
+    def fail_renderer(*args: object, **kwargs: object) -> None:
+        raise AssertionError("success must not render diagnostics")
+
+    monkeypatch.setattr(
+        "onec_runtime_jupyter.extension.render_error_trace", fail_renderer,
+    )
+    displayed = _display_reply(reply, NotebookDisplayConfig.presentation())
+
+    assert displayed.payload["succeeded"] is True
+
+
+def test_native_source_excerpt_requires_platform_fragment_match(
+    tmp_path: Path,
+) -> None:
+    from onec_runtime_jupyter.diagnostic_sources import DiagnosticSourceFiles
+
+    root = tmp_path / "source"
+    root.mkdir()
+    (root / "Configuration.xml").write_text(
+        '<MetaDataObject><Configuration uuid="00000000-0000-0000-0000-000000000001">'
+        "<Properties><Name>Test</Name></Properties></Configuration></MetaDataObject>",
+        encoding="utf-8",
+    )
+    metadata = root / "CommonModules" / "Сервис.xml"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text("<Metadata/>", encoding="utf-8")
+    module = root / "CommonModules" / "Сервис" / "Ext" / "Module.bsl"
+    module.parent.mkdir(parents=True)
+    module.write_text("Процедура Тест()\nВозврат Значение;", encoding="utf-8")
+    diagnostic = normalize_platform_diagnostic_trace(
+        parse_platform_diagnostic(
+            "Ошибка 1С\n{ОбщийМодуль.Сервис.Модуль(2)}: Возврат Значение;"
+        ),
+        stage=DiagnosticStage.EXECUTION,
+    )
+    frame = diagnostic.frames[0]
+    assert frame.origin is ErrorTraceFrameOrigin.NATIVE_MODULE
+    files = DiagnosticSourceFiles(root)
+
+    assert files.hint(frame) == "CommonModules/Сервис/Ext/Module.bsl"
+    assert files.line_excerpt(frame, "Возврат Значение;") == "Возврат Значение;"
+    assert files.line_excerpt(frame, "Возврат Другое;") is None
+
+    module.write_text("Процедура Тест()\nВозврат Локальное;", encoding="utf-8")
+    assert files.line_excerpt(frame, "Возврат Значение;") is None
+
+
+def test_presentation_adds_verified_native_file_hint_and_local_excerpt(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "source"
+    root.mkdir()
+    (root / "Configuration.xml").write_text(
+        '<MetaDataObject><Configuration uuid="00000000-0000-0000-0000-000000000001">'
+        "<Properties><Name>Test</Name></Properties></Configuration></MetaDataObject>",
+        encoding="utf-8",
+    )
+    metadata = root / "CommonModules" / "Сервис.xml"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text("<Metadata/>", encoding="utf-8")
+    module = root / "CommonModules" / "Сервис" / "Ext" / "Module.bsl"
+    module.parent.mkdir(parents=True)
+    module.write_text("Процедура Тест()\nВозврат Значение;", encoding="utf-8")
+    raw = "Ошибка 1С\n{ОбщийМодуль.Сервис.Модуль(2)}: Возврат Значение;"
+    reply = RuntimeReply(
+        RuntimeReplyKind.MAIN_COMPLETED,
+        12,
+        OperationState.FAILED,
+        succeeded=False,
+        diagnostic=normalize_platform_diagnostic_trace(
+            parse_platform_diagnostic(raw), stage=DiagnosticStage.EXECUTION,
+        ),
+    )
+
+    displayed = _display_reply(
+        reply, NotebookDisplayConfig.presentation(), source_root=root,
+    )
+
+    assert "файл: CommonModules/Сервис/Ext/Module.bsl" in displayed.text
+    assert "локальный экспорт: Возврат Значение;" in displayed.text
+    assert "фрагмент 1С: Возврат Значение;" in displayed.text
+    assert str(root) not in displayed.text
+    assert "CommonModules/Сервис" not in json.dumps(
+        displayed.payload, ensure_ascii=False,
+    )
+
+    module.write_text("Процедура Тест()\nВозврат Локальное;", encoding="utf-8")
+    mismatched = _display_reply(
+        reply, NotebookDisplayConfig.presentation(), source_root=root,
+    )
+    assert "локальный экспорт:" not in mismatched.text
+    assert "фрагмент 1С: Возврат Значение;" in mismatched.text
+
+
+def test_failed_magic_uses_configured_source_root_for_native_hint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "source"
+    root.mkdir()
+    (root / "Configuration.xml").write_text(
+        '<MetaDataObject><Configuration uuid="00000000-0000-0000-0000-000000000001">'
+        "<Properties><Name>Test</Name></Properties></Configuration></MetaDataObject>",
+        encoding="utf-8",
+    )
+    metadata = root / "CommonModules" / "Сервис.xml"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text("<Metadata/>", encoding="utf-8")
+    module = root / "CommonModules" / "Сервис" / "Ext" / "Module.bsl"
+    module.parent.mkdir(parents=True)
+    module.write_text("Процедура Тест()\nВозврат Значение;", encoding="utf-8")
+    runtime = FakeRuntime()
+    runtime.config = SimpleNamespace(source_root=root, capture_source=None)
+
+    def fail(
+        source: str,
+        *,
+        source_unit: SourceUnitRef,
+        on_execution_provenance=None,
+    ) -> RuntimeReply:
+        executed = mapped_visible_source(source, source_unit)
+        diagnostic = normalize_platform_diagnostic_trace(
+            parse_platform_diagnostic(
+                "Ошибка 1С\n{ОбщийМодуль.Сервис.Модуль(2)}: Возврат Значение;"
+            ),
+            stage=DiagnosticStage.EXECUTION,
+            executed=executed,
+            visible_source_context=VisibleSourceContext({source_unit: source}),
+        )
+        if callable(on_execution_provenance):
+            on_execution_provenance(
+                OperationExecutionProvenance(
+                    visible_source_sha256=source_unit.source_sha256,
+                    executed_source_sha256=diagnostic.execution_artifact_sha256,
+                    source_map_sha256=diagnostic.source_map_sha256,
+                    mode="main",
+                )
+            )
+        return RuntimeReply(
+            RuntimeReplyKind.MAIN_COMPLETED,
+            14,
+            OperationState.FAILED,
+            succeeded=False,
+            diagnostic=diagnostic,
+        )
+
+    runtime.execute_bsl = fail  # type: ignore[method-assign]
+    shell = FakeShell()
+    install_runtime(shell, runtime)
+    published = []
+    monkeypatch.setattr("onec_runtime_jupyter.extension.display", published.append)
+
+    with pytest.raises(BslCellError) as caught:
+        OnecRuntimeMagics(shell).bsl("", "Результат = 1;")  # type: ignore[arg-type]
+
+    assert len(published) == 1
+    assert "файл: CommonModules/Сервис/Ext/Module.bsl" in published[0].text
+    assert "Исходное сообщение 1С:" in published[0].text
+    assert "Исходное сообщение 1С:" not in str(caught.value)
+    assert str(root) not in published[0].text
+
+
 def test_diagnostic_mode_keeps_visible_structured_json() -> None:
     shell = FakeShell()
     runtime = FakeRuntime()
@@ -850,7 +1163,7 @@ def test_jupyter_public_identity_is_only_cell_revision_and_literal_source_hash()
         assert forbidden not in encoded
 
 
-def test_jupyter_diagnostic_mode_includes_only_bounded_redacted_expert_details() -> None:
+def test_jupyter_diagnostic_mode_includes_only_bounded_expert_details() -> None:
     """Break caught: diagnostic mode has no bounded expert projection."""
     reply, source = _failed_reply_with_exact_diagnostic()
 
@@ -867,13 +1180,13 @@ def test_jupyter_diagnostic_mode_includes_only_bounded_redacted_expert_details()
     assert details["excerpt"] == "О"
     assert details["runtime_summary"] == "BSL execution failed"
     assert details["lowered_location"]["line"] == 5
-    assert len(details["platform_diagnostic"]) <= 4096
-    assert details["platform_diagnostic_redacted"] is True
+    assert len(details["platform_diagnostic"].encode("utf-8")) <= 64 * 1024
+    assert details["platform_diagnostic_redacted"] is False
     assert details["worker_generation"] is None
     assert details["worker_manifest_sha256"] is None
     encoded = json.dumps(details, ensure_ascii=False)
-    assert "9182" not in encoded
-    assert "private-connection" not in encoded
+    assert "9182" in encoded
+    assert "private-connection" in encoded
     assert "generated one" not in encoded
     assert source not in encoded
 
@@ -965,7 +1278,7 @@ def test_public_and_expert_diagnostic_renderers_have_exact_allowlists_and_fail_c
     }
     assert public["runtime_summary"] == "BSL execution failed"
     assert "platform_diagnostic" not in json.dumps(public, ensure_ascii=False)
-    assert "9182" not in json.dumps(expert, ensure_ascii=False)
+    assert "9182" in json.dumps(expert, ensure_ascii=False)
     assert privacy.diagnostic_to_public_wire(
         replace(diagnostic, diagnostic_id="not-a-sha256")
     ) == {}
@@ -1002,11 +1315,11 @@ def test_public_and_expert_diagnostic_renderers_have_exact_allowlists_and_fail_c
         ),
     ),
 )
-def test_expert_renderer_conservatively_redacts_json_prose_and_camelcase_identities(
+def test_expert_renderer_preserves_json_prose_and_camelcase_identities(
     private_text: str,
     secrets: tuple[str, ...],
 ) -> None:
-    """Break caught: common runtime identity spellings bypass expert redaction."""
+    """Expert diagnostics preserve bounded platform-emitted text verbatim."""
     source = "Ошибка();"
     unit = SourceUnitRef(
         SourceUnitKind.NOTEBOOK_CELL,
@@ -1026,9 +1339,9 @@ def test_expert_renderer_conservatively_redacts_json_prose_and_camelcase_identit
     expert = privacy.diagnostic_to_expert_wire(diagnostic)
     encoded = json.dumps(expert, ensure_ascii=False)
 
-    assert expert["platform_diagnostic_redacted"] is True
-    assert len(expert["platform_diagnostic"]) <= 4096
-    assert all(secret not in encoded for secret in secrets)
+    assert expert["platform_diagnostic_redacted"] is False
+    assert len(expert["platform_diagnostic"].encode("utf-8")) <= 64 * 1024
+    assert all(secret in encoded for secret in secrets)
 
 
 @pytest.mark.parametrize(
@@ -1058,11 +1371,11 @@ def test_expert_renderer_conservatively_redacts_json_prose_and_camelcase_identit
         ('{"rdbg-connection":"hyphen-connection"}', "hyphen-connection"),
     ),
 )
-def test_platform_renderer_redacts_suffixless_rdbg_identity_assignments(
+def test_platform_renderer_preserves_rdbg_identity_assignments(
     platform_text: str,
     secret: str,
 ) -> None:
-    """Break caught: suffixless RDBG identity keys bypass redaction."""
+    """Expert diagnostics preserve identity text emitted by the platform."""
     bounded, truncated, redacted = privacy.bounded_platform_diagnostic(
         platform_text,
         truncated=False,
@@ -1070,11 +1383,11 @@ def test_platform_renderer_redacts_suffixless_rdbg_identity_assignments(
     )
 
     assert bounded is not None
-    assert secret not in bounded
-    assert "<redacted>" in bounded
-    assert len(bounded) <= 4096
+    assert secret in bounded
+    assert bounded == platform_text
+    assert len(bounded.encode("utf-8")) <= 64 * 1024
     assert truncated is False
-    assert redacted is True
+    assert redacted is False
 
 
 def test_platform_renderer_preserves_non_assignment_rdbg_diagnostic_prose() -> None:
@@ -1088,29 +1401,27 @@ def test_platform_renderer_preserves_non_assignment_rdbg_diagnostic_prose() -> N
     ) == (prose, False, False)
 
 
-def test_platform_diagnostic_markers_distinguish_redaction_from_truncation() -> None:
-    """Break caught: pure truncation is mislabeled as identity redaction."""
+def test_platform_diagnostic_markers_preserve_caller_redaction_and_truncation() -> None:
+    """Expert diagnostic rendering preserves caller markers."""
     pure_truncation = privacy.bounded_platform_diagnostic(
-        "x" * 4100,
+        "x" * (64 * 1024 + 4),
         truncated=False,
         redacted=False,
     )
-    pure_redaction = privacy.bounded_platform_diagnostic(
+    caller_redaction = privacy.bounded_platform_diagnostic(
         "token private-value",
         truncated=False,
         redacted=False,
     )
-    expansion_then_cut = privacy.bounded_platform_diagnostic(
-        "x" * 4090 + " pid=1",
+    preserved_redaction = privacy.bounded_platform_diagnostic(
+        "token private-value",
         truncated=False,
-        redacted=False,
+        redacted=True,
     )
 
-    assert pure_truncation == ("x" * 4096, True, False)
-    assert pure_redaction[1:] == (False, True)
-    assert "private-value" not in pure_redaction[0]
-    assert len(expansion_then_cut[0]) == 4096
-    assert expansion_then_cut[1:] == (True, True)
+    assert pure_truncation == ("x" * (64 * 1024), True, False)
+    assert caller_redaction == ("token private-value", False, False)
+    assert preserved_redaction == ("token private-value", False, True)
 
 
 def test_jupyter_source_units_are_session_scoped_monotonic_and_exact() -> None:
