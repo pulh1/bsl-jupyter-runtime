@@ -17,7 +17,7 @@ from onec_runtime.bsl.source_maps import (
     mapped_visible_source,
     source_sha256,
 )
-from onec_runtime.errors import ProtocolError
+from onec_runtime.errors import EvaluationDispatchUnknown, ProtocolError
 from onec_runtime.capture_values import VariableRole
 from onec_runtime.execution.arbiter import RdbgArbiter, RouteToken, Settlement
 from onec_runtime.execution.capture.messages import CaptureMessageCollector
@@ -259,6 +259,139 @@ def test_capture_worker_diagnostics_use_cell_lease_only_on_error() -> None:
         assert activation.evidence_calls == 1
     finally:
         arbiter.close(timeout=3)
+
+
+@pytest.mark.parametrize(
+    ("recovery_stage", "error_occurred"),
+    (
+        ("pending_result", True),
+        ("workspace_restore", True),
+        ("pending_messages", True),
+        ("pending_result", False),
+    ),
+    ids=(
+        "error-after-pending-result",
+        "error-after-workspace-restore",
+        "error-after-pending-messages",
+        "success-after-pending-result",
+    ),
+)
+def test_capture_recovery_uses_original_worker_lease_only_for_errors(
+    recovery_stage: str,
+    error_occurred: bool,
+) -> None:
+    """Break caught: CAPTURE repair drops its exact Worker diagnostic pin."""
+    from onec_runtime.execution.controller.controller import ExecutionController
+    from onec_runtime.execution.reply_publication import CaptureRemoteOutcome
+
+    class RecoveringSession(CompleteSession):
+        def __init__(self) -> None:
+            super().__init__()
+            self.pending_result_once = recovery_stage == "pending_result"
+            self.restore_once = recovery_stage == "workspace_restore"
+            self.pending_messages_once = recovery_stage == "pending_messages"
+
+        def start_evaluation(self, expression, **kwargs):
+            pending = super().start_evaluation(expression, **kwargs)
+            if (
+                self.pending_result_once
+                and expression.startswith(
+                    "RuntimeKernelServer.ВыполнитьКодВКонтекстеОтладки("
+                )
+            ):
+                self.pending_result_once = False
+                raise EvaluationDispatchUnknown(pending)
+            if (
+                self.pending_messages_once
+                and expression.startswith(
+                    "RuntimeKernelServer.ЗабратьСообщенияЯчейкиИзКонтекста("
+                )
+            ):
+                self.pending_messages_once = False
+                raise EvaluationDispatchUnknown(pending)
+            return pending
+
+        def wait_evaluation_event(
+            self, pending, *, timeout_s, on_transport_dispatch,
+        ):
+            if self.expression.startswith(
+                "RuntimeKernelServer.ВыполнитьКодВКонтекстеОтладки("
+            ):
+                on_transport_dispatch()
+                self._record("wait_eval")
+                self.pending = None
+                return EvaluationResult(
+                    pending.result_id,
+                    "Ошибка" if error_occurred else "Неопределено",
+                    "",
+                    error_occurred,
+                    "planned BSL error" if error_occurred else None,
+                )
+            return super().wait_evaluation_event(
+                pending,
+                timeout_s=timeout_s,
+                on_transport_dispatch=on_transport_dispatch,
+            )
+
+        def set_breakpoints(self, locations, *, on_transport_dispatch):
+            if (
+                self.restore_once
+                and tuple(locations) == (KERNEL, BUSINESS)
+                and self.expression.startswith(
+                    "RuntimeKernelServer.ВыполнитьКодВКонтекстеОтладки("
+                )
+            ):
+                self.restore_once = False
+                raise ValueError("restore rejected before transport")
+            return super().set_breakpoints(
+                locations, on_transport_dispatch=on_transport_dispatch,
+            )
+
+    activation = _DiagnosticActivation()
+    session = RecoveringSession()
+    arbiter = RdbgArbiter(session, RouteToken("runtime-1", 1, 0, "main"))
+    controller = ExecutionController(
+        arbiter,
+        MainExecutor(poll_interval_s=0.1),
+        CaptureExecutor(None, KERNEL, decode_command_id=evaluation_to_python),
+        CaptureCellEvaluator(),
+        BreakpointRegistry(KERNEL, (BUSINESS,)),
+        runtime_generation=1,
+        worker_activation=activation,
+        message_collector=CaptureMessageCollector(),
+    )
+    try:
+        controller.submit_main("Результат = 1;").wait_settled(3)
+        ticket = controller.submit_capture_cell(
+            "ОшибочнаяКоманда();",
+            _message_collector_key=(
+                "__capture_messages" if recovery_stage == "pending_messages" else ""
+            ),
+        )
+        assert ticket.wait_unknown(3)
+
+        if recovery_stage == "workspace_restore":
+            controller.repair_capture_cell_after_restore(ticket)
+        else:
+            controller.reconcile_capture_pending_eval(ticket)
+        recovered = ticket.wait_settled(3)
+
+        assert isinstance(recovered, CaptureRemoteOutcome)
+        assert recovered.evaluation.error_occurred is error_occurred
+        if error_occurred:
+            assert recovered.pinned_manifest_sha256 == "b" * 64
+            assert recovered.pinned_artifacts == activation.artifacts
+            assert activation.evidence_calls == 1
+        else:
+            assert recovered.pinned_manifest_sha256 is None
+            assert recovered.pinned_artifacts == ()
+            assert activation.evidence_calls == 0
+        cleanup = ticket.post_settlement_cleanup
+        assert cleanup is not None
+        assert cleanup.wait_settled(3) is None
+    finally:
+        if arbiter.active_ticket is None:
+            arbiter.close(timeout=3)
 
 
 @pytest.mark.parametrize("interrupt_after_adopt", (False, True))

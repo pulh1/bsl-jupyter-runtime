@@ -131,6 +131,11 @@ class _PreparationRecord:
     snapshot_reader: Callable[[], RoutePreparationSnapshot] = field(repr=False)
 
 
+@dataclass(slots=True)
+class _CaptureWorkerLeaseSlot:
+    lease: WorkerActivationLease | None = field(default=None, init=False)
+
+
 @dataclass(frozen=True, slots=True)
 class _CaptureCellRepair:
     operation: CaptureCellOperation
@@ -139,6 +144,7 @@ class _CaptureCellRepair:
     policy_bound: bool
     ledger: CaptureEvaluationLedger
     receipt_id: str
+    worker_lease: _CaptureWorkerLeaseSlot
 
 
 class _ContinuationAdmission:
@@ -1365,6 +1371,31 @@ class ExecutionController:
             # A confirmed operation outcome must not depend on enrichment.
             return None, ()
 
+    def _with_capture_worker_diagnostic_evidence(
+        self,
+        outcome: Settlement,
+        lease: WorkerActivationLease | None,
+    ) -> Settlement:
+        """Attach exact held-pin evidence only to a confirmed BSL error."""
+
+        from onec_runtime.execution.reply_publication import CaptureRemoteOutcome
+
+        remote_outcome = outcome.value
+        if (
+            not isinstance(remote_outcome, CaptureRemoteOutcome)
+            or not remote_outcome.evaluation.error_occurred
+        ):
+            return outcome
+        manifest_sha256, artifacts = self._worker_diagnostic_evidence(lease)
+        return Settlement(
+            replace(
+                remote_outcome,
+                pinned_manifest_sha256=manifest_sha256,
+                pinned_artifacts=artifacts,
+            ),
+            next_route=outcome.next_route,
+        )
+
     def _retain_main_worker_lease(
         self, operation: MainOperation, port: SessionPort,
     ) -> None:
@@ -1534,6 +1565,7 @@ class ExecutionController:
             if ledger is None or ledger.identity != scope.identity:
                 raise ProtocolError("CAPTURE evaluation ledger is unavailable")
             receipt_id = f"capture-{uuid4().hex}"
+            worker_lease = _CaptureWorkerLeaseSlot()
 
             def settle_ledger(outcome: object) -> object:
                 assert _finalizer is not None
@@ -1554,6 +1586,7 @@ class ExecutionController:
                     activation = self._worker_activation
                     if activation is not None:
                         lease = activation.pin_active(port=port)
+                        worker_lease.lease = lease
                         if lease is not None:
                             self._schedule_worker_lease_release(lease, port)
                     scope.admit_cell_dirty_roots(dirty_roots)
@@ -1579,20 +1612,9 @@ class ExecutionController:
                 if isinstance(outcome, ConfirmedFailure):
                     ledger.fail(receipt_id, "CAPTURE evaluation failed")
                     return outcome
-                from onec_runtime.execution.reply_publication import CaptureRemoteOutcome
-
-                remote_outcome = outcome.value
-                if (
-                    isinstance(remote_outcome, CaptureRemoteOutcome)
-                    and remote_outcome.evaluation.error_occurred
-                ):
-                    manifest_sha256, artifacts = self._worker_diagnostic_evidence(lease)
-                    remote_outcome = replace(
-                        remote_outcome,
-                        pinned_manifest_sha256=manifest_sha256,
-                        pinned_artifacts=artifacts,
-                    )
-                    outcome = Settlement(remote_outcome, next_route=outcome.next_route)
+                outcome = self._with_capture_worker_diagnostic_evidence(
+                    outcome, lease,
+                )
                 if _finalizer is None:
                     ledger.complete(receipt_id)
                     return outcome
@@ -1625,7 +1647,7 @@ class ExecutionController:
                 )
                 self._capture_cell_operations[ticket] = _CaptureCellRepair(
                     cell_operation, scope, selected_policy, _finalizer is not None,
-                    ledger, receipt_id,
+                    ledger, receipt_id, worker_lease,
                 )
                 self._preparation_revision += 1
                 self._arbiter.dispatch(ticket)
@@ -1719,6 +1741,9 @@ class ExecutionController:
                         repair.receipt_id, "CAPTURE evaluation failed",
                     )
                     return outcome
+                outcome = self._with_capture_worker_diagnostic_evidence(
+                    outcome, repair.worker_lease.lease,
+                )
                 if repair.policy_bound:
                     return ReadyForPolicy(
                         outcome.value, next_route=outcome.next_route
@@ -1778,6 +1803,9 @@ class ExecutionController:
                         repair.receipt_id, "CAPTURE evaluation failed",
                     )
                     return outcome
+                outcome = self._with_capture_worker_diagnostic_evidence(
+                    outcome, repair.worker_lease.lease,
+                )
                 if repair.policy_bound:
                     return ReadyForPolicy(
                         outcome.value, next_route=outcome.next_route

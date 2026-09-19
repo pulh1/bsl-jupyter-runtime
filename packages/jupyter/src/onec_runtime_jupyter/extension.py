@@ -990,20 +990,9 @@ def _display_reply(
             and execution_provenance.source_map_sha256
             == safe_diagnostic.source_map_sha256
         )
-        native_origin_verified = (
-            request_origin_verified
-            and safe_diagnostic is not None
-            and safe_diagnostic.execution_artifact_sha256 is not None
-            and safe_diagnostic.source_map_sha256 is not None
-            and any(
-                frame.origin is ErrorTraceFrameOrigin.NATIVE_MODULE
-                for frame in safe_diagnostic.frames
-            )
-        )
         unlocated_origin_verified = (
             source_unit is None
             or artifact_origin_verified
-            or native_origin_verified
         )
         reason = None
         if public_diagnostic and (

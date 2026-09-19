@@ -798,7 +798,18 @@ def remap_worker_stage_diagnostic(
         stage=stage,
         visible_source_context=artifact.visible_source_context,
     )
-    return _with_dependency_binding(diagnostic, artifact.mapped_source)
+    frames, worker_frames = _normalize_trace_frames(
+        parsed,
+        executed=artifact.mapped_source,
+        visible_source_context=artifact.visible_source_context,
+        pinned_manifest_sha256=candidate_manifest_sha256,
+        pinned_artifacts=candidate_artifacts,
+    )
+    return replace(
+        _with_dependency_binding(diagnostic, artifact.mapped_source),
+        frames=frames,
+        worker_frames=worker_frames,
+    )
 
 
 def _remap_worker_runtime_primary(

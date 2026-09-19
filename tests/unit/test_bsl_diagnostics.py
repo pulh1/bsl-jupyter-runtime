@@ -796,6 +796,15 @@ def test_worker_stage_diagnostic_resolves_only_exact_candidate_artifact(phase: s
     assert exact.source_unit is not None
     assert (exact.source_unit.unit_id, exact.source_unit.revision) == ("МодульБ", 18)
     assert exact.source_map_sha256 == artifact.mapped_source.source_map_sha256
+    assert len(exact.frames) == 1
+    frame = exact.frames[0]
+    assert frame.origin is ErrorTraceFrameOrigin.WORKER_ARTIFACT
+    assert frame.mapping_confidence is MappingConfidence.EXACT
+    assert frame.registration_name == artifact.registration_name
+    assert (frame.logical_name, frame.revision) == ("МодульБ", 18)
+    assert frame.artifact_sha256 == artifact.artifact_sha256
+    assert frame.source_unit == exact.source_unit
+    assert frame.visible_location == exact.visible_location
     for unmapped in (missing, stale):
         assert unmapped.mapping_confidence is MappingConfidence.UNKNOWN
         assert unmapped.source_unit is None

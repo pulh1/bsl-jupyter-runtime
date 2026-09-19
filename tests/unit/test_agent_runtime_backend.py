@@ -627,8 +627,9 @@ def test_direct_main_bsl_error_publishes_only_validated_diagnostic_summary(
     ]
     assert len(private_records) == 1
     assert private_records[0]["diagnostic_id"] == diagnostic.diagnostic_id
-    assert len(private_records[0]["platform_diagnostic"]) == 4_096
-    assert private_records[0]["platform_diagnostic_truncated"] is True
+    assert private_records[0]["platform_diagnostic"] == diagnostic.platform_diagnostic
+    assert private_records[0]["platform_diagnostic_truncated"] is False
+    assert private_records[0]["platform_diagnostic_redacted"] is False
 
 
 def test_prepared_capture_main_bsl_error_publishes_only_generic_summary(

@@ -815,6 +815,55 @@ def test_presentation_renders_full_cause_chain_and_mixed_stack() -> None:
     assert "platform_diagnostic" not in displayed.payload.get("diagnostic", {})
 
 
+@pytest.mark.parametrize(
+    ("executed_source_sha256", "source_map_sha256"),
+    (("c" * 64, "b" * 64), ("a" * 64, "d" * 64)),
+    ids=("artifact-mismatch", "source-map-mismatch"),
+)
+def test_native_trace_requires_exact_execution_provenance(
+    executed_source_sha256: str,
+    source_map_sha256: str,
+) -> None:
+    """Break caught: a native frame bypasses stale artifact/map fencing."""
+    source = "Результат = Сервис.Вызвать();"
+    unit = SourceUnitRef(
+        SourceUnitKind.NOTEBOOK_CELL, "native-fence", 1, source_sha256(source),
+    )
+    raw = "{ОбщийМодуль.Сервис.Модуль(7)}: Возврат СекретноеЗначение;"
+    diagnostic = replace(
+        normalize_platform_diagnostic_trace(
+            parse_platform_diagnostic(raw),
+            stage=DiagnosticStage.EXECUTION,
+        ),
+        execution_artifact_sha256="a" * 64,
+        source_map_sha256="b" * 64,
+    )
+    assert diagnostic.frames[0].origin is ErrorTraceFrameOrigin.NATIVE_MODULE
+    reply = RuntimeReply(
+        RuntimeReplyKind.MAIN_COMPLETED,
+        12,
+        OperationState.FAILED,
+        succeeded=False,
+        diagnostic=diagnostic,
+    )
+
+    displayed = _display_reply(
+        reply,
+        NotebookDisplayConfig.presentation(),
+        visible_source=source,
+        source_unit=unit,
+        execution_provenance=OperationExecutionProvenance(
+            visible_source_sha256=unit.source_sha256,
+            executed_source_sha256=executed_source_sha256,
+            source_map_sha256=source_map_sha256,
+            mode="main",
+        ),
+    )
+
+    assert displayed.text == "Ошибка исполнения BSL"
+    assert "СекретноеЗначение" not in displayed.text
+
+
 def test_presentation_marks_derived_cell_frame_as_approximate() -> None:
     source = "Результат = Сервис.Вызвать();"
     unit = SourceUnitRef(
