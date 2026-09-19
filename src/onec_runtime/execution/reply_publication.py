@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 
 from onec_runtime.bsl.diagnostics import (
     DiagnosticStage, NormalizedDiagnostic, VisibleSourceContext,
-    parse_platform_diagnostic, remap_platform_diagnostic,
+    WorkerDiagnosticArtifact, parse_platform_diagnostic, remap_platform_diagnostic,
 )
 from onec_runtime.bsl.source_maps import MappedSource
 from onec_runtime.execution.capture.scope import (
@@ -84,6 +84,10 @@ class MainConfirmedDecodeFailure:
     operation: MainOperation = field(repr=False)
     remote_error: str = field(default="", repr=False)
     messages: tuple[str, ...] = ()
+    pinned_manifest_sha256: str | None = field(default=None, repr=False)
+    pinned_artifacts: tuple[WorkerDiagnosticArtifact, ...] = field(
+        default=(), repr=False,
+    )
 
 
 class MainReplyPolicy:
@@ -207,6 +211,10 @@ class CaptureRemoteOutcome:
 
     evaluation: EvaluationResult = field(repr=False)
     messages: tuple[str, ...] = ()
+    pinned_manifest_sha256: str | None = field(default=None, repr=False)
+    pinned_artifacts: tuple[WorkerDiagnosticArtifact, ...] = field(
+        default=(), repr=False,
+    )
 
 
 class CaptureReplyPolicy:

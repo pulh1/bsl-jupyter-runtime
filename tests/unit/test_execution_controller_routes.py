@@ -7,9 +7,20 @@ from uuid import UUID
 
 import pytest
 
+from onec_runtime.bsl.diagnostics import (
+    VisibleSourceContext,
+    WorkerDiagnosticArtifact,
+)
+from onec_runtime.bsl.source_maps import (
+    SourceUnitKind,
+    SourceUnitRef,
+    mapped_visible_source,
+    source_sha256,
+)
 from onec_runtime.errors import ProtocolError
 from onec_runtime.capture_values import VariableRole
 from onec_runtime.execution.arbiter import RdbgArbiter, RouteToken, Settlement
+from onec_runtime.execution.capture.messages import CaptureMessageCollector
 from onec_runtime.execution.contracts import SubmissionReceipt
 from onec_runtime.capture_evaluation import CapturePhase
 from onec_runtime.execution.capture.cell_evaluator import CaptureCellEvaluator
@@ -83,6 +94,171 @@ class CompleteSession(RouteSession):
             pending, timeout_s=timeout_s,
             on_transport_dispatch=lambda: None,
         )
+
+
+def _worker_diagnostic_artifacts() -> tuple[WorkerDiagnosticArtifact, ...]:
+    source = "Функция Посчитать() Экспорт\nВозврат 1;\nКонецФункции"
+    unit = SourceUnitRef(
+        SourceUnitKind.NOTEBOOK_CELL, "diagnostic-worker", 1,
+        source_sha256(source),
+    )
+    mapped = mapped_visible_source(source, unit)
+    return (
+        WorkerDiagnosticArtifact(
+            logical_name="Worker",
+            revision=1,
+            artifact_sha256="a" * 64,
+            registration_name="DiagnosticWorker",
+            manifest_sha256="b" * 64,
+            source_map_sha256=mapped.source_map_sha256,
+            mapped_source=mapped,
+            visible_source_context=VisibleSourceContext({unit: source}),
+        ),
+    )
+
+
+class _DiagnosticLease:
+    def __init__(self) -> None:
+        self.released = False
+
+    def release(self, *, port) -> None:
+        del port
+        self.released = True
+
+    def retain_outcome_unknown(self, *, port) -> None:
+        del port
+        raise AssertionError("confirmed diagnostic lease cannot become unknown")
+
+
+class _DiagnosticActivation:
+    def __init__(self) -> None:
+        self.artifacts = _worker_diagnostic_artifacts()
+        self.leases: list[_DiagnosticLease] = []
+        self.evidence_calls = 0
+
+    def pin_active(self, *, port):
+        del port
+        lease = _DiagnosticLease()
+        self.leases.append(lease)
+        return lease
+
+    def diagnostic_artifacts_for_lease(self, lease):
+        assert lease in self.leases
+        assert not lease.released
+        self.evidence_calls += 1
+        return self.artifacts
+
+
+def test_main_worker_diagnostics_are_read_only_for_confirmed_failure() -> None:
+    from onec_runtime.execution.controller.controller import ExecutionController
+
+    class MainErrorSession(CompleteSession):
+        def __init__(self) -> None:
+            super().__init__(capture_count=0)
+
+        def wait_evaluation_event(self, pending, *, timeout_s, on_transport_dispatch):
+            if self.expression == "Ошибка":
+                on_transport_dispatch()
+                self._record("wait_eval")
+                self.pending = None
+                return EvaluationResult(
+                    pending.result_id, "Строка", '"planned BSL error"', False,
+                )
+            return super().wait_evaluation_event(
+                pending, timeout_s=timeout_s,
+                on_transport_dispatch=on_transport_dispatch,
+            )
+
+    def run(session):
+        activation = _DiagnosticActivation()
+        arbiter = RdbgArbiter(session, RouteToken("runtime-1", 1, 0, "main"))
+        controller = ExecutionController(
+            arbiter,
+            MainExecutor(poll_interval_s=0.1),
+            CaptureExecutor(None, KERNEL, decode_command_id=evaluation_to_python),
+            CaptureCellEvaluator(),
+            BreakpointRegistry(KERNEL, (BUSINESS,)),
+            runtime_generation=1,
+            worker_activation=activation,
+        )
+        try:
+            return controller.submit_main("Результат = 1;").wait_settled(3), activation
+        finally:
+            arbiter.close(timeout=3)
+
+    succeeded, success_activation = run(CompleteSession(capture_count=0))
+    assert succeeded.completion is not None and not succeeded.completion.error
+    assert succeeded.pinned_manifest_sha256 is None
+    assert succeeded.pinned_artifacts == ()
+    assert success_activation.evidence_calls == 0
+
+    failed, failure_activation = run(MainErrorSession())
+    assert failed.completion is not None and failed.completion.error == "planned BSL error"
+    assert failed.pinned_manifest_sha256 == "b" * 64
+    assert failed.pinned_artifacts == failure_activation.artifacts
+    assert failure_activation.evidence_calls == 1
+
+
+def test_capture_worker_diagnostics_use_cell_lease_only_on_error() -> None:
+    from onec_runtime.execution.controller.controller import ExecutionController
+
+    class CaptureErrorOnce(CompleteSession):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failed = False
+
+        def wait_evaluation_event(self, pending, *, timeout_s, on_transport_dispatch):
+            if (
+                self.expression.startswith(
+                    "RuntimeKernelServer.ВыполнитьКодВКонтекстеОтладки("
+                )
+                and not self.failed
+            ):
+                self.failed = True
+                on_transport_dispatch()
+                self._record("wait_eval")
+                self.pending = None
+                return EvaluationResult(
+                    pending.result_id, "Ошибка", "", True, "planned BSL error",
+                )
+            return super().wait_evaluation_event(
+                pending, timeout_s=timeout_s,
+                on_transport_dispatch=on_transport_dispatch,
+            )
+
+    activation = _DiagnosticActivation()
+    arbiter = RdbgArbiter(
+        CaptureErrorOnce(), RouteToken("runtime-1", 1, 0, "main"),
+    )
+    controller = ExecutionController(
+        arbiter,
+        MainExecutor(poll_interval_s=0.1),
+        CaptureExecutor(None, KERNEL, decode_command_id=evaluation_to_python),
+        CaptureCellEvaluator(),
+        BreakpointRegistry(KERNEL, (BUSINESS,)),
+        runtime_generation=1,
+        worker_activation=activation,
+        message_collector=CaptureMessageCollector(),
+    )
+    try:
+        controller.submit_main("Результат = 1;").wait_settled(3)
+        failed = controller.submit_capture_cell(
+            "ОшибочнаяКоманда();",
+        ).wait_settled(3)
+        assert failed.evaluation.error_occurred is True
+        assert failed.pinned_manifest_sha256 == "b" * 64
+        assert failed.pinned_artifacts == activation.artifacts
+        assert activation.evidence_calls == 1
+
+        succeeded = controller.submit_capture_cell(
+            "Результат = 2;",
+        ).wait_settled(3)
+        assert succeeded.evaluation.error_occurred is False
+        assert succeeded.pinned_manifest_sha256 is None
+        assert succeeded.pinned_artifacts == ()
+        assert activation.evidence_calls == 1
+    finally:
+        arbiter.close(timeout=3)
 
 
 @pytest.mark.parametrize("interrupt_after_adopt", (False, True))

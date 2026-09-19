@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from threading import RLock, Thread
 from typing import Callable
@@ -16,6 +16,7 @@ from onec_runtime.capture_evaluation import (
     CaptureEvaluationKind, CaptureFailureDiagnostic, CapturePhase,
 )
 from onec_runtime.capture_values import VariableRole
+from onec_runtime.bsl.diagnostics import WorkerDiagnosticArtifact
 from onec_runtime.bsl.parser_target import PythonParserTarget
 from onec_runtime.errors import BslExecutionError, ProtocolError, StaleCaptureError
 from onec_runtime.execution.arbiter import (
@@ -114,6 +115,10 @@ class MainYield:
     scope: CaptureScope | None = field(default=None, repr=False)
     completion: MainRemoteCompletion | None = field(default=None, repr=False)
     stop: StopEvent | None = field(default=None, repr=False)
+    pinned_manifest_sha256: str | None = field(default=None, repr=False)
+    pinned_artifacts: tuple[WorkerDiagnosticArtifact, ...] = field(
+        default=(), repr=False,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1333,6 +1338,33 @@ class ExecutionController:
 
         port.register_post_settlement_cleanup(cleanup)
 
+    def _worker_diagnostic_evidence(
+        self,
+        lease: WorkerActivationLease | None,
+    ) -> tuple[str | None, tuple[WorkerDiagnosticArtifact, ...]]:
+        """Best-effort evidence from an operation's already-held Worker lease."""
+
+        activation = self._worker_activation
+        reader = (
+            None if activation is None
+            else getattr(activation, "diagnostic_artifacts_for_lease", None)
+        )
+        if lease is None or not callable(reader):
+            return None, ()
+        try:
+            artifacts = reader(lease)
+            if type(artifacts) is not tuple or not artifacts or any(
+                not isinstance(item, WorkerDiagnosticArtifact) for item in artifacts
+            ):
+                return None, ()
+            manifests = {item.manifest_sha256 for item in artifacts}
+            if len(manifests) != 1:
+                return None, ()
+            return manifests.pop(), artifacts
+        except BaseException:
+            # A confirmed operation outcome must not depend on enrichment.
+            return None, ()
+
     def _retain_main_worker_lease(
         self, operation: MainOperation, port: SessionPort,
     ) -> None:
@@ -1515,6 +1547,7 @@ class ExecutionController:
                 return published
 
             def plan(port: SessionPort) -> Settlement | ReadyForPolicy | ConfirmedFailure:
+                lease: WorkerActivationLease | None = None
                 try:
                     if _before_first_effect is not None:
                         _before_first_effect()
@@ -1546,6 +1579,20 @@ class ExecutionController:
                 if isinstance(outcome, ConfirmedFailure):
                     ledger.fail(receipt_id, "CAPTURE evaluation failed")
                     return outcome
+                from onec_runtime.execution.reply_publication import CaptureRemoteOutcome
+
+                remote_outcome = outcome.value
+                if (
+                    isinstance(remote_outcome, CaptureRemoteOutcome)
+                    and remote_outcome.evaluation.error_occurred
+                ):
+                    manifest_sha256, artifacts = self._worker_diagnostic_evidence(lease)
+                    remote_outcome = replace(
+                        remote_outcome,
+                        pinned_manifest_sha256=manifest_sha256,
+                        pinned_artifacts=artifacts,
+                    )
+                    outcome = Settlement(remote_outcome, next_route=outcome.next_route)
                 if _finalizer is None:
                     ledger.complete(receipt_id)
                     return outcome
@@ -2606,6 +2653,7 @@ class ExecutionController:
         ).reason
         if reason is StopReason.MAIN_SERVICE:
             decoded_error: list[str] = []
+            lease = self._main_worker_leases.get(operation.command_id)
             try:
                 try:
                     completion = read_main_completion(
@@ -2623,13 +2671,30 @@ class ExecutionController:
                         MainConfirmedDecodeFailure,
                     )
 
+                    remote_error = decoded_error[0] if decoded_error else ""
+                    manifest_sha256, artifacts = (
+                        self._worker_diagnostic_evidence(lease)
+                        if remote_error else (None, ())
+                    )
                     return Settlement(MainConfirmedDecodeFailure(
                         operation,
-                        remote_error=decoded_error[0] if decoded_error else "",
+                        remote_error=remote_error,
+                        pinned_manifest_sha256=manifest_sha256,
+                        pinned_artifacts=artifacts,
                     ))
                 operation.complete(completion)
+                manifest_sha256, artifacts = (
+                    self._worker_diagnostic_evidence(lease)
+                    if completion.error else (None, ())
+                )
                 return Settlement(
-                    MainYield(MainYieldKind.COMPLETED, operation, completion=completion)
+                    MainYield(
+                        MainYieldKind.COMPLETED,
+                        operation,
+                        completion=completion,
+                        pinned_manifest_sha256=manifest_sha256,
+                        pinned_artifacts=artifacts,
+                    )
                 )
             finally:
                 # The matching command ID terminalizes MAIN before result or
