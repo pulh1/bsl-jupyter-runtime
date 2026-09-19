@@ -39,7 +39,7 @@ from onec_runtime.privacy import bounded_platform_diagnostic
 from onec_runtime.runtime_contracts import (
     MAX_DIAGNOSTIC_COORDINATE,
     MAX_DIAGNOSTIC_LABEL_LENGTH,
-    MAX_PRIVATE_DIAGNOSTIC_LENGTH,
+    MAX_PRIVATE_DIAGNOSTIC_BYTES,
     OperationExecutionProvenance,
     sanitize_normalized_diagnostic,
 )
@@ -219,14 +219,11 @@ class _PrivateDiagnosticRecord:
                 raise ValueError("private lowered location is invalid")
         if self.platform_diagnostic is not None and (
             type(self.platform_diagnostic) is not str
-            or len(self.platform_diagnostic) > MAX_PRIVATE_DIAGNOSTIC_LENGTH
+            or len(self.platform_diagnostic.encode("utf-8")) > MAX_PRIVATE_DIAGNOSTIC_BYTES
             or self.platform_diagnostic_sha256 is None
             or (
-                self.platform_diagnostic_truncated
-                and len(self.platform_diagnostic) != MAX_PRIVATE_DIAGNOSTIC_LENGTH
-            )
-            or (
                 not self.platform_diagnostic_truncated
+                and not self.platform_diagnostic_redacted
                 and sha256(self.platform_diagnostic.encode("utf-8")).hexdigest()
                 != self.platform_diagnostic_sha256
             )
@@ -294,9 +291,7 @@ class _PrivateDiagnosticRecord:
             "lowered_span_end": None if lowered is None else lowered.span.end,
             "platform_diagnostic": safe.platform_diagnostic,
             "platform_diagnostic_sha256": safe.platform_diagnostic_sha256,
-            "platform_diagnostic_truncated": (
-                safe.platform_diagnostic_truncated
-            ),
+            "platform_diagnostic_truncated": safe.platform_diagnostic_truncated,
             "platform_diagnostic_redacted": safe.platform_diagnostic_redacted,
             "execution_artifact_sha256": safe.execution_artifact_sha256,
             "source_map_sha256": safe.source_map_sha256,

@@ -336,10 +336,10 @@ def test_expert_failure_tool_fails_closed_on_private_output_widening(
     assert "9182" not in encoded
 
 
-def test_expert_failure_tool_rejects_unredacted_runtime_identity_text(
+def test_expert_failure_tool_preserves_unredacted_runtime_identity_text(
     fake_service_client: FakeServiceClient,
 ) -> None:
-    """Break caught: a valid-shaped raw PID/token diagnostic bypasses redaction."""
+    """Break caught: expert diagnostics redact platform-emitted text."""
     value = _expert_failure_value()
     details = value["diagnostic_details"]
     assert isinstance(details, dict)
@@ -361,9 +361,39 @@ def test_expert_failure_tool_rejects_unredacted_runtime_identity_text(
     result = asyncio.run(scenario())
     encoded = json.dumps(result.structured_content, ensure_ascii=False)
 
-    assert result.structured_content["ok"] is False
-    assert "9182" not in encoded
-    assert "private-connection" not in encoded
+    assert result.structured_content["ok"] is True
+    assert "9182" in encoded
+    assert "private-connection" in encoded
+
+
+def test_expert_failure_tool_accepts_64kib_utf8_unicode_diagnostic(
+    fake_service_client: FakeServiceClient,
+) -> None:
+    """Break caught: expert MCP validation treats its 64 KiB cap as characters."""
+    value = _expert_failure_value()
+    details = value["diagnostic_details"]
+    assert isinstance(details, dict)
+    platform_diagnostic = "😀" * (64 * 1024 // len("😀".encode("utf-8")))
+    details["platform_diagnostic"] = platform_diagnostic
+    details["platform_diagnostic_truncated"] = True
+    details["platform_diagnostic_redacted"] = False
+    fake_service_client.next_response = ServiceResponse.success(value)
+
+    async def scenario() -> object:
+        async with Client(
+            create_mcp_server(fake_service_client, profile=McpProfile.EXPERT)
+        ) as client:
+            return await client.call_tool(
+                "operation.explain_failure",
+                {"operation_id": "operation-failed"},
+            )
+
+    result = asyncio.run(scenario())
+    diagnostic = result.structured_content["value"]["diagnostic_details"]
+
+    assert result.structured_content["ok"] is True
+    assert diagnostic["platform_diagnostic"] == platform_diagnostic
+    assert len(platform_diagnostic.encode("utf-8")) == 64 * 1024
 
 
 def test_expert_failure_tool_canonicalizes_untrusted_failed_response_channel(

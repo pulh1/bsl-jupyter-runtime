@@ -2,53 +2,13 @@ from __future__ import annotations
 
 from dataclasses import fields, is_dataclass
 from hashlib import sha256
-import re
 from typing import Any
 
-from onec_runtime.runtime_contracts import sanitize_normalized_diagnostic
+from onec_runtime.runtime_contracts import (
+    MAX_PRIVATE_DIAGNOSTIC_BYTES,
+    sanitize_normalized_diagnostic,
+)
 from onec_runtime.bsl import NormalizedDiagnostic
-
-
-_PLATFORM_DIAGNOSTIC_LIMIT = 4_096
-_SENSITIVE_DIAGNOSTIC_KEY = (
-    r"(?:"
-    r"[0-9A-Za-z_.-]*"
-    r"(?:password|passwd|passphrase|secret|token|authorization|credential(?:s)?)"
-    r"(?:[_.-]?(?:id|key|value|header))?|"
-    r"rdbg[_\-.]?(?:session|connection|client|server|process|subject|"
-    r"target|object|property|seance)"
-    r"(?:[_\-.]?(?:pid|id|key))?|"
-    r"rdbg[0-9A-Za-z_.-]*(?:pid|id|key)|"
-    r"(?:process|session|connection|client|server|subject|runtime|worker)"
-    r"[_\-.]?(?:pid|id|token|key|secret|credential(?:s)?)|"
-    r"(?:process|session|connection|client|server|subject|runtime|worker)"
-    r"[ \t]+(?:pid|id|token|key|secret|credential(?:s)?)|"
-    r"(?:access|refresh|auth|api)[_\-.]?(?:key|secret|credential|header)|"
-    r"pid"
-    r")"
-)
-_SENSITIVE_ASSIGNMENT_RE = re.compile(
-    rf"""
-    (?P<head>
-        (?:
-            ["']{_SENSITIVE_DIAGNOSTIC_KEY}["']
-            |
-            (?<![0-9A-Za-z_]){_SENSITIVE_DIAGNOSTIC_KEY}(?![0-9A-Za-z_])
-        )
-        (?:[ \t]*(?:=|:)[ \t]*|[ \t]+)
-    )
-    (?P<value>
-        "(?:\\.|[^"\\])*"
-        |'(?:\\.|[^'\\])*'
-        |[^\r\n,;}}\]]+
-    )
-    """,
-    re.IGNORECASE | re.VERBOSE,
-)
-_AUTHORIZATION_RE = re.compile(
-    r"\b(?:bearer|basic)\s+[^\s,;}}\]]+",
-    re.IGNORECASE,
-)
 
 
 def diagnostic_to_public_wire(value: NormalizedDiagnostic) -> dict[str, object]:
@@ -84,7 +44,7 @@ def diagnostic_to_public_wire(value: NormalizedDiagnostic) -> dict[str, object]:
 
 
 def diagnostic_to_expert_wire(value: NormalizedDiagnostic) -> dict[str, object]:
-    """Render the bounded expert allowlist without source or runtime identity."""
+    """Render bounded verbatim expert evidence without source objects or paths."""
     try:
         safe = sanitize_normalized_diagnostic(value)
         public = diagnostic_to_public_wire(value)
@@ -131,30 +91,21 @@ def bounded_platform_diagnostic(
     truncated: bool,
     redacted: bool,
 ) -> tuple[str | None, bool, bool]:
-    """Bound and redact credential/process identities in expert-only prose."""
+    """Byte-bound expert prose while preserving caller redaction provenance."""
     if type(truncated) is not bool or type(redacted) is not bool:
         return None, True, True
     if value is None:
         return None, truncated, redacted
     if type(value) is not str:
         return None, True, True
-    bounded = value[:_PLATFORM_DIAGNOSTIC_LIMIT]
-    input_truncated = len(value) > _PLATFORM_DIAGNOSTIC_LIMIT
-    bounded, assignment_count = _SENSITIVE_ASSIGNMENT_RE.subn(
-        lambda match: f"{match.group('head')}<redacted>",
-        bounded,
+    encoded = value.encode("utf-8")
+    bounded = encoded[:MAX_PRIVATE_DIAGNOSTIC_BYTES].decode(
+        "utf-8", errors="ignore"
     )
-    bounded, authorization_count = _AUTHORIZATION_RE.subn(
-        "<redacted credential>",
-        bounded,
-    )
-    expansion_truncated = len(bounded) > _PLATFORM_DIAGNOSTIC_LIMIT
-    if len(bounded) > _PLATFORM_DIAGNOSTIC_LIMIT:
-        bounded = bounded[:_PLATFORM_DIAGNOSTIC_LIMIT]
     return (
         bounded,
-        truncated or input_truncated or expansion_truncated,
-        redacted or assignment_count > 0 or authorization_count > 0,
+        truncated or len(encoded) > MAX_PRIVATE_DIAGNOSTIC_BYTES,
+        redacted,
     )
 
 

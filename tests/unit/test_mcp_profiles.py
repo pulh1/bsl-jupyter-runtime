@@ -367,7 +367,7 @@ def test_acceptance_expert_diagnostic_is_bounded_and_expert_only_via_sdk() -> No
         "worker_generation",
         "worker_manifest_sha256",
     }
-    assert len(details["platform_diagnostic"]) <= 4096
+    assert len(details["platform_diagnostic"].encode("utf-8")) <= 64 * 1024
     assert details["platform_diagnostic_redacted"] is True
     encoded = json.dumps(result.structured_content, ensure_ascii=False)
     for forbidden in (
