@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "onec-interactive-jupyter"
-version = "0.1.20"
+version = "0.1.21"
 requires-python = ">=3.12"
 license = "GPL-3.0-only AND MIT"
 license-files = ["LICENSE", "COPYRIGHT"]
@@ -12,7 +12,7 @@ dependencies = [
   "ipykernel>=6.29,<7",
   "ipython>=8.22,<10",
   "jupyter-client>=8.6,<9",
-  "onec-interactive-runtime-core==0.1.20",
+  "onec-interactive-runtime-core==0.1.21",
   "psutil>=6,<8",
 ]
 

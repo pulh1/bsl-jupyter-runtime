@@ -12,7 +12,7 @@ from onec_runtime_jupyter.extension import (
 )
 from onec_runtime_jupyter.session import InteractiveRuntimeSession
 
-__version__ = "0.1.20"
+__version__ = "0.1.21"
 
 
 def _jupyter_labextension_paths():
