@@ -8,7 +8,7 @@
 
 Нужны Windows, Python 3.12+, VS Code 1.136+, установленная платформа 1С, **отдельная копия ИБ** и локальная копия выгрузки исходников той же конфигурации. По умолчанию runtime устанавливает в ИБ служебное расширение. Демо проверены на платформе **8.5.1.1529**: ЗУП — с **ЗУП КОРП 3.1.38.92** и снимком данных от **01.08.2021**, УТ — с **УТ 11.6.1.61** (дата данных определяется из ИБ). Платформа, демобазы и выгрузки в пакет не входят.
 
-Скачайте **Source code (zip)** из [релиза v0.1.21](https://github.com/pulh1/bsl-jupyter-runtime/releases/tag/v0.1.21) и распакуйте архив: в нём находятся `notebooks/demo`. Из [релиза v0.1.18](https://github.com/pulh1/bsl-jupyter-runtime/releases/tag/v0.1.18) скачайте `bsl-notebook-0.1.4.vsix`. VSIX отвечает за подсказки BSL в редакторе; Python-пакеты версии 0.1.21 устанавливаются из PyPI.
+Скачайте **Source code (zip)** и `bsl-notebook-0.1.5.vsix` из [релиза v0.1.21](https://github.com/pulh1/bsl-jupyter-runtime/releases/tag/v0.1.21). В архиве исходников находятся `notebooks/demo`, а VSIX отвечает за подсказки BSL в редакторе. Python-пакеты версии 0.1.21 устанавливаются из PyPI.
 
 В PowerShell из папки распакованного проекта создайте окружение, установите пакет и зарегистрируйте kernel:
 
@@ -28,7 +28,7 @@ $python = ".\.venv\Scripts\python.exe"
 - [Pylance](https://marketplace.visualstudio.com/items?itemName=ms-python.vscode-pylance) (`ms-python.vscode-pylance`; обычно устанавливается вместе с Python);
 - [Language 1C (BSL)](https://marketplace.visualstudio.com/items?itemName=1c-syntax.language-1c-bsl) (`1c-syntax.language-1c-bsl`).
 
-В VS Code выполните **Extensions: Install from VSIX** и укажите скачанный `bsl-notebook-0.1.4.vsix`. Откройте папку с выгрузкой исходников 1С через **File → Open Folder**, затем добавьте распакованный проект через **File → Add Folder to Workspace**. Выгрузка должна быть первой папкой рабочего пространства. В notebook выберите kernel **1C BSL** (при необходимости через **Select Another Kernel → Jupyter Kernels**) и выполните команду **1C BSL: Выбрать исходники проекта**, указав выгрузку.
+В VS Code выполните **Extensions: Install from VSIX** и укажите скачанный `bsl-notebook-0.1.5.vsix`. Откройте папку с выгрузкой исходников 1С через **File → Open Folder**, затем добавьте распакованный проект через **File → Add Folder to Workspace**. Выгрузка должна быть первой папкой рабочего пространства. В notebook выберите kernel **1C BSL** (при необходимости через **Select Another Kernel → Jupyter Kernels**) и выполните команду **1C BSL: Выбрать исходники проекта**, указав выгрузку.
 
 Для первой пробы создайте пустой Python-notebook. В первой ячейке запустите сеанс, подставив пути к своей платформе, **копии** ИБ и **копии** исходников:
 
