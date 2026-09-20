@@ -82,11 +82,11 @@ def test_capture_privacy_distinguishes_opaque_hash_from_raw_pid_leakage() -> Non
         "password-token-bearer",
     ),
 )
-def test_acceptance_private_identity_mutations_are_redacted_or_rejected_without_reflection(
+def test_private_diagnostic_is_verbatim_but_live_evidence_rejects_reflection(
     private_text: str,
     secrets: tuple[str, ...],
 ) -> None:
-    """Break caught: a private mutation crosses either expert or evidence wire."""
+    """Break caught: 1C prose is altered or leaks through live evidence."""
     from integration.evidence.capture_live_evidence import (
         CaptureEvidenceError,
         assert_mcp_response_private_safe,
@@ -98,15 +98,15 @@ def test_acceptance_private_identity_mutations_are_redacted_or_rejected_without_
         redacted=False,
     )
 
-    assert bounded is not None
-    assert len(bounded) <= 4096
+    assert bounded == private_text
+    assert len(bounded.encode("utf-8")) <= 64 * 1024
     assert truncated is False
-    assert redacted is True
+    assert redacted is False
     encoded = json.dumps(
         {"platform_diagnostic": bounded},
         ensure_ascii=False,
     )
-    assert all(secret not in encoded for secret in secrets)
+    assert all(secret in encoded for secret in secrets)
 
     with pytest.raises(CaptureEvidenceError) as rejected:
         assert_mcp_response_private_safe(

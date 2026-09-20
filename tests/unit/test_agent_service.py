@@ -1457,12 +1457,13 @@ def test_explain_failure_resolves_only_the_exact_bounded_private_diagnostic(
         assert details["source_map_sha256"] == diagnostic.source_map_sha256
         assert details["worker_generation"] == 17
         assert details["worker_manifest_sha256"] == "f" * 64
-        assert details["platform_diagnostic_redacted"] is True
+        assert details["platform_diagnostic"] == diagnostic.platform_diagnostic
+        assert details["platform_diagnostic_redacted"] is False
         assert "code" not in details
         assert "source_unit" not in details
         encoded = json.dumps(explained.value, ensure_ascii=False, default=str)
-        assert "9182" not in encoded
-        assert "private-connection" not in encoded
+        assert "9182" in encoded
+        assert "private-connection" in encoded
         assert "content_integrity_sha256" not in encoded
         journal = [
             json.loads(line)

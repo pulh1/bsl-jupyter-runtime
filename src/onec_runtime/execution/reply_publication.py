@@ -11,8 +11,12 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from onec_runtime.bsl.diagnostics import (
-    DiagnosticStage, NormalizedDiagnostic, VisibleSourceContext,
-    parse_platform_diagnostic, remap_platform_diagnostic,
+    DiagnosticStage,
+    NormalizedDiagnostic,
+    VisibleSourceContext,
+    WorkerDiagnosticArtifact,
+    normalize_platform_diagnostic_trace,
+    parse_platform_diagnostic,
 )
 from onec_runtime.bsl.source_maps import MappedSource
 from onec_runtime.execution.capture.scope import (
@@ -37,16 +41,22 @@ def _execution_diagnostic(
     error: str,
     source: MappedSource | None,
     visible: VisibleSourceContext | None,
+    *,
+    pinned_manifest_sha256: str | None = None,
+    pinned_artifacts: tuple[WorkerDiagnosticArtifact, ...] = (),
 ) -> NormalizedDiagnostic | None:
-    if not error or source is None:
+    if not error:
         return None
     try:
-        return remap_platform_diagnostic(
-            parse_platform_diagnostic(error), source,
+        return normalize_platform_diagnostic_trace(
+            parse_platform_diagnostic(error),
             stage=DiagnosticStage.EXECUTION,
+            executed=source,
             visible_source_context=visible,
+            pinned_manifest_sha256=pinned_manifest_sha256,
+            pinned_artifacts=pinned_artifacts,
         )
-    except Exception:
+    except BaseException:
         # Presentation failure must not turn a confirmed BSL result into an
         # unknown remote operation or expose unparsed platform text.
         return None
@@ -84,6 +94,10 @@ class MainConfirmedDecodeFailure:
     operation: MainOperation = field(repr=False)
     remote_error: str = field(default="", repr=False)
     messages: tuple[str, ...] = ()
+    pinned_manifest_sha256: str | None = field(default=None, repr=False)
+    pinned_artifacts: tuple[WorkerDiagnosticArtifact, ...] = field(
+        default=(), repr=False,
+    )
 
 
 class MainReplyPolicy:
@@ -118,6 +132,8 @@ class MainReplyPolicy:
                     outcome.remote_error,
                     record.executed_source,
                     record.visible_source_context,
+                    pinned_manifest_sha256=outcome.pinned_manifest_sha256,
+                    pinned_artifacts=outcome.pinned_artifacts,
                 ),
             )
         if outcome.kind is MainYieldKind.COMPLETED:
@@ -137,6 +153,8 @@ class MainReplyPolicy:
                 diagnostic=_execution_diagnostic(
                     completion.error, record.executed_source,
                     record.visible_source_context,
+                    pinned_manifest_sha256=outcome.pinned_manifest_sha256,
+                    pinned_artifacts=outcome.pinned_artifacts,
                 ),
             )
         if outcome.kind is MainYieldKind.CAPTURE:
@@ -207,6 +225,10 @@ class CaptureRemoteOutcome:
 
     evaluation: EvaluationResult = field(repr=False)
     messages: tuple[str, ...] = ()
+    pinned_manifest_sha256: str | None = field(default=None, repr=False)
+    pinned_artifacts: tuple[WorkerDiagnosticArtifact, ...] = field(
+        default=(), repr=False,
+    )
 
 
 class CaptureReplyPolicy:
@@ -235,6 +257,8 @@ class CaptureReplyPolicy:
             diagnostic = _execution_diagnostic(
                 result.error_text, record.executed_source,
                 record.visible_source_context,
+                pinned_manifest_sha256=outcome.pinned_manifest_sha256,
+                pinned_artifacts=outcome.pinned_artifacts,
             )
         else:
             try:

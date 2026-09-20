@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from threading import RLock, Thread
 from typing import Callable
@@ -16,6 +16,7 @@ from onec_runtime.capture_evaluation import (
     CaptureEvaluationKind, CaptureFailureDiagnostic, CapturePhase,
 )
 from onec_runtime.capture_values import VariableRole
+from onec_runtime.bsl.diagnostics import WorkerDiagnosticArtifact
 from onec_runtime.bsl.parser_target import PythonParserTarget
 from onec_runtime.errors import BslExecutionError, ProtocolError, StaleCaptureError
 from onec_runtime.execution.arbiter import (
@@ -114,6 +115,10 @@ class MainYield:
     scope: CaptureScope | None = field(default=None, repr=False)
     completion: MainRemoteCompletion | None = field(default=None, repr=False)
     stop: StopEvent | None = field(default=None, repr=False)
+    pinned_manifest_sha256: str | None = field(default=None, repr=False)
+    pinned_artifacts: tuple[WorkerDiagnosticArtifact, ...] = field(
+        default=(), repr=False,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +131,11 @@ class _PreparationRecord:
     snapshot_reader: Callable[[], RoutePreparationSnapshot] = field(repr=False)
 
 
+@dataclass(slots=True)
+class _CaptureWorkerLeaseSlot:
+    lease: WorkerActivationLease | None = field(default=None, init=False)
+
+
 @dataclass(frozen=True, slots=True)
 class _CaptureCellRepair:
     operation: CaptureCellOperation
@@ -134,6 +144,7 @@ class _CaptureCellRepair:
     policy_bound: bool
     ledger: CaptureEvaluationLedger
     receipt_id: str
+    worker_lease: _CaptureWorkerLeaseSlot
 
 
 class _ContinuationAdmission:
@@ -1333,6 +1344,58 @@ class ExecutionController:
 
         port.register_post_settlement_cleanup(cleanup)
 
+    def _worker_diagnostic_evidence(
+        self,
+        lease: WorkerActivationLease | None,
+    ) -> tuple[str | None, tuple[WorkerDiagnosticArtifact, ...]]:
+        """Best-effort evidence from an operation's already-held Worker lease."""
+
+        activation = self._worker_activation
+        reader = (
+            None if activation is None
+            else getattr(activation, "diagnostic_artifacts_for_lease", None)
+        )
+        if lease is None or not callable(reader):
+            return None, ()
+        try:
+            artifacts = reader(lease)
+            if type(artifacts) is not tuple or not artifacts or any(
+                not isinstance(item, WorkerDiagnosticArtifact) for item in artifacts
+            ):
+                return None, ()
+            manifests = {item.manifest_sha256 for item in artifacts}
+            if len(manifests) != 1:
+                return None, ()
+            return manifests.pop(), artifacts
+        except BaseException:
+            # A confirmed operation outcome must not depend on enrichment.
+            return None, ()
+
+    def _with_capture_worker_diagnostic_evidence(
+        self,
+        outcome: Settlement,
+        lease: WorkerActivationLease | None,
+    ) -> Settlement:
+        """Attach exact held-pin evidence only to a confirmed BSL error."""
+
+        from onec_runtime.execution.reply_publication import CaptureRemoteOutcome
+
+        remote_outcome = outcome.value
+        if (
+            not isinstance(remote_outcome, CaptureRemoteOutcome)
+            or not remote_outcome.evaluation.error_occurred
+        ):
+            return outcome
+        manifest_sha256, artifacts = self._worker_diagnostic_evidence(lease)
+        return Settlement(
+            replace(
+                remote_outcome,
+                pinned_manifest_sha256=manifest_sha256,
+                pinned_artifacts=artifacts,
+            ),
+            next_route=outcome.next_route,
+        )
+
     def _retain_main_worker_lease(
         self, operation: MainOperation, port: SessionPort,
     ) -> None:
@@ -1502,6 +1565,7 @@ class ExecutionController:
             if ledger is None or ledger.identity != scope.identity:
                 raise ProtocolError("CAPTURE evaluation ledger is unavailable")
             receipt_id = f"capture-{uuid4().hex}"
+            worker_lease = _CaptureWorkerLeaseSlot()
 
             def settle_ledger(outcome: object) -> object:
                 assert _finalizer is not None
@@ -1515,12 +1579,14 @@ class ExecutionController:
                 return published
 
             def plan(port: SessionPort) -> Settlement | ReadyForPolicy | ConfirmedFailure:
+                lease: WorkerActivationLease | None = None
                 try:
                     if _before_first_effect is not None:
                         _before_first_effect()
                     activation = self._worker_activation
                     if activation is not None:
                         lease = activation.pin_active(port=port)
+                        worker_lease.lease = lease
                         if lease is not None:
                             self._schedule_worker_lease_release(lease, port)
                     scope.admit_cell_dirty_roots(dirty_roots)
@@ -1546,6 +1612,9 @@ class ExecutionController:
                 if isinstance(outcome, ConfirmedFailure):
                     ledger.fail(receipt_id, "CAPTURE evaluation failed")
                     return outcome
+                outcome = self._with_capture_worker_diagnostic_evidence(
+                    outcome, lease,
+                )
                 if _finalizer is None:
                     ledger.complete(receipt_id)
                     return outcome
@@ -1578,7 +1647,7 @@ class ExecutionController:
                 )
                 self._capture_cell_operations[ticket] = _CaptureCellRepair(
                     cell_operation, scope, selected_policy, _finalizer is not None,
-                    ledger, receipt_id,
+                    ledger, receipt_id, worker_lease,
                 )
                 self._preparation_revision += 1
                 self._arbiter.dispatch(ticket)
@@ -1672,6 +1741,9 @@ class ExecutionController:
                         repair.receipt_id, "CAPTURE evaluation failed",
                     )
                     return outcome
+                outcome = self._with_capture_worker_diagnostic_evidence(
+                    outcome, repair.worker_lease.lease,
+                )
                 if repair.policy_bound:
                     return ReadyForPolicy(
                         outcome.value, next_route=outcome.next_route
@@ -1731,6 +1803,9 @@ class ExecutionController:
                         repair.receipt_id, "CAPTURE evaluation failed",
                     )
                     return outcome
+                outcome = self._with_capture_worker_diagnostic_evidence(
+                    outcome, repair.worker_lease.lease,
+                )
                 if repair.policy_bound:
                     return ReadyForPolicy(
                         outcome.value, next_route=outcome.next_route
@@ -2606,6 +2681,7 @@ class ExecutionController:
         ).reason
         if reason is StopReason.MAIN_SERVICE:
             decoded_error: list[str] = []
+            lease = self._main_worker_leases.get(operation.command_id)
             try:
                 try:
                     completion = read_main_completion(
@@ -2623,13 +2699,30 @@ class ExecutionController:
                         MainConfirmedDecodeFailure,
                     )
 
+                    remote_error = decoded_error[0] if decoded_error else ""
+                    manifest_sha256, artifacts = (
+                        self._worker_diagnostic_evidence(lease)
+                        if remote_error else (None, ())
+                    )
                     return Settlement(MainConfirmedDecodeFailure(
                         operation,
-                        remote_error=decoded_error[0] if decoded_error else "",
+                        remote_error=remote_error,
+                        pinned_manifest_sha256=manifest_sha256,
+                        pinned_artifacts=artifacts,
                     ))
                 operation.complete(completion)
+                manifest_sha256, artifacts = (
+                    self._worker_diagnostic_evidence(lease)
+                    if completion.error else (None, ())
+                )
                 return Settlement(
-                    MainYield(MainYieldKind.COMPLETED, operation, completion=completion)
+                    MainYield(
+                        MainYieldKind.COMPLETED,
+                        operation,
+                        completion=completion,
+                        pinned_manifest_sha256=manifest_sha256,
+                        pinned_artifacts=artifacts,
+                    )
                 )
             finally:
                 # The matching command ID terminalizes MAIN before result or

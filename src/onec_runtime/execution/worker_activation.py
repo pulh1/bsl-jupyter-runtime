@@ -12,6 +12,7 @@ from threading import RLock, local
 from typing import Callable
 
 from onec_runtime.breakpoint_workspace import BreakpointWorkspaceOutcomeUnknown
+from onec_runtime.bsl.diagnostics import WorkerDiagnosticArtifact
 from onec_runtime.bsl.notebook_method_globals import bind_notebook_method_globals
 from onec_runtime.bsl.notebook_methods import (
     NotebookMethodSet,
@@ -408,6 +409,21 @@ class WorkerUniverseActivationAdapter:
             worker_breakpoints_present=self._breakpoints_present,
             breakpoint_workspace=self._breakpoint_workspace,
         )
+
+    def diagnostic_artifacts_for_lease(
+        self,
+        lease: _GenerationLease,
+    ) -> tuple[WorkerDiagnosticArtifact, ...]:
+        """Read diagnostics through an existing lease without taking a new pin."""
+
+        if (
+            not isinstance(lease, _GenerationLease)
+            or lease._host is not self._host
+            or lease._target is not self._target
+            or lease.pin is None
+        ):
+            raise ProtocolError("Worker diagnostic lease does not belong to this adapter")
+        return self._host.diagnostic_artifacts_for_pin(lease.pin)
 
     def prebuild_for_capture(
         self, intent: WorkerCandidateIntent,

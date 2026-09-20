@@ -2173,10 +2173,18 @@ def test_old_generation_debug_view_lives_until_last_pin_release(
 
     assert host._operation_debug_view(pin) is first_view
     assert first_view in host._retained_debug_views()
+    evidence = host.diagnostic_artifacts_for_pin(pin)
+    assert evidence
+    assert {item.manifest_sha256 for item in evidence} == {first.manifest.sha256}
+    assert {item.registration_name for item in evidence} == {
+        module.registration_name for module in first.manifest.modules
+    }
 
     registry.release_pin(pin)
     with pytest.raises(ProtocolError, match="stale|released"):
         host._operation_debug_view(pin)
+    with pytest.raises(ProtocolError, match="stale|released"):
+        host.diagnostic_artifacts_for_pin(pin)
 
 
 def test_batch_staging_transports_two_large_sealed_payloads_exactly() -> None:
@@ -5652,6 +5660,14 @@ def test_worker_activation_adapter_promotes_over_supplied_port_and_retains_metho
     assert old_pin.handle is first.handle
     ordinary = adapter.pin_active(port=port)
     assert ordinary is not None and ordinary.pin.handle is second.handle
+    evidence = adapter.diagnostic_artifacts_for_lease(ordinary)
+    assert evidence
+    assert {item.manifest_sha256 for item in evidence} == {
+        ordinary.pin.handle.manifest_sha256
+    }
+    assert {item.registration_name for item in evidence} == {
+        module.registration_name for module in ordinary.pin.manifest.modules
+    }
     worker_breakpoints[0] = True
     with pytest.raises(ProtocolError, match="workspace transaction"):
         adapter.pin_active(port=port)

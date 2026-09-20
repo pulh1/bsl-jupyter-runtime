@@ -76,7 +76,12 @@ def _proxy(operation_id: str) -> ProxyDescriptor:
     )
 
 
-def _exact_diagnostic(source: str):  # type: ignore[no-untyped-def]
+def _exact_diagnostic(
+    source: str,
+    platform_diagnostic: str = (
+        "{<Неизвестный модуль>(1, 1)}: rdbg_pid=9182 token=private"
+    ),
+):  # type: ignore[no-untyped-def]
     unit = SourceUnitRef(
         SourceUnitKind.NOTEBOOK_CELL,
         "cell-main",
@@ -85,13 +90,35 @@ def _exact_diagnostic(source: str):  # type: ignore[no-untyped-def]
     )
     mapped = mapped_visible_source(source, unit)
     return remap_platform_diagnostic(
-        parse_platform_diagnostic(
-            "{<Неизвестный модуль>(1, 1)}: rdbg_pid=9182 token=private"
-        ),
+        parse_platform_diagnostic(platform_diagnostic),
         mapped,
         stage=DiagnosticStage.EXECUTION,
         visible_source_context=VisibleSourceContext({unit: source}),
     )
+
+
+def test_private_diagnostic_record_bounds_unicode_core_evidence(tmp_path) -> None:
+    source = "Результат = 1;"
+    diagnostic = _exact_diagnostic(
+        source,
+        "{<Неизвестный модуль>(1, 1)}: " + "😀" * 20_000,
+    )
+    registry = OperationRegistry(tmp_path)
+
+    registry.record_diagnostic(diagnostic, excerpt=source)
+
+    private_path = (
+        tmp_path / ".runtime" / "agent-service" / "diagnostics.private.jsonl"
+    )
+    record = json.loads(private_path.read_text(encoding="utf-8"))
+
+    assert len(record["platform_diagnostic"].encode("utf-8")) <= 64 * 1024
+    assert len(record["platform_diagnostic"].encode("utf-8")) + len(
+        "😀".encode("utf-8")
+    ) > 64 * 1024
+    assert record["platform_diagnostic_truncated"] is True
+    assert record["platform_diagnostic_sha256"] == diagnostic.platform_diagnostic_sha256
+    registry.shutdown()
 
 
 def test_operation_view_pages_messages_without_starting_another_operation(tmp_path) -> None:

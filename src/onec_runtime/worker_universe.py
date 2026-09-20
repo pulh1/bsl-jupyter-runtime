@@ -49,6 +49,7 @@ from onec_runtime.server_worker import (
     _worker_artifact_diagnostic_source_from_snapshot,
     _worker_reload_platform_message,
     rebind_worker_artifact_binary,
+    remap_worker_artifact_stage_error,
     stage_worker_module_instruction,
     validate_production_worker_artifact,
     validate_worker_export_catalog,
@@ -2033,6 +2034,29 @@ class WorkerUniverseRegistry:
                 raise ProtocolError("Worker generation debug view is unavailable")
             return record.debug_view
 
+    def diagnostic_artifacts_for_pin(
+        self,
+        pin: OperationGenerationPin,
+    ) -> tuple[WorkerDiagnosticArtifact, ...]:
+        """Read source-map evidence retained by one exact operation pin."""
+
+        view = self._operation_debug_view(pin)
+        return tuple(
+            WorkerDiagnosticArtifact(
+                logical_name=descriptor.logical_name,
+                revision=descriptor.revision,
+                artifact_sha256=module.artifact_sha256,
+                registration_name=descriptor.registration_name,
+                manifest_sha256=view.manifest.sha256,
+                source_map_sha256=module.source_map_sha256,
+                mapped_source=module.mapped_source,
+                visible_source_context=module.visible_context,
+            )
+            for descriptor, module in zip(
+                view.manifest.modules, view.modules, strict=True,
+            )
+        )
+
     def _retained_debug_views(self) -> tuple[WorkerGenerationDebugView, ...]:
         with self._lock:
             if self._state is WorkerUniverseState.CLOSED:
@@ -2980,6 +3004,19 @@ class ServerWorkerUniverseRegistry:
             def abort(error: BaseException) -> object:
                 if _worker_promotion_failure_phase(error) is not None:
                     self._record_uninstantiable_candidate_module(candidate, error)
+                    if isinstance(error, BslExecutionError):
+                        try:
+                            error = remap_worker_artifact_stage_error(
+                                error,
+                                candidate_manifest_sha256=candidate.manifest.sha256,
+                                candidate_artifacts=self._host._candidate_diagnostics(
+                                    candidate
+                                ),
+                            )
+                        except BaseException:
+                            # Diagnostic enrichment must never replace a
+                            # confirmed platform failure.
+                            pass
                     self._abort_pre_swap(candidate, error)
                 self._break_pending(candidate)
                 raise _promotion_unknown(candidate) from None
