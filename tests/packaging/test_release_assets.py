@@ -13,6 +13,7 @@ from tools.prepare_release_assets import prepare_release_assets
 VERSION = "0.1.21"
 VSCODE_VERSION = "0.1.5"
 RESOURCE_ROOT = "onec_runtime/resources/extension"
+MANIFEST = b'{"artifact_version":"test"}\n'
 
 
 def _write_release_inputs(
@@ -26,9 +27,11 @@ def _write_release_inputs(
     extension_root.mkdir()
 
     cfe = b"verified-cfe"
-    manifest = b'{"artifact_version":"test"}\n'
     (extension_root / "OnecInteractiveRuntime.cfe").write_bytes(cfe)
-    (extension_root / "extension-manifest.json").write_bytes(manifest)
+    # Git may expose this text file with CRLF on Windows while wheels keep LF.
+    (extension_root / "extension-manifest.json").write_bytes(
+        MANIFEST.replace(b"\n", b"\r\n")
+    )
 
     core_wheel = dist / f"onec_interactive_runtime_core-{VERSION}-py3-none-any.whl"
     with ZipFile(core_wheel, "w", compression=ZIP_DEFLATED) as archive:
@@ -38,7 +41,7 @@ def _write_release_inputs(
         )
         archive.writestr(
             f"{RESOURCE_ROOT}/extension-manifest.json",
-            manifest,
+            MANIFEST,
         )
 
     for filename, payload in (
@@ -69,9 +72,7 @@ def test_prepare_release_assets_builds_exact_deterministic_bundle(tmp_path: Path
     }
     assert {path.name for path in assets} == expected_names
     assert (dist / "OnecInteractiveRuntime.cfe").read_bytes() == b"verified-cfe"
-    assert (dist / "extension-manifest.json").read_bytes() == (
-        extension_root / "extension-manifest.json"
-    ).read_bytes()
+    assert (dist / "extension-manifest.json").read_bytes() == MANIFEST
 
     checksum_lines = (dist / "SHA256SUMS.txt").read_text(encoding="ascii").splitlines()
     covered_names = [line.split("  ", 1)[1] for line in checksum_lines]

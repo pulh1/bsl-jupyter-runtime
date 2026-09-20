@@ -19,6 +19,12 @@ _INPUT_PATTERNS = (
 )
 
 
+def _canonical_comparison_bytes(filename: str, payload: bytes) -> bytes:
+    if filename == "extension-manifest.json":
+        return payload.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return payload
+
+
 def _single_match(dist: Path, pattern: str) -> Path:
     matches = sorted(dist.glob(pattern))
     if len(matches) != 1:
@@ -57,7 +63,9 @@ def prepare_release_assets(
             resource = f"{_RESOURCE_ROOT}/{filename}"
             embedded = archive.read(resource)
             canonical = (extension_root / filename).read_bytes()
-            if embedded != canonical:
+            if _canonical_comparison_bytes(
+                filename, embedded
+            ) != _canonical_comparison_bytes(filename, canonical):
                 raise ValueError(
                     f"embedded {filename} differs from canonical resource"
                 )
