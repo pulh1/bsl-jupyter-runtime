@@ -58,9 +58,9 @@ CAPTURE_MAIN_SOURCE = '''РезультатFixture = JupyterBslFixtureCallerServ
 Результат = РезультатFixture;'''
 
 
-CAPTURE_SNAPSHOT_SOURCE = '''CaptureCounter = e1cRuntimeКонтекстОтладки.ЛокальныйСчетчик;
-CaptureNested = e1cRuntimeКонтекстОтладки.ЛокальнаяСтруктура;
-CaptureTable = e1cRuntimeКонтекстОтладки.ЛокальнаяТаблица;
+CAPTURE_SNAPSHOT_SOURCE = '''CaptureCounter = КонтекстОтладки.ЛокальныйСчетчик;
+CaptureNested = КонтекстОтладки.ЛокальнаяСтруктура;
+CaptureTable = КонтекстОтладки.ЛокальнаяТаблица;
 CaptureWorkerState = Новый Структура("Результат", 0);
 РезультатИнструкции = CaptureCounter;'''
 
@@ -70,7 +70,7 @@ CAPTURE_METHOD_SOURCE = '''Процедура FixtureCaptureWorker(Состоя�
 КонецПроцедуры'''
 
 
-CAPTURE_METHOD_CALL_SOURCE = '''FixtureCaptureWorker(CaptureWorkerState, e1cRuntimeКонтекстОтладки.ЛокальныйСчетчик);
+CAPTURE_METHOD_CALL_SOURCE = '''FixtureCaptureWorker(CaptureWorkerState, КонтекстОтладки.ЛокальныйСчетчик);
 CaptureMethodResult = CaptureWorkerState.Результат;
 РезультатИнструкции = CaptureMethodResult;'''
 
@@ -79,41 +79,41 @@ CAPTURE_MIXED_SOURCE = '''Процедура FixtureMixedCapture(Состоян�
     Состояние.Результат = Значение * 2;
 КонецПроцедуры;
 CaptureMixedState = Новый Структура("Результат", 0);
-FixtureMixedCapture(CaptureMixedState, e1cRuntimeКонтекстОтладки.ЛокальныйСчетчик);
-e1cRuntimeКонтекстОтладки.ЛокальныйMixed = CaptureMixedState.Результат;
-CaptureMixedResult = e1cRuntimeКонтекстОтладки.ЛокальныйMixed;
+FixtureMixedCapture(CaptureMixedState, КонтекстОтладки.ЛокальныйСчетчик);
+КонтекстОтладки.ЛокальныйMixed = CaptureMixedState.Результат;
+CaptureMixedResult = КонтекстОтладки.ЛокальныйMixed;
 РезультатИнструкции = CaptureMixedResult;'''
 
 
 CAPTURE_MIXED_ERROR_SOURCE = '''Процедура FixtureMixedCaptureAfterError(Состояние, Значение)
     Состояние.Результат = Значение + 1;
 КонецПроцедуры;
-e1cRuntimeКонтекстОтладки.ЛокальныйСчетчик = 901;
+КонтекстОтладки.ЛокальныйСчетчик = 901;
 ОшибкаMixedCapture = 1 / 0;'''
 
 
 CAPTURE_MIXED_ERROR_RECOVERY_SOURCE = '''CaptureMixedErrorState = Новый Структура("Результат", 0);
-FixtureMixedCaptureAfterError(CaptureMixedErrorState, e1cRuntimeКонтекстОтладки.ЛокальныйСчетчик);
+FixtureMixedCaptureAfterError(CaptureMixedErrorState, КонтекстОтладки.ЛокальныйСчетчик);
 CaptureMixedErrorRecovery = CaptureMixedErrorState.Результат;
 РезультатИнструкции = CaptureMixedErrorRecovery;'''
 
 
-CAPTURE_ERROR_SOURCE = '''e1cRuntimeКонтекстОтладки.ЛокальныйСчетчик = 900;
+CAPTURE_ERROR_SOURCE = '''КонтекстОтладки.ЛокальныйСчетчик = 900;
 ВызватьИсключение "fixture-capture-error";'''
 
 
-CAPTURE_ERROR_RECOVERY_SOURCE = '''Сообщить("capture-recovery:" + e1cRuntimeКонтекстОтладки.ЛокальныйСчетчик);
-РезультатИнструкции = e1cRuntimeКонтекстОтладки.ЛокальныйСчетчик;'''
+CAPTURE_ERROR_RECOVERY_SOURCE = '''Сообщить("capture-recovery:" + КонтекстОтладки.ЛокальныйСчетчик);
+РезультатИнструкции = КонтекстОтладки.ЛокальныйСчетчик;'''
 
 
-CAPTURE_WRITE_SOURCE = '''e1cRuntimeКонтекстОтладки.ЛокальныйСчетчик = 40;
-e1cRuntimeКонтекстОтладки.ЛокальнаяСтруктура.Метка = "после";
-РезультатИнструкции = e1cRuntimeКонтекстОтладки.ЛокальныйСчетчик;'''
+CAPTURE_WRITE_SOURCE = '''КонтекстОтладки.ЛокальныйСчетчик = 40;
+КонтекстОтладки.ЛокальнаяСтруктура.Метка = "после";
+РезультатИнструкции = КонтекстОтладки.ЛокальныйСчетчик;'''
 
 
-CAPTURE_STACK_SOURCE = '''StackValue = e1cRuntimeКонтекстОтладки.РезультатПодчиненного.Счетчик;
-StackMarker = e1cRuntimeКонтекстОтладки.РезультатПодчиненного.Метка;
-StackMixed = e1cRuntimeКонтекстОтладки.РезультатПодчиненного.Mixed;
+CAPTURE_STACK_SOURCE = '''StackValue = КонтекстОтладки.РезультатПодчиненного.Счетчик;
+StackMarker = КонтекстОтладки.РезультатПодчиненного.Метка;
+StackMixed = КонтекстОтладки.РезультатПодчиненного.Mixed;
 Сообщить("capture-stack:" + StackMarker + ":mixed=" + StackMixed);
 РезультатИнструкции = StackValue;'''
 

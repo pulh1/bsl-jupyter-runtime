@@ -199,8 +199,8 @@ _SCENARIOS = {
         1,
     ),
     "capture_result_channel": _ScenarioSpec(
-        "e1cRuntimeКонтекстОтладки.Счётчик = 1;\n"
-        "РезультатИнструкции = e1cRuntimeКонтекстОтладки.Счётчик;",
+        "КонтекстОтладки.Счётчик = 1;\n"
+        "РезультатИнструкции = КонтекстОтладки.Счётчик;",
         2,
         1,
         branch="capture",
@@ -430,10 +430,10 @@ def test_same_name_worker_callee_acceptance_uses_literal_visible_coordinates(
         (
             "capture_result_channel",
             1,
-            {"start": 39, "end": 40},
-            "345b49f9bfa0d79f0c7e715bcf0a4137e30aaa2cf70d3e93356cc3b8b7ebd35b",
-            "345b49f9bfa0d79f0c7e715bcf0a4137e30aaa2cf70d3e93356cc3b8b7ebd35b",
-            "de779fe2fbfd4c5bf44db94bdba7ae4cdcc9a0f11f862748a0fbecda246e67bf",
+            {"start": 29, "end": 30},
+            "8787ec326b8929898cb41e5c0e997c2958f8350101768bbaf1723af8c0eb4385",
+            "8787ec326b8929898cb41e5c0e997c2958f8350101768bbaf1723af8c0eb4385",
+            "5497e25efe9bdde04c65f448b8170ee52ecf2ec83ef8ca1a477fa8daef71f232",
         ),
         (
             "mixed_method",
@@ -733,7 +733,7 @@ def test_capture_failure_stays_paused_restores_workspace_and_sends_no_continue()
     assert captured.kind is RuntimeReplyKind.CAPTURED
     continue_calls_before = sum(name == "continue" for name, _ in session.calls)
     source = (
-        "e1cRuntimeКонтекстОтладки.Счётчик = 1;\n"
+        "КонтекстОтладки.Счётчик = 1;\n"
         "РезультатИнструкции = 1 / 0;"
     )
 

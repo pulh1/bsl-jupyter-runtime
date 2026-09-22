@@ -19,7 +19,7 @@
 | `materialize()` и `to_df()` по прямому `e1cRuntimeКонтекст.Имя` | Проверен ограниченный перенос через ticket на подтверждённом маршруте MAIN idle или CAPTURE paused. |
 | `OnecValueProxy.head()`, срез и `tabular_section()` | Фасад принимает `project_value()`/`project_to_df()` и payload-проекции через ограниченные MAIN/CAPTURE tickets. `head().to_df()` прошёл в полном живом прогоне; остальные варианты проверены компонентными тестами. |
 
-Страницы `frame.locals` и `frame.parameters` проверены на временной ИБ. Страница `capture.context.variables[:10]` даёт только имена в `UnavailableValueNode`; точный запрос `capture.context.variables["Имя"]` возвращает непрозрачный `ValueNode` с типом и размером, если debugger может их прочитать. Его `preview` скрывает исходное значение, а `shape` остаётся `UNDOCUMENTED`. Для переноса поддерживаемого значения используйте `runtime.materialize("e1cRuntimeКонтекст.e1cRuntimeКонтекстОтладки.Имя")` либо ограниченную проекцию прокси, пока CAPTURE stop подтверждён и доступен.
+Страницы `frame.locals` и `frame.parameters` проверены на временной ИБ. Страница `capture.context.variables[:10]` даёт только имена в `UnavailableValueNode`; точный запрос `capture.context.variables["Имя"]` возвращает непрозрачный `ValueNode` с типом и размером, если debugger может их прочитать. Его `preview` скрывает исходное значение, а `shape` остаётся `UNDOCUMENTED`. Для переноса поддерживаемого значения используйте `runtime.materialize("e1cRuntimeКонтекст.КонтекстОтладки.Имя")` либо ограниченную проекцию прокси, пока CAPTURE stop подтверждён и доступен.
 
 ## Сеанс и выполнение
 
@@ -167,7 +167,7 @@ if names:
 
 Если отдельное значение не удалось представить через CAPTURE inspection, страница сохраняет доступных соседей и помещает на его место `UnavailableValueNode`: только проверенное `name`, `access == "unavailable"` и `expandable == False`, без типа, preview и пути для раскрытия. Точечный доступ к такому значению вызывает `CaptureValueCheckError`; после исправления причины можно повторить чтение на той же CAPTURE-остановке, если `capture.status().can_inspect` остаётся истинным. `DeniedValueNode` с `access == "denied"` означает запрет доступа по политике приватности; точечный доступ к нему вызывает `CaptureValueAccessDeniedError`. Маркер `unavailable` не обещает поддержку произвольных объектов 1С и сам по себе не означает потерю остановленного кадра.
 
-`capture.context.variables` читает поля `e1cRuntimeКонтекстОтладки`, перенесённые из остановленного кадра. Новое имя, присвоенное в CAPTURE-ячейке без префикса `e1cRuntimeКонтекстОтладки`, попадает в постоянный notebook `e1cRuntimeКонтекст` и доступно через `bsl`/`namespace_snapshot()`, но не появляется в staged кадре. Присваивание `e1cRuntimeКонтекстОтладки.Имя = ...` меняет существующий корень staged кадра. Вложенный путь передайте в `materialize()` как прямой путь от `e1cRuntimeКонтекст`, если он допустим политикой переноса.
+`capture.context.variables` читает поля `КонтекстОтладки`, перенесённые из остановленного кадра. Новое имя, присвоенное в CAPTURE-ячейке без префикса `КонтекстОтладки`, попадает в постоянный notebook `e1cRuntimeКонтекст` и доступно через `bsl`/`namespace_snapshot()`, но не появляется в staged кадре. Присваивание `КонтекстОтладки.Имя = ...` меняет существующий корень staged кадра. Вложенный путь передайте в `materialize()` как прямой путь от `e1cRuntimeКонтекст`, если он допустим политикой переноса.
 
 ```python
 frame = capture.stack[0]

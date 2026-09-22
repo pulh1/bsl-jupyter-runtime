@@ -31,6 +31,19 @@ def test_ping_read_timeout_is_treated_as_an_empty_long_poll() -> None:
     assert transport.request("pingDebugUIParams", timeout_s=0.1) == b""
 
 
+def test_evaluation_ping_read_timeout_is_reported_not_silently_ignored() -> None:
+    def time_out(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("planned lost long poll", request=request)
+
+    client = httpx.Client(transport=httpx.MockTransport(time_out))
+    transport = RdbgTransport("127.0.0.1", 12345, client=client)
+
+    with pytest.raises(RdbgTransportTimeout, match="planned lost long poll"):
+        transport.request(
+            "pingDebugUIParams", timeout_s=15.0, read_timeout_as_empty=False,
+        )
+
+
 @pytest.mark.parametrize(
     "timeout_type",
     (

@@ -2149,7 +2149,7 @@ def _ready(service: AgentWorkspaceService) -> None:
 
 @pytest.mark.parametrize(
     ("source", "stage"),
-    [("Результат = ;", "parsing"), ("e1cRuntimeКонтекстОтладки.Значение = 1;", "lowering")],
+    [("Результат = ;", "parsing"), ("КонтекстОтладки.Значение = 1;", "lowering")],
 )
 def test_invalid_inline_bsl_is_admitted_before_preparation_without_target_execution(
     tmp_path: Path, source: str, stage: str

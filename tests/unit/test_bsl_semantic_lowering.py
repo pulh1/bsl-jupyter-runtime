@@ -33,35 +33,33 @@ def _mapped(source: str, unit_id: str, revision: int) -> MappedSource:
     )
 
 
-def test_old_context_names_are_ordinary_notebook_variables(
+def test_legacy_context_name_remains_an_ordinary_notebook_variable(
     parser_target: PythonParserTarget,
 ) -> None:
     from onec_runtime.bsl import LoweringMode, SemanticNotebookLowerer
 
     result = SemanticNotebookLowerer(parser_target).lower(
-        "Контекст = 1; КонтекстОтладки = 2; "
-        "Результат = Контекст + КонтекстОтладки;",
+        "Контекст = 1; Результат = Контекст + 2;",
         mode=LoweringMode.MAIN,
     )
 
-    assert result.context_names == ("Контекст", "КонтекстОтладки")
+    assert result.context_names == ("Контекст",)
     assert 'e1cRuntimeКонтекст.Вставить("Контекст", 1)' in result.source
-    assert 'e1cRuntimeКонтекст.Вставить("КонтекстОтладки", 2)' in result.source
-    assert 'e1cRuntimeКонтекст.Контекст + e1cRuntimeКонтекст.КонтекстОтладки' in result.source
+    assert 'e1cRuntimeКонтекст.Контекст + 2' in result.source
 
 
-def test_capture_namespace_uses_new_runtime_name(
+def test_capture_namespace_uses_short_debug_context_name(
     parser_target: PythonParserTarget,
 ) -> None:
     from onec_runtime.bsl import LoweringMode, SemanticNotebookLowerer
 
     result = SemanticNotebookLowerer(parser_target).lower(
-        "e1cRuntimeКонтекстОтладки.Счетчик = 2;",
+        "КонтекстОтладки.Счетчик = 2;",
         mode=LoweringMode.CAPTURE,
     )
 
     assert result.dirty_roots == ("Счетчик",)
-    assert result.source == "e1cRuntimeКонтекстОтладки.Счетчик = 2;"
+    assert result.source == "КонтекстОтладки.Счетчик = 2;"
 
 
 def test_lowers_persistent_assignment_worker_export_and_message_sink(
@@ -123,9 +121,9 @@ def test_binds_persistent_and_captured_contexts_without_aliasing(
     )
 
     source = (
-        'e1cRuntimeКонтекстОтладки.Результат.Добавить("x"); '
-        "Скаляр = e1cRuntimeКонтекстОтладки.Скаляр; "
-        "e1cRuntimeКонтекстОтладки.Скаляр = Скаляр + 1;"
+        'КонтекстОтладки.Результат.Добавить("x"); '
+        "Скаляр = КонтекстОтладки.Скаляр; "
+        "КонтекстОтладки.Скаляр = Скаляр + 1;"
     )
     result = SemanticNotebookLowerer(parser_target).lower(
         source,
@@ -133,9 +131,9 @@ def test_binds_persistent_and_captured_contexts_without_aliasing(
     )
 
     assert result.source == (
-        'e1cRuntimeКонтекстОтладки.Результат.Добавить("x"); '
-        'e1cRuntimeКонтекст.Вставить("Скаляр", e1cRuntimeКонтекстОтладки.Скаляр); '
-        "e1cRuntimeКонтекстОтладки.Скаляр = e1cRuntimeКонтекст.Скаляр + 1;"
+        'КонтекстОтладки.Результат.Добавить("x"); '
+        'e1cRuntimeКонтекст.Вставить("Скаляр", КонтекстОтладки.Скаляр); '
+        "КонтекстОтладки.Скаляр = e1cRuntimeКонтекст.Скаляр + 1;"
     )
     assert result.context_names == ("Скаляр",)
     assert result.dirty_roots == ("Скаляр",)
@@ -160,7 +158,7 @@ def test_lowering_profiles_define_route_specific_result_capture_and_map_behavior
         profile=MAIN_LOWERING_PROFILE,
     )
     capture = SemanticNotebookLowerer(parser_target).lower(
-        "РезультатИнструкции = e1cRuntimeКонтекстОтладки.Скаляр;",
+        "РезультатИнструкции = КонтекстОтладки.Скаляр;",
         profile=CAPTURE_LOWERING_PROFILE,
     )
     preview_profile = LoweringProfile(
@@ -169,16 +167,16 @@ def test_lowering_profiles_define_route_specific_result_capture_and_map_behavior
         source_map_tag="preview",
     )
     preview = SemanticNotebookLowerer(parser_target).lower(
-        "Итог = e1cRuntimeКонтекстОтладки.Скаляр;",
+        "Итог = КонтекстОтладки.Скаляр;",
         profile=preview_profile,
     )
 
     assert main.source == "Результат = 1;"
     assert main.mapped_source.artifact.mode == "main"
-    assert capture.source == "РезультатИнструкции = e1cRuntimeКонтекстОтладки.Скаляр;"
+    assert capture.source == "РезультатИнструкции = КонтекстОтладки.Скаляр;"
     assert capture.dirty_roots == ()
     assert capture.mapped_source.artifact.mode == "capture"
-    assert preview.source == "Итог = e1cRuntimeКонтекстОтладки.Скаляр;"
+    assert preview.source == "Итог = КонтекстОтладки.Скаляр;"
     assert preview.mapped_source.artifact.mode == "preview"
     assert preview_profile == LoweringProfile(
         result_channel="Итог",
@@ -232,12 +230,12 @@ def test_capture_namespace_is_rejected_outside_capture_and_as_bare_alias(
     lowerer = SemanticNotebookLowerer(parser_target)
     with pytest.raises(SemanticLoweringError, match="only available in CAPTURE"):
         lowerer.lower(
-            "Результат = e1cRuntimeКонтекстОтладки.Скаляр;",
+            "Результат = КонтекстОтладки.Скаляр;",
             mode=LoweringMode.MAIN,
         )
     with pytest.raises(SemanticLoweringError, match="bare capture namespace"):
         lowerer.lower(
-            "Результат = e1cRuntimeКонтекстОтладки;",
+            "Результат = КонтекстОтладки;",
             mode=LoweringMode.CAPTURE,
         )
 
@@ -276,7 +274,7 @@ def test_platform_globals_and_nested_capture_mutation_are_not_rebound(
 
     source = (
         "Строка(Значение); Таблица.Добавить(Значение); "
-        "e1cRuntimeКонтекстОтладки.Таблица[0] = Значение;"
+        "КонтекстОтладки.Таблица[0] = Значение;"
     )
     result = SemanticNotebookLowerer(
         parser_target,
@@ -287,7 +285,7 @@ def test_platform_globals_and_nested_capture_mutation_are_not_rebound(
     assert result.source == (
         "Строка(e1cRuntimeКонтекст.Значение); "
         "e1cRuntimeКонтекст.Таблица.Добавить(e1cRuntimeКонтекст.Значение); "
-        "e1cRuntimeКонтекстОтладки.Таблица[0] = e1cRuntimeКонтекст.Значение;"
+        "КонтекстОтладки.Таблица[0] = e1cRuntimeКонтекст.Значение;"
     )
     assert result.dirty_roots == ()
 
@@ -514,10 +512,10 @@ def test_module_binding_resolves_parameter_and_local_shadows_before_lower_scopes
 @pytest.mark.parametrize(
     "source",
     (
-        "e1cRuntimeКонтекстОтладки[0];",
-        "e1cRuntimeКонтекстОтладки[0] = Значение;",
-        "e1cRuntimeКонтекстОтладки.Получить();",
-        "e1cRuntimeКонтекстОтладки()[0];",
+        "КонтекстОтладки[0];",
+        "КонтекстОтладки[0] = Значение;",
+        "КонтекстОтладки.Получить();",
+        "КонтекстОтладки()[0];",
     ),
 )
 def test_capture_namespace_rejects_non_member_root_forms(
@@ -548,7 +546,7 @@ def test_bare_capture_assignment_is_rejected(
 
     with pytest.raises(SemanticLoweringError, match="reserved"):
         SemanticNotebookLowerer(parser_target).lower(
-            "e1cRuntimeКонтекстОтладки = Значение;",
+            "КонтекстОтладки = Значение;",
             mode=LoweringMode.CAPTURE,
         )
 
@@ -650,8 +648,8 @@ def test_loop_variables_are_cell_local_while_loop_inputs_remain_persistent(
     ("source", "position"),
     (
         ("e1cRuntimeКонтекст = Значение;", 0),
-        ("e1cRuntimeКонтекстОтладки = Значение;", 0),
-        ("e1cRuntimeКонтекст.e1cRuntimeКонтекстОтладки.Получить();", 18),
+        ("КонтекстОтладки = Значение;", 0),
+        ("e1cRuntimeКонтекст.КонтекстОтладки.Получить();", 18),
     ),
 )
 def test_runtime_namespaces_cannot_be_rebound_or_used_as_capture_aliases(
@@ -1074,8 +1072,8 @@ def test_capture_namespace_and_result_channel_remain_exact_unicode_multiline(
     from onec_runtime.bsl import LoweringMode, SemanticNotebookLowerer
 
     source = (
-        "e1cRuntimeКонтекстОтладки.Счётчик = e1cRuntimeКонтекстОтладки.Счётчик + 1;\n"
-        "РезультатИнструкции = e1cRuntimeКонтекстОтладки.Счётчик;"
+        "КонтекстОтладки.Счётчик = КонтекстОтладки.Счётчик + 1;\n"
+        "РезультатИнструкции = КонтекстОтладки.Счётчик;"
     )
     visible = _mapped(source, "cell-capture-unicode", 8)
     result = SemanticNotebookLowerer(parser_target).lower_mapped(
@@ -1086,7 +1084,7 @@ def test_capture_namespace_and_result_channel_remain_exact_unicode_multiline(
     assert result.source == source
     assert result.dirty_roots == ("Счётчик",)
     assert result.persistent_write_roots == ()
-    for needle in ("e1cRuntimeКонтекстОтладки", "Счётчик", "РезультатИнструкции", "\n"):
+    for needle in ("КонтекстОтладки", "Счётчик", "РезультатИнструкции", "\n"):
         generated = result.source.index(needle)
         origin = source.index(needle)
         mapped = result.source_map.map_offset(generated)

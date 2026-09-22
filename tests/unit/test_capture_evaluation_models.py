@@ -109,6 +109,18 @@ def test_admission_envelope_v1_maps_closed_nonready_tags(
     assert caught.value.__context__ is None
 
 
+def test_materialization_failure_has_route_neutral_public_error() -> None:
+    with pytest.raises(CaptureValueCheckError) as caught:
+        AdmissionEnvelopeV1.parse(
+            "E|value_admission_failed",
+            max_payload_bytes=1,
+            max_base64_chars=1,
+        )
+
+    assert type(caught.value).__name__ == "ValueMaterializationError"
+    assert str(caught.value) == "1C value materialization failed"
+
+
 @pytest.mark.parametrize(
     "encoded",
     [

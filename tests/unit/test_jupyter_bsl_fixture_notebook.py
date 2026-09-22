@@ -115,19 +115,19 @@ def test_capture_flow_has_two_source_points_error_writeback_and_two_resumes() ->
 
     assert "CALLEE_CAPTURE_FRAGMENT" in cells["capture-arm"].source
     assert "CALLER_CAPTURE_FRAGMENT" in cells["capture-arm"].source
-    assert "e1cRuntimeКонтекстОтладки.ЛокальныйСчетчик = 900" in cells["capture-error"].source
+    assert "КонтекстОтладки.ЛокальныйСчетчик = 900" in cells["capture-error"].source
     assert (
-        "FixtureMixedCapture(CaptureMixedState, e1cRuntimeКонтекстОтладки.ЛокальныйСчетчик)"
+        "FixtureMixedCapture(CaptureMixedState, КонтекстОтладки.ЛокальныйСчетчик)"
         in cells["capture-mixed"].source
     )
     assert (
-        "e1cRuntimeКонтекстОтладки.ЛокальныйMixed = CaptureMixedState.Результат"
+        "КонтекстОтладки.ЛокальныйMixed = CaptureMixedState.Результат"
         in cells["capture-mixed"].source
     )
-    assert "e1cRuntimeКонтекстОтладки.ЛокальныйСчетчик = 901" in cells["capture-mixed-error"].source
+    assert "КонтекстОтладки.ЛокальныйСчетчик = 901" in cells["capture-mixed-error"].source
     assert "ОшибкаMixedCapture = 1 / 0" in cells["capture-mixed-error"].source
     assert "FixtureMixedCaptureAfterError" in cells["capture-mixed-error-recovery"].source
-    assert "e1cRuntimeКонтекстОтладки.ЛокальныйСчетчик = 40" in cells["capture-write"].source
+    assert "КонтекстОтладки.ЛокальныйСчетчик = 40" in cells["capture-write"].source
     assert "ЛокальныйСчетчик ЛокальнаяСтруктура" in cells["capture-resume-a"].source
     assert cells["capture-resume-b"].source == "%bsl_resume"
     assert EXPECTED_ERROR_TAGS == frozenset(

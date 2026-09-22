@@ -183,7 +183,7 @@ def test_runtime_session_routes_main_capture_resume_and_heartbeat_through_one_ow
             capture_fence, filters={"name": "Amount"}, cursor=0, limit=10,
         )
         assert variables_page["items"][0]["handle"] == (
-            "e1cRuntimeКонтекст.e1cRuntimeКонтекстОтладки.Amount"
+            "e1cRuntimeКонтекст.КонтекстОтладки.Amount"
         )
         frame_page = runtime.capture_frame(
             capture_fence, level=0, cursor=0, limit=10,

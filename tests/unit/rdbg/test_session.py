@@ -11,6 +11,7 @@ from onec_runtime.errors import (
     EvaluationDispatchUnknown,
     LocalVariablesResultTimeout,
     ProtocolError,
+    RdbgTransportTimeout,
     TargetLost,
     UnexpectedStop,
 )
@@ -218,16 +219,122 @@ def target_states_payload() -> bytes:
         </item></response>'''.encode()
 
 
-def test_heartbeat_renews_the_registered_debug_ui_lease() -> None:
+def test_idle_heartbeat_checks_bound_target_without_polling_events() -> None:
     transport = FakeTransport()
-    transport.responses["pingDebugUIParams"].append(b"")
     transport.responses["getDbgAllTargetStates"].append(target_states_payload())
     session = ready_session(transport)
 
     result = session.heartbeat()
 
     assert result == {"rtt_ms": 1.0, "target_state": "stopped"}
-    assert transport.calls == ["pingDebugUIParams", "getDbgAllTargetStates"]
+    assert transport.calls == ["getDbgAllTargetStates"]
+
+
+def test_idle_heartbeat_renews_debug_ui_every_thirty_seconds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break: target checks succeed while the Debug UI lease silently expires."""
+    now = [0.0]
+    monkeypatch.setattr(session_module, "monotonic", lambda: now[0])
+    transport = FakeTransport()
+    transport.responses["getDbgAllTargetStates"].extend(
+        target_states_payload() for _ in range(5)
+    )
+    session = ready_session(transport)
+
+    for instant in (0.0, 29.9, 30.0, 59.9, 60.0):
+        now[0] = instant
+        assert session.heartbeat()["target_state"] == "stopped"
+
+    assert transport.calls == [
+        "getDbgAllTargetStates",
+        "getDbgAllTargetStates",
+        "pingDebugUIParams", "getDbgAllTargetStates",
+        "getDbgAllTargetStates",
+        "pingDebugUIParams", "getDbgAllTargetStates",
+    ]
+
+
+def test_idle_heartbeat_completes_long_poll_before_next_evaluation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A timed-out idle poll must not consume the next evaluation result."""
+    now = [0.0]
+    result_id = UUID("aaaaaaaa-1111-1111-1111-111111111111")
+    monkeypatch.setattr(session_module, "monotonic", lambda: now[0])
+    monkeypatch.setattr(session_module, "uuid4", lambda: result_id)
+
+    class LongPollTransport(FakeTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.abandoned_idle_poll = False
+            self.pings = 0
+
+        def request(self, command: str, payload: bytes = b"", **options: object) -> bytes:
+            if command != "pingDebugUIParams":
+                return super().request(command, payload, **options)
+            self.calls.append(command)
+            self.pings += 1
+            if self.pings == 1:
+                timeout_s = options["timeout_s"]
+                assert isinstance(timeout_s, (int, float))
+                if timeout_s < 5.0:
+                    self.abandoned_idle_poll = True
+                    now[0] += timeout_s
+                else:
+                    now[0] += 5.0
+                return b""
+            now[0] += 5.0
+            if self.abandoned_idle_poll:
+                return b""
+            return f'''<response xmlns="{RDBG_NS}"><result><cmdID>exprEvaluated</cmdID>
+              <evalExprResBaseData><expressionResultID xmlns="{CALC_NS}">{result_id}</expressionResultID>
+                <resultValueInfo xmlns="{CALC_NS}"><typeName>Число</typeName>
+                  <pres>MQ==</pres></resultValueInfo>
+                <errorOccurred xmlns="{CALC_NS}">false</errorOccurred>
+              </evalExprResBaseData></result></response>'''.encode()
+
+    transport = LongPollTransport()
+    transport.responses["getDbgAllTargetStates"].append(target_states_payload())
+    session = ready_session(transport)
+    now[0] = 30.0
+
+    assert session.heartbeat()["target_state"] == "stopped"
+    pending = session.start_evaluation("1")
+    result = session.wait_evaluation_event(pending, timeout_s=6.0)
+
+    assert isinstance(result, EvaluationResult)
+    assert (result.result_id, result.presentation) == (result_id, "1")
+    assert not transport.abandoned_idle_poll
+    assert transport.calls == [
+        "pingDebugUIParams", "getDbgAllTargetStates", "evalExpr", "pingDebugUIParams",
+    ]
+
+
+def test_idle_heartbeat_reports_uncertain_poll_instead_of_empty_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [0.0]
+    monkeypatch.setattr(session_module, "monotonic", lambda: now[0])
+
+    class TimedOutTransport(FakeTransport):
+        def request(self, command: str, payload: bytes = b"", **options: object) -> bytes:
+            if command == "pingDebugUIParams":
+                self.calls.append(command)
+                if options.get("read_timeout_as_empty", True):
+                    return b""
+                raise RdbgTransportTimeout("heartbeat poll outcome is unknown")
+            return super().request(command, payload, **options)
+
+    transport = TimedOutTransport()
+    transport.responses["getDbgAllTargetStates"].append(target_states_payload())
+    session = ready_session(transport)
+    now[0] = 30.0
+
+    with pytest.raises(RdbgTransportTimeout, match="outcome is unknown"):
+        session.heartbeat()
+
+    assert transport.calls == ["pingDebugUIParams"]
 
 
 def test_heartbeat_marks_each_transport_entry_before_request() -> None:
@@ -243,7 +350,6 @@ def test_heartbeat_marks_each_transport_entry_before_request() -> None:
             return super().request(command, payload, **options)
 
     transport = OrderedTransport()
-    transport.responses["pingDebugUIParams"].append(b"")
     transport.responses["getDbgAllTargetStates"].append(target_states_payload())
     session = ready_session(transport)
 
@@ -251,8 +357,7 @@ def test_heartbeat_marks_each_transport_entry_before_request() -> None:
 
     assert result == {"rtt_ms": 1.0, "target_state": "stopped"}
     assert events == [
-        "dispatch", "test_server", "dispatch", "pingDebugUIParams",
-        "dispatch", "getDbgAllTargetStates",
+        "dispatch", "test_server", "dispatch", "getDbgAllTargetStates",
     ]
 
 
@@ -293,7 +398,7 @@ def test_heartbeat_callback_rejection_blocks_first_and_later_transport_entries()
     assert later.calls == []
 
 
-def test_heartbeat_reports_lost_selected_target_after_renewing_lease() -> None:
+def test_heartbeat_reports_lost_selected_target() -> None:
     """Break: treating a missing selected target as a healthy heartbeat."""
     transport = FakeTransport()
     transport.responses["getDbgAllTargetStates"].append(
@@ -304,7 +409,7 @@ def test_heartbeat_reports_lost_selected_target_after_renewing_lease() -> None:
     with pytest.raises(TargetLost, match="Selected target disappeared"):
         session.heartbeat()
 
-    assert transport.calls == ["pingDebugUIParams", "getDbgAllTargetStates"]
+    assert transport.calls == ["getDbgAllTargetStates"]
 
 
 def stopped_payload(location: ModuleLocation) -> bytes:
@@ -316,44 +421,90 @@ def stopped_payload(location: ModuleLocation) -> bytes:
       </moduleID><lineNo>{location.line}</lineNo></callStack></result></response>""".encode()
 
 
+def test_main_stop_wait_keeps_full_poll_for_stop_after_interval_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = ready_session(FakeTransport())
+    session.state = SessionState.EXECUTING
+    assert session.target is not None
+    stop = StopEvent(session.target.target_id, CAPTURE_A, "breakpoint")
+    now = [0.0]
+    monkeypatch.setattr(session_module, "monotonic", lambda: now[0])
+    monkeypatch.setattr(session_module, "sleep", lambda _: None)
+
+    def server_long_poll(timeout_s: float, **_: object):
+        if timeout_s < 5.5:
+            raise RdbgTransportTimeout("client abandoned the server long poll")
+        if now[0] == 0.0:
+            now[0] = 5.0
+            return [], []
+        now[0] = 7.0
+        return [stop], []
+
+    monkeypatch.setattr(session, "_poll", server_long_poll)
+
+    assert session.wait_for_any_stop(timeout_s=6.0) is stop
+    assert now[0] == 7.0
+    assert session.state is SessionState.READY
+
+
 def started_payload(target_id: UUID) -> bytes:
     return f"""<response xmlns="{RDBG_NS}"><result><cmdID>targetStarted</cmdID>
       <targetID xmlns="{BASE_NS}"><id>{target_id}</id><infoBaseAlias>DefAlias</infoBaseAlias>
       <targetType>ManagedClient</targetType></targetID></result></response>""".encode()
 
 
-@pytest.mark.parametrize(
-    ("blocked_entry", "expected_calls"),
-    [
-        (3, ["pingDebugUIParams"]),
-        (4, ["pingDebugUIParams", "clearBreakOnNextStatement"]),
-        (5, ["pingDebugUIParams", "clearBreakOnNextStatement", "attachDetachDbgTargets"]),
-    ],
-)
-def test_heartbeat_fences_each_autoattach_effect_after_ping(
-    blocked_entry: int, expected_calls: list[str],
-) -> None:
-    transport = FakeTransport()
-    transport.responses["pingDebugUIParams"].append(
-        started_payload(UUID("33333333-3333-3333-3333-333333333333"))
+def test_registration_completes_poll_before_first_target_event() -> None:
+    """Break: an abandoned registration poll consumes the first targetStarted."""
+
+    class BootstrapTransport(FakeTransport):
+        first_poll = True
+        abandoned_poll = False
+
+        def request(self, command: str, payload: bytes = b"", **options: object) -> bytes:
+            if command == "pingDebugUIParams" and self.first_poll:
+                self.first_poll = False
+                self.abandoned_poll = float(options["timeout_s"]) < 5.0
+                return b""
+            if command == "pingDebugUIParams" and self.abandoned_poll:
+                # The earlier server-side poll received targetStarted.
+                self.abandoned_poll = False
+                return stopped_payload(LOCATION)
+            return super().request(command, payload, **options)
+
+    transport = BootstrapTransport()
+    transport.responses["pingDebugUIParams"].extend(
+        (started_payload(TARGET_ID), stopped_payload(LOCATION))
     )
-    transport.responses["getDbgAllTargetStates"].append(target_states_payload())
-    session = ready_session(transport)
-    session._breakpoint_installed = True
-    session._breakpoint_locations = (LOCATION,)
-    entries = 0
+    session = RdbgSession(transport, LOCATION)  # type: ignore[arg-type]
+    session.initialize()
+    session.set_service_breakpoint()
 
-    def reject_at_entry() -> None:
-        nonlocal entries
-        entries += 1
-        if entries == blocked_entry:
-            raise ValueError("Stop fenced autoattach")
+    session.verify_registration()
+    stop = session.wait_for_service_stop(timeout_s=1)
 
-    with pytest.raises(ValueError, match="Stop fenced autoattach"):
-        session.heartbeat(on_transport_dispatch=reject_at_entry)
+    assert stop.location == LOCATION
+    assert session.target is not None
+    assert session.target.target_id.id == TARGET_ID
 
-    assert entries == blocked_entry
-    assert transport.calls == expected_calls
+
+def test_registration_reports_uncertain_poll_instead_of_launching_client() -> None:
+    """Break: transport timeout appears to verify UI while the poll is outstanding."""
+
+    class TimedOutTransport(FakeTransport):
+        def request(self, command: str, payload: bytes = b"", **options: object) -> bytes:
+            if command == "pingDebugUIParams":
+                if options.get("read_timeout_as_empty", True):
+                    return b""
+                raise RdbgTransportTimeout("registration poll outcome is unknown")
+            return super().request(command, payload, **options)
+
+    session = RdbgSession(TimedOutTransport(), LOCATION)  # type: ignore[arg-type]
+    session.initialize()
+    session.set_service_breakpoint()
+
+    with pytest.raises(RdbgTransportTimeout, match="outcome is unknown"):
+        session.verify_registration()
 
 
 def test_eval_wait_fences_autoattach_discovered_during_poll() -> None:
@@ -457,10 +608,10 @@ def test_local_variables_wait_fences_autoattach_discovered_during_poll() -> None
     assert transport.calls == ["evalLocalVariables", "pingDebugUIParams"]
 
 
-def test_heartbeat_preserves_stop_evaluation_and_locals_for_real_consumers(
+def test_idle_heartbeat_leaves_stop_evaluation_and_locals_for_active_poll(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Break: dropping/duplicating heartbeat events or losing deferred result caches."""
+    """Idle checks must leave queued RDBG events for the active event reader."""
     result_id = UUID("aaaaaaaa-9999-9999-9999-999999999999")
     locals_id = UUID("bbbbbbbb-9999-9999-9999-999999999999")
     next_id = UUID("cccccccc-9999-9999-9999-999999999999")
@@ -488,6 +639,7 @@ def test_heartbeat_preserves_stop_evaluation_and_locals_for_real_consumers(
     transport.responses["getDbgAllTargetStates"].append(target_states_payload())
 
     session.heartbeat()
+    assert transport.calls.count("pingDebugUIParams") == 0
 
     stop = session.wait_evaluation_event(pending, timeout_s=0.05)
     assert isinstance(stop, StopEvent) and stop.location == CAPTURE_A
@@ -502,7 +654,7 @@ def test_heartbeat_preserves_stop_evaluation_and_locals_for_real_consumers(
     ]
     assert transport.calls.count("pingDebugUIParams") == 1
     assert transport.calls.count("step") == 1
-    # A duplicate stop/result from the heartbeat would precede this next result.
+    # The active poll consumes this batch exactly once.
     transport.responses["evalExpr"].append(f'''<response xmlns="{RDBG_NS}"><result>
       <expressionResultID xmlns="{CALC_NS}">{next_id}</expressionResultID>
       <resultValueInfo xmlns="{CALC_NS}"><typeName>Число</typeName><pres>Mg==</pres></resultValueInfo>
@@ -823,7 +975,7 @@ def test_evaluation_stop_is_returned_before_matching_result(
     )
     result = EvaluationResult(pending.result_id, "Число", "1", False)
     batches = iter((([stop], []), ([], [result])))
-    monkeypatch.setattr(session, "_poll", lambda _timeout: next(batches))
+    monkeypatch.setattr(session, "_poll", lambda _timeout, **_: next(batches))
 
     observed = session.wait_evaluation_event(pending, timeout_s=1)
     assert observed is stop
@@ -957,7 +1109,7 @@ def test_ambiguous_eval_transport_keeps_one_capability_for_late_result(
         session.start_evaluation("2")
 
     result = EvaluationResult(pending.result_id, "Число", "1", False)
-    monkeypatch.setattr(session, "_poll", lambda _timeout: ([], [result]))
+    monkeypatch.setattr(session, "_poll", lambda _timeout, **_: ([], [result]))
     assert session.wait_evaluation_event(pending, timeout_s=1) is result
     assert transport.calls.count("evalExpr") == 1
     assert session._pending_evaluation_states == {}
@@ -1018,7 +1170,7 @@ def test_malformed_eval_ack_retains_capability_until_correlated_result(
     pending = raised.value.pending
     assert isinstance(raised.value.__cause__, ProtocolError)
     result = EvaluationResult(pending.result_id, "Число", "1", False)
-    monkeypatch.setattr(session, "_poll", lambda _timeout: ([], [result]))
+    monkeypatch.setattr(session, "_poll", lambda _timeout, **_: ([], [result]))
     assert session.wait_evaluation_event(pending, timeout_s=1) is result
     assert transport.calls.count("evalExpr") == 1
 
@@ -1082,6 +1234,48 @@ def test_local_variables_correlates_deferred_ping_result(
     assert [item.name for item in result.variables] == ["Результат"]
     assert session.state is SessionState.READY
     assert "step" not in transport.calls
+
+
+def test_local_variables_keeps_full_ping_when_result_arrives_after_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result_id = UUID("dddddddd-9999-9999-9999-999999999999")
+    deferred = f"""<response xmlns="{RDBG_NS}"><result><cmdID>exprEvaluated</cmdID>
+      <evalExprResBaseData><expressionResultID xmlns="{CALC_NS}">{result_id}</expressionResultID>
+        <calculationResult xmlns="{CALC_NS}"><valueOfContextPropInfo>
+          <propInfo><propName>Результат</propName></propInfo>
+          <valueInfo><typeName>Число</typeName><pres>MQ==</pres></valueInfo>
+        </valueOfContextPropInfo></calculationResult>
+      </evalExprResBaseData></result></response>""".encode()
+    now = [0.0]
+
+    class DelayedTransport(FakeTransport):
+        def request(
+            self, command: str, payload: bytes = b"", *, timeout_s: float = 60.0,
+            **options: object,
+        ) -> bytes:
+            if command != "pingDebugUIParams":
+                return super().request(command, payload, timeout_s=timeout_s, **options)
+            self.calls.append(command)
+            if now[0] < 25.0:
+                now[0] += 5.0
+                return b""
+            if timeout_s < 7.0:
+                now[0] += timeout_s
+                raise RdbgTransportTimeout("The late long-poll response was abandoned")
+            now[0] += 7.0
+            return deferred
+
+    transport = DelayedTransport()
+    session = ready_session(transport)
+    monkeypatch.setattr("onec_runtime.rdbg.session.uuid4", lambda: result_id)
+    monkeypatch.setattr("onec_runtime.rdbg.session.monotonic", lambda: now[0])
+
+    result = session.local_variables(timeout_s=30.0)
+
+    assert result.result_id == result_id
+    assert [item.name for item in result.variables] == ["Результат"]
+    assert now[0] == 32.0
 
 
 def test_local_variables_retries_bounded_empty_results(
@@ -1275,9 +1469,55 @@ def test_collection_uses_one_deadline_for_http_dispatch_and_result_polling(monke
     with pytest.raises(CommandTimeout):
         session.evaluate_collection("e1cRuntimeКонтекст.Данные", start_index=0, timeout_s=1.0)
     assert requests[0] == ("evalExpr", pytest.approx(1.0))
-    assert requests[1] == ("pingDebugUIParams", pytest.approx(0.02))
+    assert requests[1] == ("pingDebugUIParams", pytest.approx(15.0))
     assert len(requests) == 2
-    assert now[0] == pytest.approx(101.0)
+    assert now[0] == pytest.approx(115.98)
+
+
+def test_collection_keeps_full_ping_for_result_after_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result_id = UUID("78787878-7878-7878-7878-787878787878")
+    deferred = f'''<response xmlns="{RDBG_NS}"><result><cmdID>exprEvaluated</cmdID>
+      <evalExprResBaseData><expressionResultID xmlns="{CALC_NS}">{result_id}</expressionResultID>
+        <resultValueInfo xmlns="{CALC_NS}"><typeName>ТаблицаЗначений</typeName>
+          <collectionSize>0</collectionSize></resultValueInfo>
+        <errorOccurred>false</errorOccurred>
+      </evalExprResBaseData></result></response>'''.encode()
+    now = [0.0]
+    ping_timeouts: list[float] = []
+
+    class DelayedTransport(FakeTransport):
+        def request(
+            self, command: str, payload: bytes = b"", *, timeout_s: float = 60.0,
+            **options: object,
+        ) -> bytes:
+            if command != "pingDebugUIParams":
+                return super().request(command, payload, timeout_s=timeout_s, **options)
+            self.calls.append(command)
+            ping_timeouts.append(timeout_s)
+            assert options["read_timeout_as_empty"] is False
+            if len(ping_timeouts) == 1:
+                now[0] += 5.0
+                return b""
+            if timeout_s < 5.5:
+                raise RdbgTransportTimeout("client abandoned the server long poll")
+            now[0] += 2.0
+            return deferred
+
+    transport = DelayedTransport()
+    session = ready_session(transport)
+    monkeypatch.setattr("onec_runtime.rdbg.session.uuid4", lambda: result_id)
+    monkeypatch.setattr("onec_runtime.rdbg.session.monotonic", lambda: now[0])
+
+    result = session.evaluate_collection(
+        "e1cRuntimeКонтекст.Данные", start_index=0, timeout_s=6.0,
+    )
+
+    assert result.result_id == result_id
+    assert result.collection_size == 0
+    assert ping_timeouts == [15.0, 15.0]
+    assert now[0] == 7.0
 
 
 def test_collection_rejects_direct_result_received_after_deadline(monkeypatch):
@@ -1361,23 +1601,55 @@ def test_pending_evaluation_survives_interval_timeout_and_consumes_one_late_resu
     pending = session.start_evaluation("1")
     result = EvaluationResult(pending.result_id, "Число", "1", False)
     intervals = []
+    elapsed = [0.0]
+    monkeypatch.setattr(session_module, "monotonic", lambda: elapsed[0])
 
-    def timed_out(timeout_s):
+    def empty_poll(timeout_s, **_: object):
         intervals.append(timeout_s)
-        raise CommandTimeout("interval elapsed")
+        elapsed[0] += 0.03
+        return [], []
 
-    monkeypatch.setattr(session, "_poll", timed_out)
+    monkeypatch.setattr(session, "_poll", empty_poll)
     for _ in range(3):
         with pytest.raises(CommandTimeout):
             session.wait_evaluation_event(pending, timeout_s=0.025)
     assert len(session._pending_evaluation_states) == 1
-    assert all(0 < interval <= 0.025 for interval in intervals)
-    monkeypatch.setattr(session, "_poll", lambda timeout_s: ([], [result]))
+    assert intervals == [15.0] * 3
+    monkeypatch.setattr(session, "_poll", lambda timeout_s, **_: ([], [result]))
     assert session.wait_evaluation_event(pending, timeout_s=0.025) is result
     with pytest.raises(ProtocolError, match="stale or foreign"):
         session.wait_evaluation_event(pending, timeout_s=0.025)
     assert transport.calls.count("evalExpr") == 1
     assert not session._pending_evaluation_states
+
+
+def test_pending_evaluation_does_not_abort_long_poll_at_six_second_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A result after six seconds must not be lost to a one-second HTTP read timeout."""
+    transport = FakeTransport()
+    session = ready_session(transport)
+    pending = session.start_evaluation("1")
+    result = EvaluationResult(pending.result_id, "Число", "1", False)
+    elapsed = [0.0]
+    poll_timeouts: list[float] = []
+    monkeypatch.setattr(session_module, "monotonic", lambda: elapsed[0])
+
+    def server_long_poll(timeout_s: float, **_: object):
+        poll_timeouts.append(timeout_s)
+        if timeout_s < 5.5:
+            raise RdbgTransportTimeout("client abandoned the server long poll")
+        if len(poll_timeouts) == 1:
+            elapsed[0] = 5.0
+            return [], []
+        elapsed[0] = 7.0
+        return [], [result]
+
+    monkeypatch.setattr(session, "_poll", server_long_poll)
+
+    assert session.wait_evaluation_event(pending, timeout_s=6.0) is result
+    assert poll_timeouts == [15.0, 15.0]
+    assert transport.calls.count("evalExpr") == 1
 
 @pytest.mark.parametrize('command', ['set_breakpoints', 'modify', 'continue_'])
 def test_main_commands_report_transport_entry_after_validation(command):

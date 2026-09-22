@@ -63,7 +63,7 @@ class SessionValueMaterializationAdapter:
     ) -> pd.DataFrame:
         """Copy a table with fixed public row and byte ceilings.
 
-        Runtime extension 0.1.10 / protocol 5 rejects a query result that
+        Runtime extension 0.1.11 / protocol 5 rejects a query result that
         exceeds the row ceiling instead of returning a truncated prefix.
         Older extension versions are not compatible with this guarantee.
         """

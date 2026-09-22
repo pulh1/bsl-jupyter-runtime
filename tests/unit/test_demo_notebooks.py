@@ -83,8 +83,8 @@ def test_overview_builds_from_first_bsl_cell_to_posting_result(tmp_path, monkeyp
     assert position("КадровыйУчет.КадровыеДанныеСотрудников") < position("КадровыеДанные.to_df(")
     assert position("Прием.materialize(") < position("runtime.load_worker_module(")
     assert position("runtime.load_worker_module(") < position("runtime.add_capture_point(")
-    assert position("runtime.add_capture_point(") < position("e1cRuntimeКонтекстОтладки.СтруктураДанных")
-    assert position("e1cRuntimeКонтекстОтладки.СтруктураДанных") < position("runtime.resume_capture()")
+    assert position("runtime.add_capture_point(") < position("КонтекстОтладки.СтруктураДанных")
+    assert position("КонтекстОтладки.СтруктураДанных") < position("runtime.resume_capture()")
     assert position("runtime.resume_capture()") < position(
         "РегистрСведений.ЗначенияПериодическихПоказателейРасчетаЗарплатыСотрудников"
     )

@@ -63,6 +63,9 @@ from onec_runtime.rdbg.xml_codec import (
     validate_step_acknowledgement,
 )
 
+_EVENT_PING_READ_TIMEOUT_S = 15.0
+_IDLE_UI_RENEWAL_INTERVAL_S = 30.0
+
 
 class SessionState(Enum):
     DETACHED = "detached"
@@ -124,6 +127,7 @@ class RdbgSession:
         self._pending_evaluation_states: dict[int, _PendingEvaluationState] = {}
         self._request_admission_lock = Lock()
         self._requests_invalidated = False
+        self._next_idle_ui_renewal_at = monotonic() + _IDLE_UI_RENEWAL_INTERVAL_S
         self.profiler: PhaseRecorder | None = None
 
     def _profile(self, phase: str, operation, **metadata):  # type: ignore[no-untyped-def]
@@ -423,11 +427,11 @@ class RdbgSession:
     def verify_registration(self) -> None:
         """Probe this UI before starting the client whose first stop it owns."""
         self._require(SessionState.ATTACHED)
-        self._request(
-            "pingDebugUIParams",
-            b"",
-            timeout_s=0.2,
-            dbgui=str(self.ui_id),
+        self._ingest_poll_events(
+            *self._poll(
+                _EVENT_PING_READ_TIMEOUT_S,
+                read_timeout_as_empty=False,
+            )
         )
 
     def set_breakpoints(self, locations: tuple[ModuleLocation, ...], *,
@@ -451,6 +455,7 @@ class RdbgSession:
         profile_page_start: int | None = None,
         profile_result_id: str = "",
         on_transport_dispatch: Callable[[], None] | None = None,
+        read_timeout_as_empty: bool = True,
     ) -> tuple[list[StopEvent], list[EvaluationResult]]:
         metadata = {
             "page_start": profile_page_start,
@@ -463,6 +468,7 @@ class RdbgSession:
                 b"",
                 timeout_s=timeout_s,
                 dbgui=str(self.ui_id),
+                read_timeout_as_empty=read_timeout_as_empty,
                 on_transport_entry=on_transport_dispatch,
             ),
             output_bytes=len,
@@ -610,14 +616,19 @@ class RdbgSession:
         # Foreign stops stay queued in their original relative order.
         self._require(SessionState.ATTACHED, SessionState.EXECUTING)
         deadline = monotonic() + timeout_s
-        while monotonic() < deadline:
+        while True:
             if on_poll is not None:
                 on_poll()
             queued = self._pop_queued_stop(expected_target)
             if queued is not None:
                 return self._admit_stop(queued)
-            remaining = max(0.1, min(6.0, deadline - monotonic()))
-            polled = self._poll(remaining, on_transport_dispatch=on_transport_dispatch)
+            if monotonic() >= deadline:
+                break
+            polled = self._poll(
+                _EVENT_PING_READ_TIMEOUT_S,
+                on_transport_dispatch=on_transport_dispatch,
+                read_timeout_as_empty=False,
+            )
             self._ingest_poll_events(*polled)
             sleep(0.05)
         raise StopWaitIntervalElapsed("Timed out waiting for a runtime stop")
@@ -841,7 +852,7 @@ class RdbgSession:
         if state.suspended_stop is not None:
             raise ProtocolError("Pending evaluation stop must be continued first")
         deadline = monotonic() + timeout_s
-        while monotonic() < deadline:
+        while True:
             event = self._pop_pending_evaluation_event(pending)
             if event is not None:
                 if isinstance(event, StopEvent):
@@ -867,12 +878,16 @@ class RdbgSession:
                         ),
                     )
                 return event
-            remaining = deadline - monotonic()
-            if remaining <= 0:
+            if monotonic() >= deadline:
                 break
-            interval = min(6.0, remaining)
-            polled = (self._poll(interval) if on_transport_dispatch is None else
-                      self._poll(interval, on_transport_dispatch=on_transport_dispatch))
+            # A shorter read timeout can abandon RDBG's long-poll response
+            # just as it delivers the evaluation result. Check the local
+            # interval only between complete polls.
+            polled = self._poll(
+                _EVENT_PING_READ_TIMEOUT_S,
+                on_transport_dispatch=on_transport_dispatch,
+                read_timeout_as_empty=False,
+            )
             self._ingest_poll_events(*polled)
         raise CommandTimeout(
             f"Timed out waiting for expression result {pending.result_id}"
@@ -996,7 +1011,6 @@ class RdbgSession:
             **metadata,
         )
         while result is None:
-            remaining_timeout()
             result = self._profile(
                 "rdbg.collection.pending_lookup",
                 lambda: self._pending_evaluations.pop(result_id, None),
@@ -1004,13 +1018,14 @@ class RdbgSession:
                 **metadata,
             )
             if result is None:
+                remaining_timeout()
                 polled = self._poll(
-                    min(6.0, remaining_timeout()),
+                    _EVENT_PING_READ_TIMEOUT_S,
                     profile_page_start=start_index,
                     profile_result_id=str(result_id),
+                    read_timeout_as_empty=False,
                 )
                 self._ingest_poll_events(*polled)
-        remaining_timeout()
         return self._profile(
             "rdbg.collection.reindex_rows",
             lambda: replace(
@@ -1066,13 +1081,17 @@ class RdbgSession:
                         return direct
                 except ProtocolError:
                     pass
-            while monotonic() < deadline:
+            while True:
                 pending = self._pending_local_variables.pop(result_id, None)
                 if pending is not None:
                     return pending
-                interval = max(0.1, min(6.0, deadline - monotonic()))
-                polled = (self._poll(interval) if on_transport_dispatch is None else
-                          self._poll(interval, on_transport_dispatch=on_transport_dispatch))
+                if monotonic() >= deadline:
+                    break
+                polled = self._poll(
+                    _EVENT_PING_READ_TIMEOUT_S,
+                    on_transport_dispatch=on_transport_dispatch,
+                    read_timeout_as_empty=False,
+                )
                 self._ingest_poll_events(*polled)
             raise LocalVariablesResultTimeout(
                 f"Timed out waiting for local variables result {result_id}"
@@ -1143,11 +1162,17 @@ class RdbgSession:
         if on_transport_dispatch is not None:
             on_transport_dispatch()
         rtt_ms = self.transport.test_server()
-        # The platform expires the registered Debug UI unless its dedicated
-        # long-poll endpoint is called. Server and target probes alone do not
-        # renew that lease. Bound idle empty-response waiting while RuntimeSession
-        # holds its shared operation lock; returned events are still ingested.
-        self._ingest_poll_events(*self._poll(0.1, on_transport_dispatch=on_transport_dispatch))
+        if monotonic() >= self._next_idle_ui_renewal_at:
+            # A short client-side timeout may leave RDBG's poll outstanding
+            # when the next evalExpr result arrives; wait for a real response.
+            self._ingest_poll_events(
+                *self._poll(
+                    _EVENT_PING_READ_TIMEOUT_S,
+                    on_transport_dispatch=on_transport_dispatch,
+                    read_timeout_as_empty=False,
+                )
+            )
+            self._next_idle_ui_renewal_at = monotonic() + _IDLE_UI_RENEWAL_INTERVAL_S
         matches = [
             target for target in self.list_targets(on_transport_dispatch=on_transport_dispatch)
             if target.target_id.id == self.target.target_id.id

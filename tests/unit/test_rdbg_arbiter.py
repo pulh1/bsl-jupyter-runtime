@@ -1779,8 +1779,6 @@ def test_real_rdbg_heartbeat_runs_all_requests_on_arbiter_worker():
 
         def request(self, command, payload=b'', **kwargs):
             self.calls.append((command, get_ident()))
-            if command == 'pingDebugUIParams':
-                return b''
             assert command == 'getDbgAllTargetStates'
             return f'''<response xmlns="{RDBG_NS}"><result>success</result><item>
               <targetIDStr>target</targetIDStr><targetID xmlns="{BASE_NS}">
@@ -1801,7 +1799,7 @@ def test_real_rdbg_heartbeat_runs_all_requests_on_arbiter_worker():
         arbiter.dispatch(ticket)
         assert ticket.wait(3) == {'rtt_ms': 1.0, 'target_state': 'stopped'}
         assert [command for command, _ in transport.calls] == [
-            'test-server', 'pingDebugUIParams', 'getDbgAllTargetStates',
+            'test-server', 'getDbgAllTargetStates',
         ]
         assert len({thread for _, thread in transport.calls}) == 1
         assert ticket.status().settled

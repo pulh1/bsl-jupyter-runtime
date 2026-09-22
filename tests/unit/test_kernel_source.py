@@ -103,7 +103,7 @@ def test_server_extension_exposes_debug_context_execution_method() -> None:
     source = SERVER_EXTENSION_MODULE.read_text(encoding="utf-8-sig")
 
     assert (
-        "Функция ВыполнитьВКонтекстеОтладки(e1cRuntimeКонтекстОтладки, Код) Экспорт" in source
+        "Функция ВыполнитьВКонтекстеОтладки(КонтекстОтладки, Код) Экспорт" in source
     )
     assert "Выполнить(Код);" in source
     assert "Возврат РезультатИнструкции;" in source
@@ -327,7 +327,7 @@ def test_server_kernel_has_executable_entry_before_tight_loop() -> None:
 def test_server_kernel_rebinds_evicted_context_from_live_kernel_frame() -> None:
     source = SERVER_EXTENSION_MODULE.read_text(encoding="utf-8-sig")
 
-    assert "Функция НачатьКонтекстОтладки(e1cRuntimeКонтекстОтладки) Экспорт" in source
+    assert "Функция НачатьКонтекстОтладки(КонтекстОтладки) Экспорт" in source
     assert (
         "Функция ВосстановитьКонтекстВыполнения(КонтекстВыполнения) Экспорт"
     ) in source
@@ -427,7 +427,7 @@ def test_context_store_uses_session_cache_for_cross_request_debug_evaluation() -
 def test_server_extension_persists_and_releases_capture_structure() -> None:
     source = SERVER_EXTENSION_MODULE.read_text(encoding="utf-8-sig")
 
-    assert "Функция НачатьКонтекстОтладки(e1cRuntimeКонтекстОтладки) Экспорт" in source
+    assert "Функция НачатьКонтекстОтладки(КонтекстОтладки) Экспорт" in source
     assert (
         "Функция ВосстановитьКонтекстВыполнения(КонтекстВыполнения) Экспорт"
     ) in source
@@ -435,7 +435,7 @@ def test_server_extension_persists_and_releases_capture_structure() -> None:
     assert "Функция ПолучитьЗначениеКонтекстаОтладки(Имя) Экспорт" in source
     assert "Функция ЗавершитьКонтекстОтладки() Экспорт" in source
     assert "\tВозврат Истина;\nКонецФункции" in source
-    assert source.count("e1cRuntimeКонтекстОтладки = Неопределено;") >= 2
+    assert source.count("КонтекстОтладки = Неопределено;") >= 2
     assert "РезультатКонтекста = Неопределено;" in source
     assert "Значение = Неопределено;" in source
 

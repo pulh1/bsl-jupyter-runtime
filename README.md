@@ -8,14 +8,14 @@
 
 Нужны Windows, Python 3.12+, VS Code 1.136+, установленная платформа 1С, **отдельная копия ИБ** и локальная копия выгрузки исходников той же конфигурации. По умолчанию runtime устанавливает в ИБ служебное расширение. Демо проверены на платформе **8.5.1.1529**: ЗУП — с **ЗУП КОРП 3.1.38.92** и снимком данных от **01.08.2021**, УТ — с **УТ 11.6.1.61** (дата данных определяется из ИБ). Платформа, демобазы и выгрузки в пакет не входят.
 
-Скачайте **Source code (zip)** и `bsl-notebook-0.1.5.vsix` из [релиза v0.1.21](https://github.com/pulh1/bsl-jupyter-runtime/releases/tag/v0.1.21). В архиве исходников находятся `notebooks/demo`, а VSIX отвечает за подсказки BSL в редакторе. Python-пакеты версии 0.1.21 устанавливаются из PyPI.
+Скачайте **Source code (zip)** и `bsl-notebook-0.1.5.vsix` из [релиза v0.1.22](https://github.com/pulh1/bsl-jupyter-runtime/releases/tag/v0.1.22). В архиве исходников находятся `notebooks/demo`, а VSIX отвечает за подсказки BSL в редакторе. Python-пакеты версии 0.1.22 устанавливаются из PyPI.
 
 В PowerShell из папки распакованного проекта создайте окружение, установите пакет и зарегистрируйте kernel:
 
 ```powershell
 py -3.12 -m venv .venv
 $python = ".\.venv\Scripts\python.exe"
-& $python -m pip install "onec-interactive-jupyter==0.1.21" "ipykernel>=6.29,<7" "matplotlib>=3.11,<4"
+& $python -m pip install "onec-interactive-jupyter==0.1.22" "ipykernel>=6.29,<7" "matplotlib>=3.11,<4"
 & $python -m ipykernel install --user --name onec-bsl --display-name "1C BSL"
 ```
 

@@ -127,7 +127,7 @@ def test_route_policies_lower_main_and_capture_once_and_freeze_dirty_root() -> N
     main = _prepare(MainCellPolicy(main_binding), "ГДФЛ = Расчет.Ндфл.Посчитать();")
     capture = _prepare(
         CaptureCellPolicy(capture_binding),
-        "e1cRuntimeКонтекстОтладки.Скаляр = 41;",
+        "КонтекстОтладки.Скаляр = 41;",
     )
 
     assert main.payload.statement.lowering.mapped_source.artifact.mode == LoweringMode.MAIN.value

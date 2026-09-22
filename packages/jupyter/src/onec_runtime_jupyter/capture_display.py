@@ -176,7 +176,7 @@ def _stack_lines(page: StackPage) -> list[str]:
 def _path_text(path: SafeValuePath) -> str:
     root = path.root
     if root.kind is ValueRootKind.CONTEXT:
-        text = "e1cRuntimeКонтекстОтладки"
+        text = "КонтекстОтладки"
     else:
         text = f"frame[{root.native_level}]"
     for segment in path.segments:

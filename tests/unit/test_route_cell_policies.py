@@ -207,7 +207,7 @@ def test_worker_message_sink_is_installed_without_a_direct_message_call(
 def test_capture_policy_exposes_dirty_roots_before_dispatch() -> None:
     _, capture = _policies()
     parser = PythonParserTarget.from_generated()
-    common = _common("e1cRuntimeКонтекстОтладки.Скаляр = 2;", parser)
+    common = _common("КонтекстОтладки.Скаляр = 2;", parser)
     policy = capture.CaptureCellPolicy(_Binding(parser))
     context = PreparationContext(object(), object(), policy, object())
     snapshots = PreparationSnapshots(("existing",), ("worker-version",), (1, 2))
@@ -222,7 +222,7 @@ def test_capture_policy_exposes_dirty_roots_before_dispatch() -> None:
 def test_main_policy_returns_source_diagnostic_for_capture_namespace() -> None:
     main, _ = _policies()
     parser = PythonParserTarget.from_generated()
-    common = _common("e1cRuntimeКонтекстОтладки.Скаляр = 2;", parser)
+    common = _common("КонтекстОтладки.Скаляр = 2;", parser)
     policy = main.MainCellPolicy(_Binding(parser))
     context = PreparationContext(object(), object(), policy, object())
     snapshots = PreparationSnapshots(("existing",), ("worker-version",), (1, 2))

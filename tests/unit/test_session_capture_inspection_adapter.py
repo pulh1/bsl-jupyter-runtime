@@ -100,7 +100,7 @@ def test_saved_capture_frame_variables_preserve_filter_and_safe_handle_contract(
     assert page == {
         "items": ({
             "name": "Rows", "type_name": "ТаблицаЗначений", "role": "local",
-            "handle": "e1cRuntimeКонтекст.e1cRuntimeКонтекстОтладки.Rows",
+            "handle": "e1cRuntimeКонтекст.КонтекстОтладки.Rows",
         },),
         "total": 1,
         "next_cursor": None,

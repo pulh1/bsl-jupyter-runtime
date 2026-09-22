@@ -5,7 +5,11 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from onec_runtime.errors import CaptureValueAccessDeniedError, CaptureValueCheckError
+from onec_runtime.errors import (
+    CaptureValueAccessDeniedError,
+    CaptureValueCheckError,
+    ValueMaterializationError,
+)
 
 
 MAX_ADMISSION_ENVELOPE_BYTES = 192
@@ -80,7 +84,7 @@ class AdmissionEnvelopeV1:
                 "Worker generation objects are not public values"
             )
         if encoded == cls.failed():
-            raise CaptureValueCheckError("CAPTURE value admission failed")
+            raise ValueMaterializationError("1C value materialization failed")
         fields = encoded.split("|")
         if (
             len(fields) != 6

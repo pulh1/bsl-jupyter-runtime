@@ -72,18 +72,18 @@ ADVERTISED_SHAPES = (
 
 
 def _shape_capture_source() -> str:
-    return """e1cRuntimeКонтекстОтладки.QualificationStructure = Новый Структура("Code,Name", 7, "row");
-e1cRuntimeКонтекстОтладки.QualificationFixedStructure = Новый ФиксированнаяСтруктура(e1cRuntimeКонтекстОтладки.QualificationStructure);
-e1cRuntimeКонтекстОтладки.QualificationArray = Новый Массив;
-e1cRuntimeКонтекстОтладки.QualificationArray.Добавить(7);
-e1cRuntimeКонтекстОтладки.QualificationArray.Добавить("row");
-e1cRuntimeКонтекстОтладки.QualificationFixedArray = Новый ФиксированныйМассив(e1cRuntimeКонтекстОтладки.QualificationArray);
-e1cRuntimeКонтекстОтладки.QualificationTable = Новый ТаблицаЗначений;
-e1cRuntimeКонтекстОтладки.QualificationTable.Колонки.Добавить("Code");
-e1cRuntimeКонтекстОтладки.QualificationTable.Колонки.Добавить("Name");
-e1cRuntimeКонтекстОтладки.QualificationRow = e1cRuntimeКонтекстОтладки.QualificationTable.Добавить();
-e1cRuntimeКонтекстОтладки.QualificationRow.Code = 7;
-e1cRuntimeКонтекстОтладки.QualificationRow.Name = "row";
+    return """КонтекстОтладки.QualificationStructure = Новый Структура("Code,Name", 7, "row");
+КонтекстОтладки.QualificationFixedStructure = Новый ФиксированнаяСтруктура(КонтекстОтладки.QualificationStructure);
+КонтекстОтладки.QualificationArray = Новый Массив;
+КонтекстОтладки.QualificationArray.Добавить(7);
+КонтекстОтладки.QualificationArray.Добавить("row");
+КонтекстОтладки.QualificationFixedArray = Новый ФиксированныйМассив(КонтекстОтладки.QualificationArray);
+КонтекстОтладки.QualificationTable = Новый ТаблицаЗначений;
+КонтекстОтладки.QualificationTable.Колонки.Добавить("Code");
+КонтекстОтладки.QualificationTable.Колонки.Добавить("Name");
+КонтекстОтладки.QualificationRow = КонтекстОтладки.QualificationTable.Добавить();
+КонтекстОтладки.QualificationRow.Code = 7;
+КонтекстОтладки.QualificationRow.Name = "row";
 РезультатИнструкции = Истина;"""
 
 

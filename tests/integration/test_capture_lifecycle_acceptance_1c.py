@@ -85,8 +85,8 @@ def _corrected_capture_source(value: int) -> str:
 {ARRAY_NAME} = Новый Массив;
 {ARRAY_NAME}.Добавить({value});
 {ARRAY_NAME}.Добавить("corrected");
-e1cRuntimeКонтекстОтладки.ЛокальныеЧисла = {ARRAY_NAME};
-e1cRuntimeКонтекстОтладки.ЛокальнаяТаблица = {TABLE_NAME};
+КонтекстОтладки.ЛокальныеЧисла = {ARRAY_NAME};
+КонтекстОтладки.ЛокальнаяТаблица = {TABLE_NAME};
 РезультатИнструкции = Истина;
 '''
 

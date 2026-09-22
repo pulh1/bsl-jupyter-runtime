@@ -109,7 +109,7 @@ class ValueRoot:
 
     def __repr__(self) -> str:
         return (
-            "e1cRuntimeКонтекстОтладки"
+            "КонтекстОтладки"
             if self.kind is ValueRootKind.CONTEXT
             else f"frame[{self.native_level}]"
         )

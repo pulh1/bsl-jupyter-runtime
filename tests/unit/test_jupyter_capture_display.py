@@ -302,7 +302,7 @@ def test_value_page_renders_hierarchy_redaction_cycles_and_pagination() -> None:
     text = render_capture_text(page)
     html = render_capture_html(page)
 
-    assert "e1cRuntimeКонтекстОтладки.Структура.structure_fields [0:3]" in text
+    assert "КонтекстОтладки.Структура.structure_fields [0:3]" in text
     assert "├─ Оклад: Число = 150000" in text
     assert "├─ Данные: Структура = 2 элемента <unsafe> [size=2] ▸ ↻" in text
     assert "└─ СлужебноеЗначение: <private runtime value>" in text

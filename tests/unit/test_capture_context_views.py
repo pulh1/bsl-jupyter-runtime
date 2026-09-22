@@ -199,7 +199,7 @@ def test_pages_and_descriptors_render_only_saved_bounded_data():
     page = adapter.context.variables[:2]
     calls = len(backend.calls)
     rendered = repr(page) + str(page) + repr(page.items[0]) + repr(adapter.context)
-    assert "e1cRuntimeКонтекстОтладки" in rendered and "Локальная" in rendered
+    assert "КонтекстОтладки" in rendered and "Локальная" in rendered
     assert len(backend.calls) == calls
     assert "local-old" in rendered
     assert "object at" not in rendered

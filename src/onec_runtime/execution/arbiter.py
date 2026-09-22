@@ -370,7 +370,7 @@ class SessionPort:
         return result
 
     def heartbeat(self) -> dict[str, object]:
-        """Renew the Debug UI lease without creating a second event reader."""
+        """Keep an idle Debug UI and its selected target available."""
         self._require_idle()
         result = self._owner._session.heartbeat(on_transport_dispatch=self._transport_entered)
         with self._owner._mailbox:

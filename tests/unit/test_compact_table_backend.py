@@ -239,7 +239,7 @@ def test_builds_compact_transfer_for_validated_tabular_section_path() -> None:
         "e1cRuntimeКонтекст.Документ.Товары()",
         "e1cRuntimeКонтекст.Документ; Сообщить(1)",
         "RuntimeKernelServer.ПолучитьВременнуюТаблицуОтладки("
-        "e1cRuntimeКонтекст.e1cRuntimeКонтекстОтладки.Результат, \"Итоги\", 0, 10, Новый Массив)",
+        "e1cRuntimeКонтекст.КонтекстОтладки.Результат, \"Итоги\", 0, 10, Новый Массив)",
     ),
 )
 def test_rejects_executable_compact_table_path(handle: str) -> None:

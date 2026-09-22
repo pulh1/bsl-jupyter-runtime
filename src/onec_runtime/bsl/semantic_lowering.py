@@ -646,7 +646,7 @@ class SemanticNotebookLowerer:
                 if first_argument is not None:
                     stack.append(first_argument)
                 return
-            if normalized == "e1cruntimeконтекстотладки":
+            if normalized == "контекстотладки":
                 self._bind_access(target)
             elif not self._has_call(target):
                 raise SemanticLoweringError(
@@ -658,14 +658,14 @@ class SemanticNotebookLowerer:
                 self._bind_access(target)
         elif self._is_direct_name(target) and normalized in {
             "e1cruntimeконтекст",
-            "e1cruntimeконтекстотладки",
+            "контекстотладки",
         }:
             raise SemanticLoweringError(
                 f"runtime namespace {target.Root!r} is reserved at {target.span.start}",
                 span=SourceSpan(target.span.start, target.span.end),
                 code="reserved_runtime_namespace",
             )
-        elif normalized == "e1cruntimeконтекстотладки":
+        elif normalized == "контекстотладки":
             self._bind_capture_target(target)
         elif normalized in self._cell_local_names:
             self._bind_access(target)
@@ -1172,7 +1172,7 @@ class SemanticNotebookLowerer:
         if normalized == "e1cruntimeконтекст":
             if self._is_context_capture_alias(node):
                 raise SemanticLoweringError(
-                    "e1cRuntimeКонтекст.e1cRuntimeКонтекстОтладки is forbidden at "
+                    "e1cRuntimeКонтекст.КонтекстОтладки is forbidden at "
                     f"{node.Postfix[0].span.start}",
                     span=SourceSpan(
                         node.Postfix[0].span.start,
@@ -1181,7 +1181,7 @@ class SemanticNotebookLowerer:
                     code="capture_namespace_alias",
                 )
             return
-        if normalized == "e1cruntimeконтекстотладки":
+        if normalized == "контекстотладки":
             self._require_capture_namespace(node)
             return
         if normalized in self._cell_local_names:
@@ -1270,7 +1270,7 @@ class SemanticNotebookLowerer:
         return (
             bool(node.Postfix)
             and type(node.Postfix[0]).__name__ == "MemberAccess"
-            and node.Postfix[0].Name.casefold() == "e1cruntimeконтекстотладки"
+            and node.Postfix[0].Name.casefold() == "контекстотладки"
         )
 
     def _loop_variables(self, root: Any) -> dict[str, str]:
@@ -1302,7 +1302,7 @@ class SemanticNotebookLowerer:
                     and normalized not in self._platform_globals
                     and normalized not in {
                         "сообщить", "e1cruntimeконтекст",
-                        "e1cruntimeконтекстотладки",
+                        "контекстотладки",
                     }
                 ):
                     names.setdefault(normalized, target.Root)
@@ -1391,7 +1391,7 @@ class SemanticNotebookLowerer:
     def _require_capture_namespace(self, node: Any) -> None:
         if self._profile.capture_namespace_rule is CaptureNamespaceRule.FORBIDDEN:
             raise SemanticLoweringError(
-                f"e1cRuntimeКонтекстОтладки is only available in CAPTURE at {node.span.start}",
+                f"КонтекстОтладки is only available in CAPTURE at {node.span.start}",
                 span=SourceSpan(node.span.start, node.span.end),
                 code="capture_namespace_mode",
             )

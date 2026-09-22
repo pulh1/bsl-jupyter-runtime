@@ -52,6 +52,7 @@ class RdbgTransport:
         *,
         timeout_s: float = 60.0,
         dbgui: str | None = None,
+        read_timeout_as_empty: bool = True,
     ) -> bytes:
         start_ns = monotonic_ns()
         status: int | None = None
@@ -85,7 +86,11 @@ class RdbgTransport:
             return response_body
         except httpx.TimeoutException as error:
             error_text = str(error)
-            if command == "pingDebugUIParams" and isinstance(error, httpx.ReadTimeout):
+            if (
+                command == "pingDebugUIParams"
+                and isinstance(error, httpx.ReadTimeout)
+                and read_timeout_as_empty
+            ):
                 return b""
             raise RdbgTransportTimeout(
                 f"RDBG {command} transport failure: {error}"

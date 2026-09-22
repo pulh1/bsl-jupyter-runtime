@@ -281,6 +281,25 @@ def test_compact_serializer_classifies_columns_once_before_full_row_loop() -> No
     assert "ЭтоСсылка(" not in value_encoder
 
 
+def test_compact_nullable_string_value_normalizes_enum_and_empty_reference() -> None:
+    """A declared string-kind enum must reach JSON as a string, not a BSL ref."""
+    source = SERVICE_MODULE.read_text(encoding="utf-8-sig")
+    value_encoder = source.split("Функция КомпактноеЗначение", 1)[1].split(
+        "КонецФункции", 1
+    )[0]
+    branch_start = 'ИначеЕсли Вид = "nullable_string" Тогда'
+
+    assert branch_start in value_encoder
+    branch = value_encoder.split(branch_start, 1)[1].split("ИначеЕсли Вид", 1)[0]
+    string_case = 'Если ТипЗнч(Значение) = Тип("Строка") Тогда'
+    assert string_case in branch
+    assert branch.index(string_case) < branch.index('Если Не ЗначениеЗаполнено(Значение) Тогда')
+    assert 'Возврат Значение;' in branch.split('Если Не ЗначениеЗаполнено(Значение) Тогда', 1)[0]
+    assert 'Если Не ЗначениеЗаполнено(Значение) Тогда' in branch
+    assert 'Возврат "";' in branch
+    assert 'Возврат Строка(Значение);' in branch
+
+
 def test_worker_module_contains_only_user_worker_methods() -> None:
     source = WORKER_MODULE.read_text(encoding="utf-8-sig")
 

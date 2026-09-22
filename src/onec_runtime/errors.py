@@ -218,6 +218,10 @@ class CaptureValueCheckError(ProtocolError):
     """A public-value check or bounded value payload was inconclusive."""
 
 
+class ValueMaterializationError(CaptureValueCheckError):
+    """A 1C value could not be materialized on the selected runtime route."""
+
+
 class CaptureLookupError(ProtocolError):
     """A case-insensitive exact capture lookup was missing or ambiguous."""
 
