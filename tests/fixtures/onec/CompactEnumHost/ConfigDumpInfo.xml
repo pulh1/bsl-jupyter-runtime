@@ -1,0 +1,8 @@
+﻿<?xml version="1.0" encoding="UTF-8"?>
+<ConfigDumpInfo xmlns="http://v8.1c.ru/8.3/xcf/dumpinfo" xmlns:xen="http://v8.1c.ru/8.3/xcf/enums" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" format="Hierarchical" version="2.20">
+	<ConfigVersions>
+		<Metadata name="Configuration.RuntimeTestHost" id="a23a9340-f50d-45db-8b4f-0329c28bb61d" configVersion="0d0a082d976e15499dfdf5b8fa87185b00000000"/>
+		<Metadata name="Language.Русский" id="b09dce14-098d-4d39-808a-739999aa714b" configVersion="49295c291b8dcf4480fc56826bf7cfd600000000"/>
+		<Metadata name="Enum.RuntimeProbeEnum" id="e08f7736-48bb-43df-ad3e-3095580e3406" configVersion="2875722863e7654da9f15f3e822de6af00000000"/>
+	</ConfigVersions>
+</ConfigDumpInfo>

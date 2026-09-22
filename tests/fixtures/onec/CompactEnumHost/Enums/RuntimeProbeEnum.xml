@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xr="http://v8.1c.ru/8.3/xcf/readable" version="2.20">
+	<Enum uuid="e08f7736-48bb-43df-ad3e-3095580e3406">
+		<InternalInfo>
+			<xr:GeneratedType name="EnumRef.RuntimeProbeEnum" category="Ref">
+				<xr:TypeId>f8b1a3f1-ff7f-4c01-a3a8-0c089bf7ca0c</xr:TypeId>
+				<xr:ValueId>8cbeb7d8-344f-4534-9266-23b9e01801a3</xr:ValueId>
+			</xr:GeneratedType>
+			<xr:GeneratedType name="EnumManager.RuntimeProbeEnum" category="Manager">
+				<xr:TypeId>ccd31e85-5607-4718-8e3e-9530863a9025</xr:TypeId>
+				<xr:ValueId>62e6cc4f-a52b-402f-a8a3-ff983ac7cb30</xr:ValueId>
+			</xr:GeneratedType>
+			<xr:GeneratedType name="EnumList.RuntimeProbeEnum" category="List">
+				<xr:TypeId>cef95fcd-7577-4c66-8c9a-16f69df74f45</xr:TypeId>
+				<xr:ValueId>71fffb40-af04-4f78-91ef-eaff5bb2a73b</xr:ValueId>
+			</xr:GeneratedType>
+		</InternalInfo>
+		<Properties>
+			<Name>RuntimeProbeEnum</Name>
+			<Synonym/>
+			<Comment/>
+			<UseStandardCommands>false</UseStandardCommands>
+			<StandardAttributes/>
+			<Characteristics/>
+			<QuickChoice>true</QuickChoice>
+			<ChoiceMode>BothWays</ChoiceMode>
+		</Properties>
+		<ChildObjects>
+			<EnumValue uuid="9392cfc5-ace6-44c5-9599-d65607f96d2c">
+				<Properties>
+					<Name>Filled</Name>
+					<Synonym><v8:item><v8:lang>ru</v8:lang><v8:content>Filled</v8:content></v8:item></Synonym>
+					<Comment/>
+					<Color>auto</Color>
+				</Properties>
+			</EnumValue>
+		</ChildObjects>
+	</Enum>
+</MetaDataObject>
