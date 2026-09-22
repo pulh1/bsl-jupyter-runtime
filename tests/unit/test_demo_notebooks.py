@@ -32,11 +32,10 @@ def test_demo_notebooks_are_standalone_and_capture_uses_notebook_flow(tmp_path, 
         assert "ЗУП КОРП 3.1.38.92" in notebook.cells[0].source
 
     assert "УТ 11.6.1.61" in ut_sales.cells[0].source
-    assert "дата данных ИБ не фиксируется" in ut_sales.cells[0].source
+    assert "найдём последний месяц с данными" in ut_sales.cells[0].source
     ut_sources = "\n".join(cell.source for cell in ut_sales.cells)
-    assert "runtime.add_capture_point(" in ut_sources
-    assert "runtime.clear_capture_points()" in ut_sources
-    assert "runtime.runtime_api.capture_stack(" in ut_sources
+    assert "РегистрНакопления.ВыручкаИСебестоимостьПродаж" in ut_sources
+    assert "НачалоПоследнегоМесяца = НачалоМесяца" in ut_sources
     assert "runtime.load_worker_module(" in ut_sources
     assert "CommonModules\\ПродажиСервер\\Ext\\Module.bsl" in ut_sources
 
@@ -80,19 +79,13 @@ def test_overview_builds_from_first_bsl_cell_to_posting_result(tmp_path, monkeyp
 
     assert position('Сообщить("Привет, мир!")') < position("ПроцентПовышения = 10;")
     assert position("Функция УвеличитьНаПроцент") < position("КадровыйУчет.СотрудникиОрганизации")
-    assert position("КадровыйУчет.КадровыеДанныеСотрудников") < position("КадровыеДанные.to_df(")
-    assert position("Прием.materialize(") < position("runtime.load_worker_module(")
+    assert position("КадровыйУчет.СотрудникиОрганизации") < position("КадровыеДанные.to_df(")
+    assert position("КадровыеДанные.to_df(") < position("runtime.load_worker_module(")
     assert position("runtime.load_worker_module(") < position("runtime.add_capture_point(")
     assert position("runtime.add_capture_point(") < position("КонтекстОтладки.СтруктураДанных")
     assert position("КонтекстОтладки.СтруктураДанных") < position("runtime.resume_capture()")
-    assert position("runtime.resume_capture()") < position(
-        "РегистрСведений.ЗначенияПериодическихПоказателейРасчетаЗарплатыСотрудников"
-    )
+    assert position("runtime.resume_capture()") < position("ПланПослеПроведения")
     joined = "\n".join(sources)
-    assert "УвеличитьНаПроцент(СтрокаОклада.Значение)" in joined
-    assert "УвеличитьНаПроцент(СтрокаФОТ.Размер)" in joined
-    assert "И НЕ Прием.БронированиеПозиции" in joined
-    assert "СтрокаНачисления.ИдентификаторСтрокиВидаРасчета = ВыборкаПриемов.ИдентификаторСтрокиВидаРасчета" in joined
-    assert "РегистрСведений.ПлановыеНачисления" in joined
-    assert "РегистрСведений.ПлановыйФОТИтоги" in joined
+    assert "УвеличитьНаПроцент(СтрокаПоказателя.Значение)" in joined
+    assert "Прием.Записать(РежимЗаписиДокумента.Проведение)" in joined
     assert "ПланПослеПроведения" in joined
