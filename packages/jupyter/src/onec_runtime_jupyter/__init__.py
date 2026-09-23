@@ -3,6 +3,7 @@
 from onec_runtime_jupyter.extension import (
     MACHINE_MIME_TYPE,
     BslCellError,
+    RuntimeUnavailableError,
     NotebookDisplay,
     NotebookDisplayConfig,
     OnecRuntimeMagics,
@@ -12,7 +13,7 @@ from onec_runtime_jupyter.extension import (
 )
 from onec_runtime_jupyter.session import InteractiveRuntimeSession
 
-__version__ = "0.1.22"
+__version__ = "0.1.23"
 
 
 def _jupyter_labextension_paths():
@@ -22,6 +23,7 @@ __all__ = [
     "InteractiveRuntimeSession",
     "MACHINE_MIME_TYPE",
     "BslCellError",
+    "RuntimeUnavailableError",
     "NotebookDisplay",
     "NotebookDisplayConfig",
     "OnecRuntimeMagics",

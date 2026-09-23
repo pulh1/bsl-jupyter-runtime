@@ -136,6 +136,63 @@ def test_runtime_heartbeat_ticket_wait_releases_public_operation_lock(
     assert heartbeat_errors == []
 
 
+def test_runtime_heartbeat_skips_foreground_ticket_wait_handoff(
+    tmp_path: Path,
+) -> None:
+    """Break caught: heartbeat enters RDBG while a foreground caller is preparing."""
+
+    entered, release = Event(), Event()
+    heartbeat_calls: list[str] = []
+    execution_errors: list[BaseException] = []
+
+    class TicketApi:
+        def __init__(self) -> None:
+            self.wait_handoff = nullcontext
+
+        @contextmanager
+        def execution_caller_handoff(self, release_session_lock):
+            self.wait_handoff = release_session_lock
+            try:
+                yield
+            finally:
+                self.wait_handoff = nullcontext
+
+        def execute_bsl(self, _source: str) -> str:
+            with self.wait_handoff():
+                entered.set()
+                assert release.wait(3)
+            return "settled"
+
+        def try_heartbeat_ticket(self):
+            heartbeat_calls.append("admitted")
+            return None
+
+    runtime = RuntimeSession(
+        session_config(tmp_path), SimpleNamespace(ensure_running=lambda: None),
+        SimpleNamespace(), SimpleNamespace(target=None),
+        TicketApi(), SimpleNamespace(), heartbeat_interval_s=60.0,
+    )
+
+    def execute() -> None:
+        try:
+            assert runtime.execute_bsl("Результат = 1;") == "settled"
+        except BaseException as error:
+            execution_errors.append(error)
+
+    caller = Thread(target=execute, name="foreground-ticket-waiter")
+    try:
+        caller.start()
+        assert entered.wait(1)
+        runtime._heartbeat_tick()
+        assert heartbeat_calls == []
+    finally:
+        release.set()
+        caller.join(3)
+        runtime._heartbeat_stop.set()
+        runtime._heartbeat_thread.join(2)
+    assert execution_errors == []
+
+
 def test_unknown_heartbeat_ticket_does_not_wait_for_impossible_settlement(
     tmp_path: Path,
 ) -> None:

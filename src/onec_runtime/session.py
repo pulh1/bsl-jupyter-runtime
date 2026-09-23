@@ -692,6 +692,7 @@ class RuntimeSession:
         self._native_termination_acknowledged = False
         self._bound_server_expected_target = _bound_server_cleanup_target(rdbg)
         self._operation_lock = RLock()
+        self._foreground_handoff_depth = 0
         self._capture_locations: dict[tuple[str, int], object] = {}
         self._capture_source_catalog: CaptureSourceCatalog | None = None
         self._capture_stack_source_resolver: Callable[
@@ -731,13 +732,14 @@ class RuntimeSession:
         heartbeat_ticket: object | None = None
         try:
             if not self._closed:
-                try:
-                    heartbeat_ticket = self.runtime_api.try_heartbeat_ticket()
-                except RdbgDebugUiNotRegistered:
-                    lost_debug_ui = True
-                except Exception:
-                    # The owning arbiter surfaces operational failures.
-                    pass
+                if not getattr(self, "_foreground_handoff_depth", 0):
+                    try:
+                        heartbeat_ticket = self.runtime_api.try_heartbeat_ticket()
+                    except RdbgDebugUiNotRegistered:
+                        lost_debug_ui = True
+                    except Exception:
+                        # The owning arbiter surfaces operational failures.
+                        pass
                 ensure_running = getattr(self._processes, "ensure_running", None)
                 if callable(ensure_running):
                     try:
@@ -1365,11 +1367,15 @@ class RuntimeSession:
 
     @contextmanager
     def _release_operation_lock_for_capture_wait(self) -> Iterator[None]:
+        self._foreground_handoff_depth = (
+            getattr(self, "_foreground_handoff_depth", 0) + 1
+        )
         self._operation_lock.release()
         try:
             yield
         finally:
             self._operation_lock.acquire()
+            self._foreground_handoff_depth -= 1
 
     @contextmanager
     def _capture_materialization_caller_handoff(self) -> Iterator[None]:

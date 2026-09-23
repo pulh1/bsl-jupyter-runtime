@@ -301,6 +301,41 @@ def test_runtime_exception_remains_an_ipython_error() -> None:
         InteractiveShell.clear_instance()
 
 
+def test_runtime_unavailable_reply_is_not_reported_as_bsl_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Break caught: an admission refusal is labelled as BSL execution."""
+
+    from onec_runtime_jupyter import RuntimeUnavailableError
+
+    shell = FakeShell()
+    runtime = FakeRuntime()
+    runtime.execute_bsl = lambda *args, **kwargs: RuntimeReply(
+        RuntimeReplyKind.RUNTIME_UNAVAILABLE,
+        9,
+        OperationState.IDLE,
+        error="RDBG operation is still active",
+        succeeded=False,
+    )
+    install_runtime(shell, runtime)
+    published: list[object] = []
+    monkeypatch.setattr("onec_runtime_jupyter.extension.display", published.append)
+
+    with pytest.raises(RuntimeUnavailableError) as caught:
+        OnecRuntimeMagics(shell).bsl("", "Результат = 1;")  # type: ignore[arg-type]
+
+    assert not isinstance(caught.value, BslCellError)
+    assert str(caught.value) == "RDBG operation is still active"
+    assert len(published) == 1
+    displayed = published[0]
+    assert displayed.text == (
+        "Среда выполнения BSL недоступна: RDBG operation is still active"
+    )
+    assert displayed.payload["kind"] == "runtime_unavailable"
+    assert displayed.payload["error"] == "RDBG operation is still active"
+    assert "diagnostic" not in displayed.payload
+
+
 @pytest.mark.parametrize("mode", ["presentation", "diagnostic"])
 @pytest.mark.parametrize("action", ["call", "same_runtime_reinstall", "resume"])
 def test_retained_cell_diagnostic_keeps_issued_identity_without_new_cell_excerpt(

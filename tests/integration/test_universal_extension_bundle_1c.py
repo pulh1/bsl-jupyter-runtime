@@ -14,6 +14,7 @@ import pytest
 
 import onec_runtime.session as session_module
 from onec_runtime.config import RuntimeConfig
+from onec_runtime.configurator_agent import prepare_extension
 from onec_runtime.errors import ExtensionHandshakeError, ExtensionIdentityConflict
 from onec_runtime.extension_bundle import (
     EXTENSION_NAME,
@@ -389,6 +390,7 @@ def _build_table_bound_instrumented_bundle(
 def _install_cfe(config: RuntimeConfig, cfe: Path, root: Path) -> None:
     load_target_extension_cfe(config, cfe, root / "load.log")
     apply_product_extension(config, root / "apply.log")
+    prepare_extension(config, root / "safe-mode")
 
 
 @pytest.mark.live_1c

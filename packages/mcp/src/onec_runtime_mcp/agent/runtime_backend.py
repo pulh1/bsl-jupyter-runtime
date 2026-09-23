@@ -965,6 +965,13 @@ class OnecRuntimeBackend:
 
     @classmethod
     def _execution_from_reply(cls, reply: RuntimeReply) -> BackendExecution:
+        if reply.kind is RuntimeReplyKind.RUNTIME_UNAVAILABLE:
+            return BackendExecution(
+                AgentOperationState.UNKNOWN,
+                (),
+                False,
+                reply.state.value,
+            )
         state = cls._terminal_state(reply)
         messages = cls._bounded_messages(reply.messages)
         supplied_diagnostic = reply.diagnostic

@@ -150,9 +150,10 @@ def test_capture_error_retry_inspection_materialization_and_resume_live(
         frame_variables = frames[0].variables[:20]
         assert frame_variables.items
         assert all(
-            isinstance(item, UnavailableValueNode)
+            isinstance(item, (ValueNode, UnavailableValueNode))
             for item in frame_variables.items
         )
+        assert any(isinstance(item, ValueNode) for item in frame_variables.items)
         assert any(item.name == "ЛокальныйСчетчик" for item in frame_variables.items)
         selected_counter = frames[0].variables["ЛокальныйСчетчик"]
         assert isinstance(selected_counter, ValueNode)

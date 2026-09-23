@@ -35,6 +35,7 @@ class PartialWritebackError(ProtocolError):
 
 class RuntimeReplyKind(Enum):
     SOURCE_FAILED = "source_failed"
+    RUNTIME_UNAVAILABLE = "runtime_unavailable"
     MAIN_COMPLETED = "main_completed"
     CAPTURED = "captured"
     CAPTURE_CELL = "capture_cell"

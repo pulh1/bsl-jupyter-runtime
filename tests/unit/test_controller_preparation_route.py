@@ -1010,6 +1010,51 @@ def test_preparation_waits_for_main_stop_without_holding_controller_lock() -> No
         arbiter.close(timeout=3)
 
 
+def test_preparation_waits_for_idle_heartbeat_before_selecting_route() -> None:
+    """Break caught: an idle keepalive is reported as a failed BSL cell."""
+
+    heartbeat_entered = Event()
+    release_heartbeat = Event()
+
+    class WaitingHeartbeatSession(CompleteSession):
+        def heartbeat(self, *, on_transport_dispatch):
+            on_transport_dispatch()
+            heartbeat_entered.set()
+            assert release_heartbeat.wait(3)
+            return {"rtt_ms": 1.0, "target_state": "stopped"}
+
+    owner = object()
+    controller, arbiter, _session, _parser = _runtime(
+        lambda: RoutePreparationSnapshot(owner, 1, (), ()),
+        session=WaitingHeartbeatSession(),
+    )
+    heartbeat = arbiter.try_heartbeat()
+    assert heartbeat is not None
+    assert heartbeat_entered.wait(3)
+    result: list[object] = []
+    finished = Event()
+
+    def await_route() -> None:
+        try:
+            result.append(controller.await_preparation_context())
+        finally:
+            finished.set()
+
+    waiter = Thread(target=await_route)
+    try:
+        waiter.start()
+        assert not finished.wait(0.1)
+        release_heartbeat.set()
+        assert heartbeat.wait_settled(3)["target_state"] == "stopped"
+        assert finished.wait(3)
+        assert not isinstance(result[0], Unavailable)
+        assert isinstance(result[0].policy, MainCellPolicy)
+    finally:
+        release_heartbeat.set()
+        waiter.join(3)
+        arbiter.close(timeout=3)
+
+
 def test_preparation_waits_for_queued_main_before_choosing_capture_route() -> None:
     blocker_entered = Event()
     release_blocker = Event()
@@ -1247,6 +1292,53 @@ def test_worker_intent_activates_after_ticket_admission_and_releases_on_its_rout
                 assert sum(name == "modify" for name, _thread in session.calls) > modifications_before
         else:
             assert sum(name == "modify" for name, _thread in session.calls) == modifications_before
+    finally:
+        arbiter.close(timeout=3)
+
+
+def test_mixed_capture_cell_admits_deferred_statement_dirty_roots() -> None:
+    class Lease:
+        def release(self, *, port) -> None:
+            pass
+
+        def retain_outcome_unknown(self, *, port) -> None:
+            raise AssertionError("Worker activation unexpectedly became unknown")
+
+    class Activation:
+        def pin_active(self, *, port):
+            return None
+
+        def activate(self, intent, *, port):
+            return Lease()
+
+    owner = object()
+    controller, arbiter, _session, parser = _runtime(
+        lambda: RoutePreparationSnapshot(owner, 1, (), ()),
+        worker_activation=Activation(),
+    )
+    try:
+        controller.submit_main("Результат = 1;").wait_settled(3)
+        context, prepared = _prepared(
+            controller,
+            parser,
+            "Функция Посчитать() Экспорт\n"
+            "    Возврат 20;\n"
+            "КонецФункции\n"
+            "КонтекстОтладки.ЛокальныйMixed = Посчитать();",
+        )
+        assert prepared.payload.dirty_roots == ("ЛокальныйMixed",)
+
+        accepted = controller.submit_cell(
+            context,
+            prepared,
+            context.capabilities.for_pipeline().guards,
+            SubmissionReceipt(),
+        )
+
+        assert isinstance(accepted, Accepted)
+        accepted.ticket.wait_settled(3)
+        assert controller.capture_scope is not None
+        assert controller.capture_scope.dirty_roots == ("ЛокальныйMixed",)
     finally:
         arbiter.close(timeout=3)
 

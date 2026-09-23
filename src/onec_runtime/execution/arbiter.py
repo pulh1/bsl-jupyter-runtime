@@ -599,6 +599,7 @@ class RdbgArbiter:
         self._mailbox = Condition()
         self._queue: deque[ExecutionTicket] = deque()
         self._active: ExecutionTicket | None = None
+        self._idle_heartbeat: ExecutionTicket | None = None
         self._reconciliation: Plan | None = None
         self._server_teardown: ServerTeardownAttempt | None = None
         self._file_teardown: FileTeardownAttempt | None = None
@@ -665,6 +666,40 @@ class RdbgArbiter:
                 raise ArbiterBusy('Confirmed cleanup debt requires retry') from cleanup._error
             return True
 
+    def wait_for_idle_heartbeat(self) -> bool:
+        """Wait only for the best-effort keepalive admitted while idle.
+
+        A foreground caller may arrive immediately after ``try_heartbeat``
+        admitted its ticket.  That caller must not mistake maintenance work
+        for another BSL operation, while unrelated user tickets remain busy.
+        """
+
+        with self._mailbox:
+            if get_ident() == self._worker.ident:
+                raise ArbiterBusy('The RDBG worker cannot await its own heartbeat')
+            heartbeat = self._idle_heartbeat
+            if heartbeat is None:
+                return False
+            if self._active is not heartbeat and heartbeat not in self._queue:
+                self._idle_heartbeat = None
+                return False
+            self._mailbox.wait_for(lambda: (
+                heartbeat._phase == 'unknown' or (
+                    heartbeat._phase == 'settled'
+                    and self._active is not heartbeat
+                    and heartbeat not in self._queue
+                )
+            ))
+            if self._idle_heartbeat is heartbeat:
+                self._idle_heartbeat = None
+            if heartbeat._phase == 'unknown':
+                raise OutcomeUnknown('Idle heartbeat outcome is unknown')
+            if heartbeat._error is not None:
+                if isinstance(heartbeat._error, TargetTerminated):
+                    raise heartbeat._error
+                raise ArbiterBusy('Idle heartbeat failed') from heartbeat._error
+            return True
+
     def submit(self, route: RouteToken, plan: Plan, *,
                finalizer: Callable[[Any], Any] | None = None,
                receipt: SubmissionReceipt | None = None) -> ExecutionTicket:
@@ -700,6 +735,7 @@ class RdbgArbiter:
             ticket = ExecutionTicket(
                 self, self._route, lambda port: Settlement(port.heartbeat())
             )
+            self._idle_heartbeat = ticket
             self._queue.append(ticket)
             ticket._ready = True
             self._mailbox.notify_all()

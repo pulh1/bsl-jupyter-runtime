@@ -69,7 +69,7 @@ def test_presenter_returns_failed_reply_for_an_unavailable_route() -> None:
         Unavailable("RDBG operation is still active")
     )
 
-    assert reply.kind is RuntimeReplyKind.SOURCE_FAILED
+    assert reply.kind is RuntimeReplyKind.RUNTIME_UNAVAILABLE
     assert reply.operation_id == 19
     assert reply.state is OperationState.CAPTURED
     assert reply.succeeded is False
@@ -107,5 +107,5 @@ def test_pipeline_presents_local_diagnostics_and_route_unavailability() -> None:
 
     assert diagnostic_reply.kind is RuntimeReplyKind.SOURCE_FAILED
     assert diagnostic_reply.error == "BSL lowering failed"
-    assert unavailable_reply.kind is RuntimeReplyKind.SOURCE_FAILED
+    assert unavailable_reply.kind is RuntimeReplyKind.RUNTIME_UNAVAILABLE
     assert unavailable_reply.error == "No stable MAIN or CAPTURE route is available"

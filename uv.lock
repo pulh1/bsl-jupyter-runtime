@@ -1326,7 +1326,7 @@ wheels = [
 
 [[package]]
 name = "onec-interactive-jupyter"
-version = "0.1.22"
+version = "0.1.23"
 source = { editable = "packages/jupyter" }
 dependencies = [
     { name = "ipykernel" },
@@ -1356,7 +1356,7 @@ provides-extras = ["lsp"]
 
 [[package]]
 name = "onec-interactive-mcp"
-version = "0.1.22"
+version = "0.1.23"
 source = { editable = "packages/mcp" }
 dependencies = [
     { name = "httpx" },
@@ -1379,7 +1379,7 @@ requires-dist = [
 
 [[package]]
 name = "onec-interactive-runtime-core"
-version = "0.1.22"
+version = "0.1.23"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },

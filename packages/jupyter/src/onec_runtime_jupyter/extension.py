@@ -73,6 +73,13 @@ class BslCellError(RuntimeError):
         return [f"{type(self).__name__}: {self}"]
 
 
+class RuntimeUnavailableError(RuntimeError):
+    """A runtime admission failure that did not execute the BSL cell."""
+
+    def _render_traceback_(self) -> list[str]:
+        return [f"{type(self).__name__}: {self}"]
+
+
 class NotebookRuntime(Protocol):
     def execute_bsl(
         self,
@@ -771,6 +778,10 @@ class OnecRuntimeMagics(Magics):
             # Publish the rich diagnostic before raising: failed cells have no
             # execute_result. Never use raw platform error text in an exception.
             display(displayed)
+            if reply.kind is RuntimeReplyKind.RUNTIME_UNAVAILABLE:
+                raise RuntimeUnavailableError(
+                    reply.error or "1C runtime is unavailable"
+                ) from None
             diagnostic = (
                 {}
                 if reply.diagnostic is None
@@ -932,7 +943,11 @@ def _display_reply(
                 )
             payload["diagnostic_details"] = expert_diagnostic
     else:
-        payload["error"] = reply.error if reply.succeeded else "BSL execution failed"
+        payload["error"] = (
+            reply.error
+            if reply.succeeded or reply.kind is RuntimeReplyKind.RUNTIME_UNAVAILABLE
+            else "BSL execution failed"
+        )
         payload["location"] = _json_value(reply.location)
     text = (
         f"BSL {reply.kind.value.upper()} operation={reply.operation_id} "
@@ -966,7 +981,16 @@ def _display_reply(
     elif payload.get("error"):
         text += f" error={payload['error']}"
     html = None
-    if selected.mode == "presentation" and not reply.succeeded:
+    if (
+        selected.mode == "presentation"
+        and not reply.succeeded
+        and reply.kind is RuntimeReplyKind.RUNTIME_UNAVAILABLE
+    ):
+        text = "Среда выполнения BSL недоступна"
+        if reply.error:
+            text += f": {reply.error}"
+        html = "<pre>" + escape(text) + "</pre>"
+    elif selected.mode == "presentation" and not reply.succeeded:
         stage = public_diagnostic.get("stage")
         stage_label = {
             "parsing": "разбора",

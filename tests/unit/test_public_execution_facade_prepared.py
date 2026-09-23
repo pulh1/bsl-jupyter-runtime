@@ -151,7 +151,11 @@ def test_prepare_returns_safe_typed_reply_for_local_failure(local_outcome: str) 
     )
 
     result = facade.prepare_bsl("Результат = 3;")
-    assert result.kind is RuntimeReplyKind.SOURCE_FAILED
+    assert result.kind is (
+        RuntimeReplyKind.SOURCE_FAILED
+        if local_outcome == "diagnostic"
+        else RuntimeReplyKind.RUNTIME_UNAVAILABLE
+    )
     assert result.operation_id == 19
     if local_outcome == "diagnostic":
         assert result.error == "BSL source processing failed"

@@ -56,7 +56,7 @@ class RuntimeReplyPresenter:
         from onec_runtime.runtime_models import RuntimeReply, RuntimeReplyKind
 
         return RuntimeReply(
-            RuntimeReplyKind.SOURCE_FAILED,
+            RuntimeReplyKind.RUNTIME_UNAVAILABLE,
             status.operation_id,
             status.state,
             error=unavailable.reason,

@@ -782,6 +782,9 @@ class ExecutionController:
                     pass
                 continue
 
+            if self._arbiter.wait_for_idle_heartbeat():
+                continue
+
             # A value reply may settle before its private-key cleanup ticket.
             # That ticket still owns RDBG, but it is part of the completed
             # operation, so the next statement waits for it outside our lock.
@@ -1154,9 +1157,10 @@ class ExecutionController:
                     return ReadyForPolicy(outcome.value, next_route=outcome.next_route)
 
                 assert scope is not None
+                assert isinstance(payload, CapturePreparedPayload)
+                scope.admit_cell_dirty_roots(payload.dirty_roots)
                 settlement = self._route_settlement_service()
                 if settlement is not None:
-                    assert isinstance(payload, CapturePreparedPayload)
                     settlement.register_capture(
                         scope, payload,
                         base_namespace_names=context.capabilities.namespace_names,

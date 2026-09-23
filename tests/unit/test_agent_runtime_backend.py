@@ -395,6 +395,31 @@ def test_backend_preserves_structured_deterministic_source_failure() -> None:
     assert outcome.messages == ("BSL parsing failed",)
 
 
+def test_backend_keeps_runtime_unavailability_outside_bsl_failure_stages() -> None:
+    """Break caught: route admission failure is reported as BSL execution."""
+
+    backend = OnecRuntimeBackend(
+        "runtime-unavailable",
+        FakeDemoSession(
+            RuntimeReply(
+                RuntimeReplyKind.RUNTIME_UNAVAILABLE,
+                8,
+                OperationState.IDLE,
+                error="RDBG operation is still active",
+                succeeded=False,
+            )
+        ),
+    )
+
+    outcome = backend.execute_bsl("Результат = 1;")
+
+    assert outcome.terminal_state is AgentOperationState.UNKNOWN
+    assert outcome.runtime_state == "idle"
+    assert outcome.failure_stage is None
+    assert outcome.messages == ()
+    assert outcome.state_changed is StateChanged.UNKNOWN
+
+
 def test_backend_acceptance_preserves_exact_visible_diagnostic_without_source_leakage() -> None:
     """Break caught: backend sanitization drops exact coordinates or exposes BSL."""
     source = 'Первая = "😀";\r\nОшибка();'

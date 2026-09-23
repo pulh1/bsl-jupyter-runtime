@@ -77,6 +77,7 @@ def test_runtime_reply_fields_and_wire_enum_values_remain_stable() -> None:
 
     assert OperationState.MAIN_PENDING.value == "main_pending"
     assert RuntimeReplyKind.CAPTURED.value == "captured"
+    assert RuntimeReplyKind.RUNTIME_UNAVAILABLE.value == "runtime_unavailable"
     assert [field.name for field in fields(RuntimeReply)] == [
         "kind", "operation_id", "state", "result", "error", "succeeded",
         "location", "stop_sequence", "messages", "changed_roots",
